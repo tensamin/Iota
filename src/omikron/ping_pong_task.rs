@@ -1,10 +1,10 @@
 use crate::APP_STATE;
 use crate::omikron::omikron_connection::OmikronConnection;
 use dashmap::DashMap;
-use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, rand_u32};
 use std::sync::LazyLock;
 use std::time::Instant;
 use tokio::time::Duration;
+use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, rand_u32};
 
 // Dedicated lightweight ping tracking
 static PING_TIMES: LazyLock<DashMap<u32, Instant>> = LazyLock::new(|| DashMap::new());

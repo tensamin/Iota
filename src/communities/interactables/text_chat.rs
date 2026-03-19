@@ -7,11 +7,11 @@ use crate::{
     util::file_util::{get_children, load_file, save_file},
 };
 use async_trait::async_trait;
-use epsilon_core::{CommunicationType, CommunicationValue, DataTypes};
 use json::{JsonValue, array, object};
 use std::fs;
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
+use ttp_core::{CommunicationType, CommunicationValue, DataTypes};
 use uuid::Uuid;
 pub struct TextChat {
     id: Uuid,

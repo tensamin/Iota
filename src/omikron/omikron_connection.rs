@@ -8,8 +8,6 @@ use crate::util::{chat_files, chats_util};
 use crate::util::{config_util::CONFIG, crypto_helper};
 use crate::{ACTIVE_TASKS, SHUTDOWN, log, log_cv_in, log_cv_out, log_t};
 use dashmap::DashMap;
-use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
-use epsilon_native::{Receiver, Sender};
 use json::JsonValue;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -17,6 +15,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
+use ttp_native::{Receiver, Sender};
 use uuid::Uuid;
 
 // ============================================================================
@@ -213,7 +213,7 @@ impl OmikronConnection {
 
         let addr_str = format!("https://{}:{}/ws/iota/", self.host, self.port);
 
-        let (sender, mut receiver) = epsilon_native::client::connect(&addr_str, None)
+        let (sender, mut receiver) = ttp_native::client::connect(&addr_str, None)
             .await
             .map_err(|e| format!("Connection failed: {}", e))?;
 

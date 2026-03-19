@@ -1,9 +1,9 @@
 use crate::communities::{community::Community, interactables::interactable::Interactable};
 use async_trait::async_trait;
-use epsilon_core::CommunicationValue;
 use json::JsonValue;
 use std::any::Any;
 use std::sync::Arc;
+use ttp_core::CommunicationValue;
 use uuid::Uuid;
 
 pub struct Category {

@@ -8,8 +8,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use epsilon_core::{CommunicationValue, DataTypes, DataValue};
 use ratatui::style::Color;
+use ttp_core::{CommunicationValue, DataTypes, DataValue};
 
 use crate::{
     APP_STATE,
