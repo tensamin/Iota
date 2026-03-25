@@ -4,10 +4,10 @@ use aes_gcm::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STD};
 use hkdf::Hkdf;
-use sha2::{Digest, Sha256};
+type HkdfSha256 = sha2::Sha256;
+use sha2::{Digest, Sha256 as HashSha256};
 use x448::{PublicKey, Secret};
 
-// --- Custom Errors ---
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum SecurePayloadError {
@@ -18,7 +18,6 @@ pub enum SecurePayloadError {
     InvalidKeyLength,
 }
 
-// --- Data Format Enum ---
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
 pub enum DataFormat {
@@ -27,11 +26,8 @@ pub enum DataFormat {
     Hex,
 }
 
-// --- Main Class Structure ---
 pub struct SecurePayload {
-    /// The internal canonical representation is always raw bytes.
     inner_data: Vec<u8>,
-    /// The private key of the user associated with this payload instance.
     private_key: Secret,
 }
 
@@ -46,7 +42,6 @@ impl Clone for SecurePayload {
 
 #[allow(dead_code)]
 impl SecurePayload {
-    /// Clear Constructor: Takes data in any format and the user's private key.
     pub fn new<S, T: AsRef<[u8]>>(
         data: T,
         format: DataFormat,
@@ -71,12 +66,10 @@ impl SecurePayload {
         })
     }
 
-    /// Helper to get the public key associated with this instance's private key.
     pub fn get_public_key(&self) -> [u8; 56] {
         *PublicKey::from(&self.private_key).as_bytes()
     }
 
-    /// Exports the internal data to the requested format
     pub fn export(&self, format: DataFormat) -> String {
         match format.into() {
             DataFormat::Raw => String::from_utf8_lossy(&self.inner_data).to_string(),
@@ -85,14 +78,12 @@ impl SecurePayload {
         }
     }
 
-    /// Access raw bytes directly
     pub fn get_bytes(&self) -> &[u8] {
         &self.inner_data
     }
 
-    /// Returns the SHA-256 Hash of the data in the requested format
     pub fn get_hash(&self, format: DataFormat) -> String {
-        let mut hasher = Sha256::new();
+        let mut hasher = HashSha256::new();
         hasher.update(&self.inner_data);
         let result = hasher.finalize();
 
@@ -103,8 +94,6 @@ impl SecurePayload {
         }
     }
 
-    /// Encrypts the held data for a specific recipient using AES-256-GCM.
-    /// The message will contain ONLY the ciphertext.
     pub fn encrypt_x448<S>(&self, public_key: S) -> Result<SecurePayload, SecurePayloadError>
     where
         S: Into<PublicKey>,
@@ -112,17 +101,15 @@ impl SecurePayload {
         let peer_pub = public_key.into();
         let shared_secret = self.private_key.as_diffie_hellman(&peer_pub).unwrap();
 
-        // 3. Key & Nonce Derivation (HKDF)
-        // We derive 32 bytes for the key and 12 bytes for a deterministic nonce.
-        let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
-        let mut okm = [0u8; 44]; // 32 (Key) + 12 (Nonce)
+        let hkdf = Hkdf::<HkdfSha256>::new(None, shared_secret.as_bytes());
+        let mut okm = [0u8; 44];
+
         hkdf.expand(b"x448-aes-gcm-no-overhead", &mut okm)
             .map_err(|_| SecurePayloadError::EncryptionError)?;
 
         let key = &okm[..32];
         let nonce_bytes = &okm[32..];
 
-        // 4. Encrypt with AES-256-GCM
         let cipher = Aes256Gcm::new(key.into());
         let nonce = Nonce::from_slice(nonce_bytes);
 
@@ -136,14 +123,12 @@ impl SecurePayload {
             )
             .map_err(|_| SecurePayloadError::EncryptionError)?;
 
-        // 5. Result is ONLY the ciphertext. No key or nonce is packed.
         Ok(SecurePayload {
             inner_data: ciphertext,
             private_key: Secret::from_bytes(self.private_key.as_bytes()).unwrap(),
         })
     }
 
-    /// Decrypts the held data providing the sender's public key manually.
     pub fn decrypt_to_format(
         &self,
         peer_public_key_bytes: &[u8; 56],
@@ -154,7 +139,6 @@ impl SecurePayload {
         Ok(decrypted_instance.export(output_format))
     }
 
-    /// Decrypts the held data using the internal Private Key and the provided Peer Public Key.
     pub fn decrypt_x448<S>(
         &self,
         peer_public_key_bytes: S,
@@ -162,12 +146,10 @@ impl SecurePayload {
     where
         S: Into<PublicKey>,
     {
-        // 1. Perform Exchange
         let peer_pub = peer_public_key_bytes.into();
         let shared_secret = self.private_key.as_diffie_hellman(&peer_pub).unwrap();
 
-        // 2. Key & Nonce Derivation (Must match encryption exactly)
-        let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
+        let hkdf = Hkdf::<HkdfSha256>::new(None, shared_secret.as_bytes());
         let mut okm = [0u8; 44];
         hkdf.expand(b"x448-aes-gcm-no-overhead", &mut okm)
             .map_err(|_| SecurePayloadError::DecryptionError)?;
@@ -175,7 +157,6 @@ impl SecurePayload {
         let key = &okm[..32];
         let nonce_bytes = &okm[32..];
 
-        // 3. Decrypt with AES-256-GCM
         let cipher = Aes256Gcm::new(key.into());
         let nonce = Nonce::from_slice(nonce_bytes);
 
