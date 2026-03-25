@@ -1,5 +1,4 @@
 use crossterm::event::{KeyCode, KeyEvent};
-use epsilon_core::{CommunicationType, CommunicationValue};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -7,6 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
+use ttp_core::{CommunicationType, CommunicationValue};
 use uuid::Uuid;
 
 use crate::{

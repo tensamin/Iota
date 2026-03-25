@@ -1,9 +1,9 @@
 use crate::communities::community::Community;
 use async_trait::async_trait;
-use epsilon_core::CommunicationValue;
 use json::JsonValue;
 use std::any::Any;
 use std::sync::Arc;
+use ttp_core::CommunicationValue;
 use uuid::Uuid;
 
 pub type InteractableFactory = fn() -> Box<dyn Interactable>;

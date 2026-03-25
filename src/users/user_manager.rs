@@ -6,7 +6,6 @@ use crate::util::logger::PrintType;
 use crate::{RELOAD, SHUTDOWN};
 use crate::{log, log_cv};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 use hex::{self};
 use json::JsonValue;
 use once_cell::sync::Lazy;
@@ -17,6 +16,7 @@ use sha2::{Digest, Sha256};
 use std::io::{self};
 use std::sync::Mutex;
 use std::time::Duration;
+use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 use x448::{PublicKey, Secret};
 
 static USERS: Lazy<Mutex<Vec<UserProfile>>> = Lazy::new(|| Mutex::new(Vec::new()));
