@@ -119,22 +119,12 @@ impl OmikronConnection {
     // -------------------------------------------------------------------------
 
     pub async fn connect(self: &Arc<Self>) {
-        log!(
-            "OmikronConnection::connect [id={}, ptr={:p}]",
-            self.connection_id,
-            Arc::as_ptr(self)
-        );
         if self.connection_loop_handle.lock().await.is_none() {
             self.clone().start().await;
         }
     }
 
     pub async fn start(self: Arc<Self>) {
-        log!(
-            "OmikronConnection::start [id={}, ptr={:p}]",
-            self.connection_id,
-            Arc::as_ptr(&self)
-        );
         if let Some(handle) = self.connection_loop_handle.lock().await.take() {
             handle.abort();
         }
@@ -150,11 +140,6 @@ impl OmikronConnection {
     }
 
     pub async fn stop(&self) {
-        log!(
-            "OmikronConnection::stop [id={}, ptr={:p}]",
-            self.connection_id,
-            self
-        );
         *self.reconnect_on_close.write().await = false;
 
         if let Some(tx) = self.shutdown_tx.lock().await.take() {
@@ -174,11 +159,6 @@ impl OmikronConnection {
         }
 
         *self.state.write().await = ConnectionState::Disconnected;
-        log!(
-            "OmikronConnection::stop - setting sender to None [id={}, ptr={:p}]",
-            self.connection_id,
-            self
-        );
         *self.sender.write().await = None;
     }
 
@@ -241,12 +221,6 @@ impl OmikronConnection {
 
         let sender_arc = Arc::new(sender);
         *self.sender.write().await = Some(sender_arc.clone());
-        log!(
-            "OmikronConnection::connect_once - sender set [id={}, ptr={:p}, sender_open={}]",
-            self.connection_id,
-            Arc::as_ptr(&self),
-            sender_arc.is_open()
-        );
         *self.state.write().await = ConnectionState::Connected { identified: false };
 
         // Handle registration/identification
@@ -271,13 +245,6 @@ impl OmikronConnection {
 
         // Wait for read loop to complete
         let result = read_handle.await;
-
-        // Cleanup
-        log!(
-            "OmikronConnection::connect_once - setting sender to None (cleanup) [id={}, ptr={:p}]",
-            self.connection_id,
-            Arc::as_ptr(&self)
-        );
         *self.sender.write().await = None;
         *self.state.write().await = ConnectionState::Disconnected;
         {
@@ -376,12 +343,6 @@ impl OmikronConnection {
     // -------------------------------------------------------------------------
 
     async fn read_loop(self: Arc<Self>, receiver: &mut Receiver) {
-        log!(
-            "OmikronConnection::read_loop [id={}, ptr={:p}, receiver_open={}]",
-            self.connection_id,
-            Arc::as_ptr(&self),
-            receiver.is_open()
-        );
         loop {
             let result = receiver.receive().await;
             match result {
@@ -389,13 +350,6 @@ impl OmikronConnection {
                     self.clone().handle_message(cv).await;
                 }
                 Err(e) => {
-                    log!(
-                        "Receive error: {} connection_id={} receiver_open={} ptr={:p}",
-                        e,
-                        self.connection_id,
-                        receiver.is_open(),
-                        Arc::as_ptr(&self)
-                    );
                     self.fail_all_waiting_tasks(format!(
                         "Connection receive error: {} (connection_id={})",
                         e, self.connection_id
@@ -405,11 +359,6 @@ impl OmikronConnection {
                 }
             }
             if !receiver.is_open() {
-                log!(
-                    "Connection closed connection_id={} receiver_open=false ptr={:p}",
-                    self.connection_id,
-                    Arc::as_ptr(&self)
-                );
                 self.fail_all_waiting_tasks(format!(
                     "Connection closed (connection_id={}, receiver_open=false)",
                     self.connection_id
@@ -418,11 +367,6 @@ impl OmikronConnection {
                 break;
             }
         }
-        log!(
-            "OmikronConnection::read_loop exit [id={}, ptr={:p}]",
-            self.connection_id,
-            Arc::as_ptr(&self)
-        );
     }
 
     async fn heartbeat_loop(self: Arc<Self>) {
@@ -450,13 +394,6 @@ impl OmikronConnection {
     // -------------------------------------------------------------------------
 
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
-        log!(
-            "OmikronConnection::handle_message [id={}, ptr={:p}, type={:?}, msg_id={}]",
-            self.connection_id,
-            Arc::as_ptr(&self),
-            cv.get_type(),
-            cv.get_id()
-        );
         if !cv.is_type(CommunicationType::ping) && !cv.is_type(CommunicationType::pong) {
             log_cv_in!(&cv);
         }
@@ -465,21 +402,8 @@ impl OmikronConnection {
 
         // Dispatch waiting task for this message id
         if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
-            log!(
-                "OmikronConnection::handle_message - found waiting task for msg_id={} [id={}, ptr={:p}]",
-                msg_id,
-                self.connection_id,
-                Arc::as_ptr(&self)
-            );
             if (task.task)(self.clone(), cv.clone()) {
                 return;
-            } else {
-                log!(
-                    "Waiting task for msg_id={} returned false, continuing normal handling [id={}, ptr={:p}]",
-                    msg_id,
-                    self.connection_id,
-                    Arc::as_ptr(&self)
-                );
             }
         }
 
@@ -498,11 +422,6 @@ impl OmikronConnection {
                 let mut state = self.state.write().await;
                 if let ConnectionState::Connected { identified: _ } = *state {
                     *state = ConnectionState::Connected { identified: true };
-                    log!(
-                        "OmikronConnection - identification accepted! [id={}, ptr={:p}]",
-                        self.connection_id,
-                        Arc::as_ptr(&self)
-                    );
                 }
             }
             return;
@@ -804,14 +723,6 @@ impl OmikronConnection {
             self.send_message(&response).await;
             return;
         }
-
-        log!(
-            "OmikronConnection::handle_message - unhandled message type [id={}, ptr={:p}, type={:?}, msg_id={}]",
-            self.connection_id,
-            self,
-            cv.get_type(),
-            cv.get_id()
-        );
     }
 
     async fn handle_challenge(&self, cv: &CommunicationValue) {
@@ -863,21 +774,9 @@ impl OmikronConnection {
 
     async fn send_message_result(&self, cv: &CommunicationValue) -> Result<(), String> {
         let sender_guard = self.sender.read().await;
-        log!(
-            "OmikronConnection::send_message_result [id={}, ptr={:p}, has_sender={}, sender_open={}]",
-            self.connection_id,
-            self,
-            sender_guard.is_some(),
-            sender_guard.as_ref().map(|s| s.is_open()).unwrap_or(false)
-        );
         if let Some(sender) = sender_guard.as_ref() {
             if !sender.is_open() {
                 drop(sender_guard);
-                log!(
-                    "OmikronConnection::send_message_result - sender not open, setting to None [id={}, ptr={:p}]",
-                    self.connection_id,
-                    self
-                );
                 if let Some(sender) = self.sender.write().await.take() {
                     sender.close();
                 }
@@ -891,14 +790,6 @@ impl OmikronConnection {
 
             let sender_clone = Arc::clone(sender);
             drop(sender_guard);
-
-            log!(
-                "OmikronConnection::send_message_result - sending [id={}, ptr={:p}, type={:?}, msg_id={}]",
-                self.connection_id,
-                self,
-                cv.get_type(),
-                cv.get_id()
-            );
 
             if !cv.is_type(CommunicationType::ping) && !cv.is_type(CommunicationType::pong) {
                 log_cv_out!(&cv);
@@ -948,12 +839,6 @@ impl OmikronConnection {
         let (tx, mut rx) = mpsc::channel(1);
         let msg_id = cv.get_id();
 
-        log!(
-            "OmikronConnection::await_response - inserting waiting task for msg_id={} [id={}, ptr={:p}]",
-            msg_id,
-            self.connection_id,
-            self
-        );
         WAITING_TASKS.insert(
             msg_id,
             WaitingTask {
@@ -1043,11 +928,6 @@ impl OmikronConnection {
 
 pub static OMIKRON_CONNECTION: LazyLock<Arc<OmikronConnection>> = LazyLock::new(|| {
     let conn = Arc::new(OmikronConnection::new());
-    log!(
-        "OMIKRON_CONNECTION static initialized [id={}, ptr={:p}]",
-        conn.connection_id,
-        Arc::as_ptr(&conn)
-    );
 
     start_task_cleanup_loop();
 
@@ -1056,11 +936,7 @@ pub static OMIKRON_CONNECTION: LazyLock<Arc<OmikronConnection>> = LazyLock::new(
 
 pub async fn get_omikron_connection() -> Arc<OmikronConnection> {
     let conn = OMIKRON_CONNECTION.clone();
-    log!(
-        "get_omikron_connection() called [id={}, ptr={:p}]",
-        conn.connection_id,
-        Arc::as_ptr(&conn)
-    );
+
     conn.connect().await;
     conn
 }

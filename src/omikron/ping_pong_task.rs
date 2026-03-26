@@ -6,23 +6,14 @@ use std::time::Instant;
 use tokio::time::Duration;
 use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, rand_u32};
 
-// Dedicated lightweight ping tracking
 static PING_TIMES: LazyLock<DashMap<u32, Instant>> = LazyLock::new(|| DashMap::new());
 
 impl OmikronConnection {
     pub async fn send_ping(&self) {
         let id = rand_u32();
 
-        log!(
-            "OmikronConnection::send_ping [id={}, ptr={:p}, ping_id={}]",
-            self.connection_id,
-            self,
-            id
-        );
-
         PING_TIMES.insert(id, Instant::now());
 
-        // Auto-cleanup old pings (optional)
         PING_TIMES.retain(|_, v| v.elapsed() < Duration::from_secs(30));
 
         let ping_message = CommunicationValue::new(CommunicationType::ping)
@@ -37,13 +28,6 @@ impl OmikronConnection {
 
     pub async fn handle_pong(&self, cv: &CommunicationValue) {
         let id = cv.get_id();
-
-        log!(
-            "OmikronConnection::handle_pong [id={}, ptr={:p}, ping_id={}]",
-            self.connection_id,
-            self,
-            id
-        );
 
         if let Some((_, send_time)) = PING_TIMES.remove(&id) {
             let ping_ms = Instant::now().duration_since(send_time).as_millis() as i64;
