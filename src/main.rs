@@ -155,8 +155,7 @@ async fn main() {
             )
             .await;
         }
-        let omikron: Arc<OmikronConnection> = Arc::new(OmikronConnection::new());
-        omikron.connect().await;
+        let _ = omikron::omikron_connection::get_omikron_connection().await;
 
         log_t!("setup_completed");
         loop {

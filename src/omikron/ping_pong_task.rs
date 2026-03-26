@@ -1,5 +1,5 @@
-use crate::APP_STATE;
 use crate::omikron::omikron_connection::OmikronConnection;
+use crate::{APP_STATE, log};
 use dashmap::DashMap;
 use std::sync::LazyLock;
 use std::time::Instant;
@@ -12,6 +12,13 @@ static PING_TIMES: LazyLock<DashMap<u32, Instant>> = LazyLock::new(|| DashMap::n
 impl OmikronConnection {
     pub async fn send_ping(&self) {
         let id = rand_u32();
+
+        log!(
+            "OmikronConnection::send_ping [id={}, ptr={:p}, ping_id={}]",
+            self.connection_id,
+            self,
+            id
+        );
 
         PING_TIMES.insert(id, Instant::now());
 
@@ -30,6 +37,13 @@ impl OmikronConnection {
 
     pub async fn handle_pong(&self, cv: &CommunicationValue) {
         let id = cv.get_id();
+
+        log!(
+            "OmikronConnection::handle_pong [id={}, ptr={:p}, ping_id={}]",
+            self.connection_id,
+            self,
+            id
+        );
 
         if let Some((_, send_time)) = PING_TIMES.remove(&id) {
             let ping_ms = Instant::now().duration_since(send_time).as_millis() as i64;
