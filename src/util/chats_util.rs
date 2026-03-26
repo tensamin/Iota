@@ -1,6 +1,5 @@
 use crate::users::contact::Contact;
 use crate::util::file_util::get_directory;
-use json::{JsonValue, array};
 use rusqlite::{Connection, params};
 
 fn db_path() -> String {
@@ -87,8 +86,8 @@ pub fn get_user(storage_owner: i64, user_id: i64) -> Option<Contact> {
     }
 }
 
-pub fn get_users(storage_owner: i64) -> JsonValue {
-    let mut contacts_out = array![];
+pub fn get_users(storage_owner: i64) -> Vec<Contact> {
+    let mut contacts_out = Vec::new();
 
     let conn = match open_db() {
         Ok(c) => c,
@@ -126,7 +125,7 @@ pub fn get_users(storage_owner: i64) -> JsonValue {
 
     for row in rows {
         if let Ok(contact) = row {
-            let _ = contacts_out.push(contact.to_json());
+            contacts_out.push(contact);
         }
     }
 

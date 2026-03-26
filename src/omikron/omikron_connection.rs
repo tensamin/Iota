@@ -589,21 +589,43 @@ impl OmikronConnection {
         if cv.is_type(CommunicationType::get_chats) {
             let user_id = cv.get_sender();
             let users = chats_util::get_users(user_id as i64);
+            let mut user_array = Vec::new();
+            for user in users {
+                let mut container = Vec::new();
+                container.push((DataTypes::user_id, DataValue::Number(user.user_id)));
+                if let Some(name) = user.user_name {
+                    container.push((DataTypes::username, DataValue::Str(name)));
+                }
+                if let Some(ts) = user.last_message_at {
+                    container.push((DataTypes::last_message_at, DataValue::Number(ts)));
+                }
+                user_array.push(DataValue::Container(container));
+            }
             let resp = CommunicationValue::new(CommunicationType::get_chats)
                 .with_id(cv.get_id())
                 .with_receiver(user_id)
-                .add_data(DataTypes::user_ids, DataValue::Str(users.dump()));
+                .add_data(DataTypes::user_ids, DataValue::Array(user_array));
             self.send_message(&resp).await;
             return;
         }
 
         if cv.is_type(CommunicationType::add_conversation) {
             let user_id = cv.get_sender();
-            let other_id = cv
-                .get_data(DataTypes::chat_partner_id)
-                .as_number()
-                .unwrap_or(0);
+            let other_id = match cv.get_data(DataTypes::chat_partner_id).as_number() {
+                Some(n) => n as i64,
+                None => cv
+                    .get_data(DataTypes::chat_partner_id)
+                    .as_str()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0),
+            };
             let mut contact = get_user(user_id as i64, other_id).unwrap_or(Contact::new(other_id));
+
+            if let Some(name) = cv.get_data(DataTypes::chat_partner_name).as_str() {
+                contact.user_name = Some(name.to_string());
+            }
+
             contact.set_last_message_at(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
