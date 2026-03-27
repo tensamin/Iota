@@ -1,13 +1,11 @@
 use crate::users::contact::Contact;
 use crate::util::file_util::get_directory;
 use rusqlite::{Connection, params};
+use std::sync::{LazyLock, Mutex};
 
-fn db_path() -> String {
-    format!("{}/messages.sqlite3", get_directory())
-}
-
-fn open_db() -> rusqlite::Result<Connection> {
-    let conn = Connection::open(db_path())?;
+static DB_CONN: LazyLock<Mutex<Connection>> = LazyLock::new(|| {
+    let conn = Connection::open(format!("{}/messages.sqlite3", get_directory()))
+        .expect("Failed to open DB");
     conn.execute_batch(
         r#"
         PRAGMA journal_mode = WAL;
@@ -25,15 +23,13 @@ fn open_db() -> rusqlite::Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_contacts_owner
             ON contacts (storage_owner, last_message_at DESC, user_id ASC);
         "#,
-    )?;
-    Ok(conn)
-}
+    )
+    .expect("Failed to initialize DB");
+    Mutex::new(conn)
+});
 
 pub fn mod_user(storage_owner: i64, contact: &Contact) {
-    let conn = match open_db() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    let conn = DB_CONN.lock().unwrap();
 
     let _ = conn.execute(
         r#"
@@ -57,7 +53,7 @@ pub fn mod_user(storage_owner: i64, contact: &Contact) {
 }
 
 pub fn get_user(storage_owner: i64, user_id: i64) -> Option<Contact> {
-    let conn = open_db().ok()?;
+    let conn = DB_CONN.lock().unwrap();
 
     let row = conn.query_row(
         r#"
@@ -82,17 +78,17 @@ pub fn get_user(storage_owner: i64, user_id: i64) -> Option<Contact> {
     match row {
         Ok(contact) => Some(contact),
         Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(_) => None,
+        Err(e) => {
+            eprintln!("Error querying user in get_user: {}", e);
+            None
+        }
     }
 }
 
 pub fn get_users(storage_owner: i64) -> Vec<Contact> {
     let mut contacts_out = Vec::new();
 
-    let conn = match open_db() {
-        Ok(c) => c,
-        Err(_) => return contacts_out,
-    };
+    let conn = DB_CONN.lock().unwrap();
 
     let mut stmt = match conn.prepare(
         r#"
@@ -106,7 +102,10 @@ pub fn get_users(storage_owner: i64) -> Vec<Contact> {
         "#,
     ) {
         Ok(s) => s,
-        Err(_) => return contacts_out,
+        Err(e) => {
+            eprintln!("Failed to prepare statement in get_users: {}", e);
+            return contacts_out;
+        }
     };
 
     let rows = match stmt.query_map(params![storage_owner], |r| {
@@ -120,7 +119,10 @@ pub fn get_users(storage_owner: i64) -> Vec<Contact> {
         })
     }) {
         Ok(r) => r,
-        Err(_) => return contacts_out,
+        Err(e) => {
+            eprintln!("Failed to query map in get_users: {}", e);
+            return contacts_out;
+        }
     };
 
     for row in rows {
