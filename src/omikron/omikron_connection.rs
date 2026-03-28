@@ -434,8 +434,22 @@ impl OmikronConnection {
             let sender_id = &cv.get_sender();
             let receiver_id = &cv.get_receiver();
 
+            // Parse send_time robustly: accept numeric or string, fallback to current time
+            let send_time_val = cv.get_data(DataTypes::send_time);
+            let now_i64 = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let timestamp_i64 = if let Some(n) = send_time_val.as_number() {
+                n as i64
+            } else if let Some(s) = send_time_val.as_str() {
+                s.parse::<i64>().unwrap_or(now_i64)
+            } else {
+                now_i64
+            };
+
             let _ = chat_files::change_message_state(
-                cv.get_data(DataTypes::send_time).as_number().unwrap_or(0) as i64,
+                timestamp_i64,
                 *receiver_id as i64,
                 *sender_id as i64,
                 MessageState::from_str(
@@ -447,19 +461,34 @@ impl OmikronConnection {
         if cv.is_type(CommunicationType::message_other_iota) {
             let sender_id = &cv.get_sender();
             let receiver_id = &cv.get_receiver();
-            let timestamp = cv.get_data(DataTypes::send_time).as_number().unwrap_or(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64,
-            );
+
+            // parse send_time safely (number or string), fallback to now
+            let send_time_val = cv.get_data(DataTypes::send_time);
+            let now_i64 = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let timestamp = if let Some(n) = send_time_val.as_number() {
+                n as i64
+            } else if let Some(s) = send_time_val.as_str() {
+                s.parse::<i64>().unwrap_or(now_i64)
+            } else {
+                now_i64
+            };
+
+            // content may be missing or non-string; default to empty string
+            let content = cv
+                .get_data(DataTypes::content)
+                .as_str()
+                .unwrap_or("")
+                .to_string();
 
             chat_files::add_message(
                 timestamp as u128,
                 false,
                 *receiver_id as i64,
                 *sender_id as i64,
-                cv.get_data(DataTypes::content).as_str().unwrap(),
+                &content,
             );
 
             let user_forward = CommunicationValue::new(CommunicationType::message_live)
@@ -481,13 +510,12 @@ impl OmikronConnection {
                 .await;
 
             if let Ok(user_resp) = user_resp {
-                let ms = MessageState::from_str(
-                    &user_resp
-                        .get_data(DataTypes::message_state)
-                        .as_string()
-                        .unwrap_or("".to_string()),
-                )
-                .upgrade(MessageState::Received);
+                let ms_raw = user_resp
+                    .get_data(DataTypes::message_state)
+                    .as_string()
+                    .unwrap_or_else(|| "".to_string());
+                let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
+
                 let _ = change_message_state(
                     timestamp,
                     *receiver_id as i64,
@@ -532,19 +560,37 @@ impl OmikronConnection {
 
         if cv.is_type(CommunicationType::message_send) {
             let my_id = cv.get_sender();
-            let other_id = cv.get_data(DataTypes::receiver_id).as_number().unwrap_or(0);
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u128;
 
-            chat_files::add_message(
-                now_ms,
-                true,
-                my_id as i64,
-                other_id,
-                &*cv.get_data(DataTypes::content).as_str().unwrap(),
-            );
+            // parse other id robustly (number or string)
+            let other_id = if let Some(n) = cv.get_data(DataTypes::receiver_id).as_number() {
+                n as i64
+            } else if let Some(s) = cv.get_data(DataTypes::receiver_id).as_str() {
+                s.parse::<i64>().unwrap_or(0)
+            } else {
+                0
+            };
+
+            let now_ms_u128 = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u128;
+            // derive an i64 timestamp for protocol fields; fall back to current time if out of range
+            let now_ms_i64: i64 = match i64::try_from(now_ms_u128) {
+                Ok(v) => v,
+                Err(_) => SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64,
+            };
+
+            // safe content extraction
+            let content = cv
+                .get_data(DataTypes::content)
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+
+            chat_files::add_message(now_ms_u128, true, my_id as i64, other_id, &content);
 
             let ack = CommunicationValue::new(CommunicationType::success)
                 .with_id(cv.get_id())
@@ -556,18 +602,21 @@ impl OmikronConnection {
                 .with_receiver(other_id as u64)
                 .add_data(DataTypes::receiver_id, DataValue::Number(other_id))
                 .with_sender(my_id)
-                .add_data(DataTypes::send_time, DataValue::Str(now_ms.to_string()))
+                .add_data(DataTypes::send_time, DataValue::Number(now_ms_i64))
                 .add_data(DataTypes::sender_id, DataValue::Number(my_id as i64))
-                .add_data(
-                    DataTypes::content,
-                    DataValue::Str(
-                        cv.get_data(DataTypes::content)
-                            .as_str()
-                            .unwrap()
-                            .to_string(),
-                    ),
+                .add_data(DataTypes::content, DataValue::Str(content));
+            if let Err(err) = self.send_message_result(&forward).await {
+                // sending failed - record via existing logging path
+                log_t!("send_message_failed", err);
+            } else {
+                // forwarding succeeded -> update stored message state to Sent
+                let _ = chat_files::change_message_state(
+                    now_ms_i64,
+                    my_id as i64,
+                    other_id,
+                    MessageState::Sent,
                 );
-            self.send_message(&forward).await;
+            }
             return;
         }
 
@@ -576,11 +625,45 @@ impl OmikronConnection {
             let partner_id = cv.get_data(DataTypes::user_id).as_number().unwrap_or(0);
             let offset = cv.get_data(DataTypes::offset).as_number().unwrap_or(0);
             let amount = cv.get_data(DataTypes::amount).as_number().unwrap_or(0);
+            // retrieve raw JSON messages
             let messages = chat_files::get_messages(my_id as i64, partner_id, offset, amount);
+            // convert JSON array -> protocol Array of Containers (send_time, content, sender_id, message_state)
+            let mut msg_array: Vec<DataValue> = Vec::new();
+            for m in messages.members() {
+                // extract fields defensively
+                let message_time: i64 = m["message_time"].as_i64().unwrap_or(0);
+                let content: String = m["content"].as_str().unwrap_or("").to_string();
+                let sent_by_self: bool = m["sent_by_self"].as_bool().unwrap_or(false);
+                // determine sender id:
+                // - if sent_by_self => sender is the requester (my_id)
+                // - otherwise prefer an explicit chat_partner_id if present on the request,
+                //   fallback to the partner_id parameter
+                let sender_id: i64 = if sent_by_self {
+                    my_id as i64
+                } else {
+                    // check for chat_partner_id in the incoming request (accept number or string)
+                    if let Some(n) = cv.get_data(DataTypes::chat_partner_id).as_number() {
+                        n as i64
+                    } else if let Some(s) = cv.get_data(DataTypes::chat_partner_id).as_str() {
+                        s.parse::<i64>().unwrap_or(partner_id as i64)
+                    } else {
+                        partner_id as i64
+                    }
+                };
+                let message_state: String = m["message_state"].as_str().unwrap_or("").to_string();
+
+                let mut container = Vec::new();
+                container.push((DataTypes::send_time, DataValue::Number(message_time)));
+                container.push((DataTypes::message, DataValue::Str(content)));
+                container.push((DataTypes::sender_id, DataValue::Number(sender_id)));
+                container.push((DataTypes::message_state, DataValue::Str(message_state)));
+                msg_array.push(DataValue::Container(container));
+            }
+
             let resp = CommunicationValue::new(CommunicationType::messages_get)
                 .with_id(cv.get_id())
                 .with_receiver(my_id)
-                .add_data(DataTypes::messages, DataValue::Str(messages.dump()));
+                .add_data(DataTypes::messages, DataValue::Array(msg_array));
 
             self.send_message(&resp).await;
             return;

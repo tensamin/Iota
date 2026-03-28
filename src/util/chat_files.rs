@@ -3,6 +3,7 @@ use crate::util::file_util::get_directory;
 use json::{JsonValue, array, object};
 use rusqlite::{Connection, params};
 use std::io;
+use std::sync::{LazyLock, Mutex};
 
 #[derive(PartialEq, Debug, Clone)]
 pub enum MessageState {
@@ -44,12 +45,9 @@ impl MessageState {
     }
 }
 
-fn db_path() -> String {
-    format!("{}/messages.sqlite3", get_directory())
-}
-
-fn open_db() -> rusqlite::Result<Connection> {
-    let conn = Connection::open(db_path())?;
+static DB_CONN: LazyLock<Mutex<Connection>> = LazyLock::new(|| {
+    let conn = Connection::open(format!("{}/messages.sqlite3", get_directory()))
+        .expect("Failed to open messages sqlite DB");
     conn.execute_batch(
         r#"
         PRAGMA journal_mode = WAL;
@@ -68,9 +66,10 @@ fn open_db() -> rusqlite::Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_messages_lookup
             ON messages (storage_owner, external_user, message_time DESC);
         "#,
-    )?;
-    Ok(conn)
-}
+    )
+    .expect("Failed to initialize messages DB");
+    Mutex::new(conn)
+});
 
 pub fn add_message(
     send_time: u128,
@@ -87,10 +86,10 @@ pub fn add_message(
         }
     };
 
-    let conn = match open_db() {
-        Ok(c) => c,
+    let conn = match DB_CONN.lock() {
+        Ok(g) => g,
         Err(e) => {
-            log!("Failed to open sqlite db for add_message: {}", e);
+            log!("Failed to lock messages DB mutex for add_message: {:?}", e);
             return;
         }
     };
@@ -129,7 +128,9 @@ pub fn change_message_state(
     external_user: i64,
     new_state: MessageState,
 ) -> io::Result<()> {
-    let conn = open_db().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let conn = DB_CONN
+        .lock()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Mutex lock error: {:?}", e)))?;
 
     let current: Option<String> = match conn.query_row(
         r#"
@@ -191,10 +192,10 @@ pub fn get_messages(
         return messages;
     }
 
-    let conn = match open_db() {
-        Ok(c) => c,
+    let conn = match DB_CONN.lock() {
+        Ok(g) => g,
         Err(e) => {
-            log!("Failed to open sqlite db for get_messages: {}", e);
+            log!("Failed to lock messages DB mutex for get_messages: {:?}", e);
             return messages;
         }
     };
