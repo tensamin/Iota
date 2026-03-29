@@ -22,15 +22,25 @@ use crate::{
     users::{user_manager, user_profile::UserProfile},
     util::file_util,
 };
-use std::{any::Any, time::Duration};
+use std::{
+    any::Any,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::time::Instant;
 
 pub struct ConsoleCard {
     focused: bool,
     pub title: String,
     pub content: String,
+    pub cursor_position: usize,
 
     borders: Borders,
     joins: Borders,
+
+    cursor: Arc<Mutex<bool>>,
+    last_swap: Arc<Mutex<Instant>>,
+    tab_index: usize,
 }
 
 impl ConsoleCard {
@@ -39,9 +49,178 @@ impl ConsoleCard {
             focused: false,
             title: title.to_string(),
             content: content.to_string(),
+            cursor_position: content.chars().count(),
             borders: Borders::ALL,
             joins: Borders::NONE,
+            cursor: Arc::new(Mutex::new(true)),
+            last_swap: Arc::new(Mutex::new(Instant::now())),
+            tab_index: 0,
         }
+    }
+
+    fn byte_index(&self) -> usize {
+        self.content
+            .char_indices()
+            .nth(self.cursor_position)
+            .map(|(i, _)| i)
+            .unwrap_or(self.content.len())
+    }
+
+    fn cursor_visible(&self) -> bool {
+        if !self.focused {
+            return false;
+        }
+
+        let mut visible = self.cursor.lock().unwrap();
+        let mut last = self.last_swap.lock().unwrap();
+        let now = Instant::now();
+
+        if now.duration_since(*last) >= Duration::from_millis(500) {
+            *visible = !*visible;
+            *last = now;
+        }
+
+        *visible
+    }
+
+    fn current_prefix(&self) -> Option<&str> {
+        if self.content.starts_with('/') {
+            Some("/")
+        } else {
+            None
+        }
+    }
+
+    fn get_placeholder_text(&self) -> Option<String> {
+        if self.content.is_empty() {
+            Some(" send message (start commands with /)".to_string())
+        } else {
+            None
+        }
+    }
+
+    fn cursor_spans(&self) -> Vec<Span<'static>> {
+        let cursor_visible = self.cursor_visible();
+        let cursor_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+        let mut spans = Vec::new();
+
+        if self.content.is_empty() {
+            if self.focused {
+                if cursor_visible {
+                    spans.push(Span::styled(" ", cursor_style));
+                } else {
+                    spans.push(Span::styled(" ", Style::default().fg(Color::White)));
+                }
+                spans.push(Span::styled(
+                    "send message (start commands with /)",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    " send message (start commands with /)",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            return spans;
+        }
+
+        let byte_index = self.byte_index();
+        let before = self.content[..byte_index].to_string();
+        let after = self.content[byte_index..].to_string();
+
+        let prefix_len = self.current_prefix().map(|s| s.len()).unwrap_or(0);
+
+        if prefix_len > 0 && before.len() >= prefix_len {
+            let prefix = &before[..prefix_len];
+            let rest = &before[prefix_len..];
+            spans.push(Span::styled(
+                prefix.to_string(),
+                Self::style_for_part(true, false, false),
+            ));
+            if !rest.is_empty() {
+                spans.push(Span::styled(
+                    rest.to_string(),
+                    Style::default().fg(Color::White),
+                ));
+            }
+        } else if !before.is_empty() {
+            spans.push(Span::styled(
+                before.clone(),
+                Style::default().fg(Color::White),
+            ));
+        }
+
+        if cursor_visible {
+            spans.push(Span::styled(" ", cursor_style));
+        }
+
+        if !after.is_empty() {
+            spans.push(Span::styled(after, Style::default().fg(Color::White)));
+        }
+
+        spans
+    }
+
+    fn style_for_part(is_prefix: bool, is_hint: bool, is_error: bool) -> Style {
+        if is_error {
+            return Style::default().fg(Color::Red);
+        }
+
+        if is_hint {
+            return Style::default().fg(Color::DarkGray);
+        }
+
+        if is_prefix {
+            return Style::default().fg(Color::DarkGray);
+        }
+
+        Style::default().fg(Color::White)
+    }
+
+    fn split_before_cursor(&self) -> (String, String) {
+        let byte_index = self.byte_index();
+        let before = self.content[..byte_index].to_string();
+        let after = self.content[byte_index..].to_string();
+        (before, after)
+    }
+
+    fn render_cursor_spans(&self) -> Vec<Span<'static>> {
+        self.cursor_spans()
+    }
+
+    fn move_cursor_left(&mut self) {
+        if self.cursor_position > 0 {
+            self.cursor_position -= 1;
+        }
+    }
+
+    fn move_cursor_right(&mut self) {
+        let len = self.content.chars().count();
+        if self.cursor_position < len {
+            self.cursor_position += 1;
+        }
+    }
+
+    fn delete_at_cursor(&mut self) {
+        if self.content.is_empty() || self.cursor_position == 0 {
+            return;
+        }
+
+        let start = self
+            .content
+            .char_indices()
+            .nth(self.cursor_position.saturating_sub(1))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let end = self.byte_index();
+        self.content.replace_range(start..end, "");
+        self.cursor_position -= 1;
+    }
+
+    fn insert_at_cursor(&mut self, c: char) {
+        let idx = self.byte_index();
+        self.content.insert(idx, c);
+        self.cursor_position += 1;
     }
 }
 
@@ -70,7 +249,8 @@ impl Element for ConsoleCard {
                 Style::default()
             });
 
-        let par = Paragraph::new(Line::from(Span::from(self.content.clone())))
+        let spans = self.render_cursor_spans();
+        let par = Paragraph::new(Line::from(spans))
             .block(block)
             .scroll((0, 0));
         f.render_widget(par, r);
@@ -87,11 +267,11 @@ impl JoinableElement for ConsoleCard {
         self
     }
 
-    fn as_element(&self) -> &dyn Element {
+    fn as_element(&self) -> &(dyn Element + 'static) {
         self
     }
 
-    fn as_element_mut(&mut self) -> &mut dyn Element {
+    fn as_element_mut(&mut self) -> &mut (dyn Element + 'static) {
         self
     }
 
@@ -113,11 +293,11 @@ impl InteractableElement for ConsoleCard {
         self
     }
 
-    fn as_element(&self) -> &dyn Element {
+    fn as_element(&self) -> &(dyn Element + 'static) {
         self
     }
 
-    fn as_element_mut(&mut self) -> &mut dyn Element {
+    fn as_element_mut(&mut self) -> &mut (dyn Element + 'static) {
         self
     }
 
@@ -128,26 +308,69 @@ impl InteractableElement for ConsoleCard {
                     log!("");
                     return InteractionResult::Handled;
                 }
+
                 let command = self.content.clone();
                 let id = Uuid::new_v4();
                 let id = id.to_string();
                 let id = id.split_at(8).0;
                 let task_id = format!("command_{}_{}", command, id);
                 ACTIVE_TASKS.insert(task_id.clone());
+
                 tokio::spawn(async move {
                     run_command(&command).await;
                     ACTIVE_TASKS.remove(&task_id);
                 });
-                self.content = "".to_string();
+
+                self.content.clear();
+                self.cursor_position = 0;
+                self.tab_index = 0;
                 InteractionResult::Handled
             }
             KeyCode::Backspace => {
-                self.content.pop();
+                self.delete_at_cursor();
+                InteractionResult::Handled
+            }
+            KeyCode::Delete => {
+                let len = self.content.chars().count();
+                if self.cursor_position < len {
+                    let start = self.byte_index();
+                    let end = self
+                        .content
+                        .char_indices()
+                        .nth(self.cursor_position + 1)
+                        .map(|(i, _)| i)
+                        .unwrap_or(self.content.len());
+                    self.content.replace_range(start..end, "");
+                }
+                InteractionResult::Handled
+            }
+            KeyCode::Left => {
+                self.move_cursor_left();
+                InteractionResult::Handled
+            }
+            KeyCode::Right => {
+                self.move_cursor_right();
+                InteractionResult::Handled
+            }
+            KeyCode::Home => {
+                self.cursor_position = 0;
+                InteractionResult::Handled
+            }
+            KeyCode::End => {
+                self.cursor_position = self.content.chars().count();
+                InteractionResult::Handled
+            }
+            KeyCode::Tab => {
+                if let Some(prefix) = self.current_prefix() {
+                    if prefix == "/" {
+                        self.tab_index = self.tab_index.saturating_add(1);
+                    }
+                }
                 InteractionResult::Handled
             }
             _ => {
                 if let Some(c) = key.code.as_char() {
-                    self.content.push(c);
+                    self.insert_at_cursor(c);
                     InteractionResult::Handled
                 } else {
                     InteractionResult::Unhandled
@@ -168,6 +391,7 @@ impl InteractableElement for ConsoleCard {
         self.focused = f;
     }
 }
+
 pub async fn run_command(command: &str) {
     log!(":{}", command);
 
@@ -267,8 +491,6 @@ pub async fn run_command(command: &str) {
 }
 
 pub async fn ping(time: u64) {
-    let time = time;
-
     let conn = OMIKRON_CONNECTION.clone();
 
     let response_cv = conn

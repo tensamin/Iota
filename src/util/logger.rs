@@ -13,7 +13,10 @@ use ttp_core::{CommunicationValue, DataTypes, DataValue};
 
 use crate::{
     APP_STATE,
-    gui::{elements::log_card::UiLogEntry, ui::UNIQUE},
+    gui::{
+        elements::log_card::{LogEntry, Sender, UiLogEntry},
+        ui::UNIQUE,
+    },
     langu::language_manager,
 };
 
@@ -72,14 +75,40 @@ pub fn startup() {
 
             let ts = fixed_box(&msg.timestamp_ms.to_string(), 13);
 
-            let line = format!("{} {}", msg.prefix, resolved_message);
+            let sender = match msg.kind {
+                PrintType::Client => Sender::User,
+                PrintType::Call
+                | PrintType::Iota
+                | PrintType::Omikron
+                | PrintType::Omega
+                | PrintType::General => Sender::System,
+            };
 
-            let _ = writeln!(file, "{} {}", ts, line);
+            let entry = LogEntry::new(sender, resolved_message, msg.is_error);
+
+            let prefix = if msg.prefix.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", msg.prefix)
+            };
+
+            let line = format!("{}| {}", prefix, entry.message,);
+
+            let _ = writeln!(
+                file,
+                "{} {} {}",
+                ts,
+                line,
+                format_timestamp_inline(entry.timestamp_ms)
+            );
 
             let color = colorize(msg.kind, msg.is_error);
 
             let ui_entry = UiLogEntry {
-                line: line.clone(),
+                sender,
+                message: entry.message.clone(),
+                timestamp_ms: entry.timestamp_ms,
+                is_error: msg.is_error,
                 color,
             };
 
@@ -89,6 +118,14 @@ pub fn startup() {
             }
         }
     });
+}
+
+fn format_timestamp_inline(timestamp_ms: u128) -> String {
+    let secs = (timestamp_ms / 1000) as i64;
+    let hours = (secs / 3600) % 24;
+    let minutes = (secs / 60) % 60;
+    let seconds = secs % 60;
+    format!("[{:02}:{:02}:{:02}]", hours, minutes, seconds)
 }
 
 fn colorize(kind: PrintType, is_error: bool) -> Color {
