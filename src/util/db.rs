@@ -137,6 +137,18 @@ pub fn create_general_messages_db() -> Result<Arc<Mutex<Connection>>, String> {
 
         CREATE INDEX IF NOT EXISTS idx_contacts_owner
             ON contacts (storage_owner, last_message_at DESC, user_id ASC);
+
+        CREATE TABLE IF NOT EXISTS communities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            storage_owner INTEGER NOT NULL,
+            address TEXT NOT NULL,
+            title TEXT NOT NULL,
+            position TEXT NOT NULL,
+            UNIQUE(storage_owner, address)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_communities_owner
+            ON communities (storage_owner);
     "#;
 
     match create_shared_connection("messages", INIT_SQL) {

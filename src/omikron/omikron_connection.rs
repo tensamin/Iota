@@ -1,7 +1,7 @@
 use crate::users::contact::Contact;
-use crate::users::user_community_util::UserCommunityUtil;
 use crate::util::chat_files::{MessageState, change_message_state};
 use crate::util::chats_util::{get_user, mod_user};
+use crate::util::communities_util::CommunitiesUtil;
 use crate::util::crypto_util::{DataFormat, SecurePayload};
 use crate::util::file_util::{get_children, load_file, save_file};
 use crate::util::{chat_files, chats_util};
@@ -734,6 +734,10 @@ impl OmikronConnection {
                 container.push((DataTypes::sender_id, DataValue::Number(sender_id)));
                 container.push((DataTypes::message_state, DataValue::Str(message_state)));
                 container.push((DataTypes::height, DataValue::Number(height)));
+                container.push((
+                    DataTypes::parse("sent_by_self".to_string()),
+                    DataValue::Bool(sent_by_self),
+                ));
                 msg_array.push(DataValue::Container(container));
             }
 
@@ -801,7 +805,7 @@ impl OmikronConnection {
         }
 
         if cv.is_type(CommunicationType::add_community) {
-            UserCommunityUtil::add_community(
+            CommunitiesUtil::add_community(
                 cv.get_sender() as i64,
                 cv.get_data(DataTypes::community_address)
                     .as_str()
@@ -824,19 +828,37 @@ impl OmikronConnection {
         }
 
         if cv.is_type(CommunicationType::get_communities) {
+            let mut comm_array = Vec::new();
+            for c in CommunitiesUtil::get_communities(cv.get_sender() as i64) {
+                let mut container: Vec<(DataTypes, DataValue)> = Vec::new();
+                if let Some(address) = c["address"].as_str() {
+                    container.push((
+                        DataTypes::community_address,
+                        DataValue::Str(address.to_string()),
+                    ));
+                }
+                if let Some(title) = c["title"].as_str() {
+                    container.push((
+                        DataTypes::community_title,
+                        DataValue::Str(title.to_string()),
+                    ));
+                }
+                if let Some(position) = c["position"].as_str() {
+                    container.push((DataTypes::position, DataValue::Str(position.to_string())));
+                }
+                comm_array.push(DataValue::Container(container));
+            }
+
             let resp = CommunicationValue::new(CommunicationType::get_communities)
                 .with_id(cv.get_id())
                 .with_receiver(cv.get_sender())
-                /*.add_data(
-                    DataTypes::communities,
-                    DataValue::Array(UserCommunityUtil::get_communities(cv.get_sender() as i64)),
-                ) */;
+                .add_data(DataTypes::communities, DataValue::Array(comm_array));
             self.send_message(&resp).await;
             return;
         }
 
         if cv.is_type(CommunicationType::remove_community) {
-            UserCommunityUtil::remove_community(
+            CommunitiesUtil::remove_community(
                 cv.get_sender() as i64,
                 cv.get_data(DataTypes::community_address)
                     .as_str()
