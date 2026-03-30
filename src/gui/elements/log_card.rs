@@ -2,6 +2,7 @@ use crate::APP_STATE;
 use crate::gui::elements::elements::{Element, InteractableElement, JoinableElement};
 use crate::gui::interaction_result::InteractionResult;
 use crate::gui::util::borders::draw_block_joins;
+use crate::util::logger::PrintType;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
@@ -11,52 +12,17 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 use std::any::Any;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Sender {
-    User,
-    System,
-}
-
-impl Sender {
-    pub fn prefix_color(self) -> Color {
-        match self {
-            Sender::User => Color::Magenta,
-            Sender::System => Color::Blue,
-        }
-    }
-}
-
-impl Sender {
-    pub fn color(self) -> Color {
-        match self {
-            Sender::User => Color::Magenta,
-            Sender::System => Color::Blue,
-        }
-    }
-}
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
-pub struct LogEntry {
+pub struct UiLogEntry {
     pub timestamp_ms: u128,
-    pub sender: Sender,
+    pub sender: PrintType,
     pub message: String,
     pub is_error: bool,
 }
 
-impl LogEntry {
-    pub fn new(sender: Sender, message: String, is_error: bool) -> Self {
-        Self {
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-            sender,
-            message,
-            is_error,
-        }
-    }
-
+impl UiLogEntry {
     pub fn format_timestamp(&self) -> String {
         let secs = (self.timestamp_ms / 1000) as i64;
         let hours = (secs / 3600) % 24;
@@ -66,13 +32,37 @@ impl LogEntry {
     }
 }
 
-#[derive(Clone)]
-pub struct UiLogEntry {
-    pub sender: Sender,
-    pub message: String,
+impl From<LogEntry> for UiLogEntry {
+    fn from(entry: LogEntry) -> Self {
+        Self {
+            timestamp_ms: entry.timestamp_ms,
+            sender: entry.sender,
+            message: entry.message,
+            is_error: entry.is_error,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LogEntry {
     pub timestamp_ms: u128,
+    pub sender: PrintType,
+    pub message: String,
     pub is_error: bool,
-    pub color: Color,
+}
+
+impl LogEntry {
+    pub fn new(sender: PrintType, message: String, is_error: bool) -> Self {
+        Self {
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            sender,
+            message,
+            is_error,
+        }
+    }
 }
 
 pub struct LogCard {
@@ -83,15 +73,6 @@ pub struct LogCard {
     last_visible_height: usize,
     pub borders: Borders,
     pub joins: Borders,
-}
-
-struct RenderedLine {
-    prefix: String,
-    sender: Sender,
-    timestamp: String,
-    content: String,
-    is_error: bool,
-    is_first: bool,
 }
 
 impl LogCard {
@@ -135,78 +116,85 @@ impl LogCard {
         s.len()
     }
 
-    fn wrap_entry(entry: &UiLogEntry, available_width: usize) -> Vec<(bool, String)> {
+    fn wrap_entry(entry: &UiLogEntry, available_width: usize) -> Vec<(String, Color, bool)> {
         let mut result = Vec::new();
-        let continuation_prefix_width = 2;
-        let first_line_width = available_width.saturating_sub(continuation_prefix_width);
-        let continuation_content_width = available_width.saturating_sub(continuation_prefix_width);
 
-        let paragraphs: Vec<&str> = entry.message.split('\n').collect();
+        let timestamp = entry.format_timestamp();
+        let first_prefix = "┌ ";
+        let default_prefix = "│ ";
+        let last_prefix = "└ ";
 
-        for (para_idx, paragraph) in paragraphs.iter().enumerate() {
-            if paragraph.is_empty() {
-                if para_idx == 0 {
-                    result.push((true, String::new()));
-                } else {
-                    result.push((false, String::new()));
-                }
+        let prefix_width = 2;
+        let first_line_width = available_width.saturating_sub(prefix_width + 1);
+        let continuation_width = available_width.saturating_sub(prefix_width);
+
+        let segments: Vec<&str> = entry.message.split('\n').collect();
+
+        let mut raw_lines = Vec::new();
+
+        for segment in segments {
+            let mut remaining = segment;
+            if remaining.is_empty() {
+                raw_lines.push(String::new());
                 continue;
             }
 
-            let mut remaining = *paragraph;
-            let mut is_first_line = para_idx == 0;
-
+            let mut is_first_part = true;
             while !remaining.is_empty() {
-                let current_width = if is_first_line {
+                let current_width = if is_first_part {
                     first_line_width
                 } else {
-                    continuation_content_width
+                    continuation_width
                 };
 
                 let split_point = Self::find_split_point(remaining, current_width);
-                let line_content = &remaining[..split_point];
-
-                result.push((is_first_line, line_content.to_string()));
-
+                let line_content = remaining[..split_point].to_string();
+                raw_lines.push(line_content);
                 remaining = &remaining[split_point..];
-                is_first_line = false;
+                is_first_part = false;
             }
         }
 
-        if result.is_empty() {
-            result.push((true, String::new()));
+        if raw_lines.is_empty() {
+            raw_lines.push(String::new());
+        }
+
+        for (idx, content) in raw_lines.iter().enumerate() {
+            let is_last = idx + 1 == raw_lines.len();
+            let is_single = raw_lines.len() == 1;
+            let is_first = idx == 0;
+            let prefix = if is_first {
+                first_prefix
+            } else if is_last && !is_single {
+                last_prefix
+            } else {
+                default_prefix
+            };
+
+            let mut line = String::from(prefix);
+            line.push_str(content);
+
+            if is_last && !timestamp.is_empty() {
+                line.push(' ');
+                line.push_str(&timestamp);
+            }
+
+            result.push((line, entry.sender.prefix_color(), entry.is_error));
         }
 
         result
     }
 
-    fn build_all_lines(&self, entries: Vec<UiLogEntry>, width: usize) -> Vec<RenderedLine> {
+    fn build_all_lines(
+        &self,
+        entries: Vec<UiLogEntry>,
+        width: usize,
+    ) -> Vec<(String, Color, bool)> {
         let mut lines = Vec::new();
 
         for entry in entries {
             let wrapped = Self::wrap_entry(&entry, width);
-            let timestamp = {
-                let secs = (entry.timestamp_ms / 1000) as i64;
-                let hours = (secs / 3600) % 24;
-                let minutes = (secs / 60) % 60;
-                let seconds = secs % 60;
-                format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
-            };
-
-            for (is_first, content) in wrapped {
-                lines.push(RenderedLine {
-                    prefix: "│ ".to_string(),
-                    sender: entry.sender,
-                    timestamp: if is_first {
-                        timestamp.clone()
-                    } else {
-                        String::new()
-                    },
-                    content,
-                    is_error: entry.is_error,
-                    is_first,
-                });
-            }
+            lines.extend(wrapped);
         }
 
         lines
@@ -270,6 +258,32 @@ impl LogCard {
     fn scroll_down(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
     }
+
+    fn split_line_prefix(line: &str) -> (&str, &str) {
+        if let Some(rest) = line.strip_prefix("└ ") {
+            ("└ ", rest)
+        } else if let Some(rest) = line.strip_prefix("│ ") {
+            ("│ ", rest)
+        } else if let Some(rest) = line.strip_prefix("┌ ") {
+            ("┌ ", rest)
+        } else {
+            ("", line)
+        }
+    }
+
+    fn split_timestamp_suffix(line: &str) -> (&str, &str) {
+        if let Some(idx) = line.rfind(' ') {
+            let possible_timestamp = &line[idx + 1..];
+            if possible_timestamp.len() == 8
+                && possible_timestamp.as_bytes()[2] == b':'
+                && possible_timestamp.as_bytes()[5] == b':'
+            {
+                let (content, timestamp_with_space) = line.split_at(idx);
+                return (content.trim_end(), timestamp_with_space);
+            }
+        }
+        (line, "")
+    }
 }
 
 impl Element for LogCard {
@@ -308,31 +322,33 @@ impl Element for LogCard {
         let (start, end) = self.calculate_view_window(total_lines, visible_height);
         let visible_lines = &all_lines[start..end];
 
-        let lines: Vec<Line> = visible_lines
+        let rendered_lines: Vec<Line> = visible_lines
             .iter()
-            .map(|rl| {
+            .map(|(line, prefix_color, is_error)| {
                 let mut spans = Vec::new();
 
-                spans.push(Span::styled(
-                    &rl.prefix,
-                    Style::default().fg(rl.sender.prefix_color()),
-                ));
+                let (prefix, rest) = Self::split_line_prefix(line);
 
-                if !rl.content.is_empty() {
-                    let content_color = if rl.is_error {
-                        Color::Red
-                    } else {
-                        Color::White
-                    };
+                if !prefix.is_empty() {
                     spans.push(Span::styled(
-                        &rl.content,
-                        Style::default().fg(content_color),
+                        prefix.to_string(),
+                        Style::default().fg(*prefix_color),
                     ));
                 }
 
-                if rl.is_first {
+                let (content, timestamp) = Self::split_timestamp_suffix(rest);
+                let text_color = if *is_error { Color::Red } else { Color::White };
+
+                if !content.is_empty() {
                     spans.push(Span::styled(
-                        format!(" {}", rl.timestamp),
+                        content.to_string(),
+                        Style::default().fg(text_color),
+                    ));
+                }
+
+                if !timestamp.is_empty() {
+                    spans.push(Span::styled(
+                        timestamp.to_string(),
                         Style::default().fg(Color::DarkGray),
                     ));
                 }
@@ -341,7 +357,7 @@ impl Element for LogCard {
             })
             .collect();
 
-        for (idx, line) in lines.iter().enumerate() {
+        for (idx, line) in rendered_lines.iter().enumerate() {
             let line_area = Rect {
                 x: inner_area.x,
                 y: inner_area.y + idx as u16,
@@ -365,11 +381,11 @@ impl JoinableElement for LogCard {
     }
 
     fn as_element(&self) -> &(dyn Element + 'static) {
-        self
+        &*self
     }
 
     fn as_element_mut(&mut self) -> &mut (dyn Element + 'static) {
-        self
+        &mut *self
     }
 
     fn set_borders(&mut self, borders: Borders) {
@@ -391,11 +407,11 @@ impl InteractableElement for LogCard {
     }
 
     fn as_element(&self) -> &(dyn Element + 'static) {
-        self
+        &*self
     }
 
     fn as_element_mut(&mut self) -> &mut (dyn Element + 'static) {
-        self
+        &mut *self
     }
 
     fn interact(&mut self, key: KeyEvent) -> InteractionResult {

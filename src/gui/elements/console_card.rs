@@ -17,7 +17,7 @@ use crate::{
         ui::FPS,
         util::borders::draw_block_joins,
     },
-    log, log_cv,
+    log, log_command, log_cv,
     omikron::omikron_connection::OMIKRON_CONNECTION,
     users::{user_manager, user_profile::UserProfile},
     util::file_util,
@@ -91,14 +91,6 @@ impl ConsoleCard {
         }
     }
 
-    fn get_placeholder_text(&self) -> Option<String> {
-        if self.content.is_empty() {
-            Some(" send message (start commands with /)".to_string())
-        } else {
-            None
-        }
-    }
-
     fn cursor_spans(&self) -> Vec<Span<'static>> {
         let cursor_visible = self.cursor_visible();
         let cursor_style = Style::default().fg(Color::White).bg(Color::DarkGray);
@@ -112,12 +104,12 @@ impl ConsoleCard {
                     spans.push(Span::styled(" ", Style::default().fg(Color::White)));
                 }
                 spans.push(Span::styled(
-                    "send message (start commands with /)",
+                    "send command (<help> for info)",
                     Style::default().fg(Color::DarkGray),
                 ));
             } else {
                 spans.push(Span::styled(
-                    " send message (start commands with /)",
+                    " send command (<help> for info)",
                     Style::default().fg(Color::DarkGray),
                 ));
             }
@@ -175,13 +167,6 @@ impl ConsoleCard {
         }
 
         Style::default().fg(Color::White)
-    }
-
-    fn split_before_cursor(&self) -> (String, String) {
-        let byte_index = self.byte_index();
-        let before = self.content[..byte_index].to_string();
-        let after = self.content[byte_index..].to_string();
-        (before, after)
     }
 
     fn render_cursor_spans(&self) -> Vec<Span<'static>> {
@@ -316,6 +301,8 @@ impl InteractableElement for ConsoleCard {
                 let task_id = format!("command_{}_{}", command, id);
                 ACTIVE_TASKS.insert(task_id.clone());
 
+                log_command!("{}", command);
+
                 tokio::spawn(async move {
                     run_command(&command).await;
                     ACTIVE_TASKS.remove(&task_id);
@@ -393,8 +380,6 @@ impl InteractableElement for ConsoleCard {
 }
 
 pub async fn run_command(command: &str) {
-    log!(":{}", command);
-
     let parts = command.split(" ").collect::<Vec<&str>>();
 
     match parts.as_slice() {
