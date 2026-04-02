@@ -438,7 +438,10 @@ impl OmikronConnection {
 
         if cv.is_type(CommunicationType::message_state) {
             let sender_id = &cv.get_sender();
-            let receiver_id = &cv.get_receiver();
+            let receiver_id = match cv.get_data(DataTypes::chat_partner_id).as_number() {
+                Some(id) => id,
+                _ => return,
+            };
 
             // Parse send_time robustly: accept numeric or string, fallback to current time
             let send_time_val = cv.get_data(DataTypes::send_time);
@@ -456,7 +459,7 @@ impl OmikronConnection {
 
             let _ = chat_files::change_message_state(
                 timestamp_i64,
-                *receiver_id as i64,
+                receiver_id as i64,
                 *sender_id as i64,
                 MessageState::from_str(
                     cv.get_data(DataTypes::message_state).as_str().unwrap_or(""),
@@ -572,6 +575,10 @@ impl OmikronConnection {
                         .with_id(cv.get_id())
                         .with_receiver(sender_id as u64)
                         .with_sender(receiver_id as u64)
+                        .add_data(
+                            DataTypes::chat_partner_id,
+                            DataValue::Number(sender_id as i64),
+                        )
                         .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
                         .add_data(
                             DataTypes::message_state,
@@ -602,6 +609,10 @@ impl OmikronConnection {
                         .with_receiver(sender_id as u64)
                         .with_sender(receiver_id as u64)
                         .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
+                        .add_data(
+                            DataTypes::chat_partner_id,
+                            DataValue::Number(sender_id as i64),
+                        )
                         .add_data(
                             DataTypes::message_state,
                             DataValue::Str(MessageState::Sent.as_str().to_string()),
@@ -683,6 +694,10 @@ impl OmikronConnection {
                         .with_sender(*receiver_id)
                         .add_data(DataTypes::send_time, DataValue::Number(timestamp))
                         .add_data(
+                            DataTypes::chat_partner_id,
+                            DataValue::Number(*sender_id as i64),
+                        )
+                        .add_data(
                             DataTypes::message_state,
                             DataValue::Str(ms.as_str().to_string()),
                         ),
@@ -703,6 +718,10 @@ impl OmikronConnection {
                         .with_receiver(*sender_id)
                         .with_sender(*receiver_id)
                         .add_data(DataTypes::send_time, DataValue::Number(timestamp))
+                        .add_data(
+                            DataTypes::chat_partner_id,
+                            DataValue::Number(*sender_id as i64),
+                        )
                         .add_data(
                             DataTypes::message_state,
                             DataValue::Str(MessageState::Sent.as_str().to_string()),
