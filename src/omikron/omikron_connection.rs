@@ -1,7 +1,7 @@
 use crate::users::contact::Contact;
-use crate::users::user_community_util::UserCommunityUtil;
 use crate::util::chat_files::{MessageState, change_message_state};
 use crate::util::chats_util::{get_user, mod_user};
+use crate::util::communities_util::CommunitiesUtil;
 use crate::util::crypto_util::{DataFormat, SecurePayload};
 use crate::util::file_util::{get_children, load_file, save_file};
 use crate::util::{chat_files, chats_util};
@@ -283,11 +283,16 @@ impl OmikronConnection {
 
             let key_pair = crypto_helper::generate_keypair();
             let public_key_base64 = crypto_helper::public_key_to_base64(&key_pair.public);
-            let private_key_base64 = crypto_helper::secret_key_to_base64(&key_pair.secret);
+            let _private_key_base64 = crypto_helper::secret_key_to_base64(&key_pair.secret);
 
             let mut conf_write = CONFIG.write().await;
-            /*conf_write.change("public_key", DataValue::Str(public_key_base64.clone()));
-            conf_write.change("private_key", DataValue::Str(private_key_base64));*/
+            // NOTE:
+            // Intentionally not storing the generated private/public keys directly into the
+            // config file here to avoid persisting sensitive material in plaintext. If you
+            // want to persist them, uncomment the two lines below and accept the security
+            // implications (they will be saved by `conf_write.update()`).
+            // conf_write.change("public_key", DataValue::Str(public_key_base64.clone()));
+            // conf_write.change("private_key", DataValue::Str(private_key_base64));
             conf_write.update();
             drop(conf_write);
 
@@ -418,7 +423,7 @@ impl OmikronConnection {
         }
 
         if cv.is_type(CommunicationType::identification_response) {
-            if let Some(accepted) = cv.get_data(DataTypes::accepted).as_bool() {
+            if let Some(_accepted) = cv.get_data(DataTypes::accepted).as_bool() {
                 let mut state = self.state.write().await;
                 if let ConnectionState::Connected { identified: _ } = *state {
                     *state = ConnectionState::Connected { identified: true };
@@ -430,6 +435,7 @@ impl OmikronConnection {
         // ************************************************ //
         // Direct messages                                  //
         // ************************************************ //
+
         if cv.is_type(CommunicationType::message_state) {
             let sender_id = &cv.get_sender();
             let receiver_id = &cv.get_receiver();
@@ -458,6 +464,160 @@ impl OmikronConnection {
             );
         }
 
+        // Incoming stored message: store for the recipient, attempt local delivery, notify sender.
+        if cv.is_type(CommunicationType::message_send) {
+            let sender_id: i64 = if let Some(n) = cv.get_data(DataTypes::sender_id).as_number() {
+                n as i64
+            } else if let Some(s) = cv.get_data(DataTypes::sender_id).as_str() {
+                s.parse::<i64>().unwrap_or(0)
+            } else {
+                0
+            };
+
+            // parse receiver_id (the storage owner for this incoming message)
+            let receiver_id: i64 = if let Some(n) = cv.get_data(DataTypes::receiver_id).as_number()
+            {
+                n as i64
+            } else if let Some(s) = cv.get_data(DataTypes::receiver_id).as_str() {
+                s.parse::<i64>().unwrap_or(0)
+            } else {
+                0
+            };
+
+            // parse send_time robustly (number or string), fallback to now
+            let send_time_val = cv.get_data(DataTypes::send_time);
+            let now_i64 = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let timestamp_i64 = if let Some(n) = send_time_val.as_number() {
+                n as i64
+            } else if let Some(s) = send_time_val.as_str() {
+                s.parse::<i64>().unwrap_or(now_i64)
+            } else {
+                now_i64
+            };
+            let timestamp_u128 = timestamp_i64 as u128;
+
+            // content may be missing; default to empty string
+            let content = cv
+                .get_data(DataTypes::content)
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+
+            let height = cv.get_data(DataTypes::height).as_number().unwrap_or(0) as i64;
+
+            // persist message for the receiver (storage_owner = receiver_id)
+            chat_files::add_message(
+                timestamp_u128,
+                false,
+                receiver_id as i64,
+                sender_id as i64,
+                &content,
+                height,
+            );
+
+            // persist message for the sender (storage_owner = sender_id)
+            chat_files::add_message(
+                timestamp_u128,
+                true,
+                sender_id as i64,
+                receiver_id as i64,
+                &content,
+                height,
+            );
+
+            // send confirmation back to sender
+            let conf_msg = CommunicationValue::new(CommunicationType::message_send)
+                .with_id(cv.get_id())
+                .with_receiver(sender_id as u64);
+            self.send_message(&conf_msg).await;
+
+            // Build a live-delivery message for the local client (recipient)
+            let user_forward = CommunicationValue::new(CommunicationType::message_live)
+                .with_id(cv.get_id())
+                .with_receiver(receiver_id as u64)
+                .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
+                .add_data(DataTypes::content, DataValue::Str(content.clone()))
+                .add_data(DataTypes::sender_id, DataValue::Number(sender_id as i64))
+                .add_data(DataTypes::height, DataValue::Number(height));
+
+            // Attempt delivery and await a response from the local client
+            let user_resp = self
+                .clone()
+                .await_response(&user_forward, Some(Duration::from_secs(10)))
+                .await;
+
+            if let Ok(user_resp) = user_resp {
+                let ms_raw = user_resp
+                    .get_data(DataTypes::message_state)
+                    .as_string()
+                    .unwrap_or_else(|| "".to_string());
+                let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
+
+                // update stored message state for receiver
+                let _ = chat_files::change_message_state(
+                    timestamp_i64,
+                    receiver_id as i64,
+                    sender_id as i64,
+                    ms.clone(),
+                );
+
+                // update stored message state for sender
+                let _ = chat_files::change_message_state(
+                    timestamp_i64,
+                    sender_id as i64,
+                    receiver_id as i64,
+                    ms.clone(),
+                );
+
+                // notify original sender about the delivered/read state
+                self.send_message(
+                    &CommunicationValue::new(CommunicationType::message_state)
+                        .with_id(cv.get_id())
+                        .with_receiver(sender_id as u64)
+                        .with_sender(receiver_id as u64)
+                        .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
+                        .add_data(
+                            DataTypes::message_state,
+                            DataValue::Str(ms.as_str().to_string()),
+                        ),
+                )
+                .await;
+            } else {
+                // Delivery failed or timed out; mark as Sent
+                let _ = chat_files::change_message_state(
+                    timestamp_i64,
+                    receiver_id as i64,
+                    sender_id as i64,
+                    MessageState::Sent,
+                );
+
+                let _ = chat_files::change_message_state(
+                    timestamp_i64,
+                    sender_id as i64,
+                    receiver_id as i64,
+                    MessageState::Sent,
+                );
+
+                // notify sender
+                self.send_message(
+                    &CommunicationValue::new(CommunicationType::message_state)
+                        .with_id(cv.get_id())
+                        .with_receiver(sender_id as u64)
+                        .with_sender(receiver_id as u64)
+                        .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
+                        .add_data(
+                            DataTypes::message_state,
+                            DataValue::Str(MessageState::Sent.as_str().to_string()),
+                        ),
+                )
+                .await;
+            }
+            return;
+        }
+
         if cv.is_type(CommunicationType::message_other_iota) {
             let sender_id = &cv.get_sender();
             let receiver_id = &cv.get_receiver();
@@ -483,26 +643,25 @@ impl OmikronConnection {
                 .unwrap_or("")
                 .to_string();
 
+            let height = cv.get_data(DataTypes::height).as_number().unwrap_or(0) as i64;
+
             chat_files::add_message(
                 timestamp as u128,
                 false,
                 *receiver_id as i64,
                 *sender_id as i64,
                 &content,
+                height,
             );
 
+            // Build user_forward using the parsed numeric timestamp and safe content string
             let user_forward = CommunicationValue::new(CommunicationType::message_live)
                 .with_id(cv.get_id())
                 .with_receiver(*receiver_id)
-                .add_data(
-                    DataTypes::send_time,
-                    cv.get_data(DataTypes::send_time).clone(),
-                )
-                .add_data(DataTypes::message, cv.get_data(DataTypes::content).clone())
-                .add_data(
-                    DataTypes::sender_id,
-                    DataValue::Number(cv.get_sender() as i64),
-                );
+                .add_data(DataTypes::send_time, DataValue::Number(timestamp))
+                .add_data(DataTypes::content, DataValue::Str(content.clone()))
+                .add_data(DataTypes::sender_id, DataValue::Number(*sender_id as i64))
+                .add_data(DataTypes::height, DataValue::Number(height));
 
             let user_resp = self
                 .clone()
@@ -528,10 +687,7 @@ impl OmikronConnection {
                         .with_id(cv.get_id())
                         .with_receiver(*sender_id)
                         .with_sender(*receiver_id)
-                        .add_data(
-                            DataTypes::send_time,
-                            cv.get_data(DataTypes::send_time).clone(),
-                        )
+                        .add_data(DataTypes::send_time, DataValue::Number(timestamp))
                         .add_data(
                             DataTypes::message_state,
                             DataValue::Str(ms.as_str().to_string()),
@@ -539,15 +695,20 @@ impl OmikronConnection {
                 )
                 .await;
             } else {
+                // Delivery timed out/failed — update stored state and notify sender with numeric timestamp
+                let _ = chat_files::change_message_state(
+                    timestamp,
+                    *receiver_id as i64,
+                    *sender_id as i64,
+                    MessageState::Sent,
+                );
+
                 self.send_message(
                     &CommunicationValue::new(CommunicationType::message_state)
                         .with_id(cv.get_id())
                         .with_receiver(*sender_id)
                         .with_sender(*receiver_id)
-                        .add_data(
-                            DataTypes::send_time,
-                            cv.get_data(DataTypes::send_time).clone(),
-                        )
+                        .add_data(DataTypes::send_time, DataValue::Number(timestamp))
                         .add_data(
                             DataTypes::message_state,
                             DataValue::Str(MessageState::Sent.as_str().to_string()),
@@ -558,90 +719,21 @@ impl OmikronConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::message_send) {
-            let my_id = cv.get_sender();
-
-            // parse other id robustly (number or string)
-            let other_id = if let Some(n) = cv.get_data(DataTypes::receiver_id).as_number() {
-                n as i64
-            } else if let Some(s) = cv.get_data(DataTypes::receiver_id).as_str() {
-                s.parse::<i64>().unwrap_or(0)
-            } else {
-                0
-            };
-
-            let now_ms_u128 = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u128;
-            // derive an i64 timestamp for protocol fields; fall back to current time if out of range
-            let now_ms_i64: i64 = match i64::try_from(now_ms_u128) {
-                Ok(v) => v,
-                Err(_) => SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64,
-            };
-
-            // safe content extraction
-            let content = cv
-                .get_data(DataTypes::content)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-
-            chat_files::add_message(now_ms_u128, true, my_id as i64, other_id, &content);
-
-            let ack = CommunicationValue::new(CommunicationType::success)
-                .with_id(cv.get_id())
-                .with_receiver(my_id);
-            self.send_message(&ack).await;
-
-            let forward = CommunicationValue::new(CommunicationType::message_other_iota)
-                .with_id(cv.get_id())
-                .with_receiver(other_id as u64)
-                .add_data(DataTypes::receiver_id, DataValue::Number(other_id))
-                .with_sender(my_id)
-                .add_data(DataTypes::send_time, DataValue::Number(now_ms_i64))
-                .add_data(DataTypes::sender_id, DataValue::Number(my_id as i64))
-                .add_data(DataTypes::content, DataValue::Str(content));
-            if let Err(err) = self.send_message_result(&forward).await {
-                // sending failed - record via existing logging path
-                log_t!("send_message_failed", err);
-            } else {
-                // forwarding succeeded -> update stored message state to Sent
-                let _ = chat_files::change_message_state(
-                    now_ms_i64,
-                    my_id as i64,
-                    other_id,
-                    MessageState::Sent,
-                );
-            }
-            return;
-        }
-
         if cv.is_type(CommunicationType::messages_get) {
             let my_id = cv.get_sender();
             let partner_id = cv.get_data(DataTypes::user_id).as_number().unwrap_or(0);
             let offset = cv.get_data(DataTypes::offset).as_number().unwrap_or(0);
             let amount = cv.get_data(DataTypes::amount).as_number().unwrap_or(0);
-            // retrieve raw JSON messages
             let messages = chat_files::get_messages(my_id as i64, partner_id, offset, amount);
-            // convert JSON array -> protocol Array of Containers (send_time, content, sender_id, message_state)
             let mut msg_array: Vec<DataValue> = Vec::new();
             for m in messages.members() {
-                // extract fields defensively
                 let message_time: i64 = m["message_time"].as_i64().unwrap_or(0);
                 let content: String = m["content"].as_str().unwrap_or("").to_string();
                 let sent_by_self: bool = m["sent_by_self"].as_bool().unwrap_or(false);
-                // determine sender id:
-                // - if sent_by_self => sender is the requester (my_id)
-                // - otherwise prefer an explicit chat_partner_id if present on the request,
-                //   fallback to the partner_id parameter
+                let height: i64 = m["height"].as_i64().unwrap_or(0);
                 let sender_id: i64 = if sent_by_self {
                     my_id as i64
                 } else {
-                    // check for chat_partner_id in the incoming request (accept number or string)
                     if let Some(n) = cv.get_data(DataTypes::chat_partner_id).as_number() {
                         n as i64
                     } else if let Some(s) = cv.get_data(DataTypes::chat_partner_id).as_str() {
@@ -654,9 +746,11 @@ impl OmikronConnection {
 
                 let mut container = Vec::new();
                 container.push((DataTypes::send_time, DataValue::Number(message_time)));
-                container.push((DataTypes::message, DataValue::Str(content)));
+                container.push((DataTypes::content, DataValue::Str(content)));
                 container.push((DataTypes::sender_id, DataValue::Number(sender_id)));
                 container.push((DataTypes::message_state, DataValue::Str(message_state)));
+                container.push((DataTypes::height, DataValue::Number(height)));
+                container.push((DataTypes::sent_by_self, DataValue::Bool(sent_by_self)));
                 msg_array.push(DataValue::Container(container));
             }
 
@@ -724,7 +818,7 @@ impl OmikronConnection {
         }
 
         if cv.is_type(CommunicationType::add_community) {
-            UserCommunityUtil::add_community(
+            CommunitiesUtil::add_community(
                 cv.get_sender() as i64,
                 cv.get_data(DataTypes::community_address)
                     .as_str()
@@ -747,19 +841,37 @@ impl OmikronConnection {
         }
 
         if cv.is_type(CommunicationType::get_communities) {
+            let mut comm_array = Vec::new();
+            for c in CommunitiesUtil::get_communities(cv.get_sender() as i64) {
+                let mut container: Vec<(DataTypes, DataValue)> = Vec::new();
+                if let Some(address) = c["address"].as_str() {
+                    container.push((
+                        DataTypes::community_address,
+                        DataValue::Str(address.to_string()),
+                    ));
+                }
+                if let Some(title) = c["title"].as_str() {
+                    container.push((
+                        DataTypes::community_title,
+                        DataValue::Str(title.to_string()),
+                    ));
+                }
+                if let Some(position) = c["position"].as_str() {
+                    container.push((DataTypes::position, DataValue::Str(position.to_string())));
+                }
+                comm_array.push(DataValue::Container(container));
+            }
+
             let resp = CommunicationValue::new(CommunicationType::get_communities)
                 .with_id(cv.get_id())
                 .with_receiver(cv.get_sender())
-                /*.add_data(
-                    DataTypes::communities,
-                    DataValue::Array(UserCommunityUtil::get_communities(cv.get_sender() as i64)),
-                ) */;
+                .add_data(DataTypes::communities, DataValue::Array(comm_array));
             self.send_message(&resp).await;
             return;
         }
 
         if cv.is_type(CommunicationType::remove_community) {
-            UserCommunityUtil::remove_community(
+            CommunitiesUtil::remove_community(
                 cv.get_sender() as i64,
                 cv.get_data(DataTypes::community_address)
                     .as_str()

@@ -1,9 +1,9 @@
 use crate::log;
-use crate::util::file_util::get_directory;
+use crate::util::db;
 use json::{JsonValue, array, object};
-use rusqlite::{Connection, params};
+use rusqlite::params;
 use std::io;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 #[derive(PartialEq, Debug, Clone)]
 pub enum MessageState {
@@ -45,30 +45,10 @@ impl MessageState {
     }
 }
 
-static DB_CONN: LazyLock<Mutex<Connection>> = LazyLock::new(|| {
-    let conn = Connection::open(format!("{}/messages.sqlite3", get_directory()))
-        .expect("Failed to open messages sqlite DB");
-    conn.execute_batch(
-        r#"
-        PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = NORMAL;
-
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            storage_owner INTEGER NOT NULL,
-            external_user INTEGER NOT NULL,
-            message_time INTEGER NOT NULL,
-            content TEXT NOT NULL,
-            sent_by_self INTEGER NOT NULL,
-            message_state TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_messages_lookup
-            ON messages (storage_owner, external_user, message_time DESC);
-        "#,
-    )
-    .expect("Failed to initialize messages DB");
-    Mutex::new(conn)
+// Shared DB created via helper.
+// The db helper constructs the messages sqlite file and ensures PRAGMAs and schema exist.
+static MESSAGES_DB: LazyLock<Arc<Mutex<rusqlite::Connection>>> = LazyLock::new(|| {
+    db::create_general_messages_db().expect("Failed to create or initialize general messages DB")
 });
 
 pub fn add_message(
@@ -77,6 +57,7 @@ pub fn add_message(
     storage_owner: i64,
     external_user: i64,
     message: &str,
+    height: i64,
 ) {
     let message_time = match i64::try_from(send_time) {
         Ok(v) => v,
@@ -86,40 +67,48 @@ pub fn add_message(
         }
     };
 
-    let conn = match DB_CONN.lock() {
-        Ok(g) => g,
-        Err(e) => {
-            log!("Failed to lock messages DB mutex for add_message: {:?}", e);
-            return;
-        }
-    };
+    // Insert the message into the DB
+    let insert_result = db::with_conn(&MESSAGES_DB, |conn| {
+        conn.execute(
+            r#"
+            INSERT INTO messages (
+                storage_owner,
+                external_user,
+                message_time,
+                content,
+                sent_by_self,
+                message_state,
+                height
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                storage_owner,
+                external_user,
+                message_time,
+                message,
+                if storage_owner_is_sender {
+                    1_i64
+                } else {
+                    0_i64
+                },
+                MessageState::Sending.as_str(),
+                height,
+            ],
+        )?;
+        Ok(())
+    });
 
-    if let Err(e) = conn.execute(
-        r#"
-        INSERT INTO messages (
-            storage_owner,
-            external_user,
-            message_time,
-            content,
-            sent_by_self,
-            message_state
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        "#,
-        params![
-            storage_owner,
-            external_user,
-            message_time,
-            message,
-            if storage_owner_is_sender {
-                1_i64
-            } else {
-                0_i64
-            },
-            MessageState::Sending.as_str(),
-        ],
-    ) {
+    if let Err(e) = insert_result {
         log!("Failed to insert message into sqlite: {}", e);
+        return;
     }
+
+    // Update contacts table to reflect that this conversation exists and has a recent message.
+    // Use the Contact helper to set last_message_at to the message timestamp.
+    let mut contact = crate::users::contact::Contact::new(external_user);
+    contact.set_last_message_at(message_time);
+    // This will insert or update the contact for the storage owner.
+    crate::util::chats_util::mod_user(storage_owner, &contact);
 }
 
 pub fn change_message_state(
@@ -128,56 +117,58 @@ pub fn change_message_state(
     external_user: i64,
     new_state: MessageState,
 ) -> io::Result<()> {
-    let conn = DB_CONN
-        .lock()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Mutex lock error: {:?}", e)))?;
-
-    let current: Option<String> = match conn.query_row(
-        r#"
-        SELECT message_state
-        FROM messages
-        WHERE storage_owner = ?1
-          AND external_user = ?2
-          AND message_time = ?3
-        ORDER BY id DESC
-        LIMIT 1
-        "#,
-        params![storage_owner, external_user, timestamp],
-        |row| row.get(0),
-    ) {
-        Ok(state) => Some(state),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
-    };
-
-    let Some(current_state_raw) = current else {
-        return Ok(());
-    };
-
-    let upgraded = MessageState::from_str(&current_state_raw)
-        .upgrade(new_state)
-        .as_str()
-        .to_string();
-
-    conn.execute(
-        r#"
-        UPDATE messages
-        SET message_state = ?1
-        WHERE id = (
-            SELECT id
+    // Run the SELECT and UPDATE inside with_conn to centralize connection access.
+    let res: Result<(), String> = db::with_conn(&MESSAGES_DB, |conn| {
+        let current: Option<String> = match conn.query_row(
+            r#"
+            SELECT message_state
             FROM messages
-            WHERE storage_owner = ?2
-              AND external_user = ?3
-              AND message_time = ?4
+            WHERE storage_owner = ?1
+              AND external_user = ?2
+              AND message_time = ?3
             ORDER BY id DESC
             LIMIT 1
-        )
-        "#,
-        params![upgraded, storage_owner, external_user, timestamp],
-    )
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            "#,
+            params![storage_owner, external_user, timestamp],
+            |row| row.get(0),
+        ) {
+            Ok(state) => Some(state),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e),
+        };
 
-    Ok(())
+        let Some(current_state_raw) = current else {
+            return Ok(());
+        };
+
+        let upgraded = MessageState::from_str(&current_state_raw)
+            .upgrade(new_state)
+            .as_str()
+            .to_string();
+
+        conn.execute(
+            r#"
+            UPDATE messages
+            SET message_state = ?1
+            WHERE id = (
+                SELECT id
+                FROM messages
+                WHERE storage_owner = ?2
+                  AND external_user = ?3
+                  AND message_time = ?4
+                ORDER BY id DESC
+                LIMIT 1
+            )
+            "#,
+            params![upgraded, storage_owner, external_user, timestamp],
+        )?;
+        Ok(())
+    });
+
+    match res {
+        Ok(_) => Ok(()),
+        Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+    }
 }
 
 pub fn get_messages(
@@ -186,80 +177,73 @@ pub fn get_messages(
     loaded_messages: i64,
     amount: i64,
 ) -> JsonValue {
-    let mut messages = array![];
+    let messages = array![];
 
     if amount <= 0 || loaded_messages < 0 {
         return messages;
     }
 
-    let conn = match DB_CONN.lock() {
-        Ok(g) => g,
-        Err(e) => {
-            log!("Failed to lock messages DB mutex for get_messages: {:?}", e);
-            return messages;
-        }
-    };
+    let res: Result<JsonValue, String> = db::with_conn(&MESSAGES_DB, |conn| {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                message_time,
+                content,
+                sent_by_self,
+                message_state,
+                height
+            FROM messages
+            WHERE storage_owner = ?1
+              AND external_user = ?2
+            ORDER BY message_time DESC, id DESC
+            LIMIT ?3 OFFSET ?4
+            "#,
+        )?;
 
-    let mut stmt = match conn.prepare(
-        r#"
-        SELECT
-            message_time,
-            content,
-            sent_by_self,
-            message_state
-        FROM messages
-        WHERE storage_owner = ?1
-          AND external_user = ?2
-        ORDER BY message_time DESC, id DESC
-        LIMIT ?3 OFFSET ?4
-        "#,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            log!("Failed to prepare get_messages query: {}", e);
-            return messages;
-        }
-    };
+        let rows = stmt.query_map(
+            params![storage_owner, external_user, amount, loaded_messages],
+            |row| {
+                let message_time: i64 = row.get(0)?;
+                let content: String = row.get(1)?;
+                let sent_by_self: i64 = row.get(2)?;
+                let message_state: String = row.get(3)?;
+                let height: i64 = row.get(4).unwrap_or(0);
+                Ok((message_time, content, sent_by_self, message_state, height))
+            },
+        )?;
 
-    let rows = stmt.query_map(
-        params![storage_owner, external_user, amount, loaded_messages],
-        |row| {
-            let message_time: i64 = row.get(0)?;
-            let content: String = row.get(1)?;
-            let sent_by_self: i64 = row.get(2)?;
-            let message_state: String = row.get(3)?;
-            Ok((message_time, content, sent_by_self, message_state))
-        },
-    );
-
-    let Ok(rows) = rows else {
-        if let Err(e) = rows {
-            log!("Failed to query messages: {}", e);
-        }
-        return messages;
-    };
-
-    for row in rows {
-        match row {
-            Ok((message_time, content, sent_by_self, message_state)) => {
-                let msg = object! {
-                    "message_time" => message_time,
-                    "content" => content,
-                    "sent_by_self" => (sent_by_self != 0),
-                    "message_state" => message_state
-                };
-
-                if let Err(e) = messages.push(msg) {
-                    log!("Failed to append message to output array: {}", e);
+        let mut out = array![];
+        for row in rows {
+            match row {
+                Ok((message_time, content, sent_by_self, message_state, height)) => {
+                    let msg = object! {
+                        "message_time" => message_time,
+                        "content" => content,
+                        "sent_by_self" => (sent_by_self != 0),
+                        "message_state" => message_state,
+                        "height" => height
+                    };
+                    if let Err(e) = out.push(msg) {
+                        // out.push returns a JsonError; log it instead of using `?` to avoid
+                        // incompatible error conversions inside the DB closure.
+                        log!("Failed to append message to output array: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    log!("Failed to read row from sqlite: {}", e);
                 }
             }
-            Err(e) => {
-                log!("Failed to read row from sqlite: {}", e);
-            }
+        }
+        Ok(out)
+    });
+
+    match res {
+        Ok(v) => v,
+        Err(e) => {
+            log!("Failed to query messages: {}", e);
+            messages
         }
     }
-
-    messages
 }
 
 #[cfg(test)]

@@ -13,13 +13,13 @@ use ttp_core::{CommunicationValue, DataTypes, DataValue};
 
 use crate::{
     APP_STATE,
-    gui::{elements::log_card::UiLogEntry, ui::UNIQUE},
+    gui::{elements::log_card::LogEntry, ui::UNIQUE},
     langu::language_manager,
 };
 
 static LOGGER: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[allow(unused)]
 pub enum PrintType {
     Call,
@@ -28,6 +28,20 @@ pub enum PrintType {
     Omikron,
     Omega,
     General,
+    Command,
+}
+impl PrintType {
+    pub fn prefix_color(self) -> Color {
+        match self {
+            PrintType::Call => Color::Magenta,
+            PrintType::Client => Color::Green,
+            PrintType::Iota => Color::Yellow,
+            PrintType::Omikron => Color::Blue,
+            PrintType::Omega => Color::Cyan,
+            PrintType::General => Color::LightCyan,
+            PrintType::Command => Color::LightGreen,
+        }
+    }
 }
 
 struct LogMessage {
@@ -35,10 +49,8 @@ struct LogMessage {
     prefix: String,
     kind: PrintType,
     is_error: bool,
-
     translation_key: Option<String>,
     format_args: Vec<String>,
-
     message: Option<String>,
 }
 
@@ -70,25 +82,47 @@ pub fn startup() {
                 msg.message.unwrap_or_default()
             };
 
-            let ts = fixed_box(&msg.timestamp_ms.to_string(), 13);
+            let timestamp = format_timestamp_inline(msg.timestamp_ms);
+            let entry = LogEntry::new(msg.kind, resolved_message, msg.is_error);
 
-            let line = format!("{} {}", msg.prefix, resolved_message);
-
-            let _ = writeln!(file, "{} {}", ts, line);
-
-            let color = colorize(msg.kind, msg.is_error);
-
-            let ui_entry = UiLogEntry {
-                line: line.clone(),
-                color,
+            let prefix = if msg.prefix.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", msg.prefix)
             };
 
-            {
-                let mut state = APP_STATE.lock().unwrap();
-                state.push_log(ui_entry);
-            }
+            let _ = writeln!(
+                file,
+                "{} {}{}",
+                fixed_box(&msg.timestamp_ms.to_string(), 13),
+                prefix,
+                entry.message
+            );
+
+            let _ = writeln!(file, "    {}", timestamp);
+
+            let mut state = APP_STATE.lock().unwrap();
+            state.push_log(entry.into());
         }
     });
+}
+
+fn format_timestamp_inline(timestamp_ms: u128) -> String {
+    let secs = (timestamp_ms / 1000) as i64;
+    let hours = (secs / 3600) % 24;
+    let minutes = (secs / 60) % 60;
+    let seconds = secs % 60;
+    format!("[{:02}:{:02}:{:02}]", hours, minutes, seconds)
+}
+
+fn fixed_box(content: &str, width: usize) -> String {
+    let s: String = content.chars().take(width).collect();
+    let len = s.chars().count();
+    if len < width {
+        format!("[{}{}]", " ".repeat(width - len), s)
+    } else {
+        s
+    }
 }
 
 fn colorize(kind: PrintType, is_error: bool) -> Color {
@@ -102,17 +136,8 @@ fn colorize(kind: PrintType, is_error: bool) -> Color {
         PrintType::Iota => Color::Yellow,
         PrintType::Omikron => Color::Blue,
         PrintType::Omega => Color::Cyan,
-        PrintType::General => Color::White,
-    }
-}
-
-fn fixed_box(content: &str, width: usize) -> String {
-    let s: String = content.chars().take(width).collect();
-    let len = s.chars().count();
-    if len < width {
-        format!("[{}{}]", " ".repeat(width - len), s)
-    } else {
-        s
+        PrintType::General => Color::LightCyan,
+        PrintType::Command => Color::LightGreen,
     }
 }
 
@@ -180,6 +205,7 @@ macro_rules! log_t {
         )
     };
 }
+
 #[macro_export]
 macro_rules! log_t_err {
     ($key:expr) => {
@@ -203,13 +229,32 @@ macro_rules! log_t_err {
     };
 }
 
+/// Log a command message.
+#[macro_export]
+macro_rules! log_command {
+    ($($arg:tt)*) => {
+        $crate::util::logger::log_internal(
+            $crate::util::logger::PrintType::Command,
+            "".to_string(),
+            false,
+            format!($($arg)*)
+        )
+    };
+}
+
 /// Log a general informational message.
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {
-        $crate::util::logger::log_internal($crate::util::logger::PrintType::General, "".to_string(), false, format!($($arg)*))
+        $crate::util::logger::log_internal(
+            $crate::util::logger::PrintType::General,
+            "".to_string(),
+            false,
+            format!($($arg)*)
+        )
     };
 }
+
 /// Log an inbound message (`>`).
 #[macro_export]
 macro_rules! log_in {
@@ -222,6 +267,7 @@ macro_rules! log_in {
         )
     };
 }
+
 /// Log an outbound message (`<`).
 #[macro_export]
 macro_rules! log_out {
@@ -234,6 +280,7 @@ macro_rules! log_out {
         )
     };
 }
+
 /// Log an error message (`>>`).
 #[macro_export]
 macro_rules! log_err {
@@ -373,6 +420,7 @@ macro_rules! log_cv_in {
         $crate::util::logger::log_cv_internal("> ", &$cv, None)
     };
 }
+
 #[macro_export]
 macro_rules! log_cv_out {
     ($kind:expr, $cv:expr) => {
