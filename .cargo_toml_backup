@@ -1,0 +1,76 @@
+[package]
+name = "iota"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+actix = "0.13.5"
+actix-rt = "2.11.0"
+actix-web = { version = "4.12.1", features = ["rustls-0_23"] }
+actix-web-actors = "4.3.1"
+aes-gcm = "*"
+axum = { version = "0.8.8", features = ["ws", "http2"] }
+base64 = "0.22.1"
+bytes = "*"
+cmake = "*"
+color-eyre = "*"
+crossterm = "*"
+der = "*"
+futures = "*"
+futures-util = "*"
+hex = "*"
+hkdf = "*"
+hmac = "*"
+hyper-util = { version = "*" }
+hyper = { version = "1.8.1", features = [
+    "capi",
+    "client",
+    "full",
+    "http1",
+    "http2",
+    "nightly",
+    "server",
+] }
+http-body-util = "*"
+json = "*"
+native-tls = { version = "*", default-features = false }
+once_cell = "1.21.3"
+pkcs8 = { version = "*", features = ["alloc"] }
+rand = "0.8"
+rand_core = { version = "0.6", features = ["getrandom", "std"] }
+reactive-rs = "*"
+aws-lc-rs = "*"
+reqwest = "0.12.23"
+rustls = { version = "*", features = ["aws-lc-rs"] }
+serde = { version = "1.0.219", features = ["derive"] }
+sha2 = "*"
+sys-info = "*"
+sysinfo = "0.30"
+tokio = { version = "1.48.0", features = ["full"] }
+tokio-util = { version = "*", features = ["full"] }
+tokio-tungstenite = { version = "*", features = ["native-tls"] }
+tower = "*"
+tungstenite = "*"
+uuid = { version = "*", features = ["v4"] }
+walkdir = "2.5.0"
+warp = "*"
+x448 = { version = "*" }
+x509 = "*"
+tokio-rustls = "0.26.4"
+rustls-pemfile = "2.2.0"
+async-trait = "0.1.89"
+sha1 = "0.10.6"
+async-tungstenite = "0.32.0"
+zip = "6.0.0"
+tui-textarea = "0.7.0"
+tui-input = "0.14.0"
+pnet = "0.35.0"
+dashmap = "6.1.0"
+strum = "0.27.2"
+strum_macros = "0.27.2"
+ratatui = "0.30.0"
+ratatui_input = "0.1.3"
+open = "5.3.3"
+chrono = "0.4.43"
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+serde_json = "1.0.149"

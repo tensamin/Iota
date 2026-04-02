@@ -3,18 +3,24 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::Path,
-    sync::{OnceLock, mpsc},
+    sync::{OnceLock, atomic::Ordering, mpsc},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use ansi_term::Color;
+use ratatui::style::Color;
 use ttp_core::{CommunicationValue, DataTypes, DataValue};
+
+use crate::{
+    APP_STATE,
+    gui::{elements::log_card::LogEntry, ui::UNIQUE},
+    langu::language_manager,
+};
 
 static LOGGER: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
 
-#[allow(dead_code)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(unused)]
 pub enum PrintType {
     Call,
     Client,
@@ -22,15 +28,30 @@ pub enum PrintType {
     Omikron,
     Omega,
     General,
+    Command,
+}
+impl PrintType {
+    pub fn prefix_color(self) -> Color {
+        match self {
+            PrintType::Call => Color::Magenta,
+            PrintType::Client => Color::Green,
+            PrintType::Iota => Color::Yellow,
+            PrintType::Omikron => Color::Blue,
+            PrintType::Omega => Color::Cyan,
+            PrintType::General => Color::LightCyan,
+            PrintType::Command => Color::LightGreen,
+        }
+    }
 }
 
 struct LogMessage {
     timestamp_ms: u128,
-    sender: Option<i64>,
-    prefix: &'static str,
+    prefix: String,
     kind: PrintType,
     is_error: bool,
-    message: String,
+    translation_key: Option<String>,
+    format_args: Vec<String>,
+    message: Option<String>,
 }
 
 pub fn startup() {
@@ -54,34 +75,44 @@ pub fn startup() {
             .expect("Failed to open log file");
 
         for msg in rx {
-            let ts = fixed_box(&msg.timestamp_ms.to_string(), 13);
-            let sender = match msg.sender {
-                Some(id) => fixed_box(&id.to_string(), 19),
-                _ => fixed_box("", 19),
+            let resolved_message = if let Some(key) = msg.translation_key {
+                let args: Vec<&str> = msg.format_args.iter().map(|s| s.as_str()).collect();
+                language_manager::format(&key, &args)
+            } else {
+                msg.message.unwrap_or_default()
             };
 
-            let line = format!("{} {} {} {}", ts, sender, msg.prefix, msg.message);
+            let timestamp = format_timestamp_inline(msg.timestamp_ms);
+            let entry = LogEntry::new(msg.kind, resolved_message, msg.is_error);
 
-            println!("{}", colorize(msg.kind, msg.is_error).paint(&line));
+            let prefix = if msg.prefix.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", msg.prefix)
+            };
 
-            let _ = writeln!(file, "{}", line);
+            let _ = writeln!(
+                file,
+                "{} {}{}",
+                fixed_box(&msg.timestamp_ms.to_string(), 13),
+                prefix,
+                entry.message
+            );
+
+            let _ = writeln!(file, "    {}", timestamp);
+
+            let mut state = APP_STATE.lock().unwrap();
+            state.push_log(entry.into());
         }
     });
 }
 
-fn colorize(kind: PrintType, is_error: bool) -> Color {
-    if is_error {
-        return Color::Red;
-    }
-
-    match kind {
-        PrintType::Call => Color::Purple,
-        PrintType::Client => Color::Green,
-        PrintType::Iota => Color::Yellow,
-        PrintType::Omikron => Color::Blue,
-        PrintType::Omega => Color::Cyan,
-        PrintType::General => Color::White,
-    }
+fn format_timestamp_inline(timestamp_ms: u128) -> String {
+    let secs = (timestamp_ms / 1000) as i64;
+    let hours = (secs / 3600) % 24;
+    let minutes = (secs / 60) % 60;
+    let seconds = secs % 60;
+    format!("[{:02}:{:02}:{:02}]", hours, minutes, seconds)
 }
 
 fn fixed_box(content: &str, width: usize) -> String {
@@ -94,51 +125,172 @@ fn fixed_box(content: &str, width: usize) -> String {
     }
 }
 
-pub fn log_internal(
-    sender: i64,
-    kind: PrintType,
-    prefix: &'static str,
-    is_error: bool,
-    message: String,
-) {
-    let sender = if sender == 0 { None } else { Some(sender) };
+fn colorize(kind: PrintType, is_error: bool) -> Color {
+    if is_error {
+        return Color::Red;
+    }
 
+    match kind {
+        PrintType::Call => Color::Magenta,
+        PrintType::Client => Color::Green,
+        PrintType::Iota => Color::Yellow,
+        PrintType::Omikron => Color::Blue,
+        PrintType::Omega => Color::Cyan,
+        PrintType::General => Color::LightCyan,
+        PrintType::Command => Color::LightGreen,
+    }
+}
+
+pub fn log_internal_translated(
+    kind: PrintType,
+    prefix: String,
+    is_error: bool,
+    key: &str,
+    args: Vec<String>,
+) {
     if let Some(tx) = LOGGER.get() {
+        UNIQUE.store(true, Ordering::Relaxed);
         let _ = tx.send(LogMessage {
             timestamp_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis(),
-            sender,
             prefix,
             kind,
             is_error,
-            message,
+            translation_key: Some(key.to_string()),
+            format_args: args,
+            message: None,
         });
     }
 }
+
+pub fn log_internal(kind: PrintType, prefix: String, is_error: bool, message: String) {
+    if let Some(tx) = LOGGER.get() {
+        UNIQUE.store(true, Ordering::Relaxed);
+        let _ = tx.send(LogMessage {
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            prefix,
+            kind,
+            is_error,
+            translation_key: None,
+            format_args: Vec::new(),
+            message: Some(message),
+        });
+    }
+}
+
+#[macro_export]
+macro_rules! log_t {
+    ($key:expr) => {
+        $crate::util::logger::log_internal_translated(
+            $crate::util::logger::PrintType::General,
+            "".to_string(),
+            false,
+            $key,
+            vec![]
+        )
+    };
+
+    ($key:expr, $($arg:expr),+) => {
+        $crate::util::logger::log_internal_translated(
+            $crate::util::logger::PrintType::General,
+            "".to_string(),
+            false,
+            $key,
+            vec![$($arg),+]
+        )
+    };
+}
+
+#[macro_export]
+macro_rules! log_t_err {
+    ($key:expr) => {
+        $crate::util::logger::log_internal_translated(
+            $crate::util::logger::PrintType::General,
+            "".to_string(),
+            true,
+            $key,
+            vec![]
+        )
+    };
+
+    ($key:expr, $($arg:expr),+) => {
+        $crate::util::logger::log_internal_translated(
+            $crate::util::logger::PrintType::General,
+            "".to_string(),
+            true,
+            $key,
+            vec![$($arg.to_string()),+]
+        )
+    };
+}
+
+/// Log a command message.
+#[macro_export]
+macro_rules! log_command {
+    ($($arg:tt)*) => {
+        $crate::util::logger::log_internal(
+            $crate::util::logger::PrintType::Command,
+            "".to_string(),
+            false,
+            format!($($arg)*)
+        )
+    };
+}
+
+/// Log a general informational message.
 #[macro_export]
 macro_rules! log {
-    ($sender: expr, $kind:expr, $($arg:tt)*) => {
-        $crate::util::logger::log_internal($sender, $kind, "", false, format!($($arg)*))
+    ($($arg:tt)*) => {
+        $crate::util::logger::log_internal(
+            $crate::util::logger::PrintType::General,
+            "".to_string(),
+            false,
+            format!($($arg)*)
+        )
     };
 }
+
+/// Log an inbound message (`>`).
 #[macro_export]
 macro_rules! log_in {
-    ($sender: expr, $kind:expr, $($arg:tt)*) => {
-        $crate::util::logger::log_internal($sender, $kind, ">", false, format!($($arg)*))
+    ($($arg:tt)*) => {
+        $crate::util::logger::log_internal(
+            $crate::util::logger::PrintType::General,
+            ">".to_string(),
+            false,
+            format!($($arg)*)
+        )
     };
 }
+
+/// Log an outbound message (`<`).
 #[macro_export]
 macro_rules! log_out {
-    ($sender:expr, $kind:expr, $($arg:tt)*) => {
-        $crate::util::logger::log_internal($sender, $kind, "<", false, format!($($arg)*))
+    ($($arg:tt)*) => {
+        $crate::util::logger::log_internal(
+            $crate::util::logger::PrintType::General,
+            "<".to_string(),
+            false,
+            format!($($arg)*)
+        )
     };
 }
+
+/// Log an error message (`>>`).
 #[macro_export]
 macro_rules! log_err {
-    ($sender:expr, $kind:expr, $($arg:tt)*) => {
-        $crate::util::logger::log_internal($sender, $kind, ">>", true, format!($($arg)*))
+    ($($arg:tt)*) => {
+        $crate::util::logger::log_internal(
+            $crate::util::logger::PrintType::General,
+            ">>".to_string(),
+            true,
+            format!($($arg)*)
+        )
     };
 }
 
@@ -151,9 +303,8 @@ pub fn log_cv_internal(
     let formatted = format_cv(cv);
 
     log_internal(
-        cv.get_sender() as i64,
         print_type.unwrap_or(PrintType::General),
-        prefix,
+        prefix.to_string(),
         false,
         formatted,
     );
@@ -269,6 +420,7 @@ macro_rules! log_cv_in {
         $crate::util::logger::log_cv_internal("> ", &$cv, None)
     };
 }
+
 #[macro_export]
 macro_rules! log_cv_out {
     ($kind:expr, $cv:expr) => {

@@ -1,1 +1,1 @@
-# ⚠️ Moved to [git.methanium.net](https://git.methanium.net/tensamin/omikron) ⚠️
+# ⚠️ Moved to [git.methanium.net](https://git.methanium.net/tensamin/iota) ⚠️

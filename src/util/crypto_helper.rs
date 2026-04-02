@@ -7,9 +7,9 @@ use rand_core::RngCore;
 use sha2::{Digest, Sha256};
 use x448::{PublicKey, Secret, SharedSecret};
 
-/// Errors for crypto operations
-#[allow(dead_code)]
+/// Errors for crypto opertions
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum CryptoError {
     Base64Decode(base64::DecodeError),
     InvalidKey,
@@ -24,13 +24,11 @@ impl From<base64::DecodeError> for CryptoError {
     }
 }
 
-#[allow(dead_code)]
 pub struct KeyPair {
     pub secret: Secret,
     pub public: PublicKey,
 }
 
-#[allow(dead_code)]
 pub fn generate_keypair() -> KeyPair {
     let mut buf = [0u8; 56];
     let mut rng = OsRng;
@@ -58,6 +56,7 @@ pub fn load_secret_key(base64_secret: &str) -> Option<Secret> {
     Secret::from_bytes(&bytes)
 }
 
+#[allow(dead_code)]
 fn derive_aes_key(shared: &SharedSecret) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(shared.as_bytes());
@@ -68,20 +67,13 @@ fn derive_aes_key(shared: &SharedSecret) -> [u8; 32] {
 }
 
 #[allow(dead_code)]
-pub fn encrypt_b64(
+pub fn encrypt(
     base64_secret: &str,
     base64_peer_pub: &str,
     plaintext: &str,
 ) -> Result<String, CryptoError> {
     let secret = load_secret_key(base64_secret).unwrap();
     let peer_pub = load_public_key(base64_peer_pub).unwrap();
-    encrypt(secret, peer_pub, plaintext)
-}
-pub fn encrypt(
-    secret: Secret,
-    peer_pub: PublicKey,
-    plaintext: &str,
-) -> Result<String, CryptoError> {
     let shared = secret
         .to_diffie_hellman(&peer_pub)
         .ok_or(CryptoError::AgreementError)?;
@@ -100,20 +92,14 @@ pub fn encrypt(
     Ok(STANDARD.encode(&out))
 }
 
-pub fn decrypt_b64(
+#[allow(dead_code)]
+pub fn decrypt(
     base64_secret: &str,
     base64_peer_pub: &str,
     encrypted_base64: &str,
 ) -> Result<String, CryptoError> {
     let secret = load_secret_key(base64_secret).unwrap();
     let peer_pub = load_public_key(base64_peer_pub).unwrap();
-    decrypt(secret, peer_pub, encrypted_base64)
-}
-pub fn decrypt(
-    secret: Secret,
-    peer_pub: PublicKey,
-    encrypted_base64: &str,
-) -> Result<String, CryptoError> {
     let shared = secret
         .to_diffie_hellman(&peer_pub)
         .ok_or(CryptoError::AgreementError)?;
@@ -135,14 +121,12 @@ pub fn decrypt(
     Ok(plaintext)
 }
 
-#[allow(dead_code)]
 pub fn hash_it(input: &str) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     hasher.finalize().to_vec()
 }
 
-#[allow(dead_code)]
 pub fn hex_hash(input: &str) -> String {
     let digest = hash_it(input);
     digest.iter().map(|b| format!("{:02x}", b)).collect()
