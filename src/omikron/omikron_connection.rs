@@ -438,7 +438,10 @@ impl OmikronConnection {
 
         if cv.is_type(CommunicationType::message_state) {
             let sender_id = &cv.get_sender();
-            let receiver_id = &cv.get_receiver();
+            let receiver_id = match cv.get_data(DataTypes::chat_partner_id).as_number() {
+                Some(id) => id,
+                _ => return,
+            };
 
             // Parse send_time robustly: accept numeric or string, fallback to current time
             let send_time_val = cv.get_data(DataTypes::send_time);
@@ -456,7 +459,7 @@ impl OmikronConnection {
 
             let _ = chat_files::change_message_state(
                 timestamp_i64,
-                *receiver_id as i64,
+                receiver_id as i64,
                 *sender_id as i64,
                 MessageState::from_str(
                     cv.get_data(DataTypes::message_state).as_str().unwrap_or(""),
