@@ -464,15 +464,9 @@ impl OmikronConnection {
             );
         }
 
-        // Incoming stored message: store for the recipient, attempt local delivery, notify sender.
+        // Incoming storsed message: store for the recipient, attempt local delivery, notify sender.
         if cv.is_type(CommunicationType::message_send) {
-            let sender_id: i64 = if let Some(n) = cv.get_data(DataTypes::sender_id).as_number() {
-                n as i64
-            } else if let Some(s) = cv.get_data(DataTypes::sender_id).as_str() {
-                s.parse::<i64>().unwrap_or(0)
-            } else {
-                0
-            };
+            let sender_id: u64 = cv.get_sender();
 
             // parse receiver_id (the storage owner for this incoming message)
             let receiver_id: i64 = if let Some(n) = cv.get_data(DataTypes::receiver_id).as_number()
