@@ -1,4 +1,4 @@
-use crate::util::file_util::{load_file, save_file};
+use iota_util::file_util::{load_file, save_file};
 use json::JsonValue;
 use once_cell::sync::Lazy;
 use tokio::sync::RwLock;

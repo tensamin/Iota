@@ -1,6 +1,7 @@
 use std::{any::Any, sync::Arc};
 
 use crossterm::event::KeyEvent;
+use iota_state::APP_STATE;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -12,13 +13,10 @@ use ratatui::{
 };
 
 use crate::{
-    APP_STATE,
-    gui::{
-        elements::elements::{Element, InteractableElement, JoinableElement},
-        interaction_result::InteractionResult,
-        ui::UI,
-        util::borders::draw_block_joins,
-    },
+    elements::elements::{Element, InteractableElement, JoinableElement},
+    interaction_result::InteractionResult,
+    ui::UI,
+    util::borders::draw_block_joins,
 };
 
 pub enum GRAPHS {

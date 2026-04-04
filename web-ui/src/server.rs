@@ -1,10 +1,9 @@
-use crate::log;
-use crate::server::api::api_config;
-use crate::server::web_path_parser;
-use crate::util::file_util::load_file_buf;
-use crate::{ACTIVE_TASKS, SHUTDOWN};
+use crate::api::api_config;
+use crate::web_path_parser;
 use actix_web::{App, Error, HttpRequest, HttpServer, Responder, dev::ServerHandle, web};
-use actix_web_actors::ws;
+use iota_logger::log;
+use iota_state::{ACTIVE_TASKS, SHUTDOWN};
+use iota_util::file_util::load_file_buf;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{
@@ -14,13 +13,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-
-async fn ws_handler(req: HttpRequest, stream: web::Payload) -> Result<impl Responder, Error> {
-    let path = req.path().to_string();
-    log!("WS connection from {:?}", req.peer_addr());
-    let session = WsSession::new(path);
-    ws::start(session, &req, stream)
-}
 
 use tokio::sync::oneshot;
 
@@ -36,7 +28,6 @@ pub async fn start(port: u16) -> bool {
                     App::new()
                         .app_data(web::Data::new(true))
                         .configure(api_config)
-                        .service(web::resource("/ws/{path:.*}").route(web::get().to(ws_handler)))
                         .default_service(web::to(web_path_parser::handle))
                 })
                 .bind(("0.0.0.0", port))
@@ -49,7 +40,6 @@ pub async fn start(port: u16) -> bool {
                     App::new()
                         .app_data(web::Data::new(false))
                         .configure(api_config)
-                        .service(web::resource("/ws/{path:.*}").route(web::get().to(ws_handler)))
                         .default_service(web::to(web_path_parser::handle))
                 })
                 .bind(("0.0.0.0", port))

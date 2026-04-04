@@ -5,7 +5,7 @@
 //! reuse. The goal is to centralize the "open and initialize" logic and
 //! provide small convenience helpers used by other util modules.
 
-use crate::util::file_util::get_directory;
+use iota_util::file_util::get_directory;
 use rusqlite::{Connection, Error as RusqliteError};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

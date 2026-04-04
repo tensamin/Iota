@@ -2,8 +2,13 @@ use crate::{
     interaction_result::InteractionResult,
     screens::{md_viewer::FileViewer, screens::Screen},
     ui::UI,
+    util::{
+        buttons::{checkbox, draw_buttons},
+        terms_focus::Focus,
+    },
 };
 use crossterm::event::{KeyCode, KeyEvent};
+use iota_terms::{TermsType, get_link, get_terms};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -13,6 +18,13 @@ use ratatui::{
 };
 use std::{any::Any, pin::Pin, sync::Arc};
 use tokio::sync::oneshot;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserChoice {
+    Deny,
+    AcceptEULA,
+    AcceptAll,
+}
 
 pub struct TermsCheckerScreen {
     ui: Arc<UI>,
@@ -268,9 +280,9 @@ impl Screen for TermsCheckerScreen {
             }
             KeyCode::Char('o') | KeyCode::Char('O') => {
                 let terms_type = match self.focus {
-                    Focus::Eula => Some(Type::EULA),
-                    Focus::Tos => Some(Type::TOS),
-                    Focus::Pp => Some(Type::PP),
+                    Focus::Eula => Some(TermsType::EULA),
+                    Focus::Tos => Some(TermsType::TOS),
+                    Focus::Pp => Some(TermsType::PP),
                     _ => None,
                 };
                 if let Some(terms_type) = terms_type {
@@ -288,15 +300,15 @@ impl Screen for TermsCheckerScreen {
             }
             KeyCode::Char('l') | KeyCode::Char('L') => match self.focus {
                 Focus::Eula => {
-                    let _ = open::that(get_link(Type::EULA));
+                    let _ = open::that(get_link(TermsType::EULA));
                     InteractionResult::Handled
                 }
                 Focus::Tos => {
-                    let _ = open::that(get_link(Type::TOS));
+                    let _ = open::that(get_link(TermsType::TOS));
                     InteractionResult::Handled
                 }
                 Focus::Pp => {
-                    let _ = open::that(get_link(Type::PP));
+                    let _ = open::that(get_link(TermsType::PP));
                     InteractionResult::Handled
                 }
                 _ => InteractionResult::Unhandled,

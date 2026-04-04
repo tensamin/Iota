@@ -3,6 +3,7 @@ use crate::{
     screens::screens::Screen,
 };
 use crossterm::event::KeyEvent;
+use iota_state::{ACTIVE_TASKS, SHUTDOWN, UNIQUE};
 use once_cell::sync::Lazy;
 use ratatui::{Terminal, backend::CrosstermBackend, init};
 use std::{
@@ -17,7 +18,6 @@ use std::{
 use tokio::{sync::RwLock, time::Instant};
 
 /// UI state and rendering
-pub static UNIQUE: AtomicBool = AtomicBool::new(true);
 
 pub static FPS: Lazy<RwLock<(f64, f64)>> = Lazy::new(|| RwLock::new((0.0, 0.0)));
 

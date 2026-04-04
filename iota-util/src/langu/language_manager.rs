@@ -1,4 +1,4 @@
-use crate::util::file_util::{self};
+use crate::file_util::{self};
 use json::parse;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;

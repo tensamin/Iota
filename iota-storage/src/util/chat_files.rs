@@ -1,5 +1,5 @@
-use crate::log;
 use crate::util::db;
+use iota_logger::log;
 use json::{JsonValue, array, object};
 use rusqlite::params;
 use std::io;

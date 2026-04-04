@@ -1,4 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent};
+use iota_logger::{log, log_command, log_cv};
+use iota_state::{ACTIVE_TASKS, RELOAD, SHUTDOWN};
+use iota_storage::users::{user_manager, user_profile::UserProfile};
+use iota_util::file_util;
+use omikron_connector::omikron_connection::OMIKRON_CONNECTION;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -9,25 +14,19 @@ use ratatui::{
 use ttp_core::{CommunicationType, CommunicationValue};
 use uuid::Uuid;
 
-use crate::{
-    ACTIVE_TASKS, RELOAD, SHUTDOWN,
-    gui::{
-        elements::elements::{Element, InteractableElement, JoinableElement},
-        interaction_result::InteractionResult,
-        ui::FPS,
-        util::borders::draw_block_joins,
-    },
-    log, log_command, log_cv,
-    omikron::omikron_connection::OMIKRON_CONNECTION,
-    users::{user_manager, user_profile::UserProfile},
-    util::file_util,
-};
 use std::{
     any::Any,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::time::Instant;
+
+use crate::{
+    elements::elements::{Element, InteractableElement, JoinableElement},
+    interaction_result::InteractionResult,
+    ui::FPS,
+    util::borders::draw_block_joins,
+};
 
 pub struct ConsoleCard {
     focused: bool,
@@ -425,7 +424,8 @@ pub async fn run_command(command: &str) {
             ping(time).await;
         }
         ["user", "add", username] => {
-            if let (Some(user), Some(_)) = user_manager::create_user(username).await {
+            if let (Some(user), Some(_)) = omikron_connector::user_ops::create_user(username).await
+            {
                 log!("Created user {}", user.user_id);
             } else {
                 log!("Failed to create user");

@@ -848,53 +848,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
-name = "decentralized"
-version = "0.1.0"
-dependencies = [
- "actix-web",
- "actix-web-actors",
- "aes-gcm",
- "async-trait",
- "base64",
- "chrono",
- "crossterm",
- "dashmap",
- "futures",
- "futures-util",
- "hex",
- "hkdf",
- "hyper",
- "hyper-util",
- "json",
- "lazy_static",
- "once_cell",
- "open",
- "pnet",
- "rand 0.8.5",
- "rand_core 0.6.4",
- "ratatui",
- "reqwest",
- "rusqlite",
- "rustls",
- "rustls-pemfile",
- "serde_json",
- "sha2",
- "strum 0.27.2",
- "strum_macros 0.27.2",
- "sysinfo",
- "tokio",
- "tokio-tungstenite",
- "ttp-core",
- "ttp-native",
- "tungstenite",
- "uuid",
- "walkdir",
- "warp",
- "x448",
- "zip",
-]
-
-[[package]]
 name = "deflate64"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1847,6 +1800,12 @@ dependencies = [
 [[package]]
 name = "iota-logger"
 version = "0.1.0"
+dependencies = [
+ "iota-state",
+ "iota-util",
+ "ratatui",
+ "ttp-core",
+]
 
 [[package]]
 name = "iota-state"
@@ -1868,6 +1827,9 @@ dependencies = [
  "base64",
  "hex",
  "hkdf",
+ "iota-logger",
+ "iota-state",
+ "iota-util",
  "json",
  "once_cell",
  "rand 0.8.5",
@@ -1891,6 +1853,7 @@ name = "iota-terms"
 version = "0.1.0"
 dependencies = [
  "iota-state",
+ "iota-util",
  "json",
  "reqwest",
 ]
@@ -1899,13 +1862,25 @@ dependencies = [
 name = "iota-util"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
+ "base64",
+ "hex",
+ "hkdf",
  "json",
+ "once_cell",
  "pnet",
+ "rand_core 0.6.4",
  "ratatui",
  "reqwest",
+ "sha2",
+ "sysinfo",
  "tokio",
  "ttp-core",
  "ttp-native",
+ "uuid",
+ "walkdir",
+ "x448",
+ "zip",
 ]
 
 [[package]]
@@ -2402,12 +2377,21 @@ dependencies = [
 name = "omikron-connector"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "dashmap",
+ "hex",
+ "iota-logger",
+ "iota-state",
+ "iota-storage",
+ "iota-util",
  "json",
+ "rand_core 0.6.4",
+ "sha2",
  "tokio",
  "ttp-core",
  "ttp-native",
  "uuid",
+ "x448",
 ]
 
 [[package]]
@@ -4403,8 +4387,13 @@ dependencies = [
  "hkdf",
  "hyper",
  "hyper-util",
+ "iota-logger",
+ "iota-state",
+ "iota-storage",
+ "iota-util",
  "json",
  "lazy_static",
+ "omikron-connector",
  "once_cell",
  "open",
  "pnet",

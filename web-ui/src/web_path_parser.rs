@@ -1,7 +1,7 @@
 use actix_web::{HttpRequest, HttpResponse};
 use std::path::{Path, PathBuf};
 
-use crate::util::file_util::load_file_vec;
+use iota_util::file_util::load_file_vec;
 
 fn codec_for_ext(ext: &str) -> &'static str {
     match ext {

@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+omikron-connector = { path = "../omikron-connector" }
+iota-storage = { path = "../iota-storage" }
+iota-state = { path = "../iota-state" }
+iota-util = { path = "../iota-util" }
+iota-logger = { path = "../iota-logger" }
 ttp-core = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-core" }
 ttp-native = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-native" }
 

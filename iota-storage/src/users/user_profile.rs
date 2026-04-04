@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::util::file_util::{has_file, load_file, used_dir_space};
+use iota_util::file_util::{has_file, load_file, used_dir_space};
 use base64::{Engine as _, engine::general_purpose};
 use json::{JsonValue, object};
 use rand::Rng;

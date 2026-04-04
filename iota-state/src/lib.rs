@@ -2,7 +2,7 @@ use dashmap::DashSet;
 use json::{JsonValue, object};
 use once_cell::sync::Lazy;
 use std::collections::VecDeque;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, atomic::AtomicBool};
 use std::thread;
 use std::time::Duration;
 use sysinfo::{RefreshKind, System};
@@ -10,6 +10,8 @@ use tokio::sync::RwLock;
 
 pub const MAX_POINTS: usize = 1000;
 pub const MAX_LOGS: usize = 100;
+
+pub static UNIQUE: AtomicBool = AtomicBool::new(true);
 
 #[derive(Clone, Debug)]
 pub struct UiLogEntry {

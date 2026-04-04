@@ -6,6 +6,10 @@ edition = "2024"
 [dependencies]
 ttp-core = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-core" }
 ttp-native = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-native" }
+iota-logger = { path = "../iota-logger" }
+iota-util = { path = "../iota-util" }
+iota-storage = { path = "../iota-storage" }
+iota-state = { path = "../iota-state" }
 
 actix-web = { version = "4", features = ["rustls-0_23"] }
 actix-web-actors = "4"

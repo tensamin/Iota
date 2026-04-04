@@ -1,6 +1,6 @@
 use json::JsonValue::Object;
 
-use crate::terms::doc::Doc;
+use crate::doc::Doc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Type {

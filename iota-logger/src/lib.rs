@@ -11,11 +11,8 @@ use std::{
 use ratatui::style::Color;
 use ttp_core::{CommunicationValue, DataTypes, DataValue};
 
-use crate::{
-    APP_STATE,
-    gui::{elements::log_card::LogEntry, ui::UNIQUE},
-    langu::language_manager,
-};
+use iota_state::{APP_STATE, UNIQUE, UiLogEntry};
+use iota_util::langu::language_manager;
 
 static LOGGER: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
 
@@ -83,7 +80,6 @@ pub fn startup() {
             };
 
             let timestamp = format_timestamp_inline(msg.timestamp_ms);
-            let entry = LogEntry::new(msg.kind, resolved_message, msg.is_error);
 
             let prefix = if msg.prefix.is_empty() {
                 String::new()
@@ -96,13 +92,20 @@ pub fn startup() {
                 "{} {}{}",
                 fixed_box(&msg.timestamp_ms.to_string(), 13),
                 prefix,
-                entry.message
+                resolved_message
             );
 
             let _ = writeln!(file, "    {}", timestamp);
 
+            let entry = UiLogEntry {
+                timestamp_ms: msg.timestamp_ms,
+                sender: format!("{:?}", msg.kind),
+                message: resolved_message,
+                is_error: msg.is_error,
+            };
+
             let mut state = APP_STATE.lock().unwrap();
-            state.push_log(entry.into());
+            state.push_log(entry);
         }
     });
 }
@@ -186,8 +189,8 @@ pub fn log_internal(kind: PrintType, prefix: String, is_error: bool, message: St
 #[macro_export]
 macro_rules! log_t {
     ($key:expr) => {
-        $crate::util::logger::log_internal_translated(
-            $crate::util::logger::PrintType::General,
+        $crate::log_internal_translated(
+            $crate::PrintType::General,
             "".to_string(),
             false,
             $key,
@@ -196,8 +199,8 @@ macro_rules! log_t {
     };
 
     ($key:expr, $($arg:expr),+) => {
-        $crate::util::logger::log_internal_translated(
-            $crate::util::logger::PrintType::General,
+        $crate::log_internal_translated(
+            $crate::PrintType::General,
             "".to_string(),
             false,
             $key,
@@ -209,8 +212,8 @@ macro_rules! log_t {
 #[macro_export]
 macro_rules! log_t_err {
     ($key:expr) => {
-        $crate::util::logger::log_internal_translated(
-            $crate::util::logger::PrintType::General,
+        $crate::log_internal_translated(
+            $crate::PrintType::General,
             "".to_string(),
             true,
             $key,
@@ -219,8 +222,8 @@ macro_rules! log_t_err {
     };
 
     ($key:expr, $($arg:expr),+) => {
-        $crate::util::logger::log_internal_translated(
-            $crate::util::logger::PrintType::General,
+        $crate::log_internal_translated(
+            $crate::PrintType::General,
             "".to_string(),
             true,
             $key,
@@ -233,8 +236,8 @@ macro_rules! log_t_err {
 #[macro_export]
 macro_rules! log_command {
     ($($arg:tt)*) => {
-        $crate::util::logger::log_internal(
-            $crate::util::logger::PrintType::Command,
+        $crate::log_internal(
+            $crate::PrintType::Command,
             "".to_string(),
             false,
             format!($($arg)*)
@@ -246,8 +249,8 @@ macro_rules! log_command {
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {
-        $crate::util::logger::log_internal(
-            $crate::util::logger::PrintType::General,
+        $crate::log_internal(
+            $crate::PrintType::General,
             "".to_string(),
             false,
             format!($($arg)*)
@@ -259,8 +262,8 @@ macro_rules! log {
 #[macro_export]
 macro_rules! log_in {
     ($($arg:tt)*) => {
-        $crate::util::logger::log_internal(
-            $crate::util::logger::PrintType::General,
+        $crate::log_internal(
+            $crate::PrintType::General,
             ">".to_string(),
             false,
             format!($($arg)*)
@@ -272,8 +275,8 @@ macro_rules! log_in {
 #[macro_export]
 macro_rules! log_out {
     ($($arg:tt)*) => {
-        $crate::util::logger::log_internal(
-            $crate::util::logger::PrintType::General,
+        $crate::log_internal(
+            $crate::PrintType::General,
             "<".to_string(),
             false,
             format!($($arg)*)
@@ -285,8 +288,8 @@ macro_rules! log_out {
 #[macro_export]
 macro_rules! log_err {
     ($($arg:tt)*) => {
-        $crate::util::logger::log_internal(
-            $crate::util::logger::PrintType::General,
+        $crate::log_internal(
+            $crate::PrintType::General,
             ">>".to_string(),
             true,
             format!($($arg)*)
@@ -404,29 +407,29 @@ fn format_array(arr: Vec<DataValue>) -> String {
 #[macro_export]
 macro_rules! log_cv {
     ($kind:expr, $cv:expr) => {
-        $crate::util::logger::log_cv_internal("", &$cv, Some($kind))
+        $crate::log_cv_internal("", &$cv, Some($kind))
     };
     ($cv:expr) => {
-        $crate::util::logger::log_cv_internal("", &$cv, None)
+        $crate::log_cv_internal("", &$cv, None)
     };
 }
 
 #[macro_export]
 macro_rules! log_cv_in {
     ($kind:expr, $cv:expr) => {
-        $crate::util::logger::log_cv_internal("> ", &$cv, Some($kind))
+        $crate::log_cv_internal("> ", &$cv, Some($kind))
     };
     ($cv:expr) => {
-        $crate::util::logger::log_cv_internal("> ", &$cv, None)
+        $crate::log_cv_internal("> ", &$cv, None)
     };
 }
 
 #[macro_export]
 macro_rules! log_cv_out {
     ($kind:expr, $cv:expr) => {
-        $crate::util::logger::log_cv_internal("< ", &$cv, Some($kind))
+        $crate::log_cv_internal("< ", &$cv, Some($kind))
     };
     ($cv:expr) => {
-        $crate::util::logger::log_cv_internal("< ", &$cv, None)
+        $crate::log_cv_internal("< ", &$cv, None)
     };
 }

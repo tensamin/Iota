@@ -1,6 +1,7 @@
 use json::{JsonValue, object::Object};
 
-use crate::{terms::terms_getter::Type, util::file_util::load_file};
+use crate::terms_getter::Type;
+use iota_util::file_util::load_file;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(unused)]

@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ratatui = "0.30.0"
+ttp-core = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-core" }
+iota-state = { path = "../iota-state" }
+iota-util = { path = "../iota-util" }

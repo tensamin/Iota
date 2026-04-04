@@ -1,6 +1,6 @@
-use crate::ui::{UI, UNIQUE};
-use crate::{RELOAD, SHUTDOWN};
+use crate::ui::UI;
 use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyModifiers, poll, read};
+use iota_state::{RELOAD, SHUTDOWN, UNIQUE};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;

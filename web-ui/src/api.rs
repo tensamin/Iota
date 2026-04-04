@@ -1,6 +1,6 @@
-use crate::server::server::is_local_network;
-use crate::util::config_util::CONFIG;
+use crate::server::is_local_network;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
+use iota_storage::util::config_util::CONFIG;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -56,15 +56,15 @@ async fn communities_get(req: HttpRequest, ssl: web::Data<bool>) -> impl Respond
         return forbidden();
     }
 
-    let communities = crate::communities::community_manager::get_communities().await;
+    // let communities = decentralized::communities::community_manager::get_communities().await;
 
-    let mut list = Vec::new();
+    let list: Vec<Value> = Vec::new();
 
-    for c in communities {
-        let val = c.frontend().await;
-        let s_val: Value = serde_json::to_value(val.to_string()).unwrap();
-        list.push(s_val);
-    }
+    // for c in communities {
+    //     let val = c.frontend().await.to_string();
+    //     let s_val: Value = serde_json::from_str(&val).unwrap_or(Value::Null);
+    //     list.push(s_val);
+    // }
     HttpResponse::Ok().json(list)
 }
 
@@ -77,12 +77,13 @@ async fn communities_add(
         return forbidden();
     }
 
-    let name = payload["name"].as_str().unwrap_or("").to_string();
-    let owner = payload["owner"].as_i64().unwrap_or(0);
+    // let name = payload["name"].as_str().unwrap_or("").to_string();
+    // let owner = payload["owner"].as_i64().unwrap_or(0);
 
-    let community = Arc::new(crate::communities::community::Community::create(name, owner).await);
+    // let community =
+    //     Arc::new(decentralized::communities::community::Community::create(name, owner).await);
 
-    crate::communities::community_manager::add_community(community).await;
+    // decentralized::communities::community_manager::add_community(community).await;
 
     success()
 }
@@ -92,13 +93,13 @@ async fn users_get(req: HttpRequest, ssl: web::Data<bool>) -> impl Responder {
         return forbidden();
     }
 
-    let users = crate::users::user_manager::get_users();
+    let users = iota_storage::users::user_manager::get_users();
 
     let list: Vec<_> = users
         .into_iter()
         .map(|u| {
-            let val = u.frontend();
-            serde_json::to_value(val.to_string()).unwrap()
+            let val = u.frontend().to_string();
+            serde_json::from_str(&val).unwrap_or(Value::Null)
         })
         .collect();
 
@@ -116,8 +117,8 @@ async fn users_remove(
 
     let uuid = payload.get("uuid").and_then(|v| v.as_i64()).unwrap_or(0);
 
-    crate::users::user_manager::remove_user(uuid);
-    crate::users::user_manager::save_users();
+    iota_storage::users::user_manager::remove_user(uuid);
+    iota_storage::users::user_manager::save_users();
 
     success()
 }
@@ -136,9 +137,9 @@ async fn users_add(
         _ => return error(),
     };
 
-    if let (Some(user), Some(_)) = crate::users::user_manager::create_user(username).await {
-        let val = user.frontend();
-        let s_val: Value = serde_json::to_value(val.to_string()).unwrap();
+    if let (Some(user), Some(_)) = omikron_connector::user_ops::create_user(username).await {
+        let val = user.frontend().to_string();
+        let s_val: Value = serde_json::from_str(&val).unwrap_or(Value::Null);
         HttpResponse::Ok().json(s_val)
     } else {
         error()
@@ -150,7 +151,7 @@ async fn shutdown(req: HttpRequest, ssl: web::Data<bool>) -> impl Responder {
         return forbidden();
     }
 
-    *crate::SHUTDOWN.write().await = true;
+    *iota_state::SHUTDOWN.write().await = true;
     success()
 }
 
@@ -159,8 +160,8 @@ async fn reload(req: HttpRequest, ssl: web::Data<bool>) -> impl Responder {
         return forbidden();
     }
 
-    *crate::SHUTDOWN.write().await = true;
-    *crate::RELOAD.write().await = true;
+    *iota_state::SHUTDOWN.write().await = true;
+    *iota_state::RELOAD.write().await = true;
 
     success()
 }

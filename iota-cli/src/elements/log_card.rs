@@ -1,9 +1,9 @@
-use crate::APP_STATE;
-use crate::gui::elements::elements::{Element, InteractableElement, JoinableElement};
-use crate::gui::interaction_result::InteractionResult;
-use crate::gui::util::borders::draw_block_joins;
-use crate::util::logger::PrintType;
+use crate::app_state::APP_STATE;
+use crate::elements::elements::{Element, InteractableElement, JoinableElement};
+use crate::interaction_result::InteractionResult;
+use crate::util::borders::draw_block_joins;
 use crossterm::event::{KeyCode, KeyEvent};
+use iota_logger::PrintType;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -90,7 +90,24 @@ impl LogCard {
 
     fn get_logs(&self) -> Vec<UiLogEntry> {
         let state = APP_STATE.lock().unwrap();
-        state.get_logs().iter().cloned().collect()
+        state
+            .get_logs()
+            .iter()
+            .map(|e| UiLogEntry {
+                timestamp_ms: e.timestamp_ms,
+                sender: match e.sender.as_str() {
+                    "Call" => PrintType::Call,
+                    "Client" => PrintType::Client,
+                    "Iota" => PrintType::Iota,
+                    "Omikron" => PrintType::Omikron,
+                    "Omega" => PrintType::Omega,
+                    "Command" => PrintType::Command,
+                    _ => PrintType::General,
+                },
+                message: e.message.clone(),
+                is_error: e.is_error,
+            })
+            .collect()
     }
 
     fn find_split_point(s: &str, max_width: usize) -> usize {

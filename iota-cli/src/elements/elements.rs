@@ -3,7 +3,7 @@ use std::any::Any;
 use crossterm::event::KeyEvent;
 use ratatui::{Frame, layout::Rect, widgets::Borders};
 
-use crate::gui::{interaction_result::InteractionResult, screens::screens::Screen};
+use crate::{interaction_result::InteractionResult, screens::screens::Screen};
 
 #[allow(unused)]
 pub trait Element: Send + Sync + Any {
