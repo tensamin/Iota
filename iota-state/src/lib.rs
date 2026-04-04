@@ -1,7 +1,33 @@
-use crate::{ACTIVE_TASKS, APP_STATE, SHUTDOWN, gui::elements::log_card::UiLogEntry};
+use dashmap::DashSet;
 use json::{JsonValue, object};
-use std::{collections::VecDeque, thread, time::Duration};
+use once_cell::sync::Lazy;
+use std::collections::VecDeque;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::thread;
+use std::time::Duration;
 use sysinfo::{RefreshKind, System};
+use tokio::sync::RwLock;
+
+pub const MAX_POINTS: usize = 1000;
+pub const MAX_LOGS: usize = 100;
+
+#[derive(Clone, Debug)]
+pub struct UiLogEntry {
+    pub timestamp_ms: u128,
+    pub sender: String,
+    pub message: String,
+    pub is_error: bool,
+}
+
+impl UiLogEntry {
+    pub fn format_timestamp(&self) -> String {
+        let secs = (self.timestamp_ms / 1000) as i64;
+        let hours = (secs / 3600) % 24;
+        let minutes = (secs / 60) % 60;
+        let seconds = secs % 60;
+        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -13,8 +39,6 @@ pub struct AppState {
     pub net_down: Vec<(f64, f64)>,
     pub sys_info: String,
 }
-const MAX_POINTS: usize = 1000;
-const MAX_LOGS: usize = 100;
 
 impl AppState {
     pub fn new() -> Self {
@@ -74,34 +98,17 @@ impl AppState {
             self.net_down.remove(0);
         }
     }
+
     pub fn to_json(&self) -> JsonValue {
-        let json = object! {
-            "cpu" => self.cpu
-            .iter()
-            .map(|(_, y)| *y)
-            .collect::<Vec<f64>>(),
-            "ram" => self.ram
-            .iter()
-            .map(|(_, y)| *y)
-            .collect::<Vec<f64>>(),
-            "ping" => self
-            .ping
-            .iter()
-            .map(|(_, y)| *y)
-            .collect::<Vec<f64>>(),
-            "net_up" => self
-            .net_up
-            .iter()
-            .map(|(_, y)| *y)
-            .collect::<Vec<f64>>(),
-            "net_down" => self
-            .net_down
-            .iter()
-            .map(|(_, y)| *y)
-            .collect::<Vec<f64>>(),
-        };
-        json
+        object! {
+            "cpu" => self.cpu.iter().map(|(_, y)| *y).collect::<Vec<f64>>(),
+            "ram" => self.ram.iter().map(|(_, y)| *y).collect::<Vec<f64>>(),
+            "ping" => self.ping.iter().map(|(_, y)| *y).collect::<Vec<f64>>(),
+            "net_up" => self.net_up.iter().map(|(_, y)| *y).collect::<Vec<f64>>(),
+            "net_down" => self.net_down.iter().map(|(_, y)| *y).collect::<Vec<f64>>(),
+        }
     }
+
     pub fn with_width(&self, width: u16) -> Self {
         let mut new = self.clone();
         new.cpu = Self::downsample_to_fit_width(&new.cpu, width);
@@ -128,10 +135,9 @@ impl AppState {
                 .first()
                 .map(|(x, _)| x - (dx * pad_len as f64))
                 .unwrap_or(0.0);
-            let _ = data.first().map(|(_, y)| *y).unwrap_or(0.0);
 
             for i in 0..pad_len {
-                result.push((start_x + i as f64 * dx, -1 as f64));
+                result.push((start_x + i as f64 * dx, -1.0));
             }
 
             result.extend_from_slice(data);
@@ -139,6 +145,13 @@ impl AppState {
         }
     }
 }
+
+pub static APP_STATE: LazyLock<Arc<Mutex<AppState>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(AppState::new())));
+
+pub static SHUTDOWN: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
+pub static RELOAD: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(true));
+pub static ACTIVE_TASKS: Lazy<DashSet<String>> = Lazy::new(|| DashSet::new());
 
 pub fn setup() {
     ACTIVE_TASKS.insert("System info loader".to_string());

@@ -1,4 +1,4 @@
-use crate::gui::{
+use crate::{
     elements::{
         console_card::ConsoleCard,
         elements::{InteractableElement, JoinableElement},

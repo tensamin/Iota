@@ -1,9 +1,6 @@
 use crate::{
-    ACTIVE_TASKS, SHUTDOWN,
-    gui::{
-        input_handler::setup_input_handler, interaction_result::InteractionResult,
-        screens::screens::Screen,
-    },
+    input_handler::setup_input_handler, interaction_result::InteractionResult,
+    screens::screens::Screen,
 };
 use crossterm::event::KeyEvent;
 use once_cell::sync::Lazy;

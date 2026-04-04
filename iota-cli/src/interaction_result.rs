@@ -2,7 +2,7 @@ use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::gui::screens::screens::Screen;
+use crate::screens::screens::Screen;
 
 #[allow(unused)]
 pub enum InteractionResult {

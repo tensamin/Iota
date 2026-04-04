@@ -1,39 +1,7 @@
-use dashmap::DashSet;
-use once_cell::sync::Lazy;
 use pnet::datalink::NetworkInterface;
-use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::Mutex;
-use tokio::sync::RwLock;
 use tokio::time::{Duration, sleep};
 
-mod auth;
-mod gui;
-mod langu;
-mod omikron;
-mod terms;
-mod users;
-mod util;
-
-use crate::gui::app_state;
-use crate::gui::app_state::AppState;
-use crate::gui::screens::main_screen::MainScreen;
-use crate::gui::ui::start_tui;
-use crate::langu::language_creator;
-use crate::omikron::omikron_connection::OmikronConnection;
-use crate::terms::consent_state;
-use crate::users::user_manager;
-use crate::util::config_util::CONFIG;
-use crate::util::file_util::download_and_extract_zip;
-use crate::util::file_util::has_dir;
-use crate::util::logger;
-
-pub static APP_STATE: LazyLock<Arc<Mutex<AppState>>> =
-    LazyLock::new(|| Arc::new(Mutex::new(AppState::new())));
-
-pub static SHUTDOWN: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
-pub static RELOAD: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(true));
-pub static ACTIVE_TASKS: Lazy<DashSet<String>> = Lazy::new(|| DashSet::new());
+use iota_state::{ACTIVE_TASKS, APP_STATE, AppState, RELOAD, SHUTDOWN};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 #[allow(unused_must_use, dead_code)]
@@ -73,7 +41,7 @@ async fn main() {
             println!("You can find this at 'agreements'!");
             return;
         }
-        app_state::setup();
+        iota_state::setup();
 
         let main_screen = MainScreen::new(ui.clone()).await;
         ui.set_screen(Box::new(main_screen)).await;

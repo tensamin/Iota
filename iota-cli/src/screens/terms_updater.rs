@@ -1,15 +1,6 @@
 use crate::{
-    gui::{
-        interaction_result::InteractionResult,
-        screens::{md_viewer::FileViewer, screens::Screen},
-    },
-    terms::{
-        buttons::{checkbox, draw_buttons},
-        consent_state::{UpdateDecision, UserChoice},
-        doc::Doc,
-        focus::Focus,
-        terms_getter::{Type, get_newest_link, get_terms},
-    },
+    interaction_result::InteractionResult,
+    screens::{md_viewer::FileViewer, screens::Screen},
 };
 use chrono::{Local, TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent};

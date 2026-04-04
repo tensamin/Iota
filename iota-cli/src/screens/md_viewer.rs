@@ -7,7 +7,7 @@ use ratatui::{
 };
 use std::{any::Any, time::Duration};
 
-use crate::gui::{interaction_result::InteractionResult, screens::screens::Screen};
+use crate::{interaction_result::InteractionResult, screens::screens::Screen};
 
 pub struct FileViewer {
     title: String,

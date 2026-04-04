@@ -1,4 +1,4 @@
-use crate::gui::ui::{UI, UNIQUE};
+use crate::ui::{UI, UNIQUE};
 use crate::{RELOAD, SHUTDOWN};
 use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyModifiers, poll, read};
 use std::sync::Arc;

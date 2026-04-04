@@ -3,7 +3,7 @@ use std::any::Any;
 use crossterm::event::KeyEvent;
 use ratatui::{Frame, layout::Rect};
 
-use crate::gui::interaction_result::InteractionResult;
+use crate::interaction_result::InteractionResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavDirection {

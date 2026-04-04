@@ -1,15 +1,7 @@
 use crate::{
-    gui::{
-        interaction_result::InteractionResult,
-        screens::{md_viewer::FileViewer, screens::Screen},
-        ui::UI,
-    },
-    terms::{
-        buttons::{checkbox, draw_buttons},
-        consent_state::UserChoice,
-        focus::Focus,
-        terms_getter::{Type, get_link, get_terms},
-    },
+    interaction_result::InteractionResult,
+    screens::{md_viewer::FileViewer, screens::Screen},
+    ui::UI,
 };
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{

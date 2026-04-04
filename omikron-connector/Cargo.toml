@@ -1,0 +1,13 @@
+[package]
+name = "omikron-connector"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ttp-core = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-core" }
+ttp-native = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-native" }
+
+dashmap = "6.1.0"
+json = "*"
+tokio = { version = "1.50.0", features = ["full"] }
+uuid = { version = "*", features = ["v4"] }
