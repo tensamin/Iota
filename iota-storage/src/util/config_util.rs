@@ -19,11 +19,26 @@ impl ConfigUtil {
     }
     pub fn clear(&mut self) {
         self.config = JsonValue::new_object();
+        self.unique = false;
     }
     pub fn load(&mut self) {
         let s = load_file("", "config.json");
-        if !s.is_empty() {
-            self.config = json::parse(&s).unwrap_or(JsonValue::new_object());
+        if s.is_empty() {
+            // File might be missing or empty/being written.
+            // We don't want to wipe the current config if it already has data.
+            // But if it's the first load, it will stay empty.
+            return;
+        }
+
+        match json::parse(&s) {
+            Ok(parsed) => {
+                self.config = parsed;
+                self.unique = false;
+            }
+            Err(e) => {
+                eprintln!("Failed to parse config.json: {}. Content: '{}'", e, s);
+                // Keep the current config rather than wiping it.
+            }
         }
     }
 
@@ -55,6 +70,7 @@ impl ConfigUtil {
     pub fn update(&mut self) {
         if self.unique {
             save_file("", "config.json", &self.config.to_string());
+            self.unique = false;
         }
     }
 }

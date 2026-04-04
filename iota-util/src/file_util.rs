@@ -9,8 +9,6 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
-
-
 #[allow(dead_code)]
 pub fn delete_directory(path: &str) -> bool {
     let dir = Path::new(&get_directory()).join(path);
@@ -96,17 +94,10 @@ pub fn load_file(path: &str, name: &str) -> String {
     let file_path = dir.join(name);
 
     if !dir.exists() {
-        if let Err(e) = fs::create_dir_all(&dir) {
-            println!("[IMPORTANT] Couldn't create directories: {}", e);
-            return String::new();
-        }
         return String::new();
     }
 
     if !file_path.exists() {
-        if let Err(e) = File::create(&file_path) {
-            println!("[IMPORTANT] Couldn't create file: {}", e);
-        }
         return String::new();
     }
 

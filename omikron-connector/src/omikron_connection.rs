@@ -1,15 +1,15 @@
+use dashmap::DashMap;
+use iota_logger::{log, log_cv_in, log_cv_out, log_t};
+use iota_state::{ACTIVE_TASKS, SHUTDOWN};
 use iota_storage::users::contact::Contact;
 use iota_storage::util::chat_files::{MessageState, change_message_state};
 use iota_storage::util::chats_util::{get_user, mod_user};
 use iota_storage::util::communities_util::CommunitiesUtil;
+use iota_storage::util::config_util::CONFIG;
+use iota_storage::util::{chat_files, chats_util};
+use iota_util::crypto_helper;
 use iota_util::crypto_util::{DataFormat, SecurePayload};
 use iota_util::file_util::{get_children, load_file, save_file};
-use iota_storage::util::{chat_files, chats_util};
-use iota_storage::util::config_util::CONFIG;
-use iota_util::crypto_helper;
-use iota_state::{ACTIVE_TASKS, SHUTDOWN};
-use iota_logger::{log, log_cv_in, log_cv_out, log_t};
-use dashmap::DashMap;
 use json::JsonValue;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -225,14 +225,14 @@ impl OmikronConnection {
         *self.sender.write().await = Some(sender_arc.clone());
         *self.state.write().await = ConnectionState::Connected { identified: false };
 
-        // Handle registration/identification
-        self.handle_authentication().await;
-
         // Start read loop
         let read_self = self.clone();
         let read_handle = tokio::spawn(async move {
             read_self.read_loop(&mut receiver).await;
         });
+
+        // Handle registration/identification
+        self.handle_authentication().await;
 
         // Start heartbeat
         let heartbeat_self = self.clone();
@@ -280,26 +280,26 @@ impl OmikronConnection {
         let private_key = conf.get_private_key();
         drop(conf);
 
-        if iota_id == 0 || public_key.is_none() || private_key.is_none() {
+        if iota_id == 0 {
             log_t!("iota_register_new");
 
-            let key_pair = crypto_helper::generate_keypair();
-            let public_key_base64 = crypto_helper::public_key_to_base64(&key_pair.public);
-            let _private_key_base64 = crypto_helper::secret_key_to_base64(&key_pair.secret);
+            let (pub_k, priv_k) = if let (Some(pk), Some(sk)) = (public_key, private_key) {
+                (pk, sk)
+            } else {
+                let key_pair = crypto_helper::generate_keypair();
+                let public_key_base64 = crypto_helper::public_key_to_base64(&key_pair.public);
+                let private_key_base64 = crypto_helper::secret_key_to_base64(&key_pair.secret);
 
-            let mut conf_write = CONFIG.write().await;
-            // NOTE:
-            // Intentionally not storing the generated private/public keys directly into the
-            // config file here to avoid persisting sensitive material in plaintext. If you
-            // want to persist them, uncomment the two lines below and accept the security
-            // implications (they will be saved by `conf_write.update()`).
-            // conf_write.change("public_key", DataValue::Str(public_key_base64.clone()));
-            // conf_write.change("private_key", DataValue::Str(private_key_base64));
-            conf_write.update();
-            drop(conf_write);
+                let mut conf_write = CONFIG.write().await;
+                conf_write.change("public_key", JsonValue::from(public_key_base64.clone()));
+                conf_write.change("private_key", JsonValue::from(private_key_base64.clone()));
+                conf_write.update();
+                drop(conf_write);
+                (public_key_base64, private_key_base64)
+            };
 
             let register_msg = CommunicationValue::new(CommunicationType::register_iota)
-                .add_data(DataTypes::public_key, DataValue::Str(public_key_base64));
+                .add_data(DataTypes::public_key, DataValue::Str(pub_k));
 
             let msg_id = register_msg.get_id();
 
@@ -311,7 +311,7 @@ impl OmikronConnection {
                             return false;
                         }
 
-                        let iota_value = cv.get_data(DataTypes::register_id);
+                        let iota_value = cv.get_data(DataTypes::iota_id);
                         let iota_id = iota_value.as_number().unwrap_or(0);
 
                         if iota_id != 0 {
