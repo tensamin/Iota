@@ -1,0 +1,15 @@
+[package]
+name = "iota-util"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+ttp-core = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-core" }
+ttp-native = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-native" }
+
+json = "*"
+pnet = "0.35.0"
+ratatui = "0.30.0"
+reqwest = "0.13.2"
+tokio = { version = "1.50.0", features = ["full"] }
