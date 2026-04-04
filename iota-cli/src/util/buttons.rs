@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-use crate::terms::focus::Focus;
+use crate::util::terms_focus::Focus;
 
 #[allow(mismatched_lifetime_syntaxes)]
 pub fn checkbox(label: &str, checked: bool, active: bool, allowed: bool) -> Line {

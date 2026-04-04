@@ -1793,6 +1793,7 @@ dependencies = [
  "hkdf",
  "hyper",
  "hyper-util",
+ "iota-core",
  "iota-state",
  "json",
  "lazy_static",

@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 iota-state = { path = "../iota-state" }
+iota-core = { path = "../iota-terms" }
+
+
 ttp-core = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-core" }
 ttp-native = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-native" }
 

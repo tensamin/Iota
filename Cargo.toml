@@ -1,2 +1,2 @@
 [workspace]
-members = ["iota-storage", "iota-state", "iota-cli", "iota-core", "omikron-connector", "web-server", "web-ui", "decentralized", "iota-logger"]
+members = ["iota-storage", "iota-terms", "iota-state", "iota-cli", "iota-core", "omikron-connector", "web-server", "web-ui", "decentralized", "iota-logger"]

@@ -13,6 +13,8 @@ pub mod screens {
 }
 pub mod util {
     pub mod borders;
+    pub mod buttons;
+    pub mod terms_focus;
 }
 pub mod app_state;
 pub mod input_handler;
