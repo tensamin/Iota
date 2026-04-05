@@ -113,6 +113,7 @@ async fn main() {
         log!("User IDS: {}", sb);
 
         // COMMUNITY MANAGEMENT
+        // Reason for comment: Communities have not been implemented yet.
         /*        registry::load_interactables().await;
         community_manager::load_communities().await;
         community_manager::save_communities().await;
@@ -138,7 +139,8 @@ async fn main() {
                 }
             }
         }
-        /*
+        /* Community port activation is used for activating the port for communities. 
+         * Code is currently commented because communities have not been implemented yet.
         if start(port).await {
             log_t!("community_active", ip, port.to_string());
         } else {
@@ -174,6 +176,7 @@ async fn main() {
             }
             &CONFIG.write().await.clear();
             user_manager::clear();
+            // Commhnities have not been implemented yet.
             /*community_manager::clear();*/
             *APP_STATE.lock().unwrap() = AppState::new();
         }
