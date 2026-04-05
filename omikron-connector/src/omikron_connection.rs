@@ -424,6 +424,68 @@ impl OmikronConnection {
             return;
         }
 
+        if cv.is_type(CommunicationType::client_connected) {
+            let user_id = cv.get_data(DataTypes::user_id).as_number().unwrap_or(0) as i64;
+            let session_id = cv.get_data(DataTypes::session_id).as_number().unwrap_or(0) as i64;
+
+            let mut contacts = chats_util::get_users(user_id);
+            let mut contacts_array = Vec::new();
+
+            for (i, contact) in contacts.iter().enumerate() {
+                let mut contact_container = Vec::new();
+                contact_container.push((DataTypes::user_id, DataValue::Number(contact.user_id)));
+                contact_container.push((
+                    DataTypes::last_message_at,
+                    DataValue::Number(contact.last_message_at.unwrap_or(0)),
+                ));
+
+                if let Some(ref name) = contact.user_name {
+                    contact_container.push((DataTypes::username, DataValue::Str(name.clone())));
+                }
+
+                let amount = if i < 10 { 20 } else { 1 };
+                let messages = chat_files::get_messages(user_id, contact.user_id, 0, amount);
+
+                let mut msg_array = Vec::new();
+                for m in messages.members() {
+                    let message_time = m["message_time"].as_i64().unwrap_or(0);
+                    let content = m["content"].as_str().unwrap_or("").to_string();
+                    let sent_by_self = m["sent_by_self"].as_bool().unwrap_or(false);
+                    let height = m["height"].as_i64().unwrap_or(0);
+                    let message_state = m["message_state"].as_str().unwrap_or("").to_string();
+
+                    let mut msg_container = Vec::new();
+                    msg_container.push((DataTypes::send_time, DataValue::Number(message_time)));
+                    msg_container.push((DataTypes::content, DataValue::Str(content.clone())));
+                    msg_container.push((DataTypes::message_state, DataValue::Str(message_state)));
+                    msg_container.push((DataTypes::height, DataValue::Number(height)));
+                    msg_container.push((DataTypes::sent_by_self, DataValue::Bool(sent_by_self)));
+                    msg_array.push(DataValue::Container(msg_container));
+
+                    if msg_array.len() == 1 {
+                        let sender_id = if sent_by_self {
+                            user_id
+                        } else {
+                            contact.user_id
+                        };
+                        let mut last_msg = Vec::new();
+                        last_msg.push((DataTypes::content, DataValue::Str(content)));
+                        last_msg.push((DataTypes::sender_id, DataValue::Number(sender_id)));
+                        contact_container
+                            .push((DataTypes::last_message, DataValue::Container(last_msg)));
+                    }
+                }
+                contact_container.push((DataTypes::messages, DataValue::Array(msg_array)));
+                contacts_array.push(DataValue::Container(contact_container));
+            }
+
+            let resp = CommunicationValue::new(CommunicationType::client_connected)
+                .with_id(cv.get_id())
+                .add_data(DataTypes::contacts, DataValue::Array(contacts_array));
+            self.send_message(&resp).await;
+            return;
+        }
+
         if cv.is_type(CommunicationType::identification_response) {
             if let Some(_accepted) = cv.get_data(DataTypes::accepted).as_bool() {
                 let mut state = self.state.write().await;
