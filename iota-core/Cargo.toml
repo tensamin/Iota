@@ -14,8 +14,8 @@ omikron-connector = { path = "../omikron-connector" }
 web-server = { path = "../web-server" }
 web-ui = { path = "../web-ui" }
 
-ttp-core = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-core" }
-ttp-native = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-native" }
+ttp-core = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-core" }
+ttp-native = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-native" }
 
 dashmap = "6.1.0"
 json = "*"

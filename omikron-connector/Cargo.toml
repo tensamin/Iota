@@ -8,8 +8,8 @@ iota-logger = { path = "../iota-logger" }
 iota-state = { path = "../iota-state" }
 iota-storage = { path = "../iota-storage" }
 iota-util = { path = "../iota-util" }
-ttp-core = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-core" }
-ttp-native = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-native" }
+ttp-core = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-core" }
+ttp-native = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-native" }
 
 dashmap = "6.1.0"
 json = "*"
