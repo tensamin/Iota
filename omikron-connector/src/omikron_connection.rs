@@ -641,7 +641,7 @@ impl OmikronConnection {
                         .with_sender(receiver_id as u64)
                         .add_data(
                             DataTypes::chat_partner_id,
-                            DataValue::Number(sender_id as i64),
+                            DataValue::Number(receiver_id as i64),
                         )
                         .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
                         .add_data(
