@@ -1,4 +1,5 @@
 mod consent_state;
+use iota_util::update_util::check_update;
 use pnet::datalink::NetworkInterface;
 use tokio::time::{Duration, sleep};
 
@@ -52,6 +53,7 @@ async fn main() {
             println!("You can find this at 'agreements'!");
             return;
         }
+        check_update();
         iota_state::setup();
 
         let main_screen = MainScreen::new(ui.clone()).await;
@@ -118,7 +120,7 @@ async fn main() {
                 }
             }
         }
-        /* Community port activation is used for activating the port for communities. 
+        /* Community port activation is used for activating the port for communities.
          * Code is currently commented because communities have not been implemented yet.
         if start(port).await {
             log_t!("community_active", ip, port.to_string());

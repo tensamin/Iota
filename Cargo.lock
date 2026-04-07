@@ -382,6 +382,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "258989846dd255a1e0eeef92d425d345477c9999433cecc9f0879f4549d5e5c9"
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1028,9 +1034,9 @@ dependencies = [
 
 [[package]]
 name = "fastrand"
-version = "2.4.0"
+version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a043dc74da1e37d6afe657061213aa6f425f855399a11d3463c6ecccc4dfda1f"
+checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "fiat-crypto"
@@ -1863,6 +1869,7 @@ name = "iota-util"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "anyhow",
  "base64",
  "hex",
  "hkdf",
@@ -1872,8 +1879,12 @@ dependencies = [
  "rand_core 0.6.4",
  "ratatui",
  "reqwest",
+ "semver",
+ "serde",
+ "serde_macros",
  "sha2",
  "sysinfo",
+ "tempfile",
  "tokio",
  "ttp-core",
  "ttp-native",
@@ -2811,6 +2822,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "quasi"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94a532453b931a4483a5b2e40f0fe04aee35b6bc2c0eeec876f1bd2358a134d3"
+
+[[package]]
+name = "quasi_codegen"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfb4a9a5410fdbdacbeda8063ddb8add9838dfd4cf50ac486db98abb762d8bd6"
+dependencies = [
+ "aster",
+]
+
+[[package]]
+name = "quasi_macros"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adc2b36285ea5e54e4e267f83896267ff8c5aba4f66b2e7d186ed6d968f3715f"
+dependencies = [
+ "quasi_codegen",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3376,6 +3411,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_codegen"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da68810d845f8e33a80243c28794650397056cbe7aea4c9c7516f55d1061c94e"
+dependencies = [
+ "aster",
+ "quasi",
+ "quasi_macros",
+ "serde_codegen_internals",
+]
+
+[[package]]
+name = "serde_codegen_internals"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b0115c5c602e81c61b787fb0f0fa76a614f8dbe9100b2b59b7d590155672c80"
+
+[[package]]
 name = "serde_core"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3406,6 +3459,15 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_macros"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3cf1c01933271e1e72bb788e0499d1bca8af2c09efcc3ddc0b04ff22d080b83"
+dependencies = [
+ "serde_codegen",
 ]
 
 [[package]]
@@ -4010,7 +4072,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "ttp-core"
 version = "0.1.0"
-source = "git+https://git.methanium.net/Tensamin/TTP.git#bacbcb0e38791cf1a38cf5851beb20d5645002ba"
+source = "git+https://git.methanium.net/Tensamin/TTP.git#2322bdced8183e970405d5017cd87ba805309a4c"
 dependencies = [
  "base64",
  "byteorder",
@@ -4022,7 +4084,7 @@ dependencies = [
 [[package]]
 name = "ttp-native"
 version = "0.1.0"
-source = "git+https://git.methanium.net/Tensamin/TTP.git#bacbcb0e38791cf1a38cf5851beb20d5645002ba"
+source = "git+https://git.methanium.net/Tensamin/TTP.git#2322bdced8183e970405d5017cd87ba805309a4c"
 dependencies = [
  "quinn",
  "rustls",
