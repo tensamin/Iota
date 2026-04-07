@@ -13,8 +13,8 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/iota .
+COPY --from=builder /app/target/release/iota-core .
 
 EXPOSE 1984
 
-CMD ["./iota"]
+CMD ["./iota-core"]

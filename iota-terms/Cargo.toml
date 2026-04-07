@@ -1,0 +1,11 @@
+[package]
+name = "iota-terms"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iota-state = { path = "../iota-state" }
+iota-util = { path = "../iota-util" }
+
+json = "*"
+reqwest = "0.13.2"
