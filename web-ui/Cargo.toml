@@ -24,15 +24,7 @@ futures = "*"
 futures-util = "*"
 hex = "*"
 hkdf = "0.12.4"
-hyper = { version = "1.8.1", features = [
-    "capi",
-    "client",
-    "full",
-    "http1",
-    "http2",
-    "nightly",
-    "server",
-] }
+hyper = { version = "1.8.1", features = ["capi", "client", "full", "http1", "http2", "nightly", "server"] }
 hyper-util = { version = "*" }
 json = "*"
 lazy_static = "1.5.0"

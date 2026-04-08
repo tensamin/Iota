@@ -4,9 +4,10 @@
  * It is made by Yolokit and pasted in by AlexEmmet */
 
 use anyhow::{Context, Result, anyhow};
+use iota_logger::log;
+use self_replace::self_replace;
 use semver::Version;
 use std::fs::File;
-use std::io::copy;
 use tempfile::NamedTempFile;
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -98,7 +99,7 @@ async fn asset_name_for_current_platform() -> String {
 }
 
 async fn download_asset(url: &str) -> Result<NamedTempFile> {
-    let mut response = reqwest::get(url)
+    let response = reqwest::get(url)
         .await
         .context("failed to download asset")?;
 
@@ -148,8 +149,7 @@ async fn perform_update() -> Result<bool> {
 
     let downloaded = download_asset(&asset.browser_download_url).await?;
 
-    self_replace::self_replace(downloaded.path())
-        .context("failed to replace current executable")?;
+    self_replace(downloaded.path()).context("failed to replace current executable")?;
 
     Ok(true)
 }
