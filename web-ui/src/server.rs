@@ -1,6 +1,6 @@
 use crate::api::api_config;
 use crate::web_path_parser;
-use actix_web::{App, Error, HttpRequest, HttpServer, Responder, dev::ServerHandle, web};
+use actix_web::{App, HttpServer, dev::ServerHandle, web};
 use iota_logger::log;
 use iota_state::{ACTIVE_TASKS, SHUTDOWN};
 use iota_util::file_util::load_file_buf;

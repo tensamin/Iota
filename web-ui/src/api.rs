@@ -3,7 +3,6 @@ use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use iota_storage::util::config_util::CONFIG;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 pub fn api_config(cfg: &mut web::ServiceConfig) {
     cfg.service(
