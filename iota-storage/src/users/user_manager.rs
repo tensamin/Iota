@@ -1,19 +1,13 @@
 use crate::users::user_profile::UserProfile;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use hex::{self};
-use iota_logger::{log, log_cv};
-use iota_util::crypto_helper::{self, public_key_to_base64};
+use iota_util::crypto_helper::{self};
 use iota_util::file_util::{load_file, save_file};
 use json::JsonValue;
 use once_cell::sync::Lazy;
 use rand::Rng;
 use rand_core::OsRng;
-use rand_core::RngCore;
-use sha2::{Digest, Sha256};
 use std::io::{self};
 use std::sync::Mutex;
-use std::time::Duration;
-use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 use x448::{PublicKey, Secret};
 
 static USERS: Lazy<Mutex<Vec<UserProfile>>> = Lazy::new(|| Mutex::new(Vec::new()));
