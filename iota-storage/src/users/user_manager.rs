@@ -45,7 +45,9 @@ pub async fn load_from_tu(username: &str) -> Result<(), ()> {
     Ok(())
 }
 
-pub fn add_user(user: UserProfile) { USERS.lock().unwrap().push(user); }
+pub fn add_user(user: UserProfile) {
+    USERS.lock().unwrap().push(user);
+}
 pub fn get_user_by_username(username: &str) -> Option<UserProfile> {
     USERS
         .lock()
