@@ -5,7 +5,6 @@
 
 use anyhow::{Context, Result, anyhow};
 use semver::Version;
-use serde::Deserialize;
 use std::fs::File;
 use std::io::copy;
 use tempfile::NamedTempFile;
@@ -16,13 +15,13 @@ const API_BASE: &str = "https://git.methanium.net/api/v1";
 const OWNER: &str = "Tensamin";
 const REPO: &str = "Iota";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct Release {
     tag_name: String,
     assets: Vec<Asset>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct Asset {
     name: String,
     browser_download_url: String,
@@ -39,10 +38,40 @@ async fn latest_release() -> Result<Release> {
         return Err(anyhow!("release API returned {}", response.status()));
     }
 
-    Ok(response
-        .json()
+    let text = response
+        .text()
         .await
-        .context("failed to parse release JSON")?)
+        .context("failed to read response text")?;
+
+    let parsed = json::parse(&text).map_err(|e| anyhow!("failed to parse JSON: {}", e))?;
+
+    let tag_name = parsed["tag_name"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing tag_name"))?
+        .to_string();
+
+    let assets_json = parsed["assets"].members().collect::<Vec<_>>();
+
+    let mut assets = Vec::new();
+
+    for asset in assets_json {
+        let name = asset["name"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing asset name"))?
+            .to_string();
+
+        let browser_download_url = asset["browser_download_url"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing download url"))?
+            .to_string();
+
+        assets.push(Asset {
+            name,
+            browser_download_url,
+        });
+    }
+
+    Ok(Release { tag_name, assets })
 }
 
 async fn parse_tag_version(tag: &str) -> Result<Version> {

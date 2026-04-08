@@ -12,7 +12,8 @@ use ratatui::style::Color;
 use ttp_core::{CommunicationValue, DataTypes, DataValue};
 
 use iota_state::{APP_STATE, UNIQUE, UiLogEntry};
-use iota_util::langu::language_manager;
+mod language_creator;
+mod language_manager;
 
 static LOGGER: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
 
@@ -125,22 +126,6 @@ fn fixed_box(content: &str, width: usize) -> String {
         format!("[{}{}]", " ".repeat(width - len), s)
     } else {
         s
-    }
-}
-
-fn colorize(kind: PrintType, is_error: bool) -> Color {
-    if is_error {
-        return Color::Red;
-    }
-
-    match kind {
-        PrintType::Call => Color::Magenta,
-        PrintType::Client => Color::Green,
-        PrintType::Iota => Color::Yellow,
-        PrintType::Omikron => Color::Blue,
-        PrintType::Omega => Color::Cyan,
-        PrintType::General => Color::LightCyan,
-        PrintType::Command => Color::LightGreen,
     }
 }
 
