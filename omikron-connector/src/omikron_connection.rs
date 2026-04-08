@@ -569,15 +569,19 @@ impl OmikronConnection {
 
             let height = cv.get_data(DataTypes::height).as_number().unwrap_or(0) as i64;
 
-            // persist message for the receiver (storage_owner = receiver_id)
-            chat_files::add_message(
-                timestamp_u128,
-                false,
-                receiver_id as i64,
-                sender_id as i64,
-                &content,
-                height,
-            );
+            let is_local = iota_storage::users::user_manager::get_user(receiver_id).is_some();
+
+            if is_local {
+                // persist message for the receiver (storage_owner = receiver_id)
+                chat_files::add_message(
+                    timestamp_u128,
+                    false,
+                    receiver_id as i64,
+                    sender_id as i64,
+                    &content,
+                    height,
+                );
+            }
 
             // persist message for the sender (storage_owner = sender_id)
             chat_files::add_message(
@@ -595,96 +599,168 @@ impl OmikronConnection {
                 .with_receiver(sender_id as u64);
             self.send_message(&conf_msg).await;
 
-            // Build a live-delivery message for the local client (recipient)
-            let user_forward = CommunicationValue::new(CommunicationType::message_live)
-                .with_id(cv.get_id())
-                .with_receiver(receiver_id as u64)
-                .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
-                .add_data(DataTypes::content, DataValue::Str(content.clone()))
-                .add_data(DataTypes::sender_id, DataValue::Number(sender_id as i64))
-                .add_data(DataTypes::height, DataValue::Number(height));
+            if !is_local {
+                let fw_msg = CommunicationValue::new(CommunicationType::message_other_iota)
+                    .with_id(cv.get_id())
+                    .with_receiver(receiver_id as u64)
+                    .with_sender(sender_id as u64)
+                    .add_data(DataTypes::height, DataValue::Number(height))
+                    .add_data(DataTypes::content, DataValue::Str(content))
+                    .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64));
 
-            // Attempt delivery and await a response from the local client
-            let user_resp = self
-                .clone()
-                .await_response(&user_forward, Some(Duration::from_secs(10)))
-                .await;
+                let other_iota_resp = self
+                    .clone()
+                    .await_response(&fw_msg, Some(Duration::from_secs(10)))
+                    .await;
 
-            if let Ok(user_resp) = user_resp {
-                let ms_raw = user_resp
-                    .get_data(DataTypes::message_state)
-                    .as_string()
-                    .unwrap_or_else(|| "".to_string());
-                let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
+                if let Ok(resp) = other_iota_resp {
+                    let ms_raw = resp
+                        .get_data(DataTypes::message_state)
+                        .as_string()
+                        .unwrap_or_else(|| "".to_string());
+                    let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
 
-                // update stored message state for receiver
-                let _ = chat_files::change_message_state(
-                    timestamp_i64,
-                    receiver_id as i64,
-                    sender_id as i64,
-                    ms.clone(),
-                );
+                    let _ = chat_files::change_message_state(
+                        timestamp_i64,
+                        sender_id as i64,
+                        receiver_id as i64,
+                        ms.clone(),
+                    );
 
-                // update stored message state for sender
-                let _ = chat_files::change_message_state(
-                    timestamp_i64,
-                    sender_id as i64,
-                    receiver_id as i64,
-                    ms.clone(),
-                );
+                    self.send_message(
+                        &CommunicationValue::new(CommunicationType::message_state)
+                            .with_id(cv.get_id())
+                            .with_receiver(sender_id as u64)
+                            .with_sender(receiver_id as u64)
+                            .add_data(
+                                DataTypes::chat_partner_id,
+                                DataValue::Number(receiver_id as i64),
+                            )
+                            .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
+                            .add_data(
+                                DataTypes::message_state,
+                                DataValue::Str(ms.as_str().to_string()),
+                            ),
+                    )
+                    .await;
+                } else {
+                    let _ = chat_files::change_message_state(
+                        timestamp_i64,
+                        sender_id as i64,
+                        receiver_id as i64,
+                        MessageState::Sent,
+                    );
 
-                // notify original sender about the delivered/read state
-                self.send_message(
-                    &CommunicationValue::new(CommunicationType::message_state)
-                        .with_id(cv.get_id())
-                        .with_receiver(sender_id as u64)
-                        .with_sender(receiver_id as u64)
-                        .add_data(
-                            DataTypes::chat_partner_id,
-                            DataValue::Number(receiver_id as i64),
-                        )
-                        .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
-                        .add_data(
-                            DataTypes::message_state,
-                            DataValue::Str(ms.as_str().to_string()),
-                        ),
-                )
-                .await;
+                    self.send_message(
+                        &CommunicationValue::new(CommunicationType::message_state)
+                            .with_id(cv.get_id())
+                            .with_receiver(sender_id as u64)
+                            .with_sender(receiver_id as u64)
+                            .add_data(
+                                DataTypes::chat_partner_id,
+                                DataValue::Number(receiver_id as i64),
+                            )
+                            .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
+                            .add_data(
+                                DataTypes::message_state,
+                                DataValue::Str(MessageState::Sent.as_str().to_string()),
+                            ),
+                    )
+                    .await;
+                }
+                return;
             } else {
-                // Delivery failed or timed out; mark as Sent
-                let _ = chat_files::change_message_state(
-                    timestamp_i64,
-                    receiver_id as i64,
-                    sender_id as i64,
-                    MessageState::Sent,
-                );
+                // Build a live-delivery message for the local client (recipient)
+                let user_forward = CommunicationValue::new(CommunicationType::message_live)
+                    .with_id(cv.get_id())
+                    .with_receiver(receiver_id as u64)
+                    .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
+                    .add_data(DataTypes::content, DataValue::Str(content.clone()))
+                    .add_data(DataTypes::sender_id, DataValue::Number(sender_id as i64))
+                    .add_data(DataTypes::height, DataValue::Number(height));
 
-                let _ = chat_files::change_message_state(
-                    timestamp_i64,
-                    sender_id as i64,
-                    receiver_id as i64,
-                    MessageState::Sent,
-                );
+                // Attempt delivery and await a response from the local client
+                let user_resp = self
+                    .clone()
+                    .await_response(&user_forward, Some(Duration::from_secs(10)))
+                    .await;
 
-                // notify sender
-                self.send_message(
-                    &CommunicationValue::new(CommunicationType::message_state)
-                        .with_id(cv.get_id())
-                        .with_receiver(sender_id as u64)
-                        .with_sender(receiver_id as u64)
-                        .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
-                        .add_data(
-                            DataTypes::chat_partner_id,
-                            DataValue::Number(sender_id as i64),
-                        )
-                        .add_data(
-                            DataTypes::message_state,
-                            DataValue::Str(MessageState::Sent.as_str().to_string()),
-                        ),
-                )
-                .await;
+                if let Ok(user_resp) = user_resp {
+                    let ms_raw = user_resp
+                        .get_data(DataTypes::message_state)
+                        .as_string()
+                        .unwrap_or_else(|| "".to_string());
+                    let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
+
+                    // update stored message state for receiver
+                    let _ = chat_files::change_message_state(
+                        timestamp_i64,
+                        receiver_id as i64,
+                        sender_id as i64,
+                        ms.clone(),
+                    );
+
+                    // update stored message state for sender
+                    let _ = chat_files::change_message_state(
+                        timestamp_i64,
+                        sender_id as i64,
+                        receiver_id as i64,
+                        ms.clone(),
+                    );
+
+                    // notify original sender about the delivered/read state
+                    self.send_message(
+                        &CommunicationValue::new(CommunicationType::message_state)
+                            .with_id(cv.get_id())
+                            .with_receiver(sender_id as u64)
+                            .with_sender(receiver_id as u64)
+                            .add_data(
+                                DataTypes::chat_partner_id,
+                                DataValue::Number(receiver_id as i64),
+                            )
+                            .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
+                            .add_data(
+                                DataTypes::message_state,
+                                DataValue::Str(ms.as_str().to_string()),
+                            ),
+                    )
+                    .await;
+                } else {
+                    // Delivery failed or timed out; mark as Sent
+                    let _ = chat_files::change_message_state(
+                        timestamp_i64,
+                        receiver_id as i64,
+                        sender_id as i64,
+                        MessageState::Sent,
+                    );
+
+                    let _ = chat_files::change_message_state(
+                        timestamp_i64,
+                        sender_id as i64,
+                        receiver_id as i64,
+                        MessageState::Sent,
+                    );
+
+                    // notify sender
+                    self.send_message(
+                        &CommunicationValue::new(CommunicationType::message_state)
+                            .with_id(cv.get_id())
+                            .with_receiver(sender_id as u64)
+                            .with_sender(receiver_id as u64)
+                            .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
+                            .add_data(
+                                DataTypes::chat_partner_id,
+                                DataValue::Number(sender_id as i64),
+                            )
+                            .add_data(
+                                DataTypes::message_state,
+                                DataValue::Str(MessageState::Sent.as_str().to_string()),
+                            ),
+                    )
+                    .await;
+                }
+                return;
             }
-            return;
         }
 
         if cv.is_type(CommunicationType::message_other_iota) {

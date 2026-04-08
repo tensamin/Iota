@@ -1,5 +1,3 @@
-
-
 pub mod terms_getter;
 
 pub use terms_getter::Type as TermsType;

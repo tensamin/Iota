@@ -1,13 +1,12 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::oneshot;
-use iota_cli::ui::UI;
 use iota_cli::screens::terms_checker::{TermsCheckerScreen, UserChoice};
 use iota_cli::screens::terms_updater::{TermsUpdaterScreen, UpdateDecision};
-use iota_terms::{Doc, get_current_docs, get_newest_docs, TermsType as Type};
+use iota_cli::ui::UI;
+use iota_terms::{Doc, TermsType as Type, get_current_docs, get_newest_docs};
 use iota_util::file_util::{load_file, save_file};
-
+use tokio::sync::oneshot;
 
 pub async fn check(ui: Arc<UI>) -> (bool, bool) {
     let mut state = ConsentState::load_state();
@@ -210,7 +209,6 @@ async fn get_updates() -> Option<(
         None
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct ConsentState {
