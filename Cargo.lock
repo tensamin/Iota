@@ -382,12 +382,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aster"
-version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "258989846dd255a1e0eeef92d425d345477c9999433cecc9f0879f4549d5e5c9"
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1789,6 +1783,7 @@ dependencies = [
  "iota-state",
  "iota-storage",
  "iota-terms",
+ "iota-updater",
  "iota-util",
  "json",
  "omikron-connector",
@@ -1809,6 +1804,8 @@ version = "0.1.0"
 dependencies = [
  "iota-state",
  "iota-util",
+ "json",
+ "once_cell",
  "ratatui",
  "ttp-core",
 ]
@@ -1865,7 +1862,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "iota-util"
+name = "iota-updater"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
@@ -1873,18 +1870,40 @@ dependencies = [
  "base64",
  "hex",
  "hkdf",
+ "iota-logger",
  "json",
  "once_cell",
  "pnet",
  "rand_core 0.6.4",
  "ratatui",
  "reqwest",
+ "self-replace",
  "semver",
  "serde",
- "serde_macros",
  "sha2",
  "sysinfo",
  "tempfile",
+ "tokio",
+ "ttp-core",
+ "ttp-native",
+ "uuid",
+ "walkdir",
+ "x448",
+ "zip",
+]
+
+[[package]]
+name = "iota-util"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "base64",
+ "hex",
+ "hkdf",
+ "rand_core 0.6.4",
+ "reqwest",
+ "sha2",
+ "sysinfo",
  "tokio",
  "ttp-core",
  "ttp-native",
@@ -2822,30 +2841,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quasi"
-version = "0.20.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94a532453b931a4483a5b2e40f0fe04aee35b6bc2c0eeec876f1bd2358a134d3"
-
-[[package]]
-name = "quasi_codegen"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfb4a9a5410fdbdacbeda8063ddb8add9838dfd4cf50ac486db98abb762d8bd6"
-dependencies = [
- "aster",
-]
-
-[[package]]
-name = "quasi_macros"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adc2b36285ea5e54e4e267f83896267ff8c5aba4f66b2e7d186ed6d968f3715f"
-dependencies = [
- "quasi_codegen",
-]
-
-[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3395,6 +3390,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "self-replace"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03ec815b5eab420ab893f63393878d89c90fdd94c0bcc44c07abb8ad95552fb7"
+dependencies = [
+ "fastrand",
+ "tempfile",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3409,24 +3415,6 @@ dependencies = [
  "serde_core",
  "serde_derive",
 ]
-
-[[package]]
-name = "serde_codegen"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da68810d845f8e33a80243c28794650397056cbe7aea4c9c7516f55d1061c94e"
-dependencies = [
- "aster",
- "quasi",
- "quasi_macros",
- "serde_codegen_internals",
-]
-
-[[package]]
-name = "serde_codegen_internals"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b0115c5c602e81c61b787fb0f0fa76a614f8dbe9100b2b59b7d590155672c80"
 
 [[package]]
 name = "serde_core"
@@ -3459,15 +3447,6 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
-]
-
-[[package]]
-name = "serde_macros"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3cf1c01933271e1e72bb788e0499d1bca8af2c09efcc3ddc0b04ff22d080b83"
-dependencies = [
- "serde_codegen",
 ]
 
 [[package]]

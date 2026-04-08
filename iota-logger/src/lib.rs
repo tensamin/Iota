@@ -12,8 +12,8 @@ use ratatui::style::Color;
 use ttp_core::{CommunicationValue, DataTypes, DataValue};
 
 use iota_state::{APP_STATE, UNIQUE, UiLogEntry};
-mod language_creator;
-mod language_manager;
+pub mod language_creator;
+pub mod language_manager;
 
 static LOGGER: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
 
