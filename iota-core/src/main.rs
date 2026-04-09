@@ -15,7 +15,7 @@ use iota_util::file_util::{download_and_extract_zip, has_dir};
 use omikron_connector as omikron;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
-#[allow(unused_must_use, dead_code)]
+#[allow(unused_must_use, dead_code, unused_assignments)]
 async fn main() {
     while *RELOAD.read().await {
         *RELOAD.write().await = false;
@@ -107,7 +107,9 @@ async fn main() {
             sb1 = sb1 + ",";
         }
         log!("Community IDS: {}", sb1); */
+        #[allow(unused_variables)] // port is unused
         let port = CONFIG.read().await.get_port();
+        #[allow(unused_variables)] // ip is unused
         let mut ip = "0.0.0.0".to_string();
         for iface in pnet::datalink::interfaces() {
             let iface: NetworkInterface = iface;
@@ -115,7 +117,7 @@ async fn main() {
                 let ipsv = format!("{}", iface.ips[0]);
                 let ips: &str = ipsv.split('/').next().unwrap_or("");
                 if format!("{}", ips).starts_with("10.") || format!("{}", ips).starts_with("192.") {
-                    ip = ips.to_string();
+                    ip = ips.to_string(); // Unused assignments.
                 }
             }
         }

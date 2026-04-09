@@ -7,7 +7,6 @@ use anyhow::{Context, Result, anyhow};
 use iota_logger::log;
 use self_replace::self_replace;
 use semver::Version;
-use std::fs::File;
 use tempfile::NamedTempFile;
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -108,7 +107,6 @@ async fn download_asset(url: &str) -> Result<NamedTempFile> {
     }
 
     let tmp = NamedTempFile::new().context("failed to create temp file")?;
-    let mut out = File::create(tmp.path()).context("failed to open temp file")?;
 
     let bytes = response
         .bytes()

@@ -79,6 +79,7 @@ impl ConnectionState {
 // Omikron Connection (Client-side with auto-reconnect)
 // ============================================================================
 
+#[allow(dead_code)] // message_send_times is unused.
 pub struct OmikronConnection {
     state: Arc<RwLock<ConnectionState>>,
     sender: Arc<RwLock<Option<Arc<Sender>>>>,
@@ -283,6 +284,7 @@ impl OmikronConnection {
         if iota_id == 0 {
             log_t!("iota_register_new");
 
+            #[allow(unused_variables)] // priv_k is unused
             let (pub_k, priv_k) = if let (Some(pk), Some(sk)) = (public_key, private_key) {
                 (pk, sk)
             } else {
@@ -426,9 +428,10 @@ impl OmikronConnection {
 
         if cv.is_type(CommunicationType::client_connected) {
             let user_id = cv.get_data(DataTypes::user_id).as_number().unwrap_or(0) as i64;
+            #[allow(unused_variables)] // session_id is unused.
             let session_id = cv.get_data(DataTypes::session_id).as_number().unwrap_or(0) as i64;
 
-            let mut contacts = chats_util::get_users(user_id);
+            let contacts = chats_util::get_users(user_id);
             let mut contacts_array = Vec::new();
 
             for (i, contact) in contacts.iter().enumerate() {

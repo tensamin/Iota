@@ -26,6 +26,7 @@ pub enum UserChoice {
     AcceptAll,
 }
 
+#[allow(dead_code)] // ui is unused
 pub struct TermsCheckerScreen {
     ui: Arc<UI>,
     sender: Option<oneshot::Sender<UserChoice>>,
