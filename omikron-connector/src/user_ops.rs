@@ -1,6 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hex;
-use iota_logger::{PrintType, log, log_cv};
+use iota_logger::{PrintType, log, log_cv, log_t};
 use iota_state::{RELOAD, SHUTDOWN};
 use iota_storage::users::user_manager::{add_user, save_users};
 use iota_storage::users::user_profile::UserProfile;
@@ -15,27 +15,36 @@ use x448::{PublicKey, Secret};
 use crate::omikron_connection::OMIKRON_CONNECTION;
 
 pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>) {
-    let register_cv = CommunicationValue::new(CommunicationType::get_register);
+    let register_communication_value = CommunicationValue::new(CommunicationType::get_register);
 
-    let conn = OMIKRON_CONNECTION.clone();
+    let connection = OMIKRON_CONNECTION.clone();
 
-    let response_cv = match conn
-        .await_response(&register_cv, Some(Duration::from_secs(20)))
+    let response_communication_value = match connection
+        .await_response(&register_communication_value, Some(Duration::from_secs(20)))
         .await
     {
-        Ok(cv) => cv,
-        Err(_) => return (None, None),
+        Ok(communication_value) => communication_value,
+        Err(e) => {
+            log_t!("User creation: {}", e);
+            return (None, None);
+        }
     };
-    log_cv!(PrintType::Omega, response_cv);
+    log_cv!(PrintType::Omega, response_communication_value);
 
-    let user_id = match response_cv.get_data(DataTypes::user_id).as_number() {
+    let user_id = match response_communication_value
+        .get_data(DataTypes::user_id)
+        .as_number()
+    {
         Some(id) => id,
-        None => return (None, None),
+        None => {
+            log_t!("User creation: Response returned none");
+            return (None, None);
+        }
     };
-    let mut buf = [0u8; 56];
+    let mut buffer = [0u8; 56];
     let mut rng = OsRng;
-    rng.fill_bytes(&mut buf);
-    let private_key = Secret::from_bytes(&buf).unwrap();
+    rng.fill_bytes(&mut buffer);
+    let private_key = Secret::from_bytes(&buffer).unwrap();
     let public_key = PublicKey::from(&private_key);
 
     let mut hasher = Sha256::new();
@@ -47,7 +56,7 @@ pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>
     OsRng.fill_bytes(&mut bytes);
     let reset_token = STANDARD.encode(&bytes);
 
-    let up = UserProfile::new(
+    let user_profile = UserProfile::new(
         user_id,
         username.to_string(),
         None,
@@ -56,7 +65,7 @@ pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>
         reset_token.clone(),
     );
 
-    let cv = CommunicationValue::new(CommunicationType::complete_register_user)
+    let communication_value = CommunicationValue::new(CommunicationType::complete_register_user)
         .add_data(DataTypes::user_id, DataValue::Number(user_id))
         .add_data(DataTypes::username, DataValue::Str(username.to_string()))
         .add_data(
@@ -66,16 +75,17 @@ pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>
         .add_data(DataTypes::iota_id, DataValue::Number(user_id))
         .add_data(DataTypes::reset_token, DataValue::Str(reset_token));
 
-    let response_cv = conn
-        .await_response(&cv, Some(Duration::from_secs(20)))
+    let response_communication_value = connection
+        .await_response(&communication_value, Some(Duration::from_secs(20)))
         .await;
 
-    if let Ok(resp) = response_cv {
-        log_cv!(PrintType::Omega, resp);
-        if !resp.is_type(CommunicationType::success) {
+    if let Ok(response) = response_communication_value {
+        log_cv!(PrintType::Omega, response);
+        if !response.is_type(CommunicationType::success) {
             return (None, None);
         }
     } else {
+        log_t!("User creation: Response returned none");
         return (None, None);
     }
     *SHUTDOWN.write().await = true;
@@ -87,7 +97,10 @@ pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>
         &format!("{}::{}", user_id, STANDARD.encode(&private_key.as_bytes())),
     );
 
-    add_user(up.clone());
+    add_user(user_profile.clone());
     save_users();
-    (Some(up), Some(STANDARD.encode(&private_key.as_bytes())))
+    (
+        Some(user_profile),
+        Some(STANDARD.encode(&private_key.as_bytes())),
+    )
 }
