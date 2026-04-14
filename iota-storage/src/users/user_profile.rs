@@ -16,6 +16,7 @@ pub struct UserProfile {
     pub reset_token: String,
     pub created_at: i64,
     pub display_name: Option<String>,
+    pub trusted_apps: std::collections::HashMap<String, String>,
 }
 
 impl UserProfile {
@@ -38,17 +39,24 @@ impl UserProfile {
                 .unwrap()
                 .as_millis() as i64,
             reset_token,
+            trusted_apps: std::collections::HashMap::new(),
         }
     }
 
     pub fn to_json(&self) -> JsonValue {
+        let mut trusted_apps_obj = json::JsonValue::new_object();
+        for (k, v) in &self.trusted_apps {
+            trusted_apps_obj[k] = v.clone().into();
+        }
+
         let mut obj = object! {
             "uuid" => self.user_id,
             "username" => self.username.clone(),
             "public_key" => self.public_key.clone(),
             "private_key_hash" => self.private_key_hash.clone(),
             "created_at" => self.created_at,
-            "reset_token" => self.reset_token.clone()
+            "reset_token" => self.reset_token.clone(),
+            "trusted_apps" => trusted_apps_obj,
         };
         if let Some(d) = &self.display_name {
             obj["display_name"] = d.clone().into();
@@ -82,6 +90,15 @@ impl UserProfile {
         let created_at = j["created_at"].as_i64()?;
         let display_name = j["display_name"].as_str().map(|s| s.to_string());
 
+        let mut trusted_apps = std::collections::HashMap::new();
+        if j["trusted_apps"].is_object() {
+            for (key, value) in j["trusted_apps"].entries() {
+                if let Some(s) = value.as_str() {
+                    trusted_apps.insert(key.to_string(), s.to_string());
+                }
+            }
+        }
+
         let up = UserProfile {
             user_id,
             username,
@@ -90,6 +107,7 @@ impl UserProfile {
             private_key_hash,
             created_at,
             reset_token,
+            trusted_apps,
         };
 
         // TODO: Migrate to Omikron / Wss

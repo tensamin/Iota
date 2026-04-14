@@ -42,6 +42,14 @@ pub async fn load_from_tu(username: &str) -> Result<(), ()> {
 pub fn add_user(user: UserProfile) {
     USERS.lock().unwrap().push(user);
 }
+
+pub fn update_user(user: UserProfile) {
+    let mut users = USERS.lock().unwrap();
+    if let Some(pos) = users.iter().position(|u| u.user_id == user.user_id) {
+        users[pos] = user;
+    }
+    *UNIQUE.lock().unwrap() = true;
+}
 pub fn get_user_by_username(username: &str) -> Option<UserProfile> {
     USERS
         .lock()
@@ -110,4 +118,16 @@ pub async fn load_users() -> io::Result<()> {
 #[allow(dead_code)]
 pub fn set_unique(val: bool) {
     *UNIQUE.lock().unwrap() = val;
+}
+
+pub fn save_app_data(user_id: i64, app_identifier: &str, data: &str) {
+    let path = format!("users/{}/apps", user_id);
+    let name = format!("{}.json", app_identifier);
+    save_file(&path, &name, data);
+}
+
+pub fn load_app_data(user_id: i64, app_identifier: &str) -> String {
+    let path = format!("users/{}/apps", user_id);
+    let name = format!("{}.json", app_identifier);
+    load_file(&path, &name)
 }

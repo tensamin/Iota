@@ -91,6 +91,8 @@ pub struct OmikronConnection {
     pub connection_id: Uuid,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     reconnect_on_close: Arc<RwLock<bool>>,
+    pub app_challenges: Arc<RwLock<HashMap<u64, String>>>,
+    pub app_sessions: Arc<RwLock<HashMap<u64, (i64, String)>>>,
 }
 
 impl OmikronConnection {
@@ -113,6 +115,8 @@ impl OmikronConnection {
             connection_id: Uuid::new_v4(),
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             reconnect_on_close: Arc::new(RwLock::new(true)),
+            app_challenges: Arc::new(RwLock::new(HashMap::new())),
+            app_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -421,6 +425,193 @@ impl OmikronConnection {
 
         if cv.is_type(CommunicationType::challenge) {
             self.handle_challenge(&cv).await;
+            return;
+        }
+
+        if cv.is_type(CommunicationType::app_identification) {
+            let sender_id = cv.get_sender();
+            let app_identifier = cv
+                .get_data(DataTypes::app_identifier)
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let app_public_key = cv
+                .get_data(DataTypes::app_public_key)
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let user_id = cv.get_data(DataTypes::user_id).as_number().unwrap_or(0) as i64;
+
+            let mut trusted = false;
+            if let Some(user) = iota_storage::users::user_manager::get_user(user_id) {
+                if let Some(pub_k) = user.trusted_apps.get(&app_identifier) {
+                    if pub_k == &app_public_key {
+                        trusted = true;
+                    }
+                }
+            }
+
+            if trusted {
+                use iota_util::crypto_util::{DataFormat, SecurePayload};
+
+                let challenge = Uuid::new_v4().to_string();
+
+                self.app_challenges
+                    .write()
+                    .await
+                    .insert(sender_id, challenge.clone());
+                self.app_sessions
+                    .write()
+                    .await
+                    .insert(sender_id, (user_id, app_identifier.clone()));
+
+                if let Some(pub_key) = iota_util::crypto_helper::load_public_key(&app_public_key) {
+                    let conf = CONFIG.read().await;
+                    let priv_k_str = conf.get_private_key().unwrap_or_default();
+                    let pub_k_str = conf.get_public_key().unwrap_or_default();
+                    drop(conf);
+
+                    if let Some(priv_key) = iota_util::crypto_helper::load_secret_key(&priv_k_str) {
+                        let encrypted_challenge =
+                            SecurePayload::new(challenge.as_bytes(), DataFormat::Raw, priv_key)
+                                .unwrap()
+                                .encrypt_x448(pub_key)
+                                .unwrap()
+                                .export(DataFormat::Base64);
+
+                        let res = CommunicationValue::new(CommunicationType::app_challange)
+                            .with_id(cv.get_id())
+                            .with_receiver(sender_id)
+                            .add_data(DataTypes::public_key, DataValue::Str(pub_k_str))
+                            .add_data(DataTypes::challenge, DataValue::Str(encrypted_challenge));
+
+                        self.send_message(&res).await;
+                        return;
+                    }
+                }
+            }
+
+            let res = CommunicationValue::new(CommunicationType::error)
+                .with_id(cv.get_id())
+                .with_receiver(sender_id);
+            self.send_message(&res).await;
+            return;
+        }
+
+        if cv.is_type(CommunicationType::app_challange_response) {
+            let sender_id = cv.get_sender();
+            let mut challenges = self.app_challenges.write().await;
+            if let Some(expected) = challenges.remove(&sender_id) {
+                if let DataValue::Str(response) = cv.get_data(DataTypes::challenge) {
+                    if expected == *response {
+                        let res =
+                            CommunicationValue::new(CommunicationType::app_identification_response)
+                                .with_id(cv.get_id())
+                                .with_receiver(sender_id);
+                        self.send_message(&res).await;
+                        return;
+                    }
+                }
+            }
+            let res = CommunicationValue::new(CommunicationType::error)
+                .with_id(cv.get_id())
+                .with_receiver(sender_id);
+            self.send_message(&res).await;
+            return;
+        }
+
+        if cv.is_type(CommunicationType::save_app_data) {
+            let sender_id = cv.get_sender();
+            let app_data = cv
+                .get_data(DataTypes::app_data)
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+
+            let sessions = self.app_sessions.read().await;
+            if let Some((user_id, app_identifier)) = sessions.get(&sender_id) {
+                iota_storage::users::user_manager::save_app_data(
+                    *user_id,
+                    app_identifier,
+                    &app_data,
+                );
+            }
+
+            let res = CommunicationValue::new(CommunicationType::save_app_data)
+                .with_id(cv.get_id())
+                .with_receiver(sender_id);
+            self.send_message(&res).await;
+            return;
+        }
+
+        if cv.is_type(CommunicationType::load_app_data) {
+            let sender_id = cv.get_sender();
+            let mut app_data = String::new();
+
+            let sessions = self.app_sessions.read().await;
+            if let Some((user_id, app_identifier)) = sessions.get(&sender_id) {
+                app_data =
+                    iota_storage::users::user_manager::load_app_data(*user_id, app_identifier);
+            }
+
+            let res = CommunicationValue::new(CommunicationType::load_app_data)
+                .with_id(cv.get_id())
+                .with_receiver(sender_id)
+                .add_data(DataTypes::app_data, DataValue::Str(app_data));
+            self.send_message(&res).await;
+            return;
+        }
+
+        if cv.is_type(CommunicationType::create_app) {
+            let sender_id = cv.get_sender() as i64;
+            let app_identifier = cv
+                .get_data(DataTypes::app_identifier)
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let app_public_key = cv
+                .get_data(DataTypes::app_public_key)
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+
+            if !app_identifier.is_empty() && !app_public_key.is_empty() {
+                if let Some(mut user) = iota_storage::users::user_manager::get_user(sender_id) {
+                    if !user.trusted_apps.contains_key(&app_identifier) {
+                        user.trusted_apps.insert(app_identifier, app_public_key);
+                        iota_storage::users::user_manager::update_user(user);
+                    }
+                }
+            }
+
+            let res = CommunicationValue::new(CommunicationType::create_app)
+                .with_id(cv.get_id())
+                .with_receiver(sender_id as u64);
+            self.send_message(&res).await;
+            return;
+        }
+
+        if cv.is_type(CommunicationType::delete_app) {
+            let sender_id = cv.get_sender() as i64;
+            let app_identifier = cv
+                .get_data(DataTypes::app_identifier)
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+
+            if !app_identifier.is_empty() {
+                if let Some(mut user) = iota_storage::users::user_manager::get_user(sender_id) {
+                    if user.trusted_apps.contains_key(&app_identifier) {
+                        user.trusted_apps.remove(&app_identifier);
+                        iota_storage::users::user_manager::update_user(user);
+                    }
+                }
+            }
+
+            let res = CommunicationValue::new(CommunicationType::delete_app)
+                .with_id(cv.get_id())
+                .with_receiver(sender_id as u64);
+            self.send_message(&res).await;
             return;
         }
 
