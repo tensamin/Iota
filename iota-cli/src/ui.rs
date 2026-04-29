@@ -9,10 +9,7 @@ use ratatui::{Terminal, backend::CrosstermBackend, init};
 use std::{
     collections::VecDeque,
     io::Stdout,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
 use tokio::{sync::RwLock, time::Instant};

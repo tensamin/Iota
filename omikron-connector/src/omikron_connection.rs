@@ -79,6 +79,7 @@ impl ConnectionState {
 // Omikron Connection (Client-side with auto-reconnect)
 // ============================================================================
 
+#[allow(dead_code)] // message_send_times is unused.
 pub struct OmikronConnection {
     state: Arc<RwLock<ConnectionState>>,
     sender: Arc<RwLock<Option<Arc<Sender>>>>,

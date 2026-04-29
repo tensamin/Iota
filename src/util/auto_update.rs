@@ -1,0 +1,135 @@
+/* This file is used for the auto update function for the Iota.
+ * It connects to the git server from methanium and checks if
+ * the version has updated inside the cargo.toml file.*/
+
+use anyhow::{Context, Result, anyhow};
+use semver::Version;
+use serde::Deserialize;
+use std::fs::File;
+use std::io::copy;
+use tempfile::NamedTempFile;
+
+use crate::log; // For logging messages into the iota
+
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const API_BASE: &str = "https://git.methanium.net/api/v1";
+const OWNER: &str = "Tensamin";
+const REPO: &str = "Iota";
+
+#[derive(Debug, Deserialize)]
+struct Release {
+    tag_name: String,
+    assets: Vec<Asset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Asset {
+    name: String,
+    browser_download_url: String,
+}
+
+async fn latest_release() -> Result<Release> {
+    let url = format!("{API_BASE}/repos/{OWNER}/{REPO}/releases/latest");
+
+    let response = reqwest::get(&url)
+        .await
+        .context("failed to query latest release.")?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!("release API returned {}", response.status()));
+    }
+
+    Ok(response
+        .json()
+        .await
+        .context("failed to parse release JSON")?)
+}
+
+async fn parse_tag_version(tag: &str) -> Result<Version> {
+    let normalized = tag.strip_prefix('v').unwrap_or(tag);
+    Ok(Version::parse(normalized)?)
+}
+
+async fn current_version() -> Result<Version> {
+    Ok(Version::parse(CURRENT_VERSION)?)
+}
+
+async fn asset_name_for_current_platform() -> String {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+
+    match (os, arch) {
+        ("linux", "x86_64") => "iota-linux-x86_64".to_string(),
+        ("linux", "aarch64") => "iota-linux-aarch64".to_string(),
+        ("windows", "x86_64") => "iota-windows-x86_64.exe".to_string(),
+        ("macos", "x86_64") => "iota-macos-x86_64".to_string(),
+        ("macos", "aarch64") => "iota-macos-aarch64".to_string(),
+        _ => panic!("unsupported platform: {os}/{arch}"),
+    }
+}
+
+async fn download_asset(url: &str) -> Result<NamedTempFile> {
+    let mut response = reqwest::get(url)
+        .await
+        .context("failed to download asset")?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!("asset download returned {}", response.status()));
+    }
+
+    let tmp = NamedTempFile::new().context("failed to create temp file")?;
+    let mut out = File::create(tmp.path()).context("failed to open temp file")?;
+
+    let bytes = response
+        .bytes()
+        .await
+        .context("failed to read response bytes")?;
+
+    std::fs::write(tmp.path(), &bytes).context("failed to write file")?;
+
+    Ok(tmp)
+}
+
+async fn check_for_update() -> Result<Option<Release>> {
+    let current = current_version().await?;
+    let release = latest_release().await?;
+    let latest = parse_tag_version(&release.tag_name).await?;
+
+    if latest > current {
+        Ok(Some(release))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn perform_update() -> Result<bool> {
+    let Some(release) = check_for_update().await? else {
+        return Ok(false);
+    };
+
+    let wanted_asset = asset_name_for_current_platform().await;
+
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == wanted_asset)
+        .ok_or_else(|| anyhow!("no matching asset found: {}", wanted_asset))?;
+
+    log!("Downloading update: {}", asset.name);
+
+    let downloaded = download_asset(&asset.browser_download_url).await?;
+
+    self_replace::self_replace(downloaded.path())
+        .context("failed to replace current executable")?;
+
+    Ok(true)
+}
+
+pub async fn check_update() -> Result<bool> {
+    if perform_update().await? {
+        return Ok(true);
+    } else {
+        return Ok(false);
+    }
+}

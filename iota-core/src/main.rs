@@ -15,7 +15,7 @@ use iota_util::file_util::{download_and_extract_zip, has_dir};
 use omikron_connector as omikron;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
-#[allow(unused_must_use, dead_code)]
+#[allow(unused_must_use, dead_code, unused_assignments)]
 async fn main() {
     while *RELOAD.read().await {
         *RELOAD.write().await = false;

@@ -428,7 +428,7 @@ pub async fn run_command(command: &str) {
             {
                 log!("Created user {}", user.user_id);
             } else {
-                log!("Failed to create user");
+                log!("User creation: Failed to create user. See errors above.");
             }
         }
         ["user", "remove", username] => {
@@ -436,7 +436,7 @@ pub async fn run_command(command: &str) {
                 user_manager::remove_user(user.user_id);
                 log!("Removed user {}", user.user_id);
             } else {
-                log!("Failed to find user");
+                log!("User removal: Username doesn't exist");
             }
         }
         ["user", "list"] => {
@@ -457,7 +457,7 @@ pub async fn run_command(command: &str) {
                 user_manager::remove_user(user.user_id);
                 log!("Removed user {}", user.user_id);
             } else {
-                log!("Failed to find user");
+                log!("User info: Username doesn't exist");
             }
         }
         ["reload"] | ["restart"] => {

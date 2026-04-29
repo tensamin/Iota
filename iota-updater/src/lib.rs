@@ -7,7 +7,6 @@ use anyhow::{Context, Result, anyhow};
 use iota_logger::log;
 use self_replace::self_replace;
 use semver::Version;
-use std::fs::File;
 use tempfile::NamedTempFile;
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
