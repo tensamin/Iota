@@ -87,7 +87,6 @@ pub struct OmikronConnection {
     port: u16,
     pub last_ping: Arc<Mutex<i64>>,
     heartbeat_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    message_send_times: Arc<Mutex<HashMap<Uuid, Instant>>>,
     pub connection_id: Uuid,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     reconnect_on_close: Arc<RwLock<bool>>,
@@ -111,7 +110,6 @@ impl OmikronConnection {
             port,
             last_ping: Arc::new(Mutex::new(-1)),
             heartbeat_handle: Arc::new(Mutex::new(None)),
-            message_send_times: Arc::new(Mutex::new(HashMap::new())),
             connection_id: Uuid::new_v4(),
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             reconnect_on_close: Arc::new(RwLock::new(true)),
@@ -287,7 +285,7 @@ impl OmikronConnection {
         if iota_id == 0 {
             log_t!("iota_register_new");
 
-            let (pub_k, priv_k) = if let (Some(pk), Some(sk)) = (public_key, private_key) {
+            let (pub_k, _priv_k) = if let (Some(pk), Some(sk)) = (public_key, private_key) {
                 (pk, sk)
             } else {
                 let key_pair = crypto_helper::generate_keypair();
@@ -617,9 +615,9 @@ impl OmikronConnection {
 
         if cv.is_type(CommunicationType::client_connected) {
             let user_id = cv.get_data(DataTypes::user_id).as_number().unwrap_or(0) as i64;
-            let session_id = cv.get_data(DataTypes::session_id).as_number().unwrap_or(0) as i64;
+            let _session_id = cv.get_data(DataTypes::session_id).as_number().unwrap_or(0) as i64;
 
-            let mut contacts = chats_util::get_users(user_id);
+            let contacts = chats_util::get_users(user_id);
             let mut contacts_array = Vec::new();
 
             for (i, contact) in contacts.iter().enumerate() {
@@ -865,10 +863,15 @@ impl OmikronConnection {
                 let user_forward = CommunicationValue::new(CommunicationType::message_live)
                     .with_id(cv.get_id())
                     .with_receiver(receiver_id as u64)
-                    .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
-                    .add_data(DataTypes::content, DataValue::Str(content.clone()))
                     .add_data(DataTypes::sender_id, DataValue::Number(sender_id as i64))
-                    .add_data(DataTypes::height, DataValue::Number(height));
+                    .add_data(
+                        DataTypes::message,
+                        DataValue::Container(vec![
+                            (DataTypes::content, DataValue::Str(content.clone())),
+                            (DataTypes::send_time, DataValue::Number(timestamp_i64)),
+                            (DataTypes::height, DataValue::Number(height)),
+                        ]),
+                    );
 
                 // Attempt delivery and await a response from the local client
                 let user_resp = self
@@ -941,7 +944,7 @@ impl OmikronConnection {
                             .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
                             .add_data(
                                 DataTypes::chat_partner_id,
-                                DataValue::Number(sender_id as i64),
+                                DataValue::Number(receiver_id as i64),
                             )
                             .add_data(
                                 DataTypes::message_state,
@@ -994,10 +997,15 @@ impl OmikronConnection {
             let user_forward = CommunicationValue::new(CommunicationType::message_live)
                 .with_id(cv.get_id())
                 .with_receiver(*receiver_id)
-                .add_data(DataTypes::send_time, DataValue::Number(timestamp))
-                .add_data(DataTypes::content, DataValue::Str(content.clone()))
                 .add_data(DataTypes::sender_id, DataValue::Number(*sender_id as i64))
-                .add_data(DataTypes::height, DataValue::Number(height));
+                .add_data(
+                    DataTypes::message,
+                    DataValue::Container(vec![
+                        (DataTypes::content, DataValue::Str(content.clone())),
+                        (DataTypes::send_time, DataValue::Number(timestamp)),
+                        (DataTypes::height, DataValue::Number(height)),
+                    ]),
+                );
 
             let user_resp = self
                 .clone()
@@ -1051,7 +1059,7 @@ impl OmikronConnection {
                         .add_data(DataTypes::send_time, DataValue::Number(timestamp))
                         .add_data(
                             DataTypes::chat_partner_id,
-                            DataValue::Number(*sender_id as i64),
+                            DataValue::Number(*receiver_id as i64),
                         )
                         .add_data(
                             DataTypes::message_state,

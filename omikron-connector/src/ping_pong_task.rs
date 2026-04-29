@@ -1,6 +1,5 @@
 use crate::omikron_connection::OmikronConnection;
 use dashmap::DashMap;
-use iota_logger::log;
 use iota_state::APP_STATE;
 use std::sync::LazyLock;
 use std::time::Instant;

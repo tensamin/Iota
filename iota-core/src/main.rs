@@ -107,15 +107,15 @@ async fn main() {
             sb1 = sb1 + ",";
         }
         log!("Community IDS: {}", sb1); */
-        let port = CONFIG.read().await.get_port();
-        let mut ip = "0.0.0.0".to_string();
+        let _port = CONFIG.read().await.get_port();
+        let mut _ip = "0.0.0.0".to_string();
         for iface in pnet::datalink::interfaces() {
             let iface: NetworkInterface = iface;
             if iface.ips.len() > 0 {
                 let ipsv = format!("{}", iface.ips[0]);
                 let ips: &str = ipsv.split('/').next().unwrap_or("");
                 if format!("{}", ips).starts_with("10.") || format!("{}", ips).starts_with("192.") {
-                    ip = ips.to_string();
+                    _ip = ips.to_string();
                 }
             }
         }

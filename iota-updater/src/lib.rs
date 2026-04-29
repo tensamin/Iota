@@ -108,7 +108,7 @@ async fn download_asset(url: &str) -> Result<NamedTempFile> {
     }
 
     let tmp = NamedTempFile::new().context("failed to create temp file")?;
-    let mut out = File::create(tmp.path()).context("failed to open temp file")?;
+    let _out = File::create(tmp.path()).context("failed to open temp file")?;
 
     let bytes = response
         .bytes()

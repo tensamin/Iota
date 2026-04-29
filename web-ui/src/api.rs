@@ -70,7 +70,7 @@ async fn communities_get(req: HttpRequest, ssl: web::Data<bool>) -> impl Respond
 async fn communities_add(
     req: HttpRequest,
     ssl: web::Data<bool>,
-    payload: web::Json<Value>,
+    _payload: web::Json<Value>,
 ) -> impl Responder {
     if !is_allowed_req(&req, *ssl.get_ref()) {
         return forbidden();

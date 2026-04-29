@@ -27,7 +27,7 @@ pub enum UserChoice {
 }
 
 pub struct TermsCheckerScreen {
-    ui: Arc<UI>,
+    _ui: Arc<UI>,
     sender: Option<oneshot::Sender<UserChoice>>,
 
     eula: bool,
@@ -40,7 +40,7 @@ pub struct TermsCheckerScreen {
 impl TermsCheckerScreen {
     pub fn new(ui: Arc<UI>, sender: Option<oneshot::Sender<UserChoice>>) -> Self {
         Self {
-            ui,
+            _ui: ui,
             sender,
             eula: false,
             tos: false,
