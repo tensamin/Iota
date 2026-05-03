@@ -8,29 +8,30 @@ use iota_terms::{Doc, TermsType as Type, get_current_docs, get_newest_docs};
 use iota_util::file_util::{load_file, save_file};
 use tokio::sync::oneshot;
 
-pub async fn check(ui: Arc<UI>) -> (bool, bool) {
+pub async fn check(ui: Arc<UI>) -> Result<(bool, bool), String> {
     let mut state = ConsentState::load_state();
 
-    if ensure_initial_consent(ui.clone(), &mut state)
-        .await
-        .is_err()
-    {
-        return (false, false);
-    }
+    ensure_initial_consent(ui.clone(), &mut state).await?;
     if ensure_updates(ui, &mut state).await.is_err() {
-        return (false, false);
+        // We don't stop the program if updates fail, as long as we have initial consent
     };
 
     state = state.sanitize();
     state.save_state();
 
-    (state.accepted_eula, state.accepted_tos && state.accepted_pp)
+    Ok((state.accepted_eula, state.accepted_tos && state.accepted_pp))
 }
 
-async fn ensure_initial_consent(ui: Arc<UI>, state: &mut ConsentState) -> Result<(), ()> {
+async fn ensure_initial_consent(ui: Arc<UI>, state: &mut ConsentState) -> Result<(), String> {
     if state.accepted_eula {
         return Ok(());
     }
+
+    let docs = get_current_docs().await;
+    if docs.is_none() {
+        return Err("Could not connect to the legal endpoint to fetch the current agreements. Please check your internet connection.".to_string());
+    }
+    let (current_eula, current_tos, current_privacy) = docs.unwrap();
 
     let (tx, rx) = oneshot::channel();
 
@@ -41,25 +42,23 @@ async fn ensure_initial_consent(ui: Arc<UI>, state: &mut ConsentState) -> Result
 
     match result {
         UserChoice::AcceptEULA | UserChoice::AcceptAll => {
-            if let Some((eula, tos, privacy)) = get_current_docs().await {
-                state.accepted_eula = true;
-                state.eula = Some(eula);
+            state.accepted_eula = true;
+            state.eula = Some(current_eula);
 
-                if matches!(result, UserChoice::AcceptAll) {
-                    state.accepted_tos = true;
-                    state.accepted_pp = true;
-                    state.tos = Some(tos);
-                    state.privacy = Some(privacy);
-                }
+            if matches!(result, UserChoice::AcceptAll) {
+                state.accepted_tos = true;
+                state.accepted_pp = true;
+                state.tos = Some(current_tos);
+                state.privacy = Some(current_privacy);
             }
 
             let _ = &state.save_state();
             Ok(())
         }
-        UserChoice::Deny => Err(()),
+        UserChoice::Deny => Ok(()),
     }
 }
-async fn ensure_updates(ui: Arc<UI>, state: &mut ConsentState) -> Result<(), ()> {
+async fn ensure_updates(ui: Arc<UI>, state: &mut ConsentState) -> Result<(), String> {
     let Some((eula_update, tos_update, privacy_update)) = get_updates().await else {
         return Ok(());
     };
@@ -90,7 +89,9 @@ async fn ensure_updates(ui: Arc<UI>, state: &mut ConsentState) -> Result<(), ()>
             UserChoice::AcceptEULA => {
                 state.accepted_eula = true;
             }
-            UserChoice::Deny => return Err(()),
+            UserChoice::Deny => {
+                return Err("Consent update was denied for a mandatory document.".to_string());
+            }
         }
     } else {
         apply_future_updates(state, result, eula_update, tos_update, privacy_update);

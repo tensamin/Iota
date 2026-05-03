@@ -287,13 +287,21 @@ impl Screen for TermsCheckerScreen {
                     _ => None,
                 };
                 if let Some(terms_type) = terms_type {
-                    let fut: Pin<Box<dyn Future<Output = Box<dyn Screen>> + Send>> =
-                        Box::pin(async move {
-                            let content = get_terms(terms_type.clone()).await.unwrap();
-                            let screen: FileViewer =
-                                FileViewer::new(terms_type.to_string(), &content);
-                            Box::new(screen) as Box<dyn Screen>
-                        });
+                    let fut: Pin<Box<dyn Future<Output = Box<dyn Screen>> + Send>> = Box::pin(
+                        async move {
+                            if let Some(content) = get_terms(terms_type.clone()).await {
+                                let screen: FileViewer =
+                                    FileViewer::new(terms_type.to_string(), &content);
+                                Box::new(screen) as Box<dyn Screen>
+                            } else {
+                                let screen: FileViewer = FileViewer::new(
+                                    "Error".to_string(),
+                                    "Could not connect to the legal endpoint to fetch the document. Please check your internet connection.",
+                                );
+                                Box::new(screen) as Box<dyn Screen>
+                            }
+                        },
+                    );
                     InteractionResult::OpenFutureScreen { screen: fut }
                 } else {
                     InteractionResult::Unhandled

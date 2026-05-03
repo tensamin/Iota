@@ -478,7 +478,7 @@ impl OmikronConnection {
                                 .unwrap()
                                 .export(DataFormat::Base64);
 
-                        let res = CommunicationValue::new(CommunicationType::app_challange)
+                        let res = CommunicationValue::new(CommunicationType::app_challenge)
                             .with_id(cv.get_id())
                             .with_receiver(sender_id)
                             .add_data(DataTypes::public_key, DataValue::Str(pub_k_str))
@@ -497,7 +497,7 @@ impl OmikronConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::app_challange_response) {
+        if cv.is_type(CommunicationType::app_challenge_response) {
             let sender_id = cv.get_sender();
             let mut challenges = self.app_challenges.write().await;
             if let Some(expected) = challenges.remove(&sender_id) {

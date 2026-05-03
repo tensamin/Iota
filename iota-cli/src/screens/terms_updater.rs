@@ -656,9 +656,15 @@ impl Screen for TermsUpdaterScreen {
 
                 if let Some(terms_type) = terms_type {
                     let fut = Box::pin(async move {
-                        let content = get_terms(terms_type.clone()).await.unwrap();
-                        Box::new(FileViewer::new(terms_type.to_string(), &content))
-                            as Box<dyn Screen>
+                        if let Some(content) = get_terms(terms_type.clone()).await {
+                            Box::new(FileViewer::new(terms_type.to_string(), &content))
+                                as Box<dyn Screen>
+                        } else {
+                            Box::new(FileViewer::new(
+                                "Error".to_string(),
+                                "Could not connect to the legal endpoint to fetch the document. Please check your internet connection.",
+                            )) as Box<dyn Screen>
+                        }
                     });
 
                     return InteractionResult::OpenFutureScreen { screen: fut };

@@ -23,7 +23,20 @@ async fn main() {
 
         let ui = start_tui();
 
-        let (eula, tos_pp) = consent_state::check(ui.clone()).await;
+        let (eula, tos_pp) = match consent_state::check(ui.clone()).await {
+            Ok(v) => v,
+            Err(e) => {
+                *SHUTDOWN.write().await = true;
+                loop {
+                    if ACTIVE_TASKS.is_empty() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                println!("{}", e);
+                return;
+            }
+        };
 
         if !eula {
             *SHUTDOWN.write().await = true;
