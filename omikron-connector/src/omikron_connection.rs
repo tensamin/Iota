@@ -25,7 +25,7 @@ use uuid::Uuid;
 // Configuration
 // ============================================================================
 
-const OMIKRON_HOST_DEFAULT: &str = "methanium.net";
+const OMIKRON_HOST_DEFAULT: &str = "tensamin.net";
 const OMIKRON_PORT_DEFAULT: u16 = 959;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
