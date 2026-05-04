@@ -618,6 +618,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "client"
+version = "0.1.0"
+dependencies = [
+ "actix-web",
+ "actix-web-actors",
+ "aes-gcm",
+ "async-trait",
+ "base64",
+ "chrono",
+ "crossterm",
+ "dashmap",
+ "futures",
+ "futures-util",
+ "hex",
+ "hkdf",
+ "hyper",
+ "hyper-util",
+ "iota-auth",
+ "iota-logger",
+ "iota-state",
+ "iota-storage",
+ "iota-util",
+ "json",
+ "lazy_static",
+ "once_cell",
+ "open",
+ "pnet",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "ratatui",
+ "reqwest",
+ "rusqlite",
+ "rustls",
+ "rustls-pemfile",
+ "serde_json",
+ "sha2 0.10.9",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
+ "sysinfo",
+ "tokio",
+ "tokio-tungstenite",
+ "ttp-core",
+ "ttp-native",
+ "tungstenite",
+ "uuid",
+ "walkdir",
+ "warp",
+ "x448",
+ "zip",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -634,6 +686,58 @@ checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
  "memchr",
+]
+
+[[package]]
+name = "communities"
+version = "0.1.0"
+dependencies = [
+ "actix-web",
+ "actix-web-actors",
+ "aes-gcm",
+ "async-trait",
+ "base64",
+ "chrono",
+ "crossterm",
+ "dashmap",
+ "futures",
+ "futures-util",
+ "hex",
+ "hkdf",
+ "hyper",
+ "hyper-util",
+ "iota-auth",
+ "iota-logger",
+ "iota-state",
+ "iota-storage",
+ "iota-util",
+ "json",
+ "lazy_static",
+ "once_cell",
+ "open",
+ "pnet",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "ratatui",
+ "reqwest",
+ "rusqlite",
+ "rustls",
+ "rustls-pemfile",
+ "serde_json",
+ "sha2 0.10.9",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
+ "sysinfo",
+ "tokio",
+ "tokio-tungstenite",
+ "ttp-core",
+ "ttp-native",
+ "tungstenite",
+ "uuid",
+ "walkdir",
+ "warp",
+ "x448",
+ "zip",
 ]
 
 [[package]]
@@ -1782,6 +1886,55 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "iota-auth"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "async-trait",
+ "base64",
+ "chrono",
+ "crossterm",
+ "dashmap",
+ "futures",
+ "futures-util",
+ "hex",
+ "hkdf",
+ "hyper",
+ "hyper-util",
+ "iota-logger",
+ "iota-state",
+ "iota-storage",
+ "iota-util",
+ "json",
+ "lazy_static",
+ "once_cell",
+ "open",
+ "pnet",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "ratatui",
+ "reqwest",
+ "rusqlite",
+ "rustls",
+ "rustls-pemfile",
+ "serde_json",
+ "sha2 0.10.9",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
+ "sysinfo",
+ "tokio",
+ "tokio-tungstenite",
+ "ttp-core",
+ "ttp-native",
+ "tungstenite",
+ "uuid",
+ "walkdir",
+ "warp",
+ "x448",
+ "zip",
 ]
 
 [[package]]
