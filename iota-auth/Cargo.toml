@@ -1,5 +1,5 @@
 [package]
-name = "decentralized"
+name = "iota-auth"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,8 +11,6 @@ iota-util = { path = "../iota-util" }
 iota-storage = { path = "../iota-storage" }
 iota-state = { path = "../iota-state" }
 
-actix-web = { version = "4", features = ["rustls-0_23"] }
-actix-web-actors = "4"
 aes-gcm = "0.10.3"
 async-trait = "0.1.89"
 base64 = "0.22.1"
