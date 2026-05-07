@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
-use ttp_native::{Receiver, Sender};
+use ttp_native::{Policy, Receiver, SendMode, Sender};
 use uuid::Uuid;
 
 // ============================================================================
@@ -218,9 +218,26 @@ impl OmikronConnection {
 
         let addr_str = format!("https://{}:{}/ws/iota/", self.host, self.port);
 
-        let (sender, mut receiver) = ttp_native::client::connect(&addr_str, None)
-            .await
-            .map_err(|e| format!("Connection failed: {}", e))?;
+        let (sender, mut receiver) = ttp_native::client::connect(
+            &addr_str,
+            None,
+            Policy {
+                send_mode: SendMode::SingleStreamPerMessage,
+                max_message_size: 1_000_000_000,
+                close_frame_len: u32::MAX,
+                application_close_code: 0,
+                open_stream_timeout: Duration::from_millis(2_000),
+                write_timeout: Duration::from_millis(2_000),
+                accept_stream_timeout: Duration::from_millis(10_000),
+                read_timeout: Duration::from_millis(30_000),
+                force_close_delay: Duration::from_millis(300),
+                max_transient_recv_errors: 20,
+                transient_recv_backoff: Duration::from_millis(100),
+                receiver_queue_capacity: 1000,
+            },
+        )
+        .await
+        .map_err(|e| format!("Connection failed: {}", e))?;
 
         log_t!("omikron_connection_success");
 

@@ -1,6 +1,6 @@
 use dashmap::DashMap;
-use iota_logger::{log, log_cv_in, log_cv_out, log_t};
-use iota_state::{ACTIVE_TASKS, SHUTDOWN};
+use iota_logger::{log_cv_in, log_cv_out, log_t};
+use iota_state::SHUTDOWN;
 use iota_storage::users::contact::Contact;
 use iota_storage::util::chat_files::{MessageState, change_message_state};
 use iota_storage::util::chats_util::{get_user, mod_user};
@@ -10,127 +10,73 @@ use iota_storage::util::{chat_files, chats_util};
 use iota_util::crypto_helper;
 use iota_util::crypto_util::{DataFormat, SecurePayload};
 use iota_util::file_util::{get_children, load_file, save_file};
-use json::JsonValue;
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
 use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 use ttp_native::{Receiver, Sender};
 use uuid::Uuid;
 
 // ============================================================================
-// Configuration
-// ============================================================================
-
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
-const TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
-const TASK_MAX_AGE: Duration = Duration::from_secs(60);
-
-// ============================================================================
 // Waiting Task System
 // ============================================================================
 
-pub struct WaitingTask {
-    pub task: Box<dyn Fn(Arc<OmikronConnection>, CommunicationValue) -> bool + Send + Sync>,
-    pub inserted_at: Instant,
-}
-
-// ============================================================================
-// Connection State
-// ============================================================================
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ConnectionState {
-    Disconnected,
-    Connecting,
-    Connected { identified: bool },
-}
-
-impl ConnectionState {
-    pub fn is_connected(&self) -> bool {
-        matches!(self, ConnectionState::Connected { .. })
-    }
-
-    pub fn is_identified(&self) -> bool {
-        matches!(self, ConnectionState::Connected { identified: true })
-    }
-}
-
-// ============================================================================
-// Omikron Connection (Client-side with auto-reconnect)
-// ============================================================================
-
-#[allow(dead_code)] // message_send_times is unused.
-pub struct OmikronConnection {
-    state: Arc<RwLock<ConnectionState>>,
+#[allow(dead_code)]
+pub struct ClientConnection {
     sender: Arc<RwLock<Option<Arc<Sender>>>>,
+    receiver: Receiver,
     connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    host: String,
-    port: u16,
-    pub last_ping: Arc<Mutex<i64>>,
-    heartbeat_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    pub ping: Arc<RwLock<i64>>,
     pub connection_id: Uuid,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
-    reconnect_on_close: Arc<RwLock<bool>>,
-    pub app_challenges: Arc<RwLock<HashMap<u64, String>>>,
-    pub app_sessions: Arc<RwLock<HashMap<u64, (i64, String)>>>,
+    pub waiting_tasks:
+        DashMap<u32, Box<dyn Fn(Arc<ClientConnection>, CommunicationValue) -> bool + Send + Sync>>,
 }
 
-impl OmikronConnection {
-    pub fn new() -> Self {
-        Self::with_host(OMIKRON_HOST_DEFAULT, OMIKRON_PORT_DEFAULT)
-    }
-
-    pub fn with_host(host: &str, port: u16) -> Self {
-        let (shutdown_tx, _) = watch::channel(false);
-
-        OmikronConnection {
-            state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
-            sender: Arc::new(RwLock::new(None)),
-            connection_loop_handle: Arc::new(Mutex::new(None)),
-            host: host.to_string(),
-            port,
-            last_ping: Arc::new(Mutex::new(-1)),
-            heartbeat_handle: Arc::new(Mutex::new(None)),
-            connection_id: Uuid::new_v4(),
-            shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
-            reconnect_on_close: Arc::new(RwLock::new(true)),
-            app_challenges: Arc::new(RwLock::new(HashMap::new())),
-            app_sessions: Arc::new(RwLock::new(HashMap::new())),
+impl ClientConnection {
+    pub fn new(
+        sender: Arc<RwLock<Option<Arc<Sender>>>>,
+        receiver: Receiver,
+        connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+        ping: Arc<RwLock<i64>>,
+        connection_id: Uuid,
+        shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
+        waiting_tasks: DashMap<
+            u32,
+            Box<dyn Fn(Arc<ClientConnection>, CommunicationValue) -> bool + Send + Sync>,
+        >,
+    ) -> Self {
+        Self {
+            sender,
+            receiver,
+            connection_loop_handle,
+            ping,
+            connection_id,
+            shutdown_tx,
+            waiting_tasks,
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Connection Management
-    // -------------------------------------------------------------------------
-
-    pub async fn connect(self: &Arc<Self>) {
-        if self.connection_loop_handle.lock().await.is_none() {
-            self.clone().start().await;
-        }
-    }
-
-    pub async fn start(self: Arc<Self>) {
-        if let Some(handle) = self.connection_loop_handle.lock().await.take() {
-            handle.abort();
-        }
-
-        *self.reconnect_on_close.write().await = true;
-
+    pub fn start(self: Arc<Self>) {
         let self_clone = self.clone();
-        let handle = tokio::spawn(async move {
-            self_clone.connection_loop().await;
-        });
+        tokio::spawn(async move {
+            while let Ok(cv) = self_clone.receiver.receive().await {
+                if *SHUTDOWN.read().await {
+                    return;
+                }
 
-        *self.connection_loop_handle.lock().await = Some(handle);
+                self.clone().handle_message(cv).await;
+
+                if !self_clone.receiver.is_open() {
+                    break;
+                }
+            }
+            // Handle Close
+        });
     }
 
     pub async fn stop(&self) {
-        *self.reconnect_on_close.write().await = false;
-
         if let Some(tx) = self.shutdown_tx.lock().await.take() {
             let _ = tx.send(true);
         }
@@ -139,270 +85,44 @@ impl OmikronConnection {
             handle.abort();
         }
 
-        if let Some(handle) = self.heartbeat_handle.lock().await.take() {
-            handle.abort();
-        }
-
         if let Some(sender) = self.sender.read().await.as_ref() {
             sender.close();
         }
 
-        *self.state.write().await = ConnectionState::Disconnected;
         *self.sender.write().await = None;
     }
 
-    async fn connection_loop(self: Arc<Self>) {
-        let mut reconnect_delay = RECONNECT_DELAY;
-        let shutdown_rx = self.shutdown_tx.lock().await.as_ref().unwrap().subscribe();
-        let mut shutdown_rx = shutdown_rx;
-
-        loop {
-            if *shutdown_rx.borrow() || *SHUTDOWN.read().await {
-                log_t!("omikron_connection_loop_shutdown");
-                break;
-            }
-
-            if !*self.reconnect_on_close.read().await {
-                break;
-            }
-
-            match self.clone().connect_once().await {
-                Ok(()) => {
-                    if *self.reconnect_on_close.read().await {
-                        log!("Connection lost, reconnecting in {:?}...", reconnect_delay);
-                    } else {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    log!(
-                        "Connection failed: {}, retrying in {:?}...",
-                        e,
-                        reconnect_delay
-                    );
-                }
-            }
-
-            tokio::select! {
-                _ = sleep(reconnect_delay) => {}
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        break;
-                    }
-                }
-            }
-
-            reconnect_delay = std::cmp::min(reconnect_delay * 2, MAX_RECONNECT_DELAY);
+    // -------------------------------------------------------------------------
+    // Message Handling
+    // -------------------------------------------------------------------------
+    async fn handle_ping(self: Arc<Self>, cv: CommunicationValue) {
+        // Update our ping if provided
+        if let DataValue::Number(last_ping) = cv.get_data(DataTypes::last_ping) {
+            let current = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let mut ping_guard = self.ping.write().await;
+            *ping_guard = current as i64 - last_ping;
         }
+
+        // Send pong response
+        let response = CommunicationValue::new(CommunicationType::pong)
+            .with_id(cv.get_id())
+            .add_data(DataTypes::ping_iota, DataValue::Number(0));
+
+        self.send_message(&response).await;
     }
-
-    async fn connect_once(self: Arc<Self>) -> Result<(), String> {
-        *self.state.write().await = ConnectionState::Connecting;
-        log_t!("omikron_connecting");
-
-        let addr_str = format!("https://{}:{}/ws/iota/", self.host, self.port);
-
-        let (sender, mut receiver) = ttp_native::client::connect(&addr_str, None)
-            .await
-            .map_err(|e| format!("Connection failed: {}", e))?;
-
-        log_t!("omikron_connection_success");
-
-        let sender_arc = Arc::new(sender);
-        *self.sender.write().await = Some(sender_arc.clone());
-        *self.state.write().await = ConnectionState::Connected { identified: false };
-
-        // Start read loop
-        let read_self = self.clone();
-        let read_handle = tokio::spawn(async move {
-            read_self.read_loop(&mut receiver).await;
-        });
-
-        // Handle registration/identification
-        self.handle_authentication().await;
-
-        // Start heartbeat
-        let heartbeat_self = self.clone();
-        let heartbeat_handle = tokio::spawn(async move {
-            heartbeat_self.heartbeat_loop().await;
-        });
-        *self.heartbeat_handle.lock().await = Some(heartbeat_handle);
-
-        {
-            ACTIVE_TASKS.insert("Omikron Listener".to_string());
-        }
-
-        // Wait for read loop to complete
-        let result = read_handle.await;
-        *self.sender.write().await = None;
-        *self.state.write().await = ConnectionState::Disconnected;
-        {
-            ACTIVE_TASKS.remove("Omikron Listener");
-        }
-
-        if let Some(handle) = self.heartbeat_handle.lock().await.take() {
-            handle.abort();
-        }
-
-        match result {
-            Ok(()) => {
-                if *self.reconnect_on_close.read().await {
-                    Err("Connection closed, will reconnect".to_string())
-                } else {
-                    Ok(())
-                }
-            }
-            Err(e) => Err(format!("Read loop error: {}", e)),
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Authentication (Registration/Identification)
-    // -------------------------------------------------------------------------
-
-    async fn handle_authentication(&self) {
-        let conf = CONFIG.read().await;
-        let iota_id = conf.get_iota_id();
-        let public_key = conf.get_public_key();
-        let private_key = conf.get_private_key();
-        drop(conf);
-
-        if iota_id == 0 {
-            log_t!("iota_register_new");
-
-            let (pub_k, _priv_k) = if let (Some(pk), Some(sk)) = (public_key, private_key) {
-                (pk, sk)
-            } else {
-                let key_pair = crypto_helper::generate_keypair();
-                let public_key_base64 = crypto_helper::public_key_to_base64(&key_pair.public);
-                let private_key_base64 = crypto_helper::secret_key_to_base64(&key_pair.secret);
-
-                let mut conf_write = CONFIG.write().await;
-                conf_write.change("public_key", JsonValue::from(public_key_base64.clone()));
-                conf_write.change("private_key", JsonValue::from(private_key_base64.clone()));
-                conf_write.update();
-                drop(conf_write);
-                (public_key_base64, private_key_base64)
-            };
-
-            let register_msg = CommunicationValue::new(CommunicationType::register_iota)
-                .add_data(DataTypes::public_key, DataValue::Str(pub_k));
-
-            let msg_id = register_msg.get_id();
-
-            WAITING_TASKS.insert(
-                msg_id,
-                WaitingTask {
-                    task: Box::new(|selfc, cv| {
-                        if !cv.is_type(CommunicationType::success) {
-                            return false;
-                        }
-
-                        let iota_value = cv.get_data(DataTypes::iota_id);
-                        let iota_id = iota_value.as_number().unwrap_or(0);
-
-                        if iota_id != 0 {
-                            tokio::spawn(async move {
-                                let mut conf_write = CONFIG.write().await;
-                                conf_write.change("iota_id", JsonValue::from(iota_id));
-                                conf_write.update();
-                                drop(conf_write);
-                                log!("Registered with Iota-ID: {}", iota_id);
-
-                                // Send identification after registration
-                                let identify_msg =
-                                    CommunicationValue::new(CommunicationType::identification)
-                                        .add_data(DataTypes::iota_id, DataValue::Number(iota_id));
-                                selfc.send_message(&identify_msg).await;
-                            });
-                        } else {
-                            log!("Iota registration failed.");
-                        }
-                        true
-                    }),
-                    inserted_at: Instant::now(),
-                },
-            );
-
-            self.send_message(&register_msg).await;
-        } else {
-            let identify_msg = CommunicationValue::new(CommunicationType::identification)
-                .add_data(DataTypes::iota_id, DataValue::Number(iota_id));
-            self.send_message(&identify_msg).await;
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Read Loop & Heartbeat
-    // -------------------------------------------------------------------------
-
-    async fn read_loop(self: Arc<Self>, receiver: &mut Receiver) {
-        loop {
-            let result = receiver.receive().await;
-            match result {
-                Ok(cv) => {
-                    self.clone().handle_message(cv).await;
-                }
-                Err(e) => {
-                    self.fail_all_waiting_tasks(format!(
-                        "Connection receive error: {} (connection_id={})",
-                        e, self.connection_id
-                    ))
-                    .await;
-                    break;
-                }
-            }
-            if !receiver.is_open() {
-                self.fail_all_waiting_tasks(format!(
-                    "Connection closed (connection_id={}, receiver_open=false)",
-                    self.connection_id
-                ))
-                .await;
-                break;
-            }
-        }
-    }
-
-    async fn heartbeat_loop(self: Arc<Self>) {
-        loop {
-            sleep(HEARTBEAT_INTERVAL).await;
-
-            if !self.state.read().await.is_connected() {
-                break;
-            }
-
-            if let Some(sender) = self.sender.read().await.as_ref() {
-                if !sender.is_open() {
-                    break;
-                }
-            } else {
-                break;
-            }
-
-            self.send_ping().await;
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Message Handling (Preserved from original)
-    // -------------------------------------------------------------------------
 
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
         if !cv.is_type(CommunicationType::ping) && !cv.is_type(CommunicationType::pong) {
             log_cv_in!(&cv);
         }
 
-        let msg_id = cv.get_id();
+        let _msg_id = cv.get_id();
 
-        // Dispatch waiting task for this message id
-        if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
-            if (task.task)(self.clone(), cv.clone()) {
-                return;
-            }
-        }
-
-        if cv.is_type(CommunicationType::pong) {
-            self.handle_pong(&cv).await;
+        if cv.is_type(CommunicationType::ping) {
+            self.handle_ping(cv).await;
             return;
         }
 
@@ -411,114 +131,13 @@ impl OmikronConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::app_identification) {
-            let sender_id = cv.get_sender();
-            let app_identifier = cv
-                .get_data(DataTypes::app_identifier)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let app_public_key = cv
-                .get_data(DataTypes::app_public_key)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let user_id = cv.get_data(DataTypes::user_id).as_number().unwrap_or(0) as i64;
-
-            let mut trusted = false;
-            if let Some(user) = iota_storage::users::user_manager::get_user(user_id) {
-                if let Some(pub_k) = user.trusted_apps.get(&app_identifier) {
-                    if pub_k == &app_public_key {
-                        trusted = true;
-                    }
-                }
-            }
-
-            if trusted {
-                use iota_util::crypto_util::{DataFormat, SecurePayload};
-
-                let challenge = Uuid::new_v4().to_string();
-
-                self.app_challenges
-                    .write()
-                    .await
-                    .insert(sender_id, challenge.clone());
-                self.app_sessions
-                    .write()
-                    .await
-                    .insert(sender_id, (user_id, app_identifier.clone()));
-
-                if let Some(pub_key) = iota_util::crypto_helper::load_public_key(&app_public_key) {
-                    let conf = CONFIG.read().await;
-                    let priv_k_str = conf.get_private_key().unwrap_or_default();
-                    let pub_k_str = conf.get_public_key().unwrap_or_default();
-                    drop(conf);
-
-                    if let Some(priv_key) = iota_util::crypto_helper::load_secret_key(&priv_k_str) {
-                        let encrypted_challenge =
-                            SecurePayload::new(challenge.as_bytes(), DataFormat::Raw, priv_key)
-                                .unwrap()
-                                .encrypt_x448(pub_key)
-                                .unwrap()
-                                .export(DataFormat::Base64);
-
-                        let res = CommunicationValue::new(CommunicationType::app_challenge)
-                            .with_id(cv.get_id())
-                            .with_receiver(sender_id)
-                            .add_data(DataTypes::public_key, DataValue::Str(pub_k_str))
-                            .add_data(DataTypes::challenge, DataValue::Str(encrypted_challenge));
-
-                        self.send_message(&res).await;
-                        return;
-                    }
-                }
-            }
-
-            let res = CommunicationValue::new(CommunicationType::error)
-                .with_id(cv.get_id())
-                .with_receiver(sender_id);
-            self.send_message(&res).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::app_challenge_response) {
-            let sender_id = cv.get_sender();
-            let mut challenges = self.app_challenges.write().await;
-            if let Some(expected) = challenges.remove(&sender_id) {
-                if let DataValue::Str(response) = cv.get_data(DataTypes::challenge) {
-                    if expected == *response {
-                        let res =
-                            CommunicationValue::new(CommunicationType::app_identification_response)
-                                .with_id(cv.get_id())
-                                .with_receiver(sender_id);
-                        self.send_message(&res).await;
-                        return;
-                    }
-                }
-            }
-            let res = CommunicationValue::new(CommunicationType::error)
-                .with_id(cv.get_id())
-                .with_receiver(sender_id);
-            self.send_message(&res).await;
-            return;
-        }
-
         if cv.is_type(CommunicationType::save_app_data) {
             let sender_id = cv.get_sender();
-            let app_data = cv
+            let _app_data = cv
                 .get_data(DataTypes::app_data)
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-
-            let sessions = self.app_sessions.read().await;
-            if let Some((user_id, app_identifier)) = sessions.get(&sender_id) {
-                iota_storage::users::user_manager::save_app_data(
-                    *user_id,
-                    app_identifier,
-                    &app_data,
-                );
-            }
 
             let res = CommunicationValue::new(CommunicationType::save_app_data)
                 .with_id(cv.get_id())
@@ -529,13 +148,7 @@ impl OmikronConnection {
 
         if cv.is_type(CommunicationType::load_app_data) {
             let sender_id = cv.get_sender();
-            let mut app_data = String::new();
-
-            let sessions = self.app_sessions.read().await;
-            if let Some((user_id, app_identifier)) = sessions.get(&sender_id) {
-                app_data =
-                    iota_storage::users::user_manager::load_app_data(*user_id, app_identifier);
-            }
+            let app_data = String::new();
 
             let res = CommunicationValue::new(CommunicationType::load_app_data)
                 .with_id(cv.get_id())
@@ -657,16 +270,6 @@ impl OmikronConnection {
                 .with_id(cv.get_id())
                 .add_data(DataTypes::contacts, DataValue::Array(contacts_array));
             self.send_message(&resp).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::identification_response) {
-            if let Some(_accepted) = cv.get_data(DataTypes::accepted).as_bool() {
-                let mut state = self.state.write().await;
-                if let ConnectionState::Connected { identified: _ } = *state {
-                    *state = ConnectionState::Connected { identified: true };
-                }
-            }
             return;
         }
 
@@ -1334,11 +937,6 @@ impl OmikronConnection {
                 if let Some(sender) = self.sender.write().await.take() {
                     sender.close();
                 }
-                self.fail_all_waiting_tasks(format!(
-                    "Send failed: connection closed (connection_id={})",
-                    self.connection_id
-                ))
-                .await;
                 return Err("connection closed".to_string());
             }
 
@@ -1350,11 +948,6 @@ impl OmikronConnection {
             }
 
             if let Err(e) = sender_clone.send(cv).await {
-                self.fail_all_waiting_tasks(format!(
-                    "Send failed: {} (connection_id={})",
-                    e, self.connection_id
-                ))
-                .await;
                 return Err(e.to_string());
             }
 
@@ -1364,133 +957,40 @@ impl OmikronConnection {
         }
     }
 
-    async fn fail_all_waiting_tasks(&self, reason: String) {
-        let keys: Vec<u32> = WAITING_TASKS.iter().map(|entry| *entry.key()).collect();
-
-        for key in keys {
-            if let Some((_, waiting_task)) = WAITING_TASKS.remove(&key) {
-                let response = CommunicationValue::new(CommunicationType::error)
-                    .with_id(key)
-                    .add_data(DataTypes::message, DataValue::Str(reason.clone()));
-                let _ = (waiting_task.task)(OMIKRON_CONNECTION.clone(), response);
-            }
-        }
-    }
-
-    pub async fn is_connected(&self) -> bool {
-        self.state.read().await.is_connected()
-    }
-
-    pub async fn is_identified(&self) -> bool {
-        self.state.read().await.is_identified()
-    }
-
     pub async fn await_response(
-        &self,
+        self: Arc<ClientConnection>,
         cv: &CommunicationValue,
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
         let (tx, mut rx) = mpsc::channel(1);
         let msg_id = cv.get_id();
 
-        WAITING_TASKS.insert(
+        let task_tx = tx.clone();
+        self.waiting_tasks.insert(
             msg_id,
-            WaitingTask {
-                task: Box::new(move |_, response_cv| {
-                    let inner_tx = tx.clone();
-                    tokio::spawn(async move {
-                        let _ = inner_tx.send(response_cv).await;
-                    });
-                    true
-                }),
-                inserted_at: Instant::now(),
-            },
+            Box::new(move |_, response_cv| {
+                let inner_tx = task_tx.clone();
+                tokio::spawn(async move {
+                    let _ = inner_tx.send(response_cv).await;
+                });
+                true
+            }),
         );
 
-        if let Err(send_err) = self.send_message_result(cv).await {
-            WAITING_TASKS.remove(&msg_id);
-            return Err(format!(
-                "Request send failed (msg_id={}, reason={})",
-                msg_id, send_err
-            ));
-        }
+        self.send_message(cv).await;
 
         let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
 
         match tokio::time::timeout(timeout, rx.recv()).await {
-            Ok(Some(response_cv)) => {
-                if response_cv.is_type(CommunicationType::error) {
-                    let reason = response_cv
-                        .get_data(DataTypes::message)
-                        .as_str()
-                        .unwrap_or("connection error")
-                        .to_string();
-                    Err(format!(
-                        "Request failed due to disconnect (msg_id={}, reason={})",
-                        msg_id, reason
-                    ))
-                } else {
-                    Ok(response_cv)
-                }
-            }
-            Ok(_) => {
-                WAITING_TASKS.remove(&msg_id);
-                Err("Channel closed while awaiting response".to_string())
-            }
+            Ok(Some(response_cv)) => Ok(response_cv),
+            Ok(_) => Err("Failed to receive response, channel was closed.".to_string()),
             Err(_) => {
-                let waiting_tasks_len = WAITING_TASKS.len();
-                WAITING_TASKS.remove(&msg_id);
+                self.waiting_tasks.remove(&msg_id);
                 Err(format!(
-                    "Request timed out (msg_id={}, timeout={}s, connected={}, waiting_tasks={})",
-                    msg_id,
-                    timeout.as_secs(),
-                    self.is_connected().await,
-                    waiting_tasks_len
+                    "Request timed out after {} seconds.",
+                    timeout.as_secs()
                 ))
             }
         }
     }
-
-    pub async fn await_connection(&self, timeout_duration: Option<Duration>) -> Result<(), String> {
-        if self.state.read().await.is_connected() {
-            return Ok(());
-        }
-
-        let timeout = timeout_duration.unwrap_or(CONNECTION_TIMEOUT);
-        let start = Instant::now();
-
-        loop {
-            if self.state.read().await.is_connected() {
-                return Ok(());
-            }
-
-            if start.elapsed() >= timeout {
-                return Err(format!(
-                    "Connection not established within {} seconds",
-                    timeout.as_secs()
-                ));
-            }
-
-            sleep(Duration::from_millis(100)).await;
-        }
-    }
-}
-
-// ============================================================================
-// Global Instance
-// ============================================================================
-
-pub static OMIKRON_CONNECTION: LazyLock<Arc<OmikronConnection>> = LazyLock::new(|| {
-    let conn = Arc::new(OmikronConnection::new());
-
-    start_task_cleanup_loop();
-
-    conn
-});
-
-pub async fn get_omikron_connection() -> Arc<OmikronConnection> {
-    let conn = OMIKRON_CONNECTION.clone();
-
-    conn.connect().await;
-    conn
 }
