@@ -230,6 +230,8 @@ impl OmikronConnection {
                 write_timeout: Duration::from_millis(2_000),
                 accept_stream_timeout: Duration::from_millis(10_000),
                 read_timeout: Duration::from_millis(30_000),
+                keep_alive_interval: Some(Duration::from_secs(6)),
+                max_idle_timeout: Some(Duration::from_secs(30)),
                 force_close_delay: Duration::from_millis(300),
                 max_transient_recv_errors: 20,
                 transient_recv_backoff: Duration::from_millis(100),
