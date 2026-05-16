@@ -19,10 +19,13 @@ use tokio::sync::oneshot;
 pub async fn start(port: u16) -> bool {
     let (tx, rx) = oneshot::channel::<ServerHandle>();
 
+    let bind_addr = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let bind_ip: std::net::IpAddr = bind_addr.parse().expect("Invalid BIND_ADDRESS");
+
     let _ = tokio::spawn(async move {
         let server = match load_tls_config() {
             Ok(Some(tls_config)) => {
-                log!("HTTPS (HTTP/2) Server running on 0.0.0.0:{}", port);
+                log!("HTTPS (HTTP/2) Server running on {}:{}", bind_addr, port);
                 let _config = (*tls_config).clone();
                 HttpServer::new(move || {
                     App::new()
@@ -30,19 +33,19 @@ pub async fn start(port: u16) -> bool {
                         .configure(api_config)
                         .default_service(web::to(web_path_parser::handle))
                 })
-                .bind(("0.0.0.0", port))
+                .bind((bind_ip, port))
                 .unwrap()
                 .run()
             }
             Ok(_) => {
-                log!("HTTP Server running on 0.0.0.0:{}", port);
+                log!("HTTP Server running on {}:{}", bind_addr, port);
                 HttpServer::new(move || {
                     App::new()
                         .app_data(web::Data::new(false))
                         .configure(api_config)
                         .default_service(web::to(web_path_parser::handle))
                 })
-                .bind(("0.0.0.0", port))
+                .bind((bind_ip, port))
                 .unwrap()
                 .run()
             }
