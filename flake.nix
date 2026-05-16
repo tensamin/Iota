@@ -172,8 +172,8 @@
                     '')
                   ];
 
-                  Restart = "unless-stopped";
-                  RestartSec = "5";
+                  Restart = "always";
+                  RestartSec = "5s";
 
                   AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
                   CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
