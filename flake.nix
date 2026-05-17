@@ -178,13 +178,14 @@
 
                   ExecStart = if cfg.useTmux then
                     pkgs.writeShellScript "iota-start" ''
-                      ${pkgs.tmux}/bin/tmux -S ${cfg.dataDir}/tmux.sock new-session -d -s iota ${cfg.package}/bin/iota
+                      ${pkgs.tmux}/bin/tmux -S ${cfg.dataDir}/tmux.sock new-session -d -s iota \
+                        '${cfg.package}/bin/iota 2>&1 | ${pkgs.systemd}/bin/systemd-cat -t iota-daemon'
                       while ${pkgs.tmux}/bin/tmux -S ${cfg.dataDir}/tmux.sock has-session -t iota 2>/dev/null; do
                         sleep 2
                       done
                     ''
                   else
-                    "${cfg.package}/bin/iota";
+                    "${pkgs.systemd}/bin/systemd-cat -t iota-daemon ${cfg.package}/bin/iota";
 
                   ExecStartPre = [
                     ("+" + pkgs.writeShellScript "iota-setup" ''
