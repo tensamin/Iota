@@ -179,11 +179,9 @@
                   ExecStart = if cfg.useTmux then
                     pkgs.writeShellScript "iota-start" ''
                       ${pkgs.tmux}/bin/tmux -S ${cfg.dataDir}/tmux.sock new-session -d -s iota '
+                        echo "debug: starting iota..."
                         ${cfg.package}/bin/iota 2>&1 | ${pkgs.coreutils}/bin/tee ${cfg.dataDir}/iota-output.log
                         EXIT_CODE=$?
-                        echo ""
-                        echo "============================================"
-                        echo "Iota exited with code: $EXIT_CODE"
                         echo "Output saved to: ${cfg.dataDir}/iota-output.log"
                         echo "Press ENTER to close this session..."
                         read -r
