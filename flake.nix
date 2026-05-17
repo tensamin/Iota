@@ -169,29 +169,28 @@
                 description = descriptionText;
                 wantedBy = [ "multi-user.target" ];
                 after = [ "network.target" ];
+                path = [ pkgs.tmux pkgs.bash pkgs.coreutils pkgs.systemd ];
 
                 serviceConfig = {
-                  Type = "simple";
+                  Type = if cfg.useTmux then "forking" else "simple";
                   User = "iota";
                   Group = "iota";
                   WorkingDirectory = cfg.dataDir;
 
                   ExecStart = if cfg.useTmux then
                     pkgs.writeShellScript "iota-start" ''
-                      ${pkgs.tmux}/bin/tmux -S ${cfg.dataDir}/tmux.sock new-session -d -s iota '
-                        echo "debug: starting iota..."
-                        ${cfg.package}/bin/iota 2>&1 | ${pkgs.coreutils}/bin/tee ${cfg.dataDir}/iota-output.log
-                        EXIT_CODE=$?
-                        echo "Output saved to: ${cfg.dataDir}/iota-output.log"
-                        echo "Press ENTER to close this session..."
-                        read -r
-                      '
-                      while ${pkgs.tmux}/bin/tmux -S ${cfg.dataDir}/tmux.sock has-session -t iota 2>/dev/null; do
-                        sleep 2
-                      done
+                      ${pkgs.tmux}/bin/tmux -S ${cfg.dataDir}/tmux.sock new-session -d -s iota \
+                        "${pkgs.bash}/bin/bash -lc 'exec > >(${pkgs.coreutils}/bin/tee -a ${cfg.dataDir}/iota-output.log >(${pkgs.systemd}/bin/systemd-cat -t iota-daemon)) 2>&1; ${cfg.package}/bin/iota; status=$?; printf \"\nProcess exited with status %s. Press any key to close this tmux session...\" \"\$status\"; read -r -n 1; exit \"\$status\"'"
                     ''
                   else
                     "${cfg.package}/bin/iota";
+
+                  ExecStop = if cfg.useTmux then
+                    (pkgs.writeShellScript "iota-stop" ''
+                      ${pkgs.tmux}/bin/tmux -S ${cfg.dataDir}/tmux.sock kill-session -t iota 2>/dev/null || true
+                    '')
+                  else
+                    null;
 
                   ExecStartPre = [
                     ("+" + pkgs.writeShellScript "iota-setup" ''
