@@ -4,13 +4,17 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     ttp = {
       url = "git+https://git.methanium.net/Tensamin/TTP.git?rev=7e5d1953df8592a1feba0f390d205d0ef61a3119";
       flake = false;
     };
   };
 
-  outputs = inputs@{ self, nixpkgs, flake-parts, ttp, ... }:
+  outputs = inputs@{ self, nixpkgs, flake-parts, rust-overlay, ttp, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
         "x86_64-linux"
@@ -19,37 +23,52 @@
         "aarch64-darwin"
       ];
 
-      perSystem = { self', pkgs, ... }: {
-        packages = {
-          default = self'.packages.iota;
-          iota = pkgs.rustPlatform.buildRustPackage {
-            pname = "iota";
-            version = "0.1.0";
-            src = ./.;
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-              allowBuiltinFetchGit = true;
-            };
-            nativeBuildInputs = with pkgs; [ cmake perl pkg-config ];
-            buildInputs = with pkgs; [ openssl sqlite ];
-            dontUseCmakeConfigure = true;
-            preConfigure = ''
-              if [ -d ../cargo-vendor-dir/ttp-core-0.1.0 ]; then
-                cp ${ttp}/ttp-codec.json ../cargo-vendor-dir/ttp-codec.json
-              fi
-            '';
-            postInstall = ''
-              mv $out/bin/iota-core $out/bin/iota
-              for f in $out/bin/*; do
-                if [ "$(basename "$f")" != "iota" ]; then
-                  rm "$f"
+      perSystem = { self', pkgs, system, ... }:
+        let
+          rustPkgs = import nixpkgs {
+            inherit system;
+            overlays = [ (import rust-overlay) ];
+          };
+          rustToolchain = rustPkgs.rust-bin.stable.latest.default.override {
+            extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
+          };
+        in
+        {
+          packages = {
+            default = self'.packages.iota;
+            iota = pkgs.rustPlatform.buildRustPackage {
+              pname = "iota";
+              version = "0.1.0";
+              src = ./.;
+              cargoLock = {
+                lockFile = ./Cargo.lock;
+                allowBuiltinFetchGit = true;
+              };
+              nativeBuildInputs = with pkgs; [ cmake perl pkg-config ];
+              buildInputs = with pkgs; [ openssl sqlite ];
+              dontUseCmakeConfigure = true;
+              preConfigure = ''
+                if [ -d ../cargo-vendor-dir/ttp-core-0.1.0 ]; then
+                  cp ${ttp}/ttp-codec.json ../cargo-vendor-dir/ttp-codec.json
                 fi
-              done
-            '';
-            passthru.dataDir = "/var/lib/iota";
+              '';
+              postInstall = ''
+                mv $out/bin/iota-core $out/bin/iota
+                for f in $out/bin/*; do
+                  if [ "$(basename "$f")" != "iota" ]; then
+                    rm "$f"
+                  fi
+                done
+              '';
+              passthru.dataDir = "/var/lib/iota";
+            };
+          };
+
+          devShells.default = pkgs.mkShell {
+            nativeBuildInputs = with pkgs; [ rustToolchain git cmake perl pkg-config ];
+            buildInputs = with pkgs; [ openssl sqlite ];
           };
         };
-      };
 
       flake = {
         nixosModules.default = { config, pkgs, lib, ... }:
