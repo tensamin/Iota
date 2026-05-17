@@ -955,6 +955,12 @@ impl OmikronConnection {
                         MessageState::Sent,
                     );
 
+                    // Send push notification to Omega since user is offline
+                    let push_msg = CommunicationValue::new(CommunicationType::push_notification)
+                        .with_receiver(receiver_id as u64)
+                        .add_data(DataTypes::sender_id, DataValue::Number(sender_id as i64));
+                    self.send_message(&push_msg).await;
+
                     // notify sender
                     self.send_message(
                         &CommunicationValue::new(CommunicationType::message_state)
@@ -1070,6 +1076,12 @@ impl OmikronConnection {
                     *sender_id as i64,
                     MessageState::Sent,
                 );
+
+                // Send push notification to Omega since user is offline
+                let push_msg = CommunicationValue::new(CommunicationType::push_notification)
+                    .with_receiver(*receiver_id)
+                    .add_data(DataTypes::sender_id, DataValue::Number(*sender_id as i64));
+                self.send_message(&push_msg).await;
 
                 self.send_message(
                     &CommunicationValue::new(CommunicationType::message_state)
