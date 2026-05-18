@@ -9,6 +9,7 @@ use crate::{
 use async_trait::async_trait;
 use json::{JsonValue, array, object};
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 use ttp_core::{CommunicationType, CommunicationValue, DataTypes};
@@ -36,7 +37,9 @@ impl TextChat {
             self.get_name()
         );
 
-        if let Err(e) = fs::create_dir_all(user_dir) {
+        let working_dir = iota_util::file_util::get_directory();
+        let full_dir = Path::new(&working_dir).join(user_dir);
+        if let Err(e) = fs::create_dir_all(&full_dir) {
             log!("Failed to create chat directory: {}", e);
             return;
         }

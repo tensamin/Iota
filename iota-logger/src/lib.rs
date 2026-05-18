@@ -57,8 +57,10 @@ pub fn startup() {
     LOGGER.set(tx).expect("Logger already initialized");
 
     thread::spawn(move || {
-        let log_dir = Path::new("logs");
-        fs::create_dir_all(log_dir).expect("Failed to create log directory");
+        let working_dir = iota_util::file_util::get_directory();
+        let base_dir = Path::new(&working_dir);
+        let log_dir = base_dir.join("logs");
+        fs::create_dir_all(&log_dir).expect("Failed to create log directory");
 
         let start_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)

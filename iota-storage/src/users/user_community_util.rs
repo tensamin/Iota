@@ -1,14 +1,12 @@
-use iota_util::file_util::save_file;
+use iota_util::file_util::{load_file, save_file};
 use json::{self, Array, JsonValue};
-use std::fs;
-use std::path::Path;
 
 pub struct UserCommunityUtil;
 
 impl UserCommunityUtil {
     pub fn add_community(storage_owner: i64, address: String, title: String, position: String) {
         let file_path = format!("users/{}/", storage_owner);
-        let mut communities = Self::load_array(&file_path);
+        let mut communities = Self::load_array(&file_path, "communities.json");
 
         let mut community = JsonValue::new_object();
         community["title"] = JsonValue::String(title);
@@ -26,7 +24,7 @@ impl UserCommunityUtil {
 
     pub fn remove_community(storage_owner: i64, community_address: String) {
         let file_path = format!("users/{}/", storage_owner);
-        let communities = Self::load_array(&file_path);
+        let communities = Self::load_array(&file_path, "communities.json");
 
         let filtered: Array = communities
             .iter()
@@ -41,27 +39,20 @@ impl UserCommunityUtil {
     }
 
     pub fn get_communities(storage_owner: i64) -> Array {
-        let file_path = format!("users/{}/communities.json", storage_owner);
-        Self::load_array(&file_path)
+        let file_path = format!("users/{}/", storage_owner);
+        Self::load_array(&file_path, "communities.json")
     }
 
-    fn load_array(file_path: &str) -> Array {
-        if !Path::new(file_path).exists() {
+    fn load_array(dir: &str, name: &str) -> Array {
+        let content = load_file(dir, name);
+        if content.is_empty() {
             return Array::new();
         }
 
-        match fs::read_to_string(file_path) {
-            Ok(content) => {
-                let parsed = json::parse(&content);
-                match parsed {
-                    Ok(JsonValue::Array(arr)) => arr,
-                    _ => Array::new(),
-                }
-            }
-            Err(err) => {
-                eprintln!("Failed to read file {}: {}", file_path, err);
-                Array::new()
-            }
+        let parsed = json::parse(&content);
+        match parsed {
+            Ok(JsonValue::Array(arr)) => arr,
+            _ => Array::new(),
         }
     }
 }
