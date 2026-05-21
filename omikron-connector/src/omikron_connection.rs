@@ -91,6 +91,7 @@ pub struct OmikronConnection {
     pub connection_id: Uuid,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     reconnect_on_close: Arc<RwLock<bool>>,
+    auth_failure: Arc<RwLock<Option<String>>>,
     pub app_challenges: Arc<RwLock<HashMap<u64, String>>>,
     pub app_sessions: Arc<RwLock<HashMap<u64, (i64, String)>>>,
 }
@@ -114,6 +115,7 @@ impl OmikronConnection {
             connection_id: Uuid::new_v4(),
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             reconnect_on_close: Arc::new(RwLock::new(true)),
+            auth_failure: Arc::new(RwLock::new(None)),
             app_challenges: Arc::new(RwLock::new(HashMap::new())),
             app_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -132,6 +134,11 @@ impl OmikronConnection {
     pub async fn start(self: Arc<Self>) {
         if let Some(handle) = self.connection_loop_handle.lock().await.take() {
             handle.abort();
+        }
+
+        if self.shutdown_tx.lock().await.is_none() {
+            let (shutdown_tx, _) = watch::channel(false);
+            *self.shutdown_tx.lock().await = Some(shutdown_tx);
         }
 
         *self.reconnect_on_close.write().await = true;
@@ -191,6 +198,10 @@ impl OmikronConnection {
                     }
                 }
                 Err(e) => {
+                    if self.auth_failure.read().await.is_some() {
+                        log!("Authentication failed, stopping reconnection: {}", e);
+                        break;
+                    }
                     log!(
                         "Connection failed: {}, retrying in {:?}...",
                         e,
@@ -255,6 +266,22 @@ impl OmikronConnection {
 
         // Handle registration/identification
         self.handle_authentication().await;
+
+        // Wait for identification to complete
+        if !self.await_identification(Duration::from_secs(30)).await {
+            *self.reconnect_on_close.write().await = false;
+            let reason = "Authentication failed: server did not accept the challenge. Your Iota keys may be invalid or the private key has changed on the server."
+                .to_string();
+            *self.auth_failure.write().await = Some(reason.clone());
+
+            if let Some(sender) = self.sender.write().await.take() {
+                sender.close();
+            }
+            *self.state.write().await = ConnectionState::Disconnected;
+            return Err(reason);
+        }
+
+        log_t!("omikron_authenticated");
 
         // Start heartbeat
         let heartbeat_self = self.clone();
@@ -696,11 +723,21 @@ impl OmikronConnection {
         }
 
         if cv.is_type(CommunicationType::identification_response) {
-            if let Some(_accepted) = cv.get_data(DataTypes::accepted).as_bool() {
-                let mut state = self.state.write().await;
-                if let ConnectionState::Connected { identified: _ } = *state {
-                    *state = ConnectionState::Connected { identified: true };
+            match cv.get_data(DataTypes::accepted).as_bool() {
+                Some(true) => {
+                    let mut state = self.state.write().await;
+                    if let ConnectionState::Connected { identified: _ } = *state {
+                        *state = ConnectionState::Connected { identified: true };
+                    }
                 }
+                Some(false) => {
+                    *self.auth_failure.write().await = Some(
+                        "Server rejected the challenge response — your Iota keys may be invalid."
+                            .to_string(),
+                    );
+                    log_t!("omikron_auth_rejected");
+                }
+                None => {}
             }
             return;
         }
@@ -1360,6 +1397,28 @@ impl OmikronConnection {
                 .add_data(DataTypes::challenge, DataValue::Str(solved));
 
             self.send_message(&response).await;
+        } else {
+            log_t!("omikron_challenge_decryption_failed");
+            *self.auth_failure.write().await = Some(
+                "Challenge decryption failed — your Iota private key may not match the registered key on the server."
+                    .to_string(),
+            );
+        }
+    }
+
+    async fn await_identification(&self, timeout: Duration) -> bool {
+        let start = Instant::now();
+        loop {
+            if self.state.read().await.is_identified() {
+                return true;
+            }
+            if self.auth_failure.read().await.is_some() {
+                return false;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -1520,6 +1579,25 @@ impl OmikronConnection {
 
             sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    pub async fn has_auth_failure(&self) -> bool {
+        self.auth_failure.read().await.is_some()
+    }
+
+    pub async fn get_auth_failure(&self) -> Option<String> {
+        self.auth_failure.read().await.clone()
+    }
+
+    pub async fn clear_auth_failure(&self) {
+        *self.auth_failure.write().await = None;
+    }
+
+    pub async fn reconnect(self: &Arc<Self>) {
+        self.clear_auth_failure().await;
+        *self.reconnect_on_close.write().await = true;
+        self.stop().await;
+        self.connect().await;
     }
 }
 

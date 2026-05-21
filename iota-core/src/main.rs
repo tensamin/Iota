@@ -13,7 +13,7 @@ use iota_storage::users::user_manager;
 use iota_storage::util::config_util::CONFIG;
 use iota_util::file_util::{download_and_extract_zip, has_dir};
 use omikron_connector as omikron;
-use ttp_core::{CommunicationType, DataTypes};
+use omikron_connector::omikron_connection::OMIKRON_CONNECTION;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 #[allow(unused_must_use, dead_code, unused_assignments)]
@@ -159,7 +159,15 @@ async fn main() {
                 break;
             }
 
-            sleep(Duration::from_millis(100)).await;
+            if OMIKRON_CONNECTION.has_auth_failure().await {
+                if let Some(reason) = OMIKRON_CONNECTION.get_auth_failure().await {
+                    log!("Authentication failed: {}", reason);
+                    log!("Use /reconnect to try again or /regenerate private-key to create a new key pair");
+                    OMIKRON_CONNECTION.clear_auth_failure().await;
+                }
+            }
+
+            sleep(Duration::from_millis(500)).await;
         }
         if *RELOAD.read().await {
             loop {

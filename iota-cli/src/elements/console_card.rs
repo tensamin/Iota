@@ -2,7 +2,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 use iota_logger::{log, log_command, log_cv};
 use iota_state::{ACTIVE_TASKS, RELOAD, SHUTDOWN};
 use iota_storage::users::{user_manager, user_profile::UserProfile};
-use iota_util::file_util;
+use iota_storage::util::config_util::CONFIG;
+use iota_util::{crypto_helper, file_util};
 use omikron_connector::omikron_connection::OMIKRON_CONNECTION;
 use ratatui::{
     Frame,
@@ -400,7 +401,7 @@ pub async fn run_command(command: &str) {
         }
 
         ["help"] => {
-            log!("Available commands: tasks, fps, ping, user");
+            log!("Available commands: tasks, fps, ping, user, reconnect, regenerate");
         }
 
         ["help", "tasks"] => {
@@ -414,6 +415,12 @@ pub async fn run_command(command: &str) {
         }
         ["help", "user"] => {
             log!("User command usage: user add <username> | user remove <username> | user list");
+        }
+        ["help", "reconnect"] => {
+            log!("Reconnect command usage: reconnect — retry connecting to the Omikron server");
+        }
+        ["help", "regenerate"] => {
+            log!("Regenerate command usage: regenerate private-key — generate a new Iota key pair and reconnect");
         }
 
         ["ping"] => {
@@ -459,6 +466,26 @@ pub async fn run_command(command: &str) {
             } else {
                 log!("User info: Username doesn't exist");
             }
+        }
+        ["reconnect"] => {
+            log!("Reconnecting to Omikron server...");
+            OMIKRON_CONNECTION.reconnect().await;
+            log!("Reconnected to Omikron server");
+        }
+        ["regenerate", "private-key"] => {
+            log!("Regenerating Iota key pair...");
+            let key_pair = crypto_helper::generate_keypair();
+            let public_key_base64 = crypto_helper::public_key_to_base64(&key_pair.public);
+            let private_key_base64 = crypto_helper::secret_key_to_base64(&key_pair.secret);
+            {
+                let mut conf = CONFIG.write().await;
+                conf.change("public_key", json::JsonValue::from(public_key_base64));
+                conf.change("private_key", json::JsonValue::from(private_key_base64));
+                conf.update();
+            }
+            log!("Key pair regenerated. Reconnecting to Omikron server...");
+            OMIKRON_CONNECTION.reconnect().await;
+            log!("Reconnected with new key pair");
         }
         ["reload"] | ["restart"] => {
             log!("Restarting");
