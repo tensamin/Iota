@@ -13,6 +13,7 @@ use iota_storage::users::user_manager;
 use iota_storage::util::config_util::CONFIG;
 use iota_util::file_util::{download_and_extract_zip, has_dir};
 use omikron_connector as omikron;
+use ttp_core::{CommunicationType, DataTypes};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 #[allow(unused_must_use, dead_code, unused_assignments)]
