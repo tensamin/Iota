@@ -167,7 +167,7 @@ impl CommunityConnection {
         };
 
         let Some(community) = self.community.read().await.clone() else {
-            self.send_error_response(&cv.get_id(), CommunicationType::error)
+            self.send_error_response(&cv.get_id(), CommunicationType::error_internal)
                 .await;
             return;
         };
@@ -178,7 +178,7 @@ impl CommunityConnection {
         let shared_secret = match community_private_key.to_diffie_hellman(&user_pub_key) {
             Some(secret) => secret,
             _ => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error)
+                self.send_error_response(&cv.get_id(), CommunicationType::error_internal)
                     .await;
                 return;
             }
@@ -200,7 +200,7 @@ impl CommunityConnection {
         let encrypted_challenge = match cipher.encrypt(nonce, challenge_str.as_bytes()) {
             Ok(data) => data,
             Err(_) => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error)
+                self.send_error_response(&cv.get_id(), CommunicationType::error_internal)
                     .await;
                 return;
             }
@@ -223,7 +223,7 @@ impl CommunityConnection {
         let client_challenge_response_b64 = match cv.get_data(DataTypes::challenge) {
             Some(data) => data.to_string(),
             _ => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error)
+                self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_data)
                     .await;
                 return;
             }
@@ -232,38 +232,38 @@ impl CommunityConnection {
         let challenge_response_bytes = match STANDARD.decode(&client_challenge_response_b64) {
             Ok(bytes) => bytes,
             Err(_) => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error)
+                self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_data)
                     .await;
                 return;
             }
         };
 
         if challenge_response_bytes.len() < 12 {
-            self.send_error_response(&cv.get_id(), CommunicationType::error)
+            self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_data)
                 .await;
             return;
         }
 
         let Some(user) = self.auth.read().await.clone() else {
-            self.send_error_response(&cv.get_id(), CommunicationType::error)
+            self.send_error_response(&cv.get_id(), CommunicationType::error_internal)
                 .await;
             return;
         };
 
         let Some(user_pub_bytes) = STANDARD.decode(&user.public_key).ok() else {
-            self.send_error_response(&cv.get_id(), CommunicationType::error)
+            self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_data)
                 .await;
             return;
         };
 
         let Some(user_pub_key) = PublicKey::from_bytes(&user_pub_bytes) else {
-            self.send_error_response(&cv.get_id(), CommunicationType::error)
+            self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_public_key)
                 .await;
             return;
         };
 
         let Some(community) = self.community.read().await.clone() else {
-            self.send_error_response(&cv.get_id(), CommunicationType::error)
+            self.send_error_response(&cv.get_id(), CommunicationType::error_internal)
                 .await;
             return;
         };
@@ -273,7 +273,7 @@ impl CommunityConnection {
         let shared_secret = match community_private_key.to_diffie_hellman(&user_pub_key) {
             Some(secret) => secret,
             _ => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error)
+                self.send_error_response(&cv.get_id(), CommunicationType::error_internal)
                     .await;
                 return;
             }
@@ -297,7 +297,7 @@ impl CommunityConnection {
         let decrypted_bytes = match cipher.decrypt(nonce, ciphertext) {
             Ok(pt) => pt,
             Err(_) => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error)
+                self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_challenge)
                     .await;
                 return;
             }
@@ -306,7 +306,7 @@ impl CommunityConnection {
         let client_response = match String::from_utf8(decrypted_bytes) {
             Ok(str) => str,
             Err(_) => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error)
+                self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_data)
                     .await;
                 return;
             }
@@ -315,7 +315,7 @@ impl CommunityConnection {
         let expected_challenge = self.challenge.read().await.clone();
 
         if client_response != expected_challenge {
-            self.send_error_response(&cv.get_id(), CommunicationType::error)
+            self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_challenge)
                 .await;
             self.close().await;
             return;
@@ -327,7 +327,7 @@ impl CommunityConnection {
         }
 
         let Some(community) = self.community.read().await.clone() else {
-            self.send_error_response(&cv.get_id(), CommunicationType::error)
+            self.send_error_response(&cv.get_id(), CommunicationType::error_internal)
                 .await;
             return;
         };
@@ -335,7 +335,7 @@ impl CommunityConnection {
 
         let user_id = self.get_user_id().await;
         if user_id == 0 {
-            self.send_error_response(&cv.get_id(), CommunicationType::error)
+            self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_user_id)
                 .await;
             return;
         }

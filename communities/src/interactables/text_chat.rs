@@ -243,7 +243,7 @@ impl Interactable for TextChat {
                 .add_data_str(DataTypes::result, "message_received".to_string())
                 .add_data(DataTypes::payload, JsonValue::new_object());
         }
-        CommunicationValue::new(CommunicationType::error).with_id(cv.get_id())
+        CommunicationValue::new(CommunicationType::error_internal).with_id(cv.get_id())
     }
     fn to_json(&self) -> JsonValue {
         JsonValue::new_object()

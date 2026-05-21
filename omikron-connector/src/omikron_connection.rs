@@ -536,7 +536,7 @@ impl OmikronConnection {
                 }
             }
 
-            let res = CommunicationValue::new(CommunicationType::error)
+            let res = CommunicationValue::new(CommunicationType::error_invalid_challenge)
                 .with_id(cv.get_id())
                 .with_receiver(sender_id);
             self.send_message(&res).await;
@@ -558,7 +558,7 @@ impl OmikronConnection {
                     }
                 }
             }
-            let res = CommunicationValue::new(CommunicationType::error)
+            let res = CommunicationValue::new(CommunicationType::error_invalid_challenge)
                 .with_id(cv.get_id())
                 .with_receiver(sender_id);
             self.send_message(&res).await;
@@ -1475,7 +1475,7 @@ impl OmikronConnection {
 
         for key in keys {
             if let Some((_, waiting_task)) = WAITING_TASKS.remove(&key) {
-                let response = CommunicationValue::new(CommunicationType::error)
+                let response = CommunicationValue::new(CommunicationType::error_internal)
                     .with_id(key)
                     .add_data(DataTypes::message, DataValue::Str(reason.clone()));
                 let _ = (waiting_task.task)(OMIKRON_CONNECTION.clone(), response);
@@ -1525,7 +1525,14 @@ impl OmikronConnection {
 
         match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Some(response_cv)) => {
-                if response_cv.is_type(CommunicationType::error) {
+                let resp_type = response_cv.get_type();
+                let is_error = resp_type == CommunicationType::error
+                    || resp_type == CommunicationType::error_internal
+                    || resp_type == CommunicationType::error_not_found
+                    || resp_type == CommunicationType::error_invalid_data
+                    || resp_type == CommunicationType::error_invalid_challenge
+                    || resp_type == CommunicationType::error_not_authenticated;
+                if is_error {
                     let reason = response_cv
                         .get_data(DataTypes::message)
                         .as_str()

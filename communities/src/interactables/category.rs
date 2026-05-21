@@ -95,7 +95,7 @@ impl Interactable for Category {
         v
     }
     async fn run_function(&self, _cv: CommunicationValue) -> CommunicationValue {
-        CommunicationValue::new(CommunicationType::error)
+        CommunicationValue::new(CommunicationType::error_internal)
     }
     fn to_json(&self) -> JsonValue {
         let mut v = JsonValue::new_object();

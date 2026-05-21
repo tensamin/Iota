@@ -164,7 +164,7 @@ impl Interactable for VoiceChat {
                 .add_data_str(DataTypes::result, "user_changed".to_string())
                 .add_data(DataTypes::payload, response_payload);
         }
-        CommunicationValue::new(CommunicationType::error).with_id(cv.get_id())
+        CommunicationValue::new(CommunicationType::error_internal).with_id(cv.get_id())
     }
 
     fn to_json(&self) -> JsonValue {
