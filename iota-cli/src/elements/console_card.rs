@@ -442,6 +442,9 @@ pub async fn run_command(command: &str) {
         }
         ["user", "remove", username] => {
             if let Some(user) = user_manager::get_user_by_username(username) {
+                let msg = CommunicationValue::new(CommunicationType::delete_user)
+                    .with_sender(user.user_id as u64);
+                OMIKRON_CONNECTION.send_message(&msg).await;
                 user_manager::remove_user(user.user_id);
                 log!("Removed user {}", user.user_id);
             } else {
