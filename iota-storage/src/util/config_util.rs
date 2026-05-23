@@ -67,6 +67,11 @@ impl ConfigUtil {
         self.unique = true;
     }
 
+    pub fn remove(&mut self, key: &str) {
+        self.config.remove(key);
+        self.unique = true;
+    }
+
     pub fn update(&mut self) {
         if self.unique {
             save_file("", "config.json", &self.config.to_string());
