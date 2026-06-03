@@ -2,14 +2,13 @@ use dashmap::DashMap;
 use iota_logger::{log, log_cv_in, log_cv_out, log_t};
 use iota_state::{ACTIVE_TASKS, SHUTDOWN};
 use iota_storage::users::contact::Contact;
-use iota_storage::util::chat_files::{MessageState, change_message_state};
-use iota_storage::util::chats_util::{get_user, mod_user};
+use iota_storage::util::chat_files::{self, MessageState, change_message_state};
+use iota_storage::util::chats_util::{self, get_user, mod_user};
 use iota_storage::util::communities_util::CommunitiesUtil;
 use iota_storage::util::config_util::CONFIG;
-use iota_storage::util::{chat_files, chats_util};
 use iota_util::crypto_helper;
 use iota_util::crypto_util::{DataFormat, SecurePayload};
-use iota_util::file_util::{get_children, load_file, save_file};
+use iota_util::file_util::{get_children, has_file, load_file, save_file};
 use json::JsonValue;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -20,6 +19,18 @@ use tokio::time::sleep;
 use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 use ttp_native::{Policy, Receiver, SendMode, Sender};
 use uuid::Uuid;
+
+// Helper function to check if read receipts are enabled globally
+async fn is_read_receipts_enabled() -> bool {
+    // Check global config for read receipts setting
+    // Default to true if not set
+    let conf = CONFIG.read().await;
+    let value = conf.get("read_receipts_enabled");
+    match value {
+        JsonValue::Boolean(b) => *b,
+        _ => true,
+    }
+}
 
 // ============================================================================
 // Configuration
@@ -933,7 +944,7 @@ impl OmikronConnection {
                 // Attempt delivery and await a response from the local client
                 let user_resp = self
                     .clone()
-                    .await_response(&user_forward, Some(Duration::from_secs(10)))
+                    .await_response(&user_forward, Some(Duration::from_secs(3)))
                     .await;
 
                 if let Ok(user_resp) = user_resp {
@@ -959,23 +970,25 @@ impl OmikronConnection {
                         ms.clone(),
                     );
 
-                    // notify original sender about the delivered/read state
-                    self.send_message(
-                        &CommunicationValue::new(CommunicationType::message_state)
-                            .with_id(cv.get_id())
-                            .with_receiver(sender_id as u64)
-                            .with_sender(receiver_id as u64)
-                            .add_data(
-                                DataTypes::chat_partner_id,
-                                DataValue::Number(receiver_id as i64),
-                            )
-                            .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
-                            .add_data(
-                                DataTypes::message_state,
-                                DataValue::Str(ms.as_str().to_string()),
-                            ),
-                    )
-                    .await;
+                    // notify original sender about the delivered/read state (if read receipts are enabled)
+                    if is_read_receipts_enabled().await {
+                        self.send_message(
+                            &CommunicationValue::new(CommunicationType::message_state)
+                                .with_id(cv.get_id())
+                                .with_receiver(sender_id as u64)
+                                .with_sender(receiver_id as u64)
+                                .add_data(
+                                    DataTypes::chat_partner_id,
+                                    DataValue::Number(receiver_id as i64),
+                                )
+                                .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
+                                .add_data(
+                                    DataTypes::message_state,
+                                    DataValue::Str(ms.as_str().to_string()),
+                                ),
+                        )
+                        .await;
+                    }
                 } else {
                     // Delivery failed or timed out; mark as Sent
                     let _ = chat_files::change_message_state(
@@ -1072,7 +1085,7 @@ impl OmikronConnection {
 
             let user_resp = self
                 .clone()
-                .await_response(&user_forward, Some(Duration::from_secs(10)))
+                .await_response(&user_forward, Some(Duration::from_secs(3)))
                 .await;
 
             if let Ok(user_resp) = user_resp {
@@ -1089,22 +1102,25 @@ impl OmikronConnection {
                     ms.clone(),
                 );
 
-                self.send_message(
-                    &CommunicationValue::new(CommunicationType::message_state)
-                        .with_id(cv.get_id())
-                        .with_receiver(*sender_id)
-                        .with_sender(*receiver_id)
-                        .add_data(DataTypes::send_time, DataValue::Number(timestamp))
-                        .add_data(
-                            DataTypes::chat_partner_id,
-                            DataValue::Number(*sender_id as i64),
-                        )
-                        .add_data(
-                            DataTypes::message_state,
-                            DataValue::Str(ms.as_str().to_string()),
-                        ),
-                )
-                .await;
+                // notify original sender about the delivered/read state (if read receipts are enabled)
+                if is_read_receipts_enabled().await {
+                    self.send_message(
+                        &CommunicationValue::new(CommunicationType::message_state)
+                            .with_id(cv.get_id())
+                            .with_receiver(*sender_id)
+                            .with_sender(*receiver_id)
+                            .add_data(DataTypes::send_time, DataValue::Number(timestamp))
+                            .add_data(
+                                DataTypes::chat_partner_id,
+                                DataValue::Number(*sender_id as i64),
+                            )
+                            .add_data(
+                                DataTypes::message_state,
+                                DataValue::Str(ms.as_str().to_string()),
+                            ),
+                    )
+                    .await;
+                }
             } else {
                 // Delivery timed out/failed — update stored state and notify sender with numeric timestamp
                 let _ = chat_files::change_message_state(
@@ -1306,20 +1322,145 @@ impl OmikronConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::settings_save) {
+        if cv.is_type(CommunicationType::global_settings_save) {
             let my_id = cv.get_sender();
-            let settings_name = cv.get_data(DataTypes::settings_name).as_str().unwrap();
-            let settings_value = cv.get_data(DataTypes::payload).as_str().unwrap();
+            let Some(settings_value) = cv.get_data(DataTypes::payload).as_str() else {
+                let response = CommunicationValue::new(CommunicationType::error_invalid_data)
+                    .with_id(cv.get_id())
+                    .with_receiver(my_id)
+                    .add_data(
+                        DataTypes::message,
+                        DataValue::Str("Missing settings payload".to_string()),
+                    );
+                self.send_message(&response).await;
+                return;
+            };
 
             save_file(
-                &format!("users/{}/settings/", my_id),
+                &format!("users/{}", my_id),
+                "global.settings",
+                settings_value,
+            );
+
+            let mut response = CommunicationValue::new(CommunicationType::global_settings_save)
+                .with_receiver(my_id)
+                .with_id(cv.get_id());
+
+            if let Some(session_id) = cv.get_data(DataTypes::session_id).as_number() {
+                response = response.add_data(DataTypes::session_id, DataValue::Number(session_id));
+            }
+
+            self.send_message(&response).await;
+            return;
+        }
+
+        if cv.is_type(CommunicationType::global_settings_load) {
+            let my_id = cv.get_sender();
+            let path = format!("users/{}", my_id);
+            let name = "global.settings";
+
+            if !has_file(&path, name) {
+                let mut response = CommunicationValue::new(CommunicationType::error_not_found)
+                    .with_id(cv.get_id())
+                    .with_receiver(my_id)
+                    .add_data(DataTypes::path, DataValue::Str(name.to_string()));
+
+                if let Some(session_id) = cv.get_data(DataTypes::session_id).as_number() {
+                    response =
+                        response.add_data(DataTypes::session_id, DataValue::Number(session_id));
+                }
+
+                self.send_message(&response).await;
+                return;
+            }
+
+            let settings_value_str = load_file(&path, name);
+            let mut response = CommunicationValue::new(CommunicationType::global_settings_load)
+                .with_id(cv.get_id())
+                .with_receiver(my_id)
+                .add_data(DataTypes::payload, DataValue::Str(settings_value_str));
+
+            if let Some(session_id) = cv.get_data(DataTypes::session_id).as_number() {
+                response = response.add_data(DataTypes::session_id, DataValue::Number(session_id));
+            }
+
+            self.send_message(&response).await;
+            return;
+        }
+
+        if cv.is_type(CommunicationType::settings_save) {
+            let my_id = cv.get_sender();
+            let Some(session_id) = cv.get_data(DataTypes::session_id).as_number() else {
+                let response = CommunicationValue::new(CommunicationType::error_invalid_data)
+                    .with_id(cv.get_id())
+                    .with_receiver(my_id)
+                    .add_data(
+                        DataTypes::message,
+                        DataValue::Str("Missing session_id".to_string()),
+                    );
+                self.send_message(&response).await;
+                return;
+            };
+            let Some(settings_name) = cv.get_data(DataTypes::settings_name).as_str() else {
+                let response = CommunicationValue::new(CommunicationType::error_invalid_data)
+                    .with_id(cv.get_id())
+                    .with_receiver(my_id)
+                    .add_data(
+                        DataTypes::message,
+                        DataValue::Str("Missing settings_name".to_string()),
+                    )
+                    .add_data(DataTypes::session_id, DataValue::Number(session_id));
+                self.send_message(&response).await;
+                return;
+            };
+            let Some(settings_value) = cv.get_data(DataTypes::payload).as_str() else {
+                let response = CommunicationValue::new(CommunicationType::error_invalid_data)
+                    .with_id(cv.get_id())
+                    .with_receiver(my_id)
+                    .add_data(
+                        DataTypes::message,
+                        DataValue::Str("Missing settings payload".to_string()),
+                    )
+                    .add_data(DataTypes::session_id, DataValue::Number(session_id));
+                self.send_message(&response).await;
+                return;
+            };
+
+            if !settings_name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+                || settings_name.contains("..")
+            {
+                let response = CommunicationValue::new(CommunicationType::error_invalid_data)
+                    .with_id(cv.get_id())
+                    .with_receiver(my_id)
+                    .add_data(
+                        DataTypes::message,
+                        DataValue::Str("Invalid settings_name".to_string()),
+                    )
+                    .add_data(
+                        DataTypes::settings_name,
+                        DataValue::Str(settings_name.to_string()),
+                    )
+                    .add_data(DataTypes::session_id, DataValue::Number(session_id));
+                self.send_message(&response).await;
+                return;
+            }
+
+            save_file(
+                &format!("users/{}/settings/{}/", my_id, session_id),
                 &format!("{}.settings", settings_name),
-                &settings_value,
+                settings_value,
             );
 
             let response = CommunicationValue::new(CommunicationType::settings_save)
                 .with_receiver(my_id)
-                .with_id(cv.get_id());
+                .with_id(cv.get_id())
+                .add_data(
+                    DataTypes::settings_name,
+                    DataValue::Str(settings_name.to_string()),
+                )
+                .add_data(DataTypes::session_id, DataValue::Number(session_id));
 
             self.send_message(&response).await;
             return;
@@ -1327,16 +1468,76 @@ impl OmikronConnection {
 
         if cv.is_type(CommunicationType::settings_load) {
             let my_id = cv.get_sender();
-            let settings_name = cv.get_data(DataTypes::settings_name).as_string().unwrap();
-            let settings_value_str = load_file(
-                &format!("users/{}/settings/", my_id),
-                &format!("{}.settings", settings_name),
-            );
+            let Some(session_id) = cv.get_data(DataTypes::session_id).as_number() else {
+                let response = CommunicationValue::new(CommunicationType::error_invalid_data)
+                    .with_id(cv.get_id())
+                    .with_receiver(my_id)
+                    .add_data(
+                        DataTypes::message,
+                        DataValue::Str("Missing session_id".to_string()),
+                    );
+                self.send_message(&response).await;
+                return;
+            };
+            let Some(settings_name) = cv.get_data(DataTypes::settings_name).as_str() else {
+                let response = CommunicationValue::new(CommunicationType::error_invalid_data)
+                    .with_id(cv.get_id())
+                    .with_receiver(my_id)
+                    .add_data(
+                        DataTypes::message,
+                        DataValue::Str("Missing settings_name".to_string()),
+                    )
+                    .add_data(DataTypes::session_id, DataValue::Number(session_id));
+                self.send_message(&response).await;
+                return;
+            };
+
+            if !settings_name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+                || settings_name.contains("..")
+            {
+                let response = CommunicationValue::new(CommunicationType::error_invalid_data)
+                    .with_id(cv.get_id())
+                    .with_receiver(my_id)
+                    .add_data(
+                        DataTypes::message,
+                        DataValue::Str("Invalid settings_name".to_string()),
+                    )
+                    .add_data(
+                        DataTypes::settings_name,
+                        DataValue::Str(settings_name.to_string()),
+                    )
+                    .add_data(DataTypes::session_id, DataValue::Number(session_id));
+                self.send_message(&response).await;
+                return;
+            }
+
+            let settings_file = format!("{}.settings", settings_name);
+            let settings_path = format!("users/{}/settings/{}/", my_id, session_id);
+            if !has_file(&settings_path, &settings_file) {
+                let response = CommunicationValue::new(CommunicationType::error_not_found)
+                    .with_id(cv.get_id())
+                    .with_receiver(my_id)
+                    .add_data(
+                        DataTypes::settings_name,
+                        DataValue::Str(settings_name.to_string()),
+                    )
+                    .add_data(DataTypes::session_id, DataValue::Number(session_id));
+                self.send_message(&response).await;
+                return;
+            }
+
+            let settings_value_str = load_file(&settings_path, &settings_file);
             let response = CommunicationValue::new(CommunicationType::settings_load)
                 .with_id(cv.get_id())
                 .with_receiver(my_id)
                 .add_data(DataTypes::payload, DataValue::Str(settings_value_str))
-                .add_data(DataTypes::settings_name, DataValue::Str(settings_name));
+                .add_data(
+                    DataTypes::settings_name,
+                    DataValue::Str(settings_name.to_string()),
+                )
+                .add_data(DataTypes::session_id, DataValue::Number(session_id));
 
             self.send_message(&response).await;
             return;
@@ -1344,7 +1545,19 @@ impl OmikronConnection {
 
         if cv.is_type(CommunicationType::settings_list) {
             let my_id = cv.get_sender();
-            let settings = get_children(&format!("users/{}/settings/", my_id));
+            let Some(session_id) = cv.get_data(DataTypes::session_id).as_number() else {
+                let response = CommunicationValue::new(CommunicationType::error_invalid_data)
+                    .with_id(cv.get_id())
+                    .with_receiver(my_id)
+                    .add_data(
+                        DataTypes::message,
+                        DataValue::Str("Missing session_id".to_string()),
+                    );
+                self.send_message(&response).await;
+                return;
+            };
+
+            let settings = get_children(&format!("users/{}/settings/{}/", my_id, session_id));
             let mut settings_json = Vec::new();
             for s in settings {
                 let s = s.replace(".settings", "");
@@ -1356,7 +1569,8 @@ impl OmikronConnection {
             let response = CommunicationValue::new(CommunicationType::settings_list)
                 .with_id(cv.get_id())
                 .with_receiver(my_id)
-                .add_data(DataTypes::settings, DataValue::Array(settings_json));
+                .add_data(DataTypes::settings, DataValue::Array(settings_json))
+                .add_data(DataTypes::session_id, DataValue::Number(session_id));
 
             self.send_message(&response).await;
             return;
@@ -1365,29 +1579,38 @@ impl OmikronConnection {
 
     async fn handle_challenge(&self, cv: &CommunicationValue) {
         let conf = CONFIG.read().await;
-        let private_key = conf.get_private_key().unwrap();
+        let Some(private_key) = conf.get_private_key() else {
+            drop(conf);
+            log_t!("omikron_challenge_decryption_failed");
+            *self.auth_failure.write().await = Some(
+                "Challenge decryption failed: no private key configured on this Iota.".to_string(),
+            );
+            return;
+        };
         drop(conf);
 
-        let omikron_public_key = cv.get_data(DataTypes::public_key).as_str().unwrap();
-        let encrypted_challenge = cv.get_data(DataTypes::challenge).as_str().unwrap();
-
-        let solved_challenge = {
-            if let Ok(decrypted) = SecurePayload::new(
-                encrypted_challenge,
-                DataFormat::Base64,
-                crypto_helper::load_secret_key(&private_key).unwrap(),
-            ) {
-                if let Ok(decrypted) = decrypted
-                    .decrypt_x448(crypto_helper::load_public_key(omikron_public_key).unwrap())
-                {
-                    Some(decrypted)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+        let Some(omikron_public_key) = cv.get_data(DataTypes::public_key).as_str() else {
+            log_t!("omikron_challenge_decryption_failed");
+            return;
         };
+        let Some(encrypted_challenge) = cv.get_data(DataTypes::challenge).as_str() else {
+            log_t!("omikron_challenge_decryption_failed");
+            return;
+        };
+
+        let Some(secret_key) = crypto_helper::load_secret_key(&private_key) else {
+            log_t!("omikron_challenge_decryption_failed");
+            return;
+        };
+        let Some(pub_key) = crypto_helper::load_public_key(omikron_public_key) else {
+            log_t!("omikron_challenge_decryption_failed");
+            return;
+        };
+
+        let solved_challenge =
+            SecurePayload::new(encrypted_challenge, DataFormat::Base64, secret_key)
+                .ok()
+                .and_then(|decrypted| decrypted.decrypt_x448(pub_key).ok());
 
         if let Some(decrypted) = solved_challenge {
             let solved = decrypted.export(DataFormat::Raw);
