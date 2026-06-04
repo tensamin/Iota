@@ -26,7 +26,6 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
 
@@ -96,7 +95,6 @@
             else pkgs.writeText "iota-config.json" (builtins.toJSON cfg.settings);
 
           descriptionText = "Tensamin Iota";
-          #+ lib.optionalString cfg.useTmux " (attach TUI: tmux -S ${cfg.dataDir}/tmux.sock attach -t iota)";
         in {
           options.services.iota = {
             enable = lib.mkEnableOption "Enable the Iota service.";
@@ -132,28 +130,30 @@
               description = "Whether to open the firewall for ports used by Iota.";
             };
 
-            ttpBind = lib.mkOption {
-              type = lib.types.str;
-              default = "0.0.0.0";
-              description = "IP address to bind the TTP/QUIC server to.";
-            };
-
             bindAddress = lib.mkOption {
               type = lib.types.str;
               default = "0.0.0.0";
-              description = "IP address to bind the HTTP server to.";
+              description = "IP address to bind the Iota HTTP and TTP/QUIC servers to.";
+            };
+
+            web = {
+              bindAddress = lib.mkOption {
+                type = lib.types.str;
+                default = "0.0.0.0";
+                description = "IP address to bind the ttyd terminal server to.";
+              };
+
+              port = lib.mkOption {
+                type = lib.types.port;
+                default = 7681;
+                description = "Port to bind the ttyd terminal server to.";
+              };
             };
 
             package = lib.mkOption {
               type = lib.types.package;
               default = defaultPackage;
               description = "The Iota package to use.";
-            };
-
-            useTmux = lib.mkOption {
-              type = lib.types.bool;
-              default = true;
-              description = "Whether to run Iota inside a tmux session for shared TUI access.";
             };
 
             settings = lib.mkOption {
@@ -181,19 +181,7 @@
 
             users.groups.iota = {};
 
-            systemd.services.iota = let
-              iotaTmuxCmd = pkgs.writeShellScript "iota-tmux-cmd" ''
-                mkdir -p ${cfg.dataDir}
-                echo "[$(date)] Running Iota..."
-                ${cfg.package}/bin/iota
-                status=$?
-                echo ""
-                echo "[$(date)] Iota exited with status: $status"
-                echo "Press any key to exit..."
-                read -r -n 1
-                exit $status
-              '';
-            in {
+            systemd.services.iota = {
               description = descriptionText;
               wantedBy = ["multi-user.target"];
               after = ["network.target"];
@@ -205,29 +193,7 @@
                   Group = "iota";
                   WorkingDirectory = cfg.dataDir;
 
-                  ExecStart =
-                    if cfg.useTmux
-                    then
-                      pkgs.writeShellScript "iota-start" ''
-                        set -e
-                        export TMUX_TMPDIR=${cfg.dataDir}
-                        ${pkgs.coreutils}/bin/mkdir -p ${cfg.dataDir}
-                        ${pkgs.coreutils}/bin/chown iota:iota ${cfg.dataDir}
-
-                        echo "[iota-start] Creating tmux session..."
-                        if ! ${pkgs.tmux}/bin/tmux -S ${cfg.dataDir}/tmux.sock new-session -d -s iota "${iotaTmuxCmd}"; then
-                          echo "[iota-start] ERROR: tmux new-session failed"
-                          exit 1
-                        fi
-                        echo "[iota-start] tmux session created, waiting..."
-                        echo "[iota-start] Run 'tmux -S ${cfg.dataDir}/tmux.sock attach -t iota' to attach to the tmux session."
-
-                        while ${pkgs.tmux}/bin/tmux -S ${cfg.dataDir}/tmux.sock has-session -t iota 2>/dev/null; do
-                          sleep 2
-                        done
-                        echo "[iota-start] tmux session ended"
-                      ''
-                    else "${cfg.package}/bin/iota";
+                  ExecStart = "${pkgs.ttyd}/bin/ttyd -W -i ${cfg.web.bindAddress} -p ${toString cfg.web.port} ${cfg.package}/bin/iota";
 
                   ExecStartPre = [
                     ("+"
@@ -262,7 +228,7 @@
                   LockPersonality = true;
                   MemoryDenyWriteExecute = true;
                   Environment = [
-                    "TTP_BIND=${cfg.ttpBind}"
+                    "TTP_BIND=${cfg.bindAddress}"
                     "BIND_ADDRESS=${cfg.bindAddress}"
                   ];
                 }
@@ -272,7 +238,7 @@
             };
 
             networking.firewall = lib.mkIf cfg.openFirewall {
-              allowedTCPPorts = [1984];
+              allowedTCPPorts = [1984 cfg.web.port];
               allowedUDPPorts = [1984];
             };
           };
