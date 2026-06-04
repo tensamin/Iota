@@ -39,28 +39,43 @@
           inherit system;
           overlays = [(import rust-overlay)];
         };
+
         rustToolchain = rustPkgs.rust-bin.stable.latest.default.override {
           extensions = ["rust-src" "rust-analyzer" "clippy" "rustfmt"];
         };
       in {
         packages = {
           default = self'.packages.iota;
+
           iota = pkgs.rustPlatform.buildRustPackage {
             pname = "iota";
             version = "0.1.0";
             src = ./.;
+
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
             };
-            nativeBuildInputs = with pkgs; [cmake perl pkg-config];
-            buildInputs = with pkgs; [openssl sqlite];
+
+            nativeBuildInputs = with pkgs; [
+              cmake
+              perl
+              pkg-config
+            ];
+
+            buildInputs = with pkgs; [
+              openssl
+              sqlite
+            ];
+
             dontUseCmakeConfigure = true;
+
             preConfigure = ''
               if [ -d ../cargo-vendor-dir/ttp-core-0.1.0 ]; then
                 cp ${ttp}/ttp-codec.json ../cargo-vendor-dir/ttp-codec.json
               fi
             '';
+
             postInstall = ''
               mv $out/bin/iota-core $out/bin/iota
               for f in $out/bin/*; do
@@ -69,13 +84,24 @@
                 fi
               done
             '';
+
             passthru.dataDir = "/var/lib/iota";
           };
         };
 
         devShells.default = pkgs.mkShell {
-          nativeBuildInputs = with pkgs; [rustToolchain git cmake perl pkg-config];
-          buildInputs = with pkgs; [openssl sqlite];
+          nativeBuildInputs = with pkgs; [
+            rustToolchain
+            git
+            cmake
+            perl
+            pkg-config
+          ];
+
+          buildInputs = with pkgs; [
+            openssl
+            sqlite
+          ];
         };
       };
 
@@ -87,7 +113,10 @@
           ...
         }: let
           cfg = config.services.iota;
-          defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default or (throw "iota: no pre-built package for system ${pkgs.stdenv.hostPlatform.system}");
+
+          defaultPackage =
+            self.packages.${pkgs.stdenv.hostPlatform.system}.default
+            or (throw "iota: no pre-built package for system ${pkgs.stdenv.hostPlatform.system}");
 
           configFile =
             if cfg.settingsFile != null
@@ -95,6 +124,61 @@
             else pkgs.writeText "iota-config.json" (builtins.toJSON cfg.settings);
 
           descriptionText = "Tensamin Iota";
+
+          tmuxSessionName = "iota";
+          tmuxSocket = "${cfg.dataDir}/tmux.sock";
+
+          setupScript = pkgs.writeShellScript "iota-setup" ''
+            set -euo pipefail
+
+            mkdir -p ${lib.escapeShellArg cfg.dataDir}/certs
+
+            ${lib.optionalString (cfg.certFile != null) ''
+              ln -sf ${lib.escapeShellArg cfg.certFile} ${lib.escapeShellArg cfg.dataDir}/certs/cert.pem
+            ''}
+
+            ${lib.optionalString (cfg.keyFile != null) ''
+              ln -sf ${lib.escapeShellArg cfg.keyFile} ${lib.escapeShellArg cfg.dataDir}/certs/cert.key
+            ''}
+
+            install -m 644 ${lib.escapeShellArg configFile} ${lib.escapeShellArg cfg.dataDir}/config.json
+
+            chown -R iota:iota ${lib.escapeShellArg cfg.dataDir}
+          '';
+
+          iotaSessionScript = pkgs.writeShellScript "iota-tmux-session" ''
+            set -euo pipefail
+
+            socket=${lib.escapeShellArg tmuxSocket}
+            session=${lib.escapeShellArg tmuxSessionName}
+
+            if ! ${pkgs.tmux}/bin/tmux -S "$socket" has-session -t "$session" 2>/dev/null; then
+              ${pkgs.tmux}/bin/tmux -S "$socket" new-session \
+                -d \
+                -s "$session" \
+                -c ${lib.escapeShellArg cfg.dataDir} \
+                ${lib.escapeShellArg "${cfg.package}/bin/iota"}
+            fi
+
+            while ${pkgs.tmux}/bin/tmux -S "$socket" has-session -t "$session" 2>/dev/null; do
+              sleep 5
+            done
+
+            exit 1
+          '';
+
+          ttydScript = pkgs.writeShellScript "iota-ttyd" ''
+            set -euo pipefail
+
+            exec ${pkgs.ttyd}/bin/ttyd \
+              -W \
+              -i ${lib.escapeShellArg cfg.web.bindAddress} \
+              -p ${lib.escapeShellArg (toString cfg.web.port)} \
+              ${pkgs.tmux}/bin/tmux \
+              -S ${lib.escapeShellArg tmuxSocket} \
+              attach-session \
+              -t ${lib.escapeShellArg tmuxSessionName}
+          '';
         in {
           options.services.iota = {
             enable = lib.mkEnableOption "Enable the Iota service.";
@@ -181,8 +265,8 @@
 
             users.groups.iota = {};
 
-            systemd.services.iota = {
-              description = descriptionText;
+            systemd.services.iota-session = {
+              description = "${descriptionText} tmux session";
               wantedBy = ["multi-user.target"];
               after = ["network.target"];
 
@@ -193,21 +277,15 @@
                   Group = "iota";
                   WorkingDirectory = cfg.dataDir;
 
-                  ExecStart = "${pkgs.ttyd}/bin/ttyd -W -i ${cfg.web.bindAddress} -p ${toString cfg.web.port} ${cfg.package}/bin/iota";
-
                   ExecStartPre = [
-                    ("+"
-                      + pkgs.writeShellScript "iota-setup" ''
-                        mkdir -p ${cfg.dataDir}/certs
-
-                        ${lib.optionalString (cfg.certFile != null) "ln -sf ${cfg.certFile} ${cfg.dataDir}/certs/cert.pem"}
-                        ${lib.optionalString (cfg.keyFile != null) "ln -sf ${cfg.keyFile} ${cfg.dataDir}/certs/cert.key"}
-
-                        install -m 644 ${configFile} ${cfg.dataDir}/config.json
-
-                        chown -R iota:iota ${cfg.dataDir}
-                      '')
+                    ("+" + setupScript)
                   ];
+
+                  ExecStart = iotaSessionScript;
+
+                  ExecStop = ''
+                    ${pkgs.tmux}/bin/tmux -S ${lib.escapeShellArg tmuxSocket} kill-session -t ${lib.escapeShellArg tmuxSessionName}
+                  '';
 
                   Restart = "always";
                   RestartSec = "5s";
@@ -235,6 +313,41 @@
                 // lib.optionalAttrs (cfg.environmentFiles != []) {
                   EnvironmentFile = cfg.environmentFiles;
                 };
+            };
+
+            systemd.services.iota = {
+              description = descriptionText;
+              wantedBy = ["multi-user.target"];
+              requires = ["iota-session.service"];
+              after = ["iota-session.service" "network.target"];
+
+              serviceConfig = {
+                Type = "simple";
+                User = "iota";
+                Group = "iota";
+                WorkingDirectory = cfg.dataDir;
+
+                ExecStart = ttydScript;
+
+                Restart = "always";
+                RestartSec = "5s";
+
+                AmbientCapabilities = ["CAP_NET_BIND_SERVICE"];
+                CapabilityBoundingSet = ["CAP_NET_BIND_SERVICE"];
+
+                ProtectSystem = "strict";
+                ProtectHome = true;
+                PrivateTmp = true;
+                NoNewPrivileges = true;
+                ReadWritePaths = [cfg.dataDir];
+                ProtectKernelTunables = true;
+                ProtectKernelModules = true;
+                ProtectControlGroups = true;
+                RestrictRealtime = true;
+                RestrictSUIDSGID = true;
+                LockPersonality = true;
+                MemoryDenyWriteExecute = true;
+              };
             };
 
             networking.firewall = lib.mkIf cfg.openFirewall {
