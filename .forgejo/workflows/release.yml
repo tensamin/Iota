@@ -40,6 +40,9 @@ jobs:
         run: |
           set -eu
 
+          export DOCKER_CONFIG="$(mktemp -d)"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+
           DOCKER_USER="$(printf '%s' "$DOCKER_USER" | tr -d '\r\n')"
           DOCKER_PASSWD="$(printf '%s' "$DOCKER_PASSWD" | tr -d '\r\n')"
 
