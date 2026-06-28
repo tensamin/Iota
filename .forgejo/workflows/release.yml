@@ -33,11 +33,17 @@ jobs:
       - name: Install docker
         run: nix profile add nixpkgs#docker
 
-      - name: Login
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USER }}
-          password: ${{ secrets.DOCKER_PASSWD }}
+      - name: Login to Docker Hub
+        env:
+          DOCKER_USER: ${{ secrets.DOCKER_USER }}
+          DOCKER_PASSWD: ${{ secrets.DOCKER_PASSWD }}
+        run: |
+          set -eu
+
+          DOCKER_USER="$(printf '%s' "$DOCKER_USER" | tr -d '\r\n')"
+          DOCKER_PASSWD="$(printf '%s' "$DOCKER_PASSWD" | tr -d '\r\n')"
+
+          printf '%s' "$DOCKER_PASSWD" | docker login docker.io --username "$DOCKER_USER" --password-stdin
 
       - name: Build & Push
         run: |
