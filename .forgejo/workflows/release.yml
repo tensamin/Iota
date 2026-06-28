@@ -62,9 +62,14 @@ jobs:
               echo "DOCKER_USER must be only the Docker Hub username, not username:token"
               exit 1
               ;;
+            *[!a-z0-9_-]*)
+              echo "DOCKER_USER must be only the Docker Hub username/namespace, using lowercase letters, numbers, '_' or '-'"
+              echo "Do not use an email address, repository name, JSON value, or username:token pair."
+              exit 1
+              ;;
           esac
 
-          printf '%s' "$DOCKER_PASSWD" | docker login https://index.docker.io/v1/ --username "$DOCKER_USER" --password-stdin
+          printf '%s' "$DOCKER_PASSWD" | docker login --username "$DOCKER_USER" --password-stdin
 
       - name: Build & Push
         run: |
