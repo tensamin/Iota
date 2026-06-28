@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use json::JsonValue;
 use std::any::Any;
 use std::sync::Arc;
-use ttp_core::CommunicationValue;
+use mtp::codec::CommunicationValue;
 use uuid::Uuid;
 
 pub struct Category {
@@ -95,7 +95,7 @@ impl Interactable for Category {
         v
     }
     async fn run_function(&self, _cv: CommunicationValue) -> CommunicationValue {
-        CommunicationValue::new(CommunicationType::error_internal)
+        CommunicationValue::new(CommunicationType::ErrorInternal)
     }
     fn to_json(&self) -> JsonValue {
         let mut v = JsonValue::new_object();

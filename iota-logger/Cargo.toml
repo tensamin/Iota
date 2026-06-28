@@ -7,7 +7,7 @@ edition = "2024"
 iota-state = { path = "../iota-state" }
 iota-util = { path = "../iota-util" }
 
-ttp-core = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-core" }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git" }
 
 ratatui = "0.30.0"
 json = "0.12.4"

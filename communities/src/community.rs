@@ -210,7 +210,7 @@ impl Community {
             for interactable in target_interactables.iter() {
                 if interactable.get_name() == name {
                     if interactable.get_codec() == "category" {
-                        return CommunicationValue::new(CommunicationType::error_internal);
+                        return CommunicationValue::new(CommunicationType::ErrorInternal);
                     } else {
                         // cannot move a value of type dyn Interactable the size of dyn Interactable cannot be statically determined (rustc E0161)
                         return interactable.run_function(cv.clone()).await;
@@ -231,12 +231,12 @@ impl Community {
                             .run_function(cv.clone())
                             .await;
                     } else {
-                        return CommunicationValue::new(CommunicationType::error_internal);
+                        return CommunicationValue::new(CommunicationType::ErrorInternal);
                     }
                 }
             }
         }
-        CommunicationValue::new(CommunicationType::add_conversation)
+        CommunicationValue::new(CommunicationType::AddConversation)
     }
 
     pub async fn save(&self) {

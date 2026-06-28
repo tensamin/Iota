@@ -8,8 +8,7 @@ iota-logger = { path = "../iota-logger" }
 iota-state = { path = "../iota-state" }
 iota-util = { path = "../iota-util" }
 
-ttp-core = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-core" }
-ttp-native = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-native" }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git" }
 
 aes-gcm = "0.10.3"
 base64 = "0.22.1"

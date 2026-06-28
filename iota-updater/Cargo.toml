@@ -6,8 +6,7 @@ edition = "2024"
 [dependencies]
 iota-logger = { path = "../iota-logger" }
 
-ttp-core = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-core" }
-ttp-native = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-native" }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git" }
 
 json = "*"
 pnet = "0.35.0"

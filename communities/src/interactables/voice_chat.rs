@@ -116,8 +116,8 @@ impl Interactable for VoiceChat {
         data
     }
     async fn run_function(&self, cv: CommunicationValue) -> CommunicationValue {
-        let payload = cv.get_data(DataTypes::payload).unwrap();
-        let function = cv.get_data(DataTypes::function).unwrap().as_str().unwrap();
+        let payload = cv.get_data(DataType::Payload).unwrap();
+        let function = cv.get_data(DataType::Function).unwrap().as_str().unwrap();
 
         if function == "get_call" {
             let sender_id = payload["sender_id"].as_str().unwrap();
@@ -129,12 +129,12 @@ impl Interactable for VoiceChat {
             response_payload["message"] = JsonValue::String(message_id.to_string());
             response_payload["send_time"] = JsonValue::String(send_time.to_string());
 
-            return CommunicationValue::new(CommunicationType::function)
+            return CommunicationValue::new(CommunicationType::Function)
                 .with_id(cv.get_id())
-                .add_data_str(DataTypes::name, self.name.clone())
-                .add_data_str(DataTypes::path, self.path.clone())
-                .add_data_str(DataTypes::result, "getting_call".to_string())
-                .add_data(DataTypes::payload, response_payload);
+                .add_data_str(DataType::Name, self.name.clone())
+                .add_data_str(DataType::Path, self.path.clone())
+                .add_data_str(DataType::Result, "getting_call".to_string())
+                .add_data(DataType::Payload, response_payload);
         }
 
         if function == "update_user_state" {
@@ -153,18 +153,18 @@ impl Interactable for VoiceChat {
                 user.streaming = streaming;
             }
             let mut response_payload = JsonValue::new_object();
-            response_payload["user_id"] = JsonValue::String(user_id.to_string());
+            response_payload["user_id"] = JsonValue::Number(user_id);
             response_payload["state"] = JsonValue::String(state.to_string());
             response_payload["streaming"] = JsonValue::Boolean(streaming);
 
-            return CommunicationValue::new(CommunicationType::update)
+            return CommunicationValue::new(CommunicationType::Update)
                 .with_id(cv.get_id())
-                .add_data_str(DataTypes::name, self.name.clone())
-                .add_data_str(DataTypes::path, self.path.clone())
-                .add_data_str(DataTypes::result, "user_changed".to_string())
-                .add_data(DataTypes::payload, response_payload);
+                .add_data_str(DataType::Name, self.name.clone())
+                .add_data_str(DataType::Path, self.path.clone())
+                .add_data_str(DataType::Result, "user_changed".to_string())
+                .add_data(DataType::Payload, response_payload);
         }
-        CommunicationValue::new(CommunicationType::error_internal).with_id(cv.get_id())
+        CommunicationValue::new(CommunicationType::ErrorInternal).with_id(cv.get_id())
     }
 
     fn to_json(&self) -> JsonValue {

@@ -12,7 +12,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
-use ttp_core::{CommunicationType, CommunicationValue, DataTypes};
+use mtp::codec::{CommunicationType, CommunicationValue, DataType};
 use uuid::Uuid;
 pub struct TextChat {
     id: Uuid,
@@ -193,21 +193,21 @@ impl Interactable for TextChat {
         JsonValue::new_object()
     }
     async fn run_function(&self, cv: CommunicationValue) -> CommunicationValue {
-        let payload = cv.get_data(DataTypes::payload).as_container().unwrap();
-        if cv.get_data(DataTypes::function).as_str().unwrap() == "get_messages" {
-            let amount = payload.get(DataTypes::amount).as_i64().unwrap();
+        let payload = cv.get_data(DataType::Payload).as_container().unwrap();
+        if cv.get_data(DataType::Function).as_str().unwrap() == "get_messages" {
+            let amount = payload.get(DataType::Amount).as_i64().unwrap();
             let loaded_messages = payload["loaded_messages"].as_i64().unwrap();
             let messages = self.get_messages(loaded_messages, amount).clone();
             let mut payload = JsonValue::new_object();
             payload["messages"] = messages;
-            return CommunicationValue::new(CommunicationType::function)
+            return CommunicationValue::new(CommunicationType::Function)
                 .with_id(cv.get_id())
-                .add_data_str(DataTypes::name, self.name.clone())
-                .add_data_str(DataTypes::path, self.path.clone())
-                .add_data_str(DataTypes::result, "message_chunk".to_string())
-                .add_data(DataTypes::payload, payload);
+                .add_data_str(DataType::Name, self.name.clone())
+                .add_data_str(DataType::Path, self.path.clone())
+                .add_data_str(DataType::Result, "message_chunk".to_string())
+                .add_data(DataType::Payload, payload);
         }
-        if cv.get_data(DataTypes::function).unwrap().as_str().unwrap() == "send_message" {
+        if cv.get_data(DataType::Function).unwrap().as_str().unwrap() == "send_message" {
             let message = payload["message"].as_str().unwrap();
             let milliseconds_timestamp: u128 = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -220,12 +220,12 @@ impl Interactable for TextChat {
             distribution_payload["sender_id"] = JsonValue::String(cv.get_sender().to_string());
             distribution_payload["send_time"] =
                 JsonValue::String(milliseconds_timestamp.to_string());
-            let distribution = CommunicationValue::new(CommunicationType::update)
+            let distribution = CommunicationValue::new(CommunicationType::Update)
                 .with_id(cv.get_id())
-                .add_data_str(DataTypes::name, self.name.clone())
-                .add_data_str(DataTypes::path, self.path.clone())
-                .add_data_str(DataTypes::result, "message_live".to_string())
-                .add_data(DataTypes::payload, distribution_payload);
+                .add_data_str(DataType::Name, self.name.clone())
+                .add_data_str(DataType::Path, self.path.clone())
+                .add_data_str(DataType::Result, "message_live".to_string())
+                .add_data(DataType::Payload, distribution_payload);
 
             let connections: HashMap<i64, Vec<Arc<CommunityConnection>>> =
                 self.get_community().get_connections().await.clone();
@@ -236,14 +236,14 @@ impl Interactable for TextChat {
                     cd.send_message(&distribution).await;
                 }
             }
-            return CommunicationValue::new(CommunicationType::function)
+            return CommunicationValue::new(CommunicationType::Function)
                 .with_id(cv.get_id())
-                .add_data_str(DataTypes::name, self.name.clone())
-                .add_data_str(DataTypes::path, self.path.clone())
-                .add_data_str(DataTypes::result, "message_received".to_string())
-                .add_data(DataTypes::payload, JsonValue::new_object());
+                .add_data_str(DataType::Name, self.name.clone())
+                .add_data_str(DataType::Path, self.path.clone())
+                .add_data_str(DataType::Result, "message_received".to_string())
+                .add_data(DataType::Payload, JsonValue::new_object());
         }
-        CommunicationValue::new(CommunicationType::error_internal).with_id(cv.get_id())
+        CommunicationValue::new(CommunicationType::ErrorInternal).with_id(cv.get_id())
     }
     fn to_json(&self) -> JsonValue {
         JsonValue::new_object()

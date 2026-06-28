@@ -9,8 +9,7 @@ iota-storage = { path = "../iota-storage" }
 iota-state = { path = "../iota-state" }
 iota-util = { path = "../iota-util" }
 iota-logger = { path = "../iota-logger" }
-ttp-core = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-core" }
-ttp-native = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-native" }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git" }
 
 actix-web = { version = "4", features = ["rustls-0_23"] }
 actix-web-actors = "4"
@@ -24,7 +23,15 @@ futures = "*"
 futures-util = "*"
 hex = "*"
 hkdf = "0.12.4"
-hyper = { version = "1.8.1", features = ["capi", "client", "full", "http1", "http2", "nightly", "server"] }
+hyper = { version = "1.8.1", features = [
+    "capi",
+    "client",
+    "full",
+    "http1",
+    "http2",
+    "nightly",
+    "server",
+] }
 hyper-util = { version = "*" }
 json = "*"
 lazy_static = "1.5.0"

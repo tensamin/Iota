@@ -4,6 +4,7 @@ use iota_state::{ACTIVE_TASKS, RELOAD, SHUTDOWN};
 use iota_storage::users::{user_manager, user_profile::UserProfile};
 use iota_storage::util::config_util::CONFIG;
 use iota_util::{crypto_helper, file_util};
+use mtp::codec::{CommunicationType, CommunicationValue};
 use omikron_connector::omikron_connection::OMIKRON_CONNECTION;
 use ratatui::{
     Frame,
@@ -12,7 +13,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
-use ttp_core::{CommunicationType, CommunicationValue};
 use uuid::Uuid;
 
 use std::{
@@ -442,7 +442,7 @@ pub async fn run_command(command: &str) {
         }
         ["user", "remove", username] => {
             if let Some(user) = user_manager::get_user_by_username(username) {
-                let msg = CommunicationValue::new(CommunicationType::delete_user)
+                let msg = CommunicationValue::new(CommunicationType::DeleteUser)
                     .with_sender(user.user_id as u64);
                 OMIKRON_CONNECTION.send_message(&msg).await;
                 user_manager::remove_user(user.user_id);
@@ -510,7 +510,7 @@ pub async fn ping(time: u64) {
 
     let response_cv = conn
         .await_response(
-            &CommunicationValue::new(CommunicationType::ping),
+            &CommunicationValue::new(CommunicationType::Ping),
             Some(Duration::from_secs(time)),
         )
         .await;

@@ -10,13 +10,24 @@ use iota_storage::util::{chat_files, chats_util};
 use iota_util::crypto_helper;
 use iota_util::crypto_util::{DataFormat, SecurePayload};
 use iota_util::file_util::{get_children, load_file, save_file};
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+use mtp::transport::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
-use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
-use ttp_native::{Receiver, Sender};
 use uuid::Uuid;
+
+fn typed_container(items: Vec<(DataType, DataValue)>) -> DataValue {
+    use mtp::type_map::{DataTypeId, TypeMap};
+    let tm = TypeMap::latest();
+    DataValue::Container(
+        items
+            .into_iter()
+            .filter_map(|(dt, dv)| tm.data_id_enum(dt).map(|id| (DataTypeId(id), dv)))
+            .collect(),
+    )
+}
 
 // ============================================================================
 // Waiting Task System
@@ -97,76 +108,76 @@ impl ClientConnection {
     // -------------------------------------------------------------------------
     async fn handle_ping(self: Arc<Self>, cv: CommunicationValue) {
         // Update our ping if provided
-        if let DataValue::Number(last_ping) = cv.get_data(DataTypes::last_ping) {
+        if let DataValue::SignedNumber(last_ping) = cv.get_data(DataType::LastPing) {
             let current = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis();
             let mut ping_guard = self.ping.write().await;
-            *ping_guard = current as i64 - last_ping;
+            *ping_guard = current as i64 - *last_ping as i64;
         }
 
         // Send pong response
-        let response = CommunicationValue::new(CommunicationType::pong)
+        let response = CommunicationValue::new(CommunicationType::Pong)
             .with_id(cv.get_id())
-            .add_data(DataTypes::ping_iota, DataValue::Number(0));
+            .add_typed_default(DataType::PingIota, DataValue::SignedNumber(0));
 
         self.send_message(&response).await;
     }
 
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
-        if !cv.is_type(CommunicationType::ping) && !cv.is_type(CommunicationType::pong) {
+        if !cv.is_type(CommunicationType::Ping) && !cv.is_type(CommunicationType::Pong) {
             log_cv_in!(&cv);
         }
 
         let _msg_id = cv.get_id();
 
-        if cv.is_type(CommunicationType::ping) {
+        if cv.is_type(CommunicationType::Ping) {
             self.handle_ping(cv).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::challenge) {
+        if cv.is_type(CommunicationType::Challenge) {
             self.handle_challenge(&cv).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::save_app_data) {
+        if cv.is_type(CommunicationType::SaveAppData) {
             let sender_id = cv.get_sender();
             let _app_data = cv
-                .get_data(DataTypes::app_data)
+                .get_data(DataType::AppData)
                 .as_str()
                 .unwrap_or("")
                 .to_string();
 
-            let res = CommunicationValue::new(CommunicationType::save_app_data)
+            let res = CommunicationValue::new(CommunicationType::SaveAppData)
                 .with_id(cv.get_id())
                 .with_receiver(sender_id);
             self.send_message(&res).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::load_app_data) {
+        if cv.is_type(CommunicationType::LoadAppData) {
             let sender_id = cv.get_sender();
             let app_data = String::new();
 
-            let res = CommunicationValue::new(CommunicationType::load_app_data)
+            let res = CommunicationValue::new(CommunicationType::LoadAppData)
                 .with_id(cv.get_id())
                 .with_receiver(sender_id)
-                .add_data(DataTypes::app_data, DataValue::Str(app_data));
+                .add_typed_default(DataType::AppData, DataValue::Str(app_data));
             self.send_message(&res).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::create_app) {
+        if cv.is_type(CommunicationType::CreateApp) {
             let sender_id = cv.get_sender() as i64;
             let app_identifier = cv
-                .get_data(DataTypes::app_identifier)
+                .get_data(DataType::AppIdentifier)
                 .as_str()
                 .unwrap_or("")
                 .to_string();
             let app_public_key = cv
-                .get_data(DataTypes::app_public_key)
+                .get_data(DataType::AppPublicKey)
                 .as_str()
                 .unwrap_or("")
                 .to_string();
@@ -180,17 +191,17 @@ impl ClientConnection {
                 }
             }
 
-            let res = CommunicationValue::new(CommunicationType::create_app)
+            let res = CommunicationValue::new(CommunicationType::CreateApp)
                 .with_id(cv.get_id())
                 .with_receiver(sender_id as u64);
             self.send_message(&res).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::delete_app) {
+        if cv.is_type(CommunicationType::DeleteApp) {
             let sender_id = cv.get_sender() as i64;
             let app_identifier = cv
-                .get_data(DataTypes::app_identifier)
+                .get_data(DataType::AppIdentifier)
                 .as_str()
                 .unwrap_or("")
                 .to_string();
@@ -204,30 +215,30 @@ impl ClientConnection {
                 }
             }
 
-            let res = CommunicationValue::new(CommunicationType::delete_app)
+            let res = CommunicationValue::new(CommunicationType::DeleteApp)
                 .with_id(cv.get_id())
                 .with_receiver(sender_id as u64);
             self.send_message(&res).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::client_connected) {
-            let user_id = cv.get_data(DataTypes::user_id).as_number().unwrap_or(0) as i64;
-            let _session_id = cv.get_data(DataTypes::session_id).as_number().unwrap_or(0) as i64;
+        if cv.is_type(CommunicationType::ClientConnected) {
+            let user_id = cv.get_data(DataType::UserId).as_number().unwrap_or(0) as i64;
+            let _session_id = cv.get_data(DataType::SessionId).as_number().unwrap_or(0) as i64;
 
             let contacts = chats_util::get_users(user_id);
             let mut contacts_array = Vec::new();
 
             for (i, contact) in contacts.iter().enumerate() {
                 let mut contact_container = Vec::new();
-                contact_container.push((DataTypes::user_id, DataValue::Number(contact.user_id)));
+                contact_container.push((DataType::UserId, DataValue::SignedNumber(contact.user_id as i128)));
                 contact_container.push((
-                    DataTypes::last_message_at,
-                    DataValue::Number(contact.last_message_at.unwrap_or(0)),
+                    DataType::LastMessageAt,
+                    DataValue::SignedNumber(contact.last_message_at.unwrap_or(0) as i128),
                 ));
 
                 if let Some(ref name) = contact.user_name {
-                    contact_container.push((DataTypes::username, DataValue::Str(name.clone())));
+                    contact_container.push((DataType::Username, DataValue::Str(name.clone())));
                 }
 
                 let amount = if i < 10 { 20 } else { 1 };
@@ -242,12 +253,12 @@ impl ClientConnection {
                     let message_state = m["message_state"].as_str().unwrap_or("").to_string();
 
                     let mut msg_container = Vec::new();
-                    msg_container.push((DataTypes::send_time, DataValue::Number(message_time)));
-                    msg_container.push((DataTypes::content, DataValue::Str(content.clone())));
-                    msg_container.push((DataTypes::message_state, DataValue::Str(message_state)));
-                    msg_container.push((DataTypes::height, DataValue::Number(height)));
-                    msg_container.push((DataTypes::sent_by_self, DataValue::Bool(sent_by_self)));
-                    msg_array.push(DataValue::Container(msg_container));
+                    msg_container.push((DataType::SendTime, DataValue::SignedNumber(message_time as i128)));
+                    msg_container.push((DataType::Content, DataValue::Str(content.clone())));
+                    msg_container.push((DataType::MessageState, DataValue::Str(message_state)));
+                    msg_container.push((DataType::Height, DataValue::SignedNumber(height as i128)));
+                    msg_container.push((DataType::SentBySelf, DataValue::Bool(sent_by_self)));
+                    msg_array.push(typed_container(msg_container));
 
                     if msg_array.len() == 1 {
                         let sender_id = if sent_by_self {
@@ -256,19 +267,19 @@ impl ClientConnection {
                             contact.user_id
                         };
                         let mut last_msg = Vec::new();
-                        last_msg.push((DataTypes::content, DataValue::Str(content)));
-                        last_msg.push((DataTypes::sender_id, DataValue::Number(sender_id)));
+                        last_msg.push((DataType::Content, DataValue::Str(content)));
+                        last_msg.push((DataType::SenderId, DataValue::SignedNumber(sender_id as i128)));
                         contact_container
-                            .push((DataTypes::last_message, DataValue::Container(last_msg)));
+                            .push((DataType::LastMessage, typed_container(last_msg)));
                     }
                 }
-                contact_container.push((DataTypes::messages, DataValue::Array(msg_array)));
-                contacts_array.push(DataValue::Container(contact_container));
+                contact_container.push((DataType::Messages, DataValue::Array(msg_array)));
+                contacts_array.push(typed_container(contact_container));
             }
 
-            let resp = CommunicationValue::new(CommunicationType::client_connected)
+            let resp = CommunicationValue::new(CommunicationType::ClientConnected)
                 .with_id(cv.get_id())
-                .add_data(DataTypes::contacts, DataValue::Array(contacts_array));
+                .add_typed_default(DataType::Contacts, DataValue::Array(contacts_array));
             self.send_message(&resp).await;
             return;
         }
@@ -277,15 +288,15 @@ impl ClientConnection {
         // Direct messages                                  //
         // ************************************************ //
 
-        if cv.is_type(CommunicationType::message_state) {
+        if cv.is_type(CommunicationType::MessageState) {
             let sender_id = &cv.get_sender();
-            let receiver_id = match cv.get_data(DataTypes::chat_partner_id).as_number() {
+            let receiver_id = match cv.get_data(DataType::ChatPartnerId).as_number() {
                 Some(id) => id,
                 _ => return,
             };
 
             // Parse send_time robustly: accept numeric or string, fallback to current time
-            let send_time_val = cv.get_data(DataTypes::send_time);
+            let send_time_val = cv.get_data(DataType::SendTime);
             let now_i64 = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -302,28 +313,25 @@ impl ClientConnection {
                 timestamp_i64,
                 receiver_id as i64,
                 *sender_id as i64,
-                MessageState::from_str(
-                    cv.get_data(DataTypes::message_state).as_str().unwrap_or(""),
-                ),
+                MessageState::from_str(cv.get_data(DataType::MessageState).as_str().unwrap_or("")),
             );
         }
 
         // Incoming storsed message: store for the recipient, attempt local delivery, notify sender.
-        if cv.is_type(CommunicationType::message_send) {
+        if cv.is_type(CommunicationType::MessageSend) {
             let sender_id: u64 = cv.get_sender();
 
             // parse receiver_id (the storage owner for this incoming message)
-            let receiver_id: i64 = if let Some(n) = cv.get_data(DataTypes::receiver_id).as_number()
-            {
+            let receiver_id: i64 = if let Some(n) = cv.get_data(DataType::ReceiverId).as_number() {
                 n as i64
-            } else if let Some(s) = cv.get_data(DataTypes::receiver_id).as_str() {
+            } else if let Some(s) = cv.get_data(DataType::ReceiverId).as_str() {
                 s.parse::<i64>().unwrap_or(0)
             } else {
                 0
             };
 
             // parse send_time robustly (number or string), fallback to now
-            let send_time_val = cv.get_data(DataTypes::send_time);
+            let send_time_val = cv.get_data(DataType::SendTime);
             let now_i64 = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -339,12 +347,12 @@ impl ClientConnection {
 
             // content may be missing; default to empty string
             let content = cv
-                .get_data(DataTypes::content)
+                .get_data(DataType::Content)
                 .as_str()
                 .unwrap_or("")
                 .to_string();
 
-            let height = cv.get_data(DataTypes::height).as_number().unwrap_or(0) as i64;
+            let height = cv.get_data(DataType::Height).as_number().unwrap_or(0) as i64;
 
             let is_local = iota_storage::users::user_manager::get_user(receiver_id).is_some();
 
@@ -371,19 +379,19 @@ impl ClientConnection {
             );
 
             // send confirmation back to sender
-            let conf_msg = CommunicationValue::new(CommunicationType::message_send)
+            let conf_msg = CommunicationValue::new(CommunicationType::MessageSend)
                 .with_id(cv.get_id())
                 .with_receiver(sender_id as u64);
             self.send_message(&conf_msg).await;
 
             if !is_local {
-                let fw_msg = CommunicationValue::new(CommunicationType::message_other_iota)
+                let fw_msg = CommunicationValue::new(CommunicationType::MessageOtherIota)
                     .with_id(cv.get_id())
                     .with_receiver(receiver_id as u64)
                     .with_sender(sender_id as u64)
-                    .add_data(DataTypes::height, DataValue::Number(height))
-                    .add_data(DataTypes::content, DataValue::Str(content))
-                    .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64));
+                    .add_typed_default(DataType::Height, DataValue::SignedNumber(height as i128))
+                    .add_typed_default(DataType::Content, DataValue::Str(content))
+                    .add_typed_default(DataType::SendTime, DataValue::SignedNumber(timestamp_i64 as i128));
 
                 let other_iota_resp = self
                     .clone()
@@ -392,7 +400,7 @@ impl ClientConnection {
 
                 if let Ok(resp) = other_iota_resp {
                     let ms_raw = resp
-                        .get_data(DataTypes::message_state)
+                        .get_data(DataType::MessageState)
                         .as_string()
                         .unwrap_or_else(|| "".to_string());
                     let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
@@ -405,17 +413,17 @@ impl ClientConnection {
                     );
 
                     self.send_message(
-                        &CommunicationValue::new(CommunicationType::message_state)
+                        &CommunicationValue::new(CommunicationType::MessageState)
                             .with_id(cv.get_id())
                             .with_receiver(sender_id as u64)
                             .with_sender(receiver_id as u64)
-                            .add_data(
-                                DataTypes::chat_partner_id,
-                                DataValue::Number(receiver_id as i64),
+                            .add_typed_default(
+                                DataType::ChatPartnerId,
+                                DataValue::SignedNumber(receiver_id as i128),
                             )
-                            .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
-                            .add_data(
-                                DataTypes::message_state,
+                            .add_typed_default(DataType::SendTime, DataValue::SignedNumber(timestamp_i64 as i128))
+                            .add_typed_default(
+                                DataType::MessageState,
                                 DataValue::Str(ms.as_str().to_string()),
                             ),
                     )
@@ -429,17 +437,17 @@ impl ClientConnection {
                     );
 
                     self.send_message(
-                        &CommunicationValue::new(CommunicationType::message_state)
+                        &CommunicationValue::new(CommunicationType::MessageState)
                             .with_id(cv.get_id())
                             .with_receiver(sender_id as u64)
                             .with_sender(receiver_id as u64)
-                            .add_data(
-                                DataTypes::chat_partner_id,
-                                DataValue::Number(receiver_id as i64),
+                            .add_typed_default(
+                                DataType::ChatPartnerId,
+                                DataValue::SignedNumber(receiver_id as i128),
                             )
-                            .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
-                            .add_data(
-                                DataTypes::message_state,
+                            .add_typed_default(DataType::SendTime, DataValue::SignedNumber(timestamp_i64 as i128))
+                            .add_typed_default(
+                                DataType::MessageState,
                                 DataValue::Str(MessageState::Sent.as_str().to_string()),
                             ),
                     )
@@ -448,16 +456,16 @@ impl ClientConnection {
                 return;
             } else {
                 // Build a live-delivery message for the local client (recipient)
-                let user_forward = CommunicationValue::new(CommunicationType::message_live)
+                let user_forward = CommunicationValue::new(CommunicationType::MessageLive)
                     .with_id(cv.get_id())
                     .with_receiver(receiver_id as u64)
-                    .add_data(DataTypes::sender_id, DataValue::Number(sender_id as i64))
-                    .add_data(
-                        DataTypes::message,
-                        DataValue::Container(vec![
-                            (DataTypes::content, DataValue::Str(content.clone())),
-                            (DataTypes::send_time, DataValue::Number(timestamp_i64)),
-                            (DataTypes::height, DataValue::Number(height)),
+                    .add_typed_default(DataType::SenderId, DataValue::SignedNumber(sender_id as i128))
+                    .add_typed_default(
+                        DataType::Message,
+                        typed_container(vec![
+                            (DataType::Content, DataValue::Str(content.clone())),
+                            (DataType::SendTime, DataValue::SignedNumber(timestamp_i64 as i128)),
+                            (DataType::Height, DataValue::SignedNumber(height as i128)),
                         ]),
                     );
 
@@ -469,7 +477,7 @@ impl ClientConnection {
 
                 if let Ok(user_resp) = user_resp {
                     let ms_raw = user_resp
-                        .get_data(DataTypes::message_state)
+                        .get_data(DataType::MessageState)
                         .as_string()
                         .unwrap_or_else(|| "".to_string());
                     let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
@@ -492,17 +500,17 @@ impl ClientConnection {
 
                     // notify original sender about the delivered/read state
                     self.send_message(
-                        &CommunicationValue::new(CommunicationType::message_state)
+                        &CommunicationValue::new(CommunicationType::MessageState)
                             .with_id(cv.get_id())
                             .with_receiver(sender_id as u64)
                             .with_sender(receiver_id as u64)
-                            .add_data(
-                                DataTypes::chat_partner_id,
-                                DataValue::Number(receiver_id as i64),
+                            .add_typed_default(
+                                DataType::ChatPartnerId,
+                                DataValue::SignedNumber(receiver_id as i128),
                             )
-                            .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
-                            .add_data(
-                                DataTypes::message_state,
+                            .add_typed_default(DataType::SendTime, DataValue::SignedNumber(timestamp_i64 as i128))
+                            .add_typed_default(
+                                DataType::MessageState,
                                 DataValue::Str(ms.as_str().to_string()),
                             ),
                     )
@@ -525,17 +533,17 @@ impl ClientConnection {
 
                     // notify sender
                     self.send_message(
-                        &CommunicationValue::new(CommunicationType::message_state)
+                        &CommunicationValue::new(CommunicationType::MessageState)
                             .with_id(cv.get_id())
                             .with_receiver(sender_id as u64)
                             .with_sender(receiver_id as u64)
-                            .add_data(DataTypes::send_time, DataValue::Number(timestamp_i64))
-                            .add_data(
-                                DataTypes::chat_partner_id,
-                                DataValue::Number(receiver_id as i64),
+                            .add_typed_default(DataType::SendTime, DataValue::SignedNumber(timestamp_i64 as i128))
+                            .add_typed_default(
+                                DataType::ChatPartnerId,
+                                DataValue::SignedNumber(receiver_id as i128),
                             )
-                            .add_data(
-                                DataTypes::message_state,
+                            .add_typed_default(
+                                DataType::MessageState,
                                 DataValue::Str(MessageState::Sent.as_str().to_string()),
                             ),
                     )
@@ -545,12 +553,12 @@ impl ClientConnection {
             }
         }
 
-        if cv.is_type(CommunicationType::message_other_iota) {
+        if cv.is_type(CommunicationType::MessageOtherIota) {
             let sender_id = &cv.get_sender();
             let receiver_id = &cv.get_receiver();
 
             // parse send_time safely (number or string), fallback to now
-            let send_time_val = cv.get_data(DataTypes::send_time);
+            let send_time_val = cv.get_data(DataType::SendTime);
             let now_i64 = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -565,12 +573,12 @@ impl ClientConnection {
 
             // content may be missing or non-string; default to empty string
             let content = cv
-                .get_data(DataTypes::content)
+                .get_data(DataType::Content)
                 .as_str()
                 .unwrap_or("")
                 .to_string();
 
-            let height = cv.get_data(DataTypes::height).as_number().unwrap_or(0) as i64;
+            let height = cv.get_data(DataType::Height).as_number().unwrap_or(0) as i64;
 
             chat_files::add_message(
                 timestamp as u128,
@@ -582,16 +590,16 @@ impl ClientConnection {
             );
 
             // Build user_forward using the parsed numeric timestamp and safe content string
-            let user_forward = CommunicationValue::new(CommunicationType::message_live)
+            let user_forward = CommunicationValue::new(CommunicationType::MessageLive)
                 .with_id(cv.get_id())
                 .with_receiver(*receiver_id)
-                .add_data(DataTypes::sender_id, DataValue::Number(*sender_id as i64))
-                .add_data(
-                    DataTypes::message,
-                    DataValue::Container(vec![
-                        (DataTypes::content, DataValue::Str(content.clone())),
-                        (DataTypes::send_time, DataValue::Number(timestamp)),
-                        (DataTypes::height, DataValue::Number(height)),
+                .add_typed_default(DataType::SenderId, DataValue::SignedNumber(*sender_id as i128))
+                .add_typed_default(
+                    DataType::Message,
+                    typed_container(vec![
+                        (DataType::Content, DataValue::Str(content.clone())),
+                        (DataType::SendTime, DataValue::SignedNumber(timestamp as i128)),
+                        (DataType::Height, DataValue::SignedNumber(height as i128)),
                     ]),
                 );
 
@@ -602,7 +610,7 @@ impl ClientConnection {
 
             if let Ok(user_resp) = user_resp {
                 let ms_raw = user_resp
-                    .get_data(DataTypes::message_state)
+                    .get_data(DataType::MessageState)
                     .as_string()
                     .unwrap_or_else(|| "".to_string());
                 let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
@@ -615,17 +623,17 @@ impl ClientConnection {
                 );
 
                 self.send_message(
-                    &CommunicationValue::new(CommunicationType::message_state)
+                    &CommunicationValue::new(CommunicationType::MessageState)
                         .with_id(cv.get_id())
                         .with_receiver(*sender_id)
                         .with_sender(*receiver_id)
-                        .add_data(DataTypes::send_time, DataValue::Number(timestamp))
-                        .add_data(
-                            DataTypes::chat_partner_id,
-                            DataValue::Number(*sender_id as i64),
+                        .add_typed_default(DataType::SendTime, DataValue::SignedNumber(timestamp as i128))
+                        .add_typed_default(
+                            DataType::ChatPartnerId,
+                            DataValue::SignedNumber(*sender_id as i128),
                         )
-                        .add_data(
-                            DataTypes::message_state,
+                        .add_typed_default(
+                            DataType::MessageState,
                             DataValue::Str(ms.as_str().to_string()),
                         ),
                 )
@@ -640,17 +648,17 @@ impl ClientConnection {
                 );
 
                 self.send_message(
-                    &CommunicationValue::new(CommunicationType::message_state)
+                    &CommunicationValue::new(CommunicationType::MessageState)
                         .with_id(cv.get_id())
                         .with_receiver(*sender_id)
                         .with_sender(*receiver_id)
-                        .add_data(DataTypes::send_time, DataValue::Number(timestamp))
-                        .add_data(
-                            DataTypes::chat_partner_id,
-                            DataValue::Number(*receiver_id as i64),
+                        .add_typed_default(DataType::SendTime, DataValue::SignedNumber(timestamp as i128))
+                        .add_typed_default(
+                            DataType::ChatPartnerId,
+                            DataValue::SignedNumber(*receiver_id as i128),
                         )
-                        .add_data(
-                            DataTypes::message_state,
+                        .add_typed_default(
+                            DataType::MessageState,
                             DataValue::Str(MessageState::Sent.as_str().to_string()),
                         ),
                 )
@@ -659,12 +667,12 @@ impl ClientConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::messages_get) {
+        if cv.is_type(CommunicationType::MessagesGet) {
             let my_id = cv.get_sender();
-            let partner_id = cv.get_data(DataTypes::user_id).as_number().unwrap_or(0);
-            let offset = cv.get_data(DataTypes::offset).as_number().unwrap_or(0);
-            let amount = cv.get_data(DataTypes::amount).as_number().unwrap_or(0);
-            let messages = chat_files::get_messages(my_id as i64, partner_id, offset, amount);
+            let partner_id = cv.get_data(DataType::UserId).as_number().unwrap_or(0);
+            let offset = cv.get_data(DataType::Offset).as_number().unwrap_or(0);
+            let amount = cv.get_data(DataType::Amount).as_number().unwrap_or(0);
+            let messages = chat_files::get_messages(my_id as i64, partner_id as i64, offset as i64, amount as i64);
             let mut msg_array: Vec<DataValue> = Vec::new();
             for m in messages.members() {
                 let message_time: i64 = m["message_time"].as_i64().unwrap_or(0);
@@ -674,9 +682,9 @@ impl ClientConnection {
                 let sender_id: i64 = if sent_by_self {
                     my_id as i64
                 } else {
-                    if let Some(n) = cv.get_data(DataTypes::chat_partner_id).as_number() {
+                    if let Some(n) = cv.get_data(DataType::ChatPartnerId).as_number() {
                         n as i64
-                    } else if let Some(s) = cv.get_data(DataTypes::chat_partner_id).as_str() {
+                    } else if let Some(s) = cv.get_data(DataType::ChatPartnerId).as_str() {
                         s.parse::<i64>().unwrap_or(partner_id as i64)
                     } else {
                         partner_id as i64
@@ -685,53 +693,53 @@ impl ClientConnection {
                 let message_state: String = m["message_state"].as_str().unwrap_or("").to_string();
 
                 let mut container = Vec::new();
-                container.push((DataTypes::send_time, DataValue::Number(message_time)));
-                container.push((DataTypes::content, DataValue::Str(content)));
-                container.push((DataTypes::sender_id, DataValue::Number(sender_id)));
-                container.push((DataTypes::message_state, DataValue::Str(message_state)));
-                container.push((DataTypes::height, DataValue::Number(height)));
-                container.push((DataTypes::sent_by_self, DataValue::Bool(sent_by_self)));
-                msg_array.push(DataValue::Container(container));
+                container.push((DataType::SendTime, DataValue::SignedNumber(message_time as i128)));
+                container.push((DataType::Content, DataValue::Str(content)));
+                container.push((DataType::SenderId, DataValue::SignedNumber(sender_id as i128)));
+                container.push((DataType::MessageState, DataValue::Str(message_state)));
+                container.push((DataType::Height, DataValue::SignedNumber(height as i128)));
+                container.push((DataType::SentBySelf, DataValue::Bool(sent_by_self)));
+                msg_array.push(typed_container(container));
             }
 
-            let resp = CommunicationValue::new(CommunicationType::messages_get)
+            let resp = CommunicationValue::new(CommunicationType::MessagesGet)
                 .with_id(cv.get_id())
                 .with_receiver(my_id)
-                .add_data(DataTypes::messages, DataValue::Array(msg_array));
+                .add_typed_default(DataType::Messages, DataValue::Array(msg_array));
 
             self.send_message(&resp).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::get_chats) {
+        if cv.is_type(CommunicationType::GetChats) {
             let user_id = cv.get_sender();
             let users = chats_util::get_users(user_id as i64);
             let mut user_array = Vec::new();
             for user in users {
                 let mut container = Vec::new();
-                container.push((DataTypes::user_id, DataValue::Number(user.user_id)));
+                container.push((DataType::UserId, DataValue::SignedNumber(user.user_id as i128)));
                 if let Some(name) = user.user_name {
-                    container.push((DataTypes::username, DataValue::Str(name)));
+                    container.push((DataType::Username, DataValue::Str(name)));
                 }
                 if let Some(ts) = user.last_message_at {
-                    container.push((DataTypes::last_message_at, DataValue::Number(ts)));
+                    container.push((DataType::LastMessageAt, DataValue::SignedNumber(ts as i128)));
                 }
-                user_array.push(DataValue::Container(container));
+                user_array.push(typed_container(container));
             }
-            let resp = CommunicationValue::new(CommunicationType::get_chats)
+            let resp = CommunicationValue::new(CommunicationType::GetChats)
                 .with_id(cv.get_id())
                 .with_receiver(user_id)
-                .add_data(DataTypes::user_ids, DataValue::Array(user_array));
+                .add_typed_default(DataType::UserIds, DataValue::Array(user_array));
             self.send_message(&resp).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::add_conversation) {
+        if cv.is_type(CommunicationType::AddConversation) {
             let user_id = cv.get_sender();
-            let other_id = match cv.get_data(DataTypes::chat_partner_id).as_number() {
+            let other_id = match cv.get_data(DataType::ChatPartnerId).as_number() {
                 Some(n) => n as i64,
                 None => cv
-                    .get_data(DataTypes::chat_partner_id)
+                    .get_data(DataType::ChatPartnerId)
                     .as_str()
                     .unwrap_or("0")
                     .parse()
@@ -739,7 +747,7 @@ impl ClientConnection {
             };
             let mut contact = get_user(user_id as i64, other_id).unwrap_or(Contact::new(other_id));
 
-            if let Some(name) = cv.get_data(DataTypes::chat_partner_name).as_str() {
+            if let Some(name) = cv.get_data(DataType::ChatPartnerName).as_str() {
                 contact.user_name = Some(name.to_string());
             }
 
@@ -750,85 +758,82 @@ impl ClientConnection {
                     .as_millis() as i64,
             );
             mod_user(user_id as i64, &contact);
-            let resp = CommunicationValue::new(CommunicationType::add_conversation)
+            let resp = CommunicationValue::new(CommunicationType::AddConversation)
                 .with_id(cv.get_id())
                 .with_receiver(user_id);
             self.send_message(&resp).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::add_community) {
+        if cv.is_type(CommunicationType::AddCommunity) {
             CommunitiesUtil::add_community(
                 cv.get_sender() as i64,
-                cv.get_data(DataTypes::community_address)
+                cv.get_data(DataType::CommunityAddress)
                     .as_str()
                     .unwrap()
                     .to_string(),
-                cv.get_data(DataTypes::community_title)
+                cv.get_data(DataType::CommunityTitle)
                     .as_str()
                     .unwrap()
                     .to_string(),
-                cv.get_data(DataTypes::position)
+                cv.get_data(DataType::Position)
                     .as_str()
                     .unwrap()
                     .to_string(),
             );
-            let resp = CommunicationValue::new(CommunicationType::add_community)
+            let resp = CommunicationValue::new(CommunicationType::AddCommunity)
                 .with_id(cv.get_id())
                 .with_receiver(cv.get_sender());
             self.send_message(&resp).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::get_communities) {
+        if cv.is_type(CommunicationType::GetCommunities) {
             let mut comm_array = Vec::new();
             for c in CommunitiesUtil::get_communities(cv.get_sender() as i64) {
-                let mut container: Vec<(DataTypes, DataValue)> = Vec::new();
+                let mut container: Vec<(DataType, DataValue)> = Vec::new();
                 if let Some(address) = c["address"].as_str() {
                     container.push((
-                        DataTypes::community_address,
+                        DataType::CommunityAddress,
                         DataValue::Str(address.to_string()),
                     ));
                 }
                 if let Some(title) = c["title"].as_str() {
-                    container.push((
-                        DataTypes::community_title,
-                        DataValue::Str(title.to_string()),
-                    ));
+                    container.push((DataType::CommunityTitle, DataValue::Str(title.to_string())));
                 }
                 if let Some(position) = c["position"].as_str() {
-                    container.push((DataTypes::position, DataValue::Str(position.to_string())));
+                    container.push((DataType::Position, DataValue::Str(position.to_string())));
                 }
-                comm_array.push(DataValue::Container(container));
+                comm_array.push(typed_container(container));
             }
 
-            let resp = CommunicationValue::new(CommunicationType::get_communities)
+            let resp = CommunicationValue::new(CommunicationType::GetCommunities)
                 .with_id(cv.get_id())
                 .with_receiver(cv.get_sender())
-                .add_data(DataTypes::communities, DataValue::Array(comm_array));
+                .add_typed_default(DataType::Communities, DataValue::Array(comm_array));
             self.send_message(&resp).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::remove_community) {
+        if cv.is_type(CommunicationType::RemoveCommunity) {
             CommunitiesUtil::remove_community(
                 cv.get_sender() as i64,
-                cv.get_data(DataTypes::community_address)
+                cv.get_data(DataType::CommunityAddress)
                     .as_str()
                     .unwrap()
                     .to_string(),
             );
-            let resp = CommunicationValue::new(CommunicationType::remove_community)
+            let resp = CommunicationValue::new(CommunicationType::RemoveCommunity)
                 .with_id(cv.get_id())
                 .with_receiver(cv.get_sender());
             self.send_message(&resp).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::settings_save) {
+        if cv.is_type(CommunicationType::SettingsSave) {
             let my_id = cv.get_sender();
-            let settings_name = cv.get_data(DataTypes::settings_name).as_str().unwrap();
-            let settings_value = cv.get_data(DataTypes::payload).as_str().unwrap();
+            let settings_name = cv.get_data(DataType::SettingsName).as_str().unwrap();
+            let settings_value = cv.get_data(DataType::Payload).as_str().unwrap();
 
             save_file(
                 &format!("users/{}/settings/", my_id),
@@ -836,7 +841,7 @@ impl ClientConnection {
                 &settings_value,
             );
 
-            let response = CommunicationValue::new(CommunicationType::settings_save)
+            let response = CommunicationValue::new(CommunicationType::SettingsSave)
                 .with_receiver(my_id)
                 .with_id(cv.get_id());
 
@@ -844,24 +849,24 @@ impl ClientConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::settings_load) {
+        if cv.is_type(CommunicationType::SettingsLoad) {
             let my_id = cv.get_sender();
-            let settings_name = cv.get_data(DataTypes::settings_name).as_string().unwrap();
+            let settings_name = cv.get_data(DataType::SettingsName).as_string().unwrap();
             let settings_value_str = load_file(
                 &format!("users/{}/settings/", my_id),
                 &format!("{}.settings", settings_name),
             );
-            let response = CommunicationValue::new(CommunicationType::settings_load)
+            let response = CommunicationValue::new(CommunicationType::SettingsLoad)
                 .with_id(cv.get_id())
                 .with_receiver(my_id)
-                .add_data(DataTypes::payload, DataValue::Str(settings_value_str))
-                .add_data(DataTypes::settings_name, DataValue::Str(settings_name));
+                .add_typed_default(DataType::Payload, DataValue::Str(settings_value_str))
+                .add_typed_default(DataType::SettingsName, DataValue::Str(settings_name));
 
             self.send_message(&response).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::settings_list) {
+        if cv.is_type(CommunicationType::SettingsList) {
             let my_id = cv.get_sender();
             let settings = get_children(&format!("users/{}/settings/", my_id));
             let mut settings_json = Vec::new();
@@ -872,10 +877,10 @@ impl ClientConnection {
                 }
                 let _ = settings_json.push(DataValue::Str(s));
             }
-            let response = CommunicationValue::new(CommunicationType::settings_list)
+            let response = CommunicationValue::new(CommunicationType::SettingsList)
                 .with_id(cv.get_id())
                 .with_receiver(my_id)
-                .add_data(DataTypes::settings, DataValue::Array(settings_json));
+                .add_typed_default(DataType::Settings, DataValue::Array(settings_json));
 
             self.send_message(&response).await;
             return;
@@ -887,8 +892,8 @@ impl ClientConnection {
         let private_key = conf.get_private_key().unwrap();
         drop(conf);
 
-        let omikron_public_key = cv.get_data(DataTypes::public_key).as_str().unwrap();
-        let encrypted_challenge = cv.get_data(DataTypes::challenge).as_str().unwrap();
+        let omikron_public_key = cv.get_data(DataType::PublicKey).as_str().unwrap();
+        let encrypted_challenge = cv.get_data(DataType::Challenge).as_str().unwrap();
 
         let solved_challenge = {
             if let Ok(decrypted) = SecurePayload::new(
@@ -911,9 +916,9 @@ impl ClientConnection {
         if let Some(decrypted) = solved_challenge {
             let solved = decrypted.export(DataFormat::Raw);
 
-            let response = CommunicationValue::new(CommunicationType::challenge_response)
+            let response = CommunicationValue::new(CommunicationType::ChallengeResponse)
                 .with_id(cv.get_id())
-                .add_data(DataTypes::challenge, DataValue::Str(solved));
+                .add_typed_default(DataType::Challenge, DataValue::Str(solved));
 
             self.send_message(&response).await;
         }
@@ -943,7 +948,7 @@ impl ClientConnection {
             let sender_clone = Arc::clone(sender);
             drop(sender_guard);
 
-            if !cv.is_type(CommunicationType::ping) && !cv.is_type(CommunicationType::pong) {
+            if !cv.is_type(CommunicationType::Ping) && !cv.is_type(CommunicationType::Pong) {
                 log_cv_out!(&cv);
             }
 

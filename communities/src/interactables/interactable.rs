@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use json::JsonValue;
 use std::any::Any;
 use std::sync::Arc;
-use ttp_core::CommunicationValue;
+use mtp::codec::CommunicationValue;
 use uuid::Uuid;
 
 pub type InteractableFactory = fn() -> Box<dyn Interactable>;

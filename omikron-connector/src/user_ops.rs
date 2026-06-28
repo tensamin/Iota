@@ -6,16 +6,16 @@ use iota_storage::users::user_manager::{add_user, save_users};
 use iota_storage::users::user_profile::UserProfile;
 use iota_util::crypto_helper::public_key_to_base64;
 use iota_util::file_util::save_file;
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
-use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 use x448::{PublicKey, Secret};
 
 use crate::omikron_connection::OMIKRON_CONNECTION;
 
 pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>) {
-    let register_communication_value = CommunicationValue::new(CommunicationType::get_register);
+    let register_communication_value = CommunicationValue::new(CommunicationType::GetRegister);
 
     let connection = OMIKRON_CONNECTION.clone();
 
@@ -32,7 +32,7 @@ pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>
     log_cv!(PrintType::Omega, response_communication_value);
 
     let user_id = match response_communication_value
-        .get_data(DataTypes::user_id)
+        .get_data(DataType::UserId)
         .as_number()
     {
         Some(id) => id,
@@ -57,7 +57,7 @@ pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>
     let reset_token = STANDARD.encode(&bytes);
 
     let user_profile = UserProfile::new(
-        user_id,
+        user_id as i64,
         username.to_string(),
         None,
         STANDARD.encode(&public_key.as_bytes()),
@@ -65,15 +65,15 @@ pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>
         reset_token.clone(),
     );
 
-    let communication_value = CommunicationValue::new(CommunicationType::complete_register_user)
-        .add_data(DataTypes::user_id, DataValue::Number(user_id))
-        .add_data(DataTypes::username, DataValue::Str(username.to_string()))
-        .add_data(
-            DataTypes::public_key,
+    let communication_value = CommunicationValue::new(CommunicationType::CompleteRegisterUser)
+        .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id as i128))
+        .add_typed_default(DataType::Username, DataValue::Str(username.to_string()))
+        .add_typed_default(
+            DataType::PublicKey,
             DataValue::Str(public_key_to_base64(&public_key)),
         )
-        .add_data(DataTypes::iota_id, DataValue::Number(user_id))
-        .add_data(DataTypes::reset_token, DataValue::Str(reset_token));
+        .add_typed_default(DataType::IotaId, DataValue::SignedNumber(user_id as i128))
+        .add_typed_default(DataType::ResetToken, DataValue::Str(reset_token));
 
     let response_communication_value = connection
         .await_response(&communication_value, Some(Duration::from_secs(20)))
@@ -81,7 +81,7 @@ pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>
 
     if let Ok(response) = response_communication_value {
         log_cv!(PrintType::Omega, response);
-        if !response.is_type(CommunicationType::success) {
+        if !response.is_type(CommunicationType::Success) {
             return (None, None);
         }
     } else {

@@ -12,8 +12,7 @@ iota-util = { path = "../iota-util" }
 omikron-connector = { path = "../omikron-connector" }
 
 
-ttp-core = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-core" }
-ttp-native = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-native" }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git" }
 
 actix-web = { version = "4", features = ["rustls-0_23"] }
 actix-web-actors = "4"

@@ -262,7 +262,7 @@
                   LockPersonality = true;
                   MemoryDenyWriteExecute = true;
                   Environment = [
-                    "TTP_BIND=${cfg.ttpBind}"
+                    "mtp::BIND=${cfg.ttpBind}"
                     "BIND_ADDRESS=${cfg.bindAddress}"
                   ];
                 }
