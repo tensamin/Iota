@@ -35,7 +35,7 @@ jobs:
           set -eu
           DOCKER_USER="$(printf '%s' "$DOCKER_USER" | tr -d '\r\n')"
           DOCKER_PASSWD="$(printf '%s' "$DOCKER_PASSWD" | tr -d '\r\n')"
-          printf '%s' "$DOCKER_PASSWD" | docker login docker.io --username "$DOCKER_USER" --password-stdin
+          printf '%s' "$DOCKER_PASSWD" | nix-shell -p docker --run "docker login docker.io --username \"$DOCKER_USER\" --password-stdin"
 
       - name: Build & Push
         run: |
