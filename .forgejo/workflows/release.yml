@@ -39,8 +39,7 @@ jobs:
 
       - name: Build & Push
         run: |
-          docker build -f dockerfile -t tensamin/iota:latest .
-          docker push tensamin/iota:latest
+          nix-shell -p docker --run "docker build -f dockerfile -t tensamin/iota:latest . && docker push tensamin/iota:latest"
 
       - name: Build release binary
         run: |
