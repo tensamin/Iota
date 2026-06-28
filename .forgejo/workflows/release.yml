@@ -21,6 +21,9 @@ jobs:
     name: Build & Publish Release
     runs-on: nixos
     steps:
+      - name: Install node
+        run: nix profile add nixpkgs#nodejs_24
+
       - name: Set up repository
         uses: actions/checkout@v4
 
