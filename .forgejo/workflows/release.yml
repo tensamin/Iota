@@ -1,5 +1,8 @@
 name: Build & Publish Release
 
+env:
+  NIX_CONFIG: experimental-features = nix-command flakes
+
 on:
   workflow_dispatch:
     inputs:
