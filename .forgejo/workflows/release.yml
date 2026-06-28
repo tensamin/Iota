@@ -1,0 +1,125 @@
+name: Build & Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Release type: 'dev' or 'stable'"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - stable
+      description:
+        description: "Release description"
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build & Publish Release
+    runs-on: nixos
+    steps:
+      - name: Set up repository
+        uses: actions/checkout@v4
+
+      - name: Login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASSWD }}
+
+      - name: Build & Push
+        run: |
+          docker build -f dockerfile -t tensamin/iota:latest .
+          docker push tensamin/iota:latest
+
+      - name: Build release binary
+        run: |
+          set -eu
+
+          nix build .#iota --print-build-logs
+          install -Dm755 result/bin/iota dist/iota
+
+      - name: Read release metadata
+        id: version
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
+        run: |
+          set -eu
+
+          VERSION="$(nix eval --raw .#iota.version)"
+          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+
+          case "$RELEASE_TYPE" in
+            dev)
+              TAG="${VERSION}-dev-${SHORT_SHA}"
+              PRERELEASE="true"
+              ;;
+            stable)
+              TAG="$VERSION"
+              PRERELEASE="false"
+              ;;
+            *)
+              echo "release_type must be either 'dev' or 'stable'"
+              exit 1
+              ;;
+          esac
+
+          ASSET_PATH="dist/iota"
+          ASSET_NAME="iota"
+          test -x "$ASSET_PATH"
+
+          echo "version=$VERSION" >> "$FORGEJO_OUTPUT"
+          echo "tag=$TAG" >> "$FORGEJO_OUTPUT"
+          echo "title=$TAG" >> "$FORGEJO_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$FORGEJO_OUTPUT"
+          echo "asset_path=$ASSET_PATH" >> "$FORGEJO_OUTPUT"
+          echo "asset_name=$ASSET_NAME" >> "$FORGEJO_OUTPUT"
+
+      - name: Create release and upload binary
+        env:
+          TOKEN: ${{ forgejo.token }}
+          API: ${{ forgejo.api_url }}
+          REPO: ${{ forgejo.repository }}
+          SHA: ${{ forgejo.sha }}
+          TAG: ${{ steps.version.outputs.tag }}
+          TITLE: ${{ steps.version.outputs.title }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          ASSET_PATH: ${{ steps.version.outputs.asset_path }}
+          ASSET_NAME: ${{ steps.version.outputs.asset_name }}
+          DESCRIPTION: ${{ inputs.description }}
+        run: |
+          set -eu
+
+          HTTP_STATUS=$(curl -s -w "%{http_code}" -o release_out.json -H "Authorization: token $TOKEN" "$API/repos/$REPO/releases/tags/$TAG")
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "Release $TAG already exists."
+            RELEASE_ID="$(jq -r .id release_out.json)"
+          else
+            echo "Creating release for $TAG"
+            RELEASE_JSON="$(curl -f -sS -X POST "$API/repos/$REPO/releases" \
+              -H "Authorization: token $TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n \
+                --arg tag "$TAG" \
+                --arg name "$TITLE" \
+                --arg body "$DESCRIPTION" \
+                --arg target "$SHA" \
+                --argjson prerelease "$PRERELEASE" \
+                '{
+                  tag_name: $tag,
+                  name: $name,
+                  body: $body,
+                  target_commitish: $target,
+                  draft: false,
+                  prerelease: $prerelease
+                }')")"
+            RELEASE_ID="$(echo "$RELEASE_JSON" | jq -r .id)"
+          fi
+
+          curl -fsS -X POST "$API/repos/$REPO/releases/$RELEASE_ID/assets?name=$ASSET_NAME" \
+            -H "Authorization: token $TOKEN" \
+            -F "attachment=@$ASSET_PATH"
