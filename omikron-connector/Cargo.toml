@@ -8,9 +8,13 @@ iota-logger = { path = "../iota-logger" }
 iota-state = { path = "../iota-state" }
 iota-storage = { path = "../iota-storage" }
 iota-util = { path = "../iota-util" }
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git" }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", features = [
+    "client",
+    "crypto",
+    "files",
+] }
 
-dashmap = "6.1.0"
+dashmap = "6.2.1"
 json = "*"
 tokio = { version = "1.50.0", features = ["full"] }
 uuid = { version = "*", features = ["v4"] }

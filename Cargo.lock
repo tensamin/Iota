@@ -1813,7 +1813,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -2655,22 +2655,40 @@ dependencies = [
 [[package]]
 name = "mtp"
 version = "0.1.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#5bfcccc056a2a491a72e4315aa95effb2243ad3c"
+source = "git+https://git.methanium.net/Methanium/mtp.git#b96c072a0f87de7828e45cf3dcd44aef4a9e459d"
 dependencies = [
+ "mtp-client",
  "mtp-codec",
  "mtp-common",
+ "mtp-crypto",
+ "mtp-files",
+ "mtp-host",
  "mtp-transport",
  "mtp-type-map",
 ]
 
 [[package]]
+name = "mtp-client"
+version = "0.1.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git#b96c072a0f87de7828e45cf3dcd44aef4a9e459d"
+dependencies = [
+ "mtp-codec",
+ "mtp-common",
+ "mtp-crypto",
+ "mtp-transport",
+ "rand 0.8.6",
+ "tokio",
+]
+
+[[package]]
 name = "mtp-codec"
 version = "0.1.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#5bfcccc056a2a491a72e4315aa95effb2243ad3c"
+source = "git+https://git.methanium.net/Methanium/mtp.git#b96c072a0f87de7828e45cf3dcd44aef4a9e459d"
 dependencies = [
  "base64",
  "byteorder",
  "mtp-common",
+ "mtp-crypto",
  "mtp-type-map",
  "rand 0.8.6",
 ]
@@ -2678,7 +2696,7 @@ dependencies = [
 [[package]]
 name = "mtp-common"
 version = "0.1.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#5bfcccc056a2a491a72e4315aa95effb2243ad3c"
+source = "git+https://git.methanium.net/Methanium/mtp.git#b96c072a0f87de7828e45cf3dcd44aef4a9e459d"
 dependencies = [
  "quinn",
  "rustls",
@@ -2689,8 +2707,9 @@ dependencies = [
 [[package]]
 name = "mtp-crypto"
 version = "0.1.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#5bfcccc056a2a491a72e4315aa95effb2243ad3c"
+source = "git+https://git.methanium.net/Methanium/mtp.git#b96c072a0f87de7828e45cf3dcd44aef4a9e459d"
 dependencies = [
+ "base64",
  "chacha20poly1305",
  "ed25519-dalek",
  "getrandom 0.4.3",
@@ -2698,15 +2717,38 @@ dependencies = [
  "ml-dsa",
  "mlkem-tls",
  "rand_core 0.6.4",
+ "serde",
  "sha2 0.11.0",
  "thiserror 1.0.69",
  "zeroize",
 ]
 
 [[package]]
+name = "mtp-files"
+version = "0.1.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git#b96c072a0f87de7828e45cf3dcd44aef4a9e459d"
+dependencies = [
+ "mtp-crypto",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "mtp-host"
+version = "0.1.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git#b96c072a0f87de7828e45cf3dcd44aef4a9e459d"
+dependencies = [
+ "mtp-codec",
+ "mtp-common",
+ "mtp-crypto",
+ "mtp-transport",
+ "rand 0.8.6",
+ "tokio",
+]
+
+[[package]]
 name = "mtp-transport"
 version = "0.1.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#5bfcccc056a2a491a72e4315aa95effb2243ad3c"
+source = "git+https://git.methanium.net/Methanium/mtp.git#b96c072a0f87de7828e45cf3dcd44aef4a9e459d"
 dependencies = [
  "log",
  "mtp-codec",
@@ -2720,7 +2762,7 @@ dependencies = [
 [[package]]
 name = "mtp-type-map"
 version = "0.1.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#5bfcccc056a2a491a72e4315aa95effb2243ad3c"
+source = "git+https://git.methanium.net/Methanium/mtp.git#b96c072a0f87de7828e45cf3dcd44aef4a9e459d"
 dependencies = [
  "serde",
  "serde_yaml",
@@ -2783,9 +2825,9 @@ dependencies = [
 
 [[package]]
 name = "num-bigint"
-version = "0.4.6"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
+checksum = "c863e9ab5e7bf9c99ba75e1050f1e4d624ae87ed3532d6238ffbdc7b585dbbe6"
 dependencies = [
  "num-integer",
  "num-traits",
@@ -3416,7 +3458,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3454,7 +3496,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -3799,9 +3841,9 @@ dependencies = [
 
 [[package]]
 name = "rustc-hash"
-version = "2.1.2"
+version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustc_version"

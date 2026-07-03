@@ -10,8 +10,8 @@ use iota_util::crypto_helper::{self, keyring_from_base64};
 use iota_util::crypto_util::{self};
 use iota_util::file_util::{get_children, has_file, load_file, save_file};
 use json::JsonValue;
+use mtp::client::{Policy, Receiver, SendMode, Sender};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
-use mtp::transport::{Policy, Receiver, SendMode, Sender};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -251,7 +251,7 @@ impl OmikronConnection {
 
         let addr_str = format!("https://{}:{}/ws/iota/", self.host, self.port);
 
-        let (sender, mut receiver) = mtp::transport::client::connect(
+        let (sender, mut receiver) = mtp::client::client::connect(
             &addr_str,
             None,
             Policy {
@@ -552,20 +552,16 @@ impl OmikronConnection {
                     drop(conf);
 
                     if let Some(keyring) = keyring_from_base64(&kr_str) {
-                        if let Ok(encrypted_challenge) = crypto_util::encrypt_challenge(
-                            &challenge,
-                            &app_pub_bundle,
-                        ) {
+                        if let Ok(encrypted_challenge) =
+                            crypto_util::encrypt_challenge(&challenge, &app_pub_bundle)
+                        {
                             let bundle = keyring.public_key_bundle();
                             let pub_k_b64 = crypto_helper::public_key_bundle_to_base64(&bundle);
 
                             let res = CommunicationValue::new(CommunicationType::AppChallenge)
                                 .with_id(cv.get_id())
                                 .with_receiver(sender_id)
-                                .add_typed_default(
-                                    DataType::PublicKey,
-                                    DataValue::Str(pub_k_b64),
-                                )
+                                .add_typed_default(DataType::PublicKey, DataValue::Str(pub_k_b64))
                                 .add_typed_default(
                                     DataType::Challenge,
                                     DataValue::Str(encrypted_challenge),
