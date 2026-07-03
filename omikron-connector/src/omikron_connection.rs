@@ -6,8 +6,8 @@ use iota_storage::util::chat_files::{self, MessageState, change_message_state};
 use iota_storage::util::chats_util::{self, get_user, mod_user};
 use iota_storage::util::communities_util::CommunitiesUtil;
 use iota_storage::util::config_util::CONFIG;
-use iota_util::crypto_helper;
-use iota_util::crypto_util::{DataFormat, SecurePayload};
+use iota_util::crypto_helper::{self, keyring_from_base64};
+use iota_util::crypto_util::{self};
 use iota_util::file_util::{get_children, has_file, load_file, save_file};
 use json::JsonValue;
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
@@ -347,30 +347,41 @@ impl OmikronConnection {
     async fn handle_authentication(&self) {
         let conf = CONFIG.read().await;
         let iota_id = conf.get_iota_id();
-        let public_key = conf.get_public_key();
-        let private_key = conf.get_private_key();
+        let keyring_b64 = conf.get_keyring();
         drop(conf);
 
         if iota_id == 0 {
             log_t!("iota_register_new");
 
-            let (pub_k, _priv_k) = if let (Some(pk), Some(sk)) = (public_key, private_key) {
-                (pk, sk)
+            let pub_key_b64 = if let Some(kr) = keyring_b64 {
+                if let Some(keyring) = keyring_from_base64(&kr) {
+                    let bundle = keyring.public_key_bundle();
+                    crypto_helper::public_key_bundle_to_base64(&bundle)
+                } else {
+                    let keyring = crypto_helper::generate_keyring();
+                    let kb64 = crypto_helper::keyring_to_base64(&keyring);
+                    let bundle = keyring.public_key_bundle();
+                    let pk_b64 = crypto_helper::public_key_bundle_to_base64(&bundle);
+                    let mut conf_write = CONFIG.write().await;
+                    conf_write.change("keyring", JsonValue::from(kb64));
+                    conf_write.update();
+                    drop(conf_write);
+                    pk_b64
+                }
             } else {
-                let key_pair = crypto_helper::generate_keypair();
-                let public_key_base64 = crypto_helper::public_key_to_base64(&key_pair.public);
-                let private_key_base64 = crypto_helper::secret_key_to_base64(&key_pair.secret);
-
+                let keyring = crypto_helper::generate_keyring();
+                let kb64 = crypto_helper::keyring_to_base64(&keyring);
+                let bundle = keyring.public_key_bundle();
+                let pk_b64 = crypto_helper::public_key_bundle_to_base64(&bundle);
                 let mut conf_write = CONFIG.write().await;
-                conf_write.change("public_key", JsonValue::from(public_key_base64.clone()));
-                conf_write.change("private_key", JsonValue::from(private_key_base64.clone()));
+                conf_write.change("keyring", JsonValue::from(kb64));
                 conf_write.update();
                 drop(conf_write);
-                (public_key_base64, private_key_base64)
+                pk_b64
             };
 
             let register_msg = CommunicationValue::new(CommunicationType::RegisterIota)
-                .add_typed_default(DataType::PublicKey, DataValue::Str(pub_k));
+                .add_typed_default(DataType::PublicKey, DataValue::Str(pub_key_b64));
 
             let msg_id = register_msg.get_id();
 
@@ -522,8 +533,6 @@ impl OmikronConnection {
             }
 
             if trusted {
-                use iota_util::crypto_util::{DataFormat, SecurePayload};
-
                 let challenge = Uuid::new_v4().to_string();
 
                 self.app_challenges
@@ -535,31 +544,36 @@ impl OmikronConnection {
                     .await
                     .insert(sender_id, (user_id, app_identifier.clone()));
 
-                if let Some(pub_key) = iota_util::crypto_helper::load_public_key(&app_public_key) {
+                if let Some(app_pub_bundle) =
+                    iota_util::crypto_helper::public_key_bundle_from_base64(&app_public_key)
+                {
                     let conf = CONFIG.read().await;
-                    let priv_k_str = conf.get_private_key().unwrap_or_default();
-                    let pub_k_str = conf.get_public_key().unwrap_or_default();
+                    let kr_str = conf.get_keyring().unwrap_or_default();
                     drop(conf);
 
-                    if let Some(priv_key) = iota_util::crypto_helper::load_secret_key(&priv_k_str) {
-                        let encrypted_challenge =
-                            SecurePayload::new(challenge.as_bytes(), DataFormat::Raw, priv_key)
-                                .unwrap()
-                                .encrypt_x448(pub_key)
-                                .unwrap()
-                                .export(DataFormat::Base64);
+                    if let Some(keyring) = keyring_from_base64(&kr_str) {
+                        if let Ok(encrypted_challenge) = crypto_util::encrypt_challenge(
+                            &challenge,
+                            &app_pub_bundle,
+                        ) {
+                            let bundle = keyring.public_key_bundle();
+                            let pub_k_b64 = crypto_helper::public_key_bundle_to_base64(&bundle);
 
-                        let res = CommunicationValue::new(CommunicationType::AppChallenge)
-                            .with_id(cv.get_id())
-                            .with_receiver(sender_id)
-                            .add_typed_default(DataType::PublicKey, DataValue::Str(pub_k_str))
-                            .add_typed_default(
-                                DataType::Challenge,
-                                DataValue::Str(encrypted_challenge),
-                            );
+                            let res = CommunicationValue::new(CommunicationType::AppChallenge)
+                                .with_id(cv.get_id())
+                                .with_receiver(sender_id)
+                                .add_typed_default(
+                                    DataType::PublicKey,
+                                    DataValue::Str(pub_k_b64),
+                                )
+                                .add_typed_default(
+                                    DataType::Challenge,
+                                    DataValue::Str(encrypted_challenge),
+                                );
 
-                        self.send_message(&res).await;
-                        return;
+                            self.send_message(&res).await;
+                            return;
+                        }
                     }
                 }
             }
@@ -1686,17 +1700,17 @@ impl OmikronConnection {
 
     async fn handle_challenge(&self, cv: &CommunicationValue) {
         let conf = CONFIG.read().await;
-        let Some(private_key) = conf.get_private_key() else {
+        let Some(kr_str) = conf.get_keyring() else {
             drop(conf);
             log_t!("omikron_challenge_decryption_failed");
             *self.auth_failure.write().await = Some(
-                "Challenge decryption failed: no private key configured on this Iota.".to_string(),
+                "Challenge decryption failed: no keyring configured on this Iota.".to_string(),
             );
             return;
         };
         drop(conf);
 
-        let Some(omikron_public_key) = cv.get_data(DataType::PublicKey).as_str() else {
+        let Some(_omikron_pub_key_bundle) = cv.get_data(DataType::PublicKey).as_str() else {
             log_t!("omikron_challenge_decryption_failed");
             return;
         };
@@ -1705,23 +1719,14 @@ impl OmikronConnection {
             return;
         };
 
-        let Some(secret_key) = crypto_helper::load_secret_key(&private_key) else {
-            log_t!("omikron_challenge_decryption_failed");
-            return;
-        };
-        let Some(pub_key) = crypto_helper::load_public_key(omikron_public_key) else {
+        let Some(keyring) = keyring_from_base64(&kr_str) else {
             log_t!("omikron_challenge_decryption_failed");
             return;
         };
 
-        let solved_challenge =
-            SecurePayload::new(encrypted_challenge, DataFormat::Base64, secret_key)
-                .ok()
-                .and_then(|decrypted| decrypted.decrypt_x448(pub_key).ok());
+        let solved_challenge = crypto_util::decrypt_challenge(encrypted_challenge, &keyring).ok();
 
-        if let Some(decrypted) = solved_challenge {
-            let solved = decrypted.export(DataFormat::Raw);
-
+        if let Some(solved) = solved_challenge {
             let response = CommunicationValue::new(CommunicationType::ChallengeResponse)
                 .with_id(cv.get_id())
                 .add_typed_default(DataType::Challenge, DataValue::Str(solved));
@@ -1730,7 +1735,7 @@ impl OmikronConnection {
         } else {
             log_t!("omikron_challenge_decryption_failed");
             *self.auth_failure.write().await = Some(
-                "Challenge decryption failed — your Iota private key may not match the registered key on the server."
+                "Challenge decryption failed — your Iota keyring may not match the registered keys on the server."
                     .to_string(),
             );
         }

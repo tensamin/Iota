@@ -50,6 +50,10 @@ impl ConfigUtil {
         self.config["port"].as_u16().unwrap_or(1984)
     }
 
+    pub fn get_keyring(&self) -> Option<String> {
+        self.config["keyring"].as_str().map(String::from)
+    }
+
     pub fn get_public_key(&self) -> Option<String> {
         self.config["public_key"].as_str().map(String::from)
     }

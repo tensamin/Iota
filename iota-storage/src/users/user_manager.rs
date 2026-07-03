@@ -1,14 +1,12 @@
 use crate::users::user_profile::UserProfile;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use iota_util::crypto_helper::{self};
+use iota_util::crypto_helper::{self, hex_hash, keyring_from_base64, public_key_bundle_to_base64};
 use iota_util::file_util::{load_file, save_file};
 use json::JsonValue;
 use once_cell::sync::Lazy;
-use rand::Rng;
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use std::io::{self};
 use std::sync::Mutex;
-use x448::{PublicKey, Secret};
 
 static USERS: Lazy<Mutex<Vec<UserProfile>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static UNIQUE: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
@@ -20,19 +18,20 @@ pub async fn load_from_tu(username: &str) -> Result<(), ()> {
     let uuid = segments[0].parse::<i64>().unwrap_or(0);
     let b64_private_key = segments[1];
 
-    let secret: Secret = crypto_helper::load_secret_key(b64_private_key).unwrap();
-    let public_key = PublicKey::from(&secret);
+    let keyring = keyring_from_base64(b64_private_key).unwrap();
+    let pub_key_bundle = keyring.public_key_bundle();
+    let keyring_b64 = crypto_helper::keyring_to_base64(&keyring);
 
     let mut bytes = [0u8; 192];
-    OsRng.fill(bytes.as_mut());
+    OsRng.fill_bytes(&mut bytes);
     let reset_token = STANDARD.encode(&bytes);
 
     let user_profile = UserProfile::new(
         uuid,
         username.to_string(),
         Some(username.to_string()),
-        crypto_helper::public_key_to_base64(&public_key),
-        crypto_helper::hex_hash(b64_private_key),
+        public_key_bundle_to_base64(&pub_key_bundle),
+        hex_hash(&keyring_b64),
         reset_token,
     );
     USERS.lock().unwrap().push(user_profile);

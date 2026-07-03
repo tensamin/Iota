@@ -3,7 +3,7 @@ use iota_logger::{log, log_command, log_cv};
 use iota_state::{ACTIVE_TASKS, RELOAD, SHUTDOWN};
 use iota_storage::users::{user_manager, user_profile::UserProfile};
 use iota_storage::util::config_util::CONFIG;
-use iota_util::{crypto_helper, file_util};
+use iota_util::file_util;
 use mtp::codec::{CommunicationType, CommunicationValue};
 use omikron_connector::omikron_connection::OMIKRON_CONNECTION;
 use ratatui::{

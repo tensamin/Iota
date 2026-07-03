@@ -7,8 +7,8 @@ use iota_storage::util::chats_util::{get_user, mod_user};
 use iota_storage::util::communities_util::CommunitiesUtil;
 use iota_storage::util::config_util::CONFIG;
 use iota_storage::util::{chat_files, chats_util};
-use iota_util::crypto_helper;
-use iota_util::crypto_util::{DataFormat, SecurePayload};
+use iota_util::crypto_helper::keyring_from_base64;
+use iota_util::crypto_util::{self};
 use iota_util::file_util::{get_children, load_file, save_file};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::transport::{Receiver, Sender};
@@ -889,33 +889,18 @@ impl ClientConnection {
 
     async fn handle_challenge(&self, cv: &CommunicationValue) {
         let conf = CONFIG.read().await;
-        let private_key = conf.get_private_key().unwrap();
+        let kr_str = conf.get_keyring().unwrap();
         drop(conf);
 
-        let omikron_public_key = cv.get_data(DataType::PublicKey).as_str().unwrap();
-        let encrypted_challenge = cv.get_data(DataType::Challenge).as_str().unwrap();
-
-        let solved_challenge = {
-            if let Ok(decrypted) = SecurePayload::new(
-                encrypted_challenge,
-                DataFormat::Base64,
-                crypto_helper::load_secret_key(&private_key).unwrap(),
-            ) {
-                if let Ok(decrypted) = decrypted
-                    .decrypt_x448(crypto_helper::load_public_key(omikron_public_key).unwrap())
-                {
-                    Some(decrypted)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+        let Some(keyring) = keyring_from_base64(&kr_str) else {
+            return;
         };
 
-        if let Some(decrypted) = solved_challenge {
-            let solved = decrypted.export(DataFormat::Raw);
+        let encrypted_challenge = cv.get_data(DataType::Challenge).as_str().unwrap();
 
+        let solved = crypto_util::decrypt_challenge(encrypted_challenge, &keyring).ok();
+
+        if let Some(solved) = solved {
             let response = CommunicationValue::new(CommunicationType::ChallengeResponse)
                 .with_id(cv.get_id())
                 .add_typed_default(DataType::Challenge, DataValue::Str(solved));

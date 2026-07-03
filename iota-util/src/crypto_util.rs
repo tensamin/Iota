@@ -1,178 +1,58 @@
-use aes_gcm::{
-    Aes256Gcm, Nonce,
-    aead::{Aead, KeyInit, Payload},
-};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STD};
-use hkdf::Hkdf;
-type HkdfSha256 = sha2::Sha256;
-use sha2::{Digest, Sha256 as HashSha256};
-use x448::{PublicKey, Secret};
-
-#[derive(Debug)]
-#[allow(dead_code)]
-pub enum SecurePayloadError {
-    InvalidBase64,
-    InvalidHex,
-    EncryptionError,
-    DecryptionError,
-    InvalidKeyLength,
-}
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use mtp_crypto::{EncryptionType, Keyring, PublicKeyBundle, encrypt_for, decrypt_with};
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 pub enum DataFormat {
     Raw,
     Base64,
     Hex,
 }
 
-pub struct SecurePayload {
-    inner_data: Vec<u8>,
-    private_key: Secret,
+pub fn encrypt(
+    plaintext: &[u8],
+    aad: &[u8],
+    recipient_pub_key_bundle: &PublicKeyBundle,
+) -> Result<Vec<u8>, String> {
+    encrypt_for(
+        EncryptionType::MlKemChaCha20Poly1305,
+        recipient_pub_key_bundle,
+        plaintext,
+        aad,
+    )
+    .map_err(|e| format!("encryption error: {:?}", e))
 }
 
-impl Clone for SecurePayload {
-    fn clone(&self) -> Self {
-        Self {
-            inner_data: self.inner_data.clone(),
-            private_key: Secret::from_bytes(self.private_key.as_bytes()).unwrap(),
-        }
-    }
+pub fn decrypt(
+    ciphertext: &[u8],
+    aad: &[u8],
+    keyring: &Keyring,
+) -> Result<Vec<u8>, String> {
+    decrypt_with(ciphertext, keyring, aad)
+        .map_err(|e| format!("decryption error: {:?}", e))
 }
 
-#[allow(dead_code)]
-impl SecurePayload {
-    pub fn new<S, T: AsRef<[u8]>>(
-        data: T,
-        format: DataFormat,
-        private_key: S,
-    ) -> Result<Self, SecurePayloadError>
-    where
-        S: Into<Secret>,
-    {
-        let raw_data = match format {
-            DataFormat::Raw => data.as_ref().to_vec(),
-            DataFormat::Base64 => BASE64_STD
-                .decode(data.as_ref())
-                .map_err(|_| SecurePayloadError::InvalidBase64)?,
-            DataFormat::Hex => {
-                hex::decode(data.as_ref()).map_err(|_| SecurePayloadError::InvalidHex)?
-            }
-        };
+pub fn encrypt_challenge(
+    challenge: &str,
+    recipient_pub_key_bundle: &PublicKeyBundle,
+) -> Result<String, String> {
+    let blob = encrypt(challenge.as_bytes(), b"challenge", recipient_pub_key_bundle)?;
+    Ok(STANDARD.encode(&blob))
+}
 
-        Ok(Self {
-            inner_data: raw_data,
-            private_key: private_key.into(),
-        })
-    }
+pub fn decrypt_challenge(
+    encrypted: &str,
+    keyring: &Keyring,
+) -> Result<String, String> {
+    let blob =
+        STANDARD.decode(encrypted).map_err(|e| format!("base64 decode error: {}", e))?;
+    let pt = decrypt(&blob, b"challenge", keyring)?;
+    String::from_utf8(pt).map_err(|e| format!("utf8 decode error: {}", e))
+}
 
-    pub fn get_public_key(&self) -> [u8; 56] {
-        *PublicKey::from(&self.private_key).as_bytes()
-    }
-
-    pub fn export(&self, format: DataFormat) -> String {
-        match format.into() {
-            DataFormat::Raw => String::from_utf8_lossy(&self.inner_data).to_string(),
-            DataFormat::Base64 => BASE64_STD.encode(&self.inner_data),
-            DataFormat::Hex => hex::encode(&self.inner_data),
-        }
-    }
-
-    pub fn get_bytes(&self) -> &[u8] {
-        &self.inner_data
-    }
-
-    pub fn get_hash(&self, format: DataFormat) -> String {
-        let mut hasher = HashSha256::new();
-        hasher.update(&self.inner_data);
-        let result = hasher.finalize();
-
-        match format {
-            DataFormat::Raw => String::from_utf8_lossy(&result).to_string(),
-            DataFormat::Base64 => BASE64_STD.encode(result),
-            DataFormat::Hex => hex::encode(result),
-        }
-    }
-
-    pub fn encrypt_x448<S>(&self, public_key: S) -> Result<SecurePayload, SecurePayloadError>
-    where
-        S: Into<PublicKey>,
-    {
-        let peer_pub = public_key.into();
-        let shared_secret = self.private_key.as_diffie_hellman(&peer_pub).unwrap();
-
-        let hkdf = Hkdf::<HkdfSha256>::new(None, shared_secret.as_bytes());
-        let mut okm = [0u8; 44];
-
-        hkdf.expand(b"x448-aes-gcm-no-overhead", &mut okm)
-            .map_err(|_| SecurePayloadError::EncryptionError)?;
-
-        let key = &okm[..32];
-        let nonce_bytes = &okm[32..];
-
-        let cipher = Aes256Gcm::new(key.into());
-        let nonce = Nonce::from_slice(nonce_bytes);
-
-        let ciphertext = cipher
-            .encrypt(
-                nonce,
-                Payload {
-                    msg: &self.inner_data,
-                    aad: &[],
-                },
-            )
-            .map_err(|_| SecurePayloadError::EncryptionError)?;
-
-        Ok(SecurePayload {
-            inner_data: ciphertext,
-            private_key: Secret::from_bytes(self.private_key.as_bytes()).unwrap(),
-        })
-    }
-
-    pub fn decrypt_to_format(
-        &self,
-        peer_public_key_bytes: &[u8; 56],
-        output_format: DataFormat,
-    ) -> Result<String, SecurePayloadError> {
-        let decrypted_instance =
-            self.decrypt_x448(PublicKey::from_bytes(peer_public_key_bytes).unwrap())?;
-        Ok(decrypted_instance.export(output_format))
-    }
-
-    pub fn decrypt_x448<S>(
-        &self,
-        peer_public_key_bytes: S,
-    ) -> Result<SecurePayload, SecurePayloadError>
-    where
-        S: Into<PublicKey>,
-    {
-        let peer_pub = peer_public_key_bytes.into();
-        let shared_secret = self.private_key.as_diffie_hellman(&peer_pub).unwrap();
-
-        let hkdf = Hkdf::<HkdfSha256>::new(None, shared_secret.as_bytes());
-        let mut okm = [0u8; 44];
-        hkdf.expand(b"x448-aes-gcm-no-overhead", &mut okm)
-            .map_err(|_| SecurePayloadError::DecryptionError)?;
-
-        let key = &okm[..32];
-        let nonce_bytes = &okm[32..];
-
-        let cipher = Aes256Gcm::new(key.into());
-        let nonce = Nonce::from_slice(nonce_bytes);
-
-        let plaintext = cipher
-            .decrypt(
-                nonce,
-                Payload {
-                    msg: &self.inner_data,
-                    aad: &[],
-                },
-            )
-            .map_err(|_| SecurePayloadError::DecryptionError)?;
-
-        Ok(SecurePayload {
-            inner_data: plaintext,
-            private_key: Secret::from_bytes(self.private_key.as_bytes()).unwrap(),
-        })
+pub fn export(data: &[u8], format: DataFormat) -> String {
+    match format {
+        DataFormat::Raw => String::from_utf8_lossy(data).to_string(),
+        DataFormat::Base64 => STANDARD.encode(data),
+        DataFormat::Hex => hex::encode(data),
     }
 }
