@@ -943,9 +943,7 @@ impl ClientConnection {
     }
 
     async fn handle_challenge(&self, cv: &CommunicationValue) {
-        let conf = CONFIG.read().await;
-        let kr_str = conf.get_keyring().unwrap();
-        drop(conf);
+        let kr_str = CONFIG.load().keyring.clone().unwrap();
 
         let Some(keyring) = keyring_from_base64(&kr_str) else {
             return;

@@ -5,11 +5,10 @@ use iota_storage::users::contact::Contact;
 use iota_storage::util::chat_files::{self, MessageState, change_message_state};
 use iota_storage::util::chats_util::{self, get_user, mod_user};
 use iota_storage::util::communities_util::CommunitiesUtil;
-use iota_storage::util::config_util::CONFIG;
+use iota_storage::util::config_util::{modify_config, CONFIG};
 use iota_util::crypto_helper::{self, keyring_from_base64};
 use iota_util::crypto_util::{self};
 use iota_util::file_util::{get_children, has_file, load_file, save_file};
-use json::JsonValue;
 use mtp::client::{Client, ClientConfig, Policy, Receiver, SendMode, Sender};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::{Keyring, PublicKeyBundle};
@@ -37,14 +36,7 @@ fn typed_container(items: Vec<(DataType, DataValue)>) -> DataValue {
 
 // Helper function to check if read receipts are enabled globally
 async fn is_read_receipts_enabled() -> bool {
-    // Check global config for read receipts setting
-    // Default to true if not set
-    let conf = CONFIG.read().await;
-    let value = conf.get("read_receipts_enabled");
-    match value {
-        JsonValue::Boolean(b) => *b,
-        _ => true,
-    }
+    CONFIG.load().read_receipts_enabled
 }
 
 // ============================================================================
@@ -247,15 +239,14 @@ impl OmikronConnection {
 
         let keyring = self.load_or_migrate_keyring().await;
 
-        let existing_iota_id = match CONFIG.read().await.get_iota_id() {
-            0 => None,
-            id => Some(id as u64),
-        };
+        let existing_iota_id = CONFIG.load().iota_id;
 
         let (host, port, omikron_public_key) =
             self.resolve_omikron_endpoint(existing_iota_id).await?;
 
-        let addr_str = format!("https://{}:{}/ws/iota/", host, port);
+        let addr_str = format!("https://{}:{}", host, port);
+
+        log!("Connecting to Omikron at {}", addr_str);
 
         let client_config = ClientConfig::new(&addr_str)
             .with_description("iota")
@@ -301,10 +292,7 @@ impl OmikronConnection {
         log_t!("omikron_connection_success");
 
         if existing_iota_id.is_none() {
-            let mut conf_write = CONFIG.write().await;
-            conf_write.change("iota_id", JsonValue::from(connection.client_id as i64));
-            conf_write.update();
-            drop(conf_write);
+            modify_config(|cfg| cfg.iota_id = Some(connection.client_id));
             log!("Registered with Iota-ID: {}", connection.client_id);
         }
 
@@ -372,7 +360,7 @@ impl OmikronConnection {
             return kr;
         }
 
-        let legacy = CONFIG.read().await.get_keyring();
+        let legacy = CONFIG.load().keyring.clone();
         let keyring = legacy
             .and_then(|b64| keyring_from_base64(&b64))
             .unwrap_or_else(crypto_helper::generate_keyring);
@@ -382,10 +370,7 @@ impl OmikronConnection {
         }
 
         let b64 = crypto_helper::keyring_to_base64(&keyring);
-        let mut conf = CONFIG.write().await;
-        conf.change("keyring", JsonValue::from(b64));
-        conf.update();
-        drop(conf);
+        modify_config(|cfg| cfg.keyring = Some(b64));
 
         keyring
     }
@@ -430,9 +415,9 @@ impl OmikronConnection {
 
         let cached_key = mtp::files::load_public_key_bundle(OMIKRON_PUBLIC_KEY_PATH).ok();
         let cached_host_port = {
-            let conf = CONFIG.read().await;
-            match (conf.get_omikron_host(), conf.get_omikron_port()) {
-                (Some(host), Some(port)) => Some((host, port)),
+            let conf = CONFIG.load();
+            match (&conf.omikron_host, conf.omikron_port) {
+                (Some(host), Some(port)) => Some((host.clone(), port)),
                 _ => None,
             }
         };
@@ -482,17 +467,14 @@ impl OmikronConnection {
             (host.clone(), *port, cached.clone())
         } else {
             return Err(
-                "Omega discovery failed and no cached Omikron address/key is available"
-                    .to_string(),
+                "Omega discovery failed and no cached Omikron address/key is available".to_string(),
             );
         };
 
-        {
-            let mut conf = CONFIG.write().await;
-            conf.change("omikron_host", JsonValue::from(host.clone()));
-            conf.change("omikron_port", JsonValue::from(port));
-            conf.update();
-        }
+        modify_config(|cfg| {
+            cfg.omikron_host = Some(host.clone());
+            cfg.omikron_port = Some(port);
+        });
 
         Ok((host, port, public_key))
     }
@@ -609,9 +591,7 @@ impl OmikronConnection {
                 if let Some(app_pub_bundle) =
                     iota_util::crypto_helper::public_key_bundle_from_base64(&app_public_key)
                 {
-                    let conf = CONFIG.read().await;
-                    let kr_str = conf.get_keyring().unwrap_or_default();
-                    drop(conf);
+                    let kr_str = CONFIG.load().keyring.clone().unwrap_or_default();
 
                     if let Some(keyring) = keyring_from_base64(&kr_str) {
                         if let Ok(encrypted_challenge) =

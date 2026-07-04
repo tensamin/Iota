@@ -82,7 +82,7 @@ async fn main() {
         logger::startup();
 
         // BASIC CONFIGURATION
-        &CONFIG.write().await.load();
+        iota_storage::util::config_util::load_config();
 
         // USER MANAGEMENT
         if let Err(_) = user_manager::load_users().await {
@@ -102,7 +102,7 @@ async fn main() {
         }
         log!(
             "IOTA ID:  {}",
-            CONFIG.read().await.get_iota_id().to_string()
+            CONFIG.load().iota_id.map(|id| id.to_string()).unwrap_or_else(|| "N/A".to_string())
         );
         log!("User IDS: {}", sb);
 
@@ -121,7 +121,7 @@ async fn main() {
             sb1 = sb1 + ",";
         }
         log!("Community IDS: {}", sb1); */
-        let _port = CONFIG.read().await.get_port();
+        let _port = CONFIG.load().port;
         let mut _ip = "0.0.0.0".to_string();
         for iface in pnet::datalink::interfaces() {
             let iface: NetworkInterface = iface;
@@ -176,7 +176,7 @@ async fn main() {
                 }
                 sleep(Duration::from_secs(1)).await;
             }
-            &CONFIG.write().await.clear();
+            iota_storage::util::config_util::clear_config();
             user_manager::clear();
             // Commhnities have not been implemented yet.
             /*community_manager::clear();*/

@@ -1,6 +1,6 @@
 use crate::server::is_local_network;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
-use iota_storage::util::config_util::CONFIG;
+use iota_storage::util::config_util::{modify_config, CONFIG};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 
@@ -29,12 +29,25 @@ async fn settings_set(req: HttpRequest, ssl: web::Data<bool>) -> impl Responder 
 
     match (key, value) {
         (Some(k), Some(v)) => {
-            let _ = CONFIG
-                .write()
-                .await
-                .config
-                .insert(&k.to_string(), v.to_string());
-
+            modify_config(|cfg| match k {
+                "port" => {
+                    if let Ok(port) = v.parse::<u16>() {
+                        cfg.port = port;
+                    }
+                }
+                "omikron_host" => {
+                    cfg.omikron_host = Some(v.to_string());
+                }
+                "omikron_port" => {
+                    if let Ok(port) = v.parse::<u16>() {
+                        cfg.omikron_port = Some(port);
+                    }
+                }
+                "read_receipts_enabled" => {
+                    cfg.read_receipts_enabled = v == "true";
+                }
+                _ => {}
+            });
             success()
         }
         _ => error(),
@@ -45,8 +58,7 @@ async fn settings_get(req: HttpRequest, ssl: web::Data<bool>) -> impl Responder 
     if !is_allowed_req(&req, *ssl.get_ref()) {
         return forbidden();
     }
-    let config = CONFIG.read().await.config.clone();
-    let serde_config: Value = serde_json::to_value(config.to_string()).unwrap();
+    let serde_config: Value = serde_json::to_value(&**CONFIG.load()).unwrap();
     HttpResponse::Ok().json(serde_config)
 }
 

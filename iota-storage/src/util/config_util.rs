@@ -1,93 +1,85 @@
+use arc_swap::ArcSwap;
 use iota_util::file_util::{load_file, save_file};
-use json::JsonValue;
 use once_cell::sync::Lazy;
-use tokio::sync::RwLock;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-pub static CONFIG: Lazy<RwLock<ConfigUtil>> = Lazy::new(|| RwLock::new(ConfigUtil::new()));
+pub static CONFIG: Lazy<ArcSwap<IotaConfig>> =
+    Lazy::new(|| ArcSwap::new(Arc::new(IotaConfig::default())));
 
-pub struct ConfigUtil {
-    pub config: JsonValue,
-    pub unique: bool,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IotaConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iota_id: Option<u64>,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub omikron_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub omikron_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyring: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    #[serde(default = "default_read_receipts_enabled")]
+    pub read_receipts_enabled: bool,
 }
 
-impl ConfigUtil {
-    pub fn new() -> Self {
+const fn default_port() -> u16 {
+    1984
+}
+
+const fn default_read_receipts_enabled() -> bool {
+    true
+}
+
+impl Default for IotaConfig {
+    fn default() -> Self {
         Self {
-            config: JsonValue::new_object(),
-            unique: false,
+            iota_id: None,
+            port: default_port(),
+            omikron_host: None,
+            omikron_port: None,
+            keyring: None,
+            public_key: None,
+            private_key: None,
+            read_receipts_enabled: default_read_receipts_enabled(),
         }
     }
-    pub fn clear(&mut self) {
-        self.config = JsonValue::new_object();
-        self.unique = false;
-    }
-    pub fn load(&mut self) {
-        let s = load_file("", "config.json");
-        if s.is_empty() {
-            // File might be missing or empty/being written.
-            // We don't want to wipe the current config if it already has data.
-            // But if it's the first load, it will stay empty.
-            return;
-        }
+}
 
-        match json::parse(&s) {
-            Ok(parsed) => {
-                self.config = parsed;
-                self.unique = false;
-            }
-            Err(e) => {
-                eprintln!("Failed to parse config.json: {}. Content: '{}'", e, s);
-                // Keep the current config rather than wiping it.
-            }
+pub fn load_config() {
+    let s = load_file("", "config.json");
+    if s.is_empty() {
+        return;
+    }
+
+    match serde_json::from_str::<IotaConfig>(&s) {
+        Ok(parsed) => {
+            CONFIG.store(Arc::new(parsed));
+        }
+        Err(e) => {
+            eprintln!("Failed to parse config.json: {}. Content: '{}'", e, s);
         }
     }
+}
 
-    pub fn get_iota_id(&self) -> i64 {
-        self.config["iota_id"].as_i64().unwrap_or(0)
-    }
+pub fn clear_config() {
+    CONFIG.store(Arc::new(IotaConfig::default()));
+    save_config();
+}
 
-    pub fn get_port(&self) -> u16 {
-        self.config["port"].as_u16().unwrap_or(1984)
+pub fn save_config() {
+    if let Ok(json) = serde_json::to_string(&**CONFIG.load()) {
+        save_file("", "config.json", &json);
     }
+}
 
-    pub fn get_omikron_host(&self) -> Option<String> {
-        self.config["omikron_host"].as_str().map(String::from)
-    }
-
-    pub fn get_omikron_port(&self) -> Option<u16> {
-        self.config["omikron_port"].as_u16()
-    }
-
-    pub fn get_keyring(&self) -> Option<String> {
-        self.config["keyring"].as_str().map(String::from)
-    }
-
-    pub fn get_public_key(&self) -> Option<String> {
-        self.config["public_key"].as_str().map(String::from)
-    }
-
-    pub fn get_private_key(&self) -> Option<String> {
-        self.config["private_key"].as_str().map(String::from)
-    }
-
-    pub fn get(&self, key: &str) -> &JsonValue {
-        &self.config[key]
-    }
-
-    pub fn change(&mut self, key: &str, value: JsonValue) {
-        self.config[key] = value;
-        self.unique = true;
-    }
-
-    pub fn remove(&mut self, key: &str) {
-        self.config.remove(key);
-        self.unique = true;
-    }
-
-    pub fn update(&mut self) {
-        if self.unique {
-            save_file("", "config.json", &self.config.to_string());
-            self.unique = false;
-        }
-    }
+pub fn modify_config(f: impl FnOnce(&mut IotaConfig)) {
+    let mut cfg = IotaConfig::clone(&**CONFIG.load());
+    f(&mut cfg);
+    CONFIG.store(Arc::new(cfg));
+    save_config();
 }

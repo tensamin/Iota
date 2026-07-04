@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use iota_logger::{log, log_command, log_cv};
 use iota_state::{ACTIVE_TASKS, RELOAD, SHUTDOWN};
 use iota_storage::users::{user_manager, user_profile::UserProfile};
-use iota_storage::util::config_util::CONFIG;
+use iota_storage::util::config_util::modify_config;
 use iota_util::file_util;
 use mtp::codec::{CommunicationType, CommunicationValue};
 use omikron_connector::omikron_connection::OMIKRON_CONNECTION;
@@ -479,13 +479,11 @@ pub async fn run_command(command: &str) {
         }
         ["regenerate", "keys"] => {
             log!("Regenerating Iota key pair...");
-            {
-                let mut conf = CONFIG.write().await;
-                conf.remove("public_key");
-                conf.remove("private_key");
-                conf.remove("iota_id");
-                conf.update();
-            }
+            modify_config(|cfg| {
+                cfg.public_key = None;
+                cfg.private_key = None;
+                cfg.iota_id = None;
+            });
             log!("Key pair regenerated. Reconnecting to Omikron server...");
             OMIKRON_CONNECTION.reconnect().await;
             log!("Reconnected with new key pair");

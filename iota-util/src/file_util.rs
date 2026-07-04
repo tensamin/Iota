@@ -126,12 +126,25 @@ pub fn save_file(path: &str, name: &str, value: &str) {
         }
     }
 
-    if let Err(e) = fs::write(&file_path, value) {
+    // Write to a temp file first, then atomically rename to prevent partial writes.
+    let tmp_name = format!(".{}.tmp", name);
+    let tmp_path = dir.join(&tmp_name);
+    if let Err(e) = fs::write(&tmp_path, value) {
         println!(
-            "[IMPORTANT] Couldn't write file {}: {}",
+            "[IMPORTANT] Couldn't write temp file {}: {}",
+            tmp_path.display(),
+            e
+        );
+        return;
+    }
+    if let Err(e) = fs::rename(&tmp_path, &file_path) {
+        println!(
+            "[IMPORTANT] Couldn't rename {} to {}: {}",
+            tmp_path.display(),
             file_path.display(),
             e
         );
+        let _ = fs::remove_file(&tmp_path);
     }
 }
 

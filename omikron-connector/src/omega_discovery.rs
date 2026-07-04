@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use mtp::crypto::PublicKeyBundle;
 
-const OMEGA_API_BASE_DEFAULT: &str = "https://tensamin.net:9188";
+const OMEGA_API_BASE_DEFAULT: &str = "https://omega.tensamin.net";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct OmikronEndpoint {
