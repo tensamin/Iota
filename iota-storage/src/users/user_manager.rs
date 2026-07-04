@@ -15,7 +15,8 @@ static UNIQUE: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 pub async fn load_from_tu(username: &str) -> Result<(), ()> {
     let file_content = load_file("", &format!("{}.tu", username));
     let segments = file_content.split("::").collect::<Vec<&str>>();
-    let uuid = segments[0].parse::<i64>().unwrap_or(0);
+    let (uuid_str, _omega_host) = segments[0].split_once('@').unwrap_or((segments[0], ""));
+    let uuid = uuid_str.parse::<i64>().unwrap_or(0);
     let b64_private_key = segments[1];
 
     let keyring = keyring_from_base64(b64_private_key).unwrap();

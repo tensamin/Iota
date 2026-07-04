@@ -2926,6 +2926,7 @@ dependencies = [
  "mtp",
  "rand 0.8.6",
  "rand_core 0.6.4",
+ "reqwest",
  "sha2 0.10.9",
  "tokio",
  "uuid",

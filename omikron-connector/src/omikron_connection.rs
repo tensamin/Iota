@@ -10,15 +10,19 @@ use iota_util::crypto_helper::{self, keyring_from_base64};
 use iota_util::crypto_util::{self};
 use iota_util::file_util::{get_children, has_file, load_file, save_file};
 use json::JsonValue;
-use mtp::client::{Policy, Receiver, SendMode, Sender};
+use mtp::client::{Client, ClientConfig, Policy, Receiver, SendMode, Sender};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+use mtp::crypto::{Keyring, PublicKeyBundle};
 use std::collections::HashMap;
+use std::env;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use uuid::Uuid;
+
+use crate::omega_discovery;
 
 fn typed_container(items: Vec<(DataType, DataValue)>) -> DataValue {
     use mtp::type_map::{DataTypeId, TypeMap};
@@ -47,8 +51,8 @@ async fn is_read_receipts_enabled() -> bool {
 // Configuration
 // ============================================================================
 
-const OMIKRON_HOST_DEFAULT: &str = "tensamin.net";
-const OMIKRON_PORT_DEFAULT: u16 = 959;
+const IOTA_KEYRING_PATH: &str = "iota.mk";
+const OMIKRON_PUBLIC_KEY_PATH: &str = "omikron.mpkb";
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -106,8 +110,6 @@ pub struct OmikronConnection {
     state: Arc<RwLock<ConnectionState>>,
     sender: Arc<RwLock<Option<Arc<Sender>>>>,
     connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    host: String,
-    port: u16,
     pub last_ping: Arc<Mutex<i64>>,
     heartbeat_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub connection_id: Uuid,
@@ -120,18 +122,12 @@ pub struct OmikronConnection {
 
 impl OmikronConnection {
     pub fn new() -> Self {
-        Self::with_host(OMIKRON_HOST_DEFAULT, OMIKRON_PORT_DEFAULT)
-    }
-
-    pub fn with_host(host: &str, port: u16) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
 
         OmikronConnection {
             state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
             sender: Arc::new(RwLock::new(None)),
             connection_loop_handle: Arc::new(Mutex::new(None)),
-            host: host.to_string(),
-            port,
             last_ping: Arc::new(Mutex::new(-1)),
             heartbeat_handle: Arc::new(Mutex::new(None)),
             connection_id: Uuid::new_v4(),
@@ -249,12 +245,21 @@ impl OmikronConnection {
         *self.state.write().await = ConnectionState::Connecting;
         log_t!("omikron_connecting");
 
-        let addr_str = format!("https://{}:{}/ws/iota/", self.host, self.port);
+        let keyring = self.load_or_migrate_keyring().await;
 
-        let (sender, mut receiver) = mtp::client::client::connect(
-            &addr_str,
-            None,
-            Policy {
+        let existing_iota_id = match CONFIG.read().await.get_iota_id() {
+            0 => None,
+            id => Some(id as u64),
+        };
+
+        let (host, port, omikron_public_key) =
+            self.resolve_omikron_endpoint(existing_iota_id).await?;
+
+        let addr_str = format!("https://{}:{}/ws/iota/", host, port);
+
+        let client_config = ClientConfig::new(&addr_str)
+            .with_description("iota")
+            .with_policy(Policy {
                 send_mode: SendMode::SingleStreamPerMessage,
                 max_message_size: 1_000_000_000,
                 close_frame_len: u32::MAX,
@@ -269,39 +274,50 @@ impl OmikronConnection {
                 max_transient_recv_errors: 20,
                 transient_recv_backoff: Duration::from_millis(100),
                 receiver_queue_capacity: 1000,
-            },
+            });
+
+        let connection = match Client::auth_connect_or_register(
+            client_config,
+            existing_iota_id,
+            &keyring,
+            &omikron_public_key,
         )
         .await
-        .map_err(|e| format!("Connection failed: {}", e))?;
+        {
+            Ok(connection) => connection,
+            Err(mtp::common::CommunicationError::AuthenticationFailed(reason)) => {
+                let reason = format!(
+                    "Authentication failed: {}. Your Iota keys may be invalid or the private key has changed on the server.",
+                    reason
+                );
+                *self.reconnect_on_close.write().await = false;
+                *self.auth_failure.write().await = Some(reason.clone());
+                *self.state.write().await = ConnectionState::Disconnected;
+                return Err(reason);
+            }
+            Err(e) => return Err(format!("Connection failed: {}", e)),
+        };
 
         log_t!("omikron_connection_success");
 
-        let sender_arc = Arc::new(sender);
+        if existing_iota_id.is_none() {
+            let mut conf_write = CONFIG.write().await;
+            conf_write.change("iota_id", JsonValue::from(connection.client_id as i64));
+            conf_write.update();
+            drop(conf_write);
+            log!("Registered with Iota-ID: {}", connection.client_id);
+        }
+
+        let sender_arc = Arc::new(connection.sender);
         *self.sender.write().await = Some(sender_arc.clone());
-        *self.state.write().await = ConnectionState::Connected { identified: false };
+        *self.state.write().await = ConnectionState::Connected { identified: true };
 
         // Start read loop
+        let mut receiver = connection.receiver;
         let read_self = self.clone();
         let read_handle = tokio::spawn(async move {
             read_self.read_loop(&mut receiver).await;
         });
-
-        // Handle registration/identification
-        self.handle_authentication().await;
-
-        // Wait for identification to complete
-        if !self.await_identification(Duration::from_secs(30)).await {
-            *self.reconnect_on_close.write().await = false;
-            let reason = "Authentication failed: server did not accept the challenge. Your Iota keys may be invalid or the private key has changed on the server."
-                .to_string();
-            *self.auth_failure.write().await = Some(reason.clone());
-
-            if let Some(sender) = self.sender.write().await.take() {
-                sender.close();
-            }
-            *self.state.write().await = ConnectionState::Disconnected;
-            return Err(reason);
-        }
 
         log_t!("omikron_authenticated");
 
@@ -341,93 +357,144 @@ impl OmikronConnection {
     }
 
     // -------------------------------------------------------------------------
-    // Authentication (Registration/Identification)
+    // Identity (own Keyring, migrated from the legacy base64-in-config format)
     // -------------------------------------------------------------------------
 
-    async fn handle_authentication(&self) {
-        let conf = CONFIG.read().await;
-        let iota_id = conf.get_iota_id();
-        let keyring_b64 = conf.get_keyring();
+    /*
+     * `iota.mk` is now the source of truth for this Iota's identity. A
+     * pre-existing base64 keyring in config.json (from before the MTP auth
+     * migration) is imported once so already-registered Iotas keep their
+     * identity, and mirrored back into config.json for older code paths
+     * that still read it directly.
+     */
+    async fn load_or_migrate_keyring(&self) -> Keyring {
+        if let Ok(kr) = mtp::files::load_keyring(IOTA_KEYRING_PATH) {
+            return kr;
+        }
+
+        let legacy = CONFIG.read().await.get_keyring();
+        let keyring = legacy
+            .and_then(|b64| keyring_from_base64(&b64))
+            .unwrap_or_else(crypto_helper::generate_keyring);
+
+        if let Err(e) = mtp::files::save_keyring(&keyring, IOTA_KEYRING_PATH) {
+            log!("Failed to persist {}: {}", IOTA_KEYRING_PATH, e);
+        }
+
+        let b64 = crypto_helper::keyring_to_base64(&keyring);
+        let mut conf = CONFIG.write().await;
+        conf.change("keyring", JsonValue::from(b64));
+        conf.update();
         drop(conf);
 
-        if iota_id == 0 {
-            log_t!("iota_register_new");
+        keyring
+    }
 
-            let pub_key_b64 = if let Some(kr) = keyring_b64 {
-                if let Some(keyring) = keyring_from_base64(&kr) {
-                    let bundle = keyring.public_key_bundle();
-                    crypto_helper::public_key_bundle_to_base64(&bundle)
-                } else {
-                    let keyring = crypto_helper::generate_keyring();
-                    let kb64 = crypto_helper::keyring_to_base64(&keyring);
-                    let bundle = keyring.public_key_bundle();
-                    let pk_b64 = crypto_helper::public_key_bundle_to_base64(&bundle);
-                    let mut conf_write = CONFIG.write().await;
-                    conf_write.change("keyring", JsonValue::from(kb64));
-                    conf_write.update();
-                    drop(conf_write);
-                    pk_b64
-                }
-            } else {
-                let keyring = crypto_helper::generate_keyring();
-                let kb64 = crypto_helper::keyring_to_base64(&keyring);
-                let bundle = keyring.public_key_bundle();
-                let pk_b64 = crypto_helper::public_key_bundle_to_base64(&bundle);
-                let mut conf_write = CONFIG.write().await;
-                conf_write.change("keyring", JsonValue::from(kb64));
-                conf_write.update();
-                drop(conf_write);
-                pk_b64
-            };
+    // -------------------------------------------------------------------------
+    // Omikron discovery (via Omega's HTTP API, replacing the static
+    // host/port/public-key-file model)
+    // -------------------------------------------------------------------------
 
-            let register_msg = CommunicationValue::new(CommunicationType::RegisterIota)
-                .add_typed_default(DataType::PublicKey, DataValue::Str(pub_key_b64));
-
-            let msg_id = register_msg.get_id();
-
-            WAITING_TASKS.insert(
-                msg_id,
-                WaitingTask {
-                    task: Box::new(|selfc, cv| {
-                        if !cv.is_type(CommunicationType::Success) {
-                            return false;
-                        }
-
-                        let iota_value = cv.get_data(DataType::IotaId);
-                        let iota_id = iota_value.as_number().unwrap_or(0);
-
-                        if iota_id != 0 {
-                            tokio::spawn(async move {
-                                let mut conf_write = CONFIG.write().await;
-                                conf_write.change("iota_id", JsonValue::from(iota_id as i64));
-                                conf_write.update();
-                                drop(conf_write);
-                                log!("Registered with Iota-ID: {}", iota_id);
-
-                                // Send identification after registration
-                                let identify_msg =
-                                    CommunicationValue::new(CommunicationType::Identification)
-                                        .add_typed_default(
-                                            DataType::IotaId,
-                                            DataValue::SignedNumber(iota_id as i128),
-                                        );
-                                selfc.send_message(&identify_msg).await;
-                            });
-                        } else {
-                            log!("Iota registration failed.");
-                        }
-                        true
-                    }),
-                    inserted_at: Instant::now(),
-                },
-            );
-
-            self.send_message(&register_msg).await;
-        } else {
-            let identify_msg = CommunicationValue::new(CommunicationType::Identification)
-                .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id as i128));
-            self.send_message(&identify_msg).await;
+    /*
+     * Discovery runs fresh on every `connect_once()` attempt rather than once
+     * at construction, since a fixed `OmikronConnection` may need to move to
+     * a different Omikron across reconnects (e.g. after the sticky/primary
+     * Omikron dies). `OMIKRON_HOST`/`OMIKRON_PORT` remain as a manual
+     * override for local dev/testing against a hand-run Omikron without a
+     * live Omega.
+     *
+     * The fetched Omikron public key is pinned to `omikron.mpkb` (trust on
+     * first use): if a cached key exists and a fresh discovery response
+     * disagrees with it, the mismatch is logged loudly and the cached key is
+     * kept rather than silently trusting whatever Omega's HTTP API returned
+     * this time - the same trust boundary the previous manual-file-drop
+     * model had, just automated for the common case.
+     */
+    async fn resolve_omikron_endpoint(
+        &self,
+        existing_iota_id: Option<u64>,
+    ) -> Result<(String, u16, PublicKeyBundle), String> {
+        if let (Ok(host), Ok(port_str)) = (env::var("OMIKRON_HOST"), env::var("OMIKRON_PORT")) {
+            let port: u16 = port_str
+                .parse()
+                .map_err(|_| format!("Invalid OMIKRON_PORT: {}", port_str))?;
+            let public_key = mtp::files::load_public_key_bundle(OMIKRON_PUBLIC_KEY_PATH)
+                .map_err(|e| {
+                    format!(
+                        "Failed to load Omikron public key bundle from {}: {}. Obtain {} from the Omikron operator and place it in the working directory.",
+                        OMIKRON_PUBLIC_KEY_PATH, e, OMIKRON_PUBLIC_KEY_PATH
+                    )
+                })?;
+            return Ok((host, port, public_key));
         }
+
+        let cached_key = mtp::files::load_public_key_bundle(OMIKRON_PUBLIC_KEY_PATH).ok();
+        let cached_host_port = {
+            let conf = CONFIG.read().await;
+            match (conf.get_omikron_host(), conf.get_omikron_port()) {
+                (Some(host), Some(port)) => Some((host, port)),
+                _ => None,
+            }
+        };
+
+        let discovered = match existing_iota_id {
+            Some(id) => match omega_discovery::discover_primary(id).await {
+                Ok(endpoint) => Some(endpoint),
+                Err(e) => {
+                    log!(
+                        "Sticky Omikron discovery failed ({}), falling back to a random Omikron",
+                        e
+                    );
+                    omega_discovery::discover_random().await.ok()
+                }
+            },
+            None => omega_discovery::discover_random().await.ok(),
+        };
+
+        let (host, port, public_key) = if let Some(endpoint) = discovered {
+            match &cached_key {
+                Some(cached) if cached.as_bytes() != endpoint.public_key.as_bytes() => {
+                    log!(
+                        "Fetched Omikron public key differs from the cached {} - keeping the \
+                         cached key. Delete {} manually if this is an expected key rotation.",
+                        OMIKRON_PUBLIC_KEY_PATH,
+                        OMIKRON_PUBLIC_KEY_PATH
+                    );
+                    (endpoint.host, endpoint.port, cached.clone())
+                }
+                Some(cached) => (endpoint.host, endpoint.port, cached.clone()),
+                None => {
+                    if let Err(e) = mtp::files::save_public_key_bundle(
+                        &endpoint.public_key,
+                        OMIKRON_PUBLIC_KEY_PATH,
+                    ) {
+                        log!("Failed to cache Omikron public key: {}", e);
+                    }
+                    (endpoint.host, endpoint.port, endpoint.public_key)
+                }
+            }
+        } else if let (Some(cached), Some((host, port))) = (&cached_key, &cached_host_port) {
+            log!(
+                "Omega discovery unreachable, falling back to last-known Omikron {}:{}",
+                host,
+                port
+            );
+            (host.clone(), *port, cached.clone())
+        } else {
+            return Err(
+                "Omega discovery failed and no cached Omikron address/key is available"
+                    .to_string(),
+            );
+        };
+
+        {
+            let mut conf = CONFIG.write().await;
+            conf.change("omikron_host", JsonValue::from(host.clone()));
+            conf.change("omikron_port", JsonValue::from(port));
+            conf.update();
+        }
+
+        Ok((host, port, public_key))
     }
 
     // -------------------------------------------------------------------------
@@ -501,11 +568,6 @@ impl OmikronConnection {
 
         if cv.is_type(CommunicationType::Pong) {
             self.handle_pong(&cv).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::Challenge) {
-            self.handle_challenge(&cv).await;
             return;
         }
 
@@ -765,26 +827,6 @@ impl OmikronConnection {
                 .with_id(cv.get_id())
                 .add_typed_default(DataType::Contacts, DataValue::Array(contacts_array));
             self.send_message(&resp).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::IdentificationResponse) {
-            match cv.get_data(DataType::Accepted).as_bool() {
-                Some(true) => {
-                    let mut state = self.state.write().await;
-                    if let ConnectionState::Connected { identified: _ } = *state {
-                        *state = ConnectionState::Connected { identified: true };
-                    }
-                }
-                Some(false) => {
-                    *self.auth_failure.write().await = Some(
-                        "Server rejected the challenge response — your Iota keys may be invalid."
-                            .to_string(),
-                    );
-                    log_t!("omikron_auth_rejected");
-                }
-                None => {}
-            }
             return;
         }
 
@@ -1691,65 +1733,6 @@ impl OmikronConnection {
 
             self.send_message(&response).await;
             return;
-        }
-    }
-
-    async fn handle_challenge(&self, cv: &CommunicationValue) {
-        let conf = CONFIG.read().await;
-        let Some(kr_str) = conf.get_keyring() else {
-            drop(conf);
-            log_t!("omikron_challenge_decryption_failed");
-            *self.auth_failure.write().await = Some(
-                "Challenge decryption failed: no keyring configured on this Iota.".to_string(),
-            );
-            return;
-        };
-        drop(conf);
-
-        let Some(_omikron_pub_key_bundle) = cv.get_data(DataType::PublicKey).as_str() else {
-            log_t!("omikron_challenge_decryption_failed");
-            return;
-        };
-        let Some(encrypted_challenge) = cv.get_data(DataType::Challenge).as_str() else {
-            log_t!("omikron_challenge_decryption_failed");
-            return;
-        };
-
-        let Some(keyring) = keyring_from_base64(&kr_str) else {
-            log_t!("omikron_challenge_decryption_failed");
-            return;
-        };
-
-        let solved_challenge = crypto_util::decrypt_challenge(encrypted_challenge, &keyring).ok();
-
-        if let Some(solved) = solved_challenge {
-            let response = CommunicationValue::new(CommunicationType::ChallengeResponse)
-                .with_id(cv.get_id())
-                .add_typed_default(DataType::Challenge, DataValue::Str(solved));
-
-            self.send_message(&response).await;
-        } else {
-            log_t!("omikron_challenge_decryption_failed");
-            *self.auth_failure.write().await = Some(
-                "Challenge decryption failed — your Iota keyring may not match the registered keys on the server."
-                    .to_string(),
-            );
-        }
-    }
-
-    async fn await_identification(&self, timeout: Duration) -> bool {
-        let start = Instant::now();
-        loop {
-            if self.state.read().await.is_identified() {
-                return true;
-            }
-            if self.auth_failure.read().await.is_some() {
-                return false;
-            }
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            sleep(Duration::from_millis(100)).await;
         }
     }
 

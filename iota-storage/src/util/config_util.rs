@@ -50,6 +50,14 @@ impl ConfigUtil {
         self.config["port"].as_u16().unwrap_or(1984)
     }
 
+    pub fn get_omikron_host(&self) -> Option<String> {
+        self.config["omikron_host"].as_str().map(String::from)
+    }
+
+    pub fn get_omikron_port(&self) -> Option<u16> {
+        self.config["omikron_port"].as_u16()
+    }
+
     pub fn get_keyring(&self) -> Option<String> {
         self.config["keyring"].as_str().map(String::from)
     }

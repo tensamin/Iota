@@ -9,6 +9,7 @@ use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use rand_core::{OsRng, RngCore};
 use std::time::Duration;
 
+use crate::omega_discovery;
 use crate::omikron_connection::OMIKRON_CONNECTION;
 
 pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>) {
@@ -86,7 +87,7 @@ pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>
     save_file(
         "",
         &format!("{}.tu", username),
-        &format!("{}::{}", user_id, keyring_b64),
+        &format!("{}@{}::{}", user_id, omega_discovery::omega_host(), keyring_b64),
     );
 
     add_user(user_profile.clone());
