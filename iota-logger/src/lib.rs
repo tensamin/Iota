@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
     path::Path,
@@ -8,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mtp::codec::{CommunicationValue, DataType, DataTypeId, DataValue, Version};
+use mtp::codec::{CommunicationValue, DataTypeId, DataValue, Version};
 use ratatui::style::Color;
 
 use iota_state::{APP_STATE, UNIQUE, UiLogEntry};
