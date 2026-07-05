@@ -7,11 +7,16 @@ use iota_storage::util::chats_util::{get_user, mod_user};
 use iota_storage::util::communities_util::CommunitiesUtil;
 use iota_storage::util::config_util::CONFIG;
 use iota_storage::util::{chat_files, chats_util};
+use iota_storage::util::e2ee_storage::{
+    self, EncryptedDeviceSecretQuery, EncryptedMessageQuery,
+    StoredEncryptedDeviceSecret, StoredEncryptedMessage,
+};
 use iota_util::crypto_helper::keyring_from_base64;
 use iota_util::crypto_util::{self};
 use iota_util::file_util::{get_children, load_file, save_file};
 use mtp::client::{Receiver, Sender};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
@@ -27,6 +32,41 @@ fn typed_container(items: Vec<(DataType, DataValue)>) -> DataValue {
             .filter_map(|(dt, dv)| tm.data_id_enum(dt).map(|id| (DataTypeId(id), dv)))
             .collect(),
     )
+}
+
+
+
+fn data_string(cv: &CommunicationValue, dt: DataType) -> Option<String> {
+    cv.get_data(dt)
+        .as_str()
+        .map(|s| s.to_string())
+        .or_else(|| cv.get_data(dt).as_number().map(|n| n.to_string()))
+        .or_else(|| cv.get_data(dt).as_signed_number().map(|n| n.to_string()))
+}
+
+fn data_i64(cv: &CommunicationValue, dt: DataType) -> Option<i64> {
+    cv.get_data(dt)
+        .as_number()
+        .and_then(|n| i64::try_from(n).ok())
+        .or_else(|| cv.get_data(dt).as_signed_number().and_then(|n| i64::try_from(n).ok()))
+        .or_else(|| cv.get_data(dt).as_str().and_then(|s| s.parse::<i64>().ok()))
+}
+
+fn data_bytes(cv: &CommunicationValue, dt: DataType) -> Option<Vec<u8>> {
+    cv.get_bytes(dt).map(|bytes| bytes.to_vec())
+}
+
+fn now_millis_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn error_response(request: &CommunicationValue, ty: CommunicationType) -> CommunicationValue {
+    CommunicationValue::new(ty)
+        .with_id(request.get_id())
+        .with_receiver(request.get_sender())
 }
 
 // ============================================================================
@@ -139,6 +179,190 @@ impl ClientConnection {
 
         if cv.is_type(CommunicationType::Challenge) {
             self.handle_challenge(&cv).await;
+            return;
+        }
+
+        if cv.is_type(CommunicationType::SetEncryptedDeviceSecret) {
+            let sender_id = cv.get_sender().to_string();
+            if data_string(&cv, DataType::UserId).as_deref() != Some(sender_id.as_str()) {
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+                return;
+            }
+            let now = now_millis_i64();
+            let record = data_string(&cv, DataType::UserId)
+                .zip(data_string(&cv, DataType::DeviceId))
+                .zip(data_string(&cv, DataType::SecretId))
+                .zip(data_i64(&cv, DataType::VersionNumber))
+                .zip(data_bytes(&cv, DataType::EncryptedSecret))
+                .zip(data_string(&cv, DataType::WrappingScheme))
+                .map(|(((((user_id, device_id), secret_id), version), encrypted_secret), wrapping_scheme)| {
+                    StoredEncryptedDeviceSecret {
+                        user_id,
+                        device_id,
+                        secret_id,
+                        version,
+                        encrypted_secret,
+                        wrapping_public_key_id: data_string(&cv, DataType::WrappingPublicKeyId),
+                        wrapping_scheme,
+                        created_at: data_i64(&cv, DataType::CreatedAt).unwrap_or(now),
+                        updated_at: now,
+                    }
+                });
+
+            match record.map(e2ee_storage::put_encrypted_device_secret) {
+                Some(Ok(())) => {
+                    self.send_message(&error_response(&cv, CommunicationType::Success)).await;
+                }
+                _ => {
+                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+                }
+            }
+            return;
+        }
+
+        if cv.is_type(CommunicationType::GetEncryptedDeviceSecret) {
+            let Some(user_id) = data_string(&cv, DataType::UserId) else {
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+                return;
+            };
+            let sender_id = cv.get_sender().to_string();
+            if user_id != sender_id {
+                self.send_message(&error_response(&cv, CommunicationType::ErrorNotFound)).await;
+                return;
+            }
+
+            match e2ee_storage::get_encrypted_device_secret(EncryptedDeviceSecretQuery {
+                user_id,
+                device_id: data_string(&cv, DataType::DeviceId),
+                secret_id: data_string(&cv, DataType::SecretId),
+            }) {
+                Ok(Some(record)) => {
+                    let mut response = CommunicationValue::new(CommunicationType::EncryptedDeviceSecretResponse)
+                        .with_id(cv.get_id())
+                        .with_receiver(cv.get_sender())
+                        .add_typed_default(DataType::UserId, DataValue::Str(record.user_id))
+                        .add_typed_default(DataType::DeviceId, DataValue::Str(record.device_id))
+                        .add_typed_default(DataType::SecretId, DataValue::Str(record.secret_id))
+                        .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(record.version as i128))
+                        .add_typed_default(DataType::EncryptedSecret, DataValue::Bytes(record.encrypted_secret))
+                        .add_typed_default(DataType::WrappingScheme, DataValue::Str(record.wrapping_scheme))
+                        .add_typed_default(DataType::CreatedAt, DataValue::SignedNumber(record.created_at as i128))
+                        .add_typed_default(DataType::UpdatedAt, DataValue::SignedNumber(record.updated_at as i128));
+                    if let Some(value) = record.wrapping_public_key_id {
+                        response = response.add_typed_default(DataType::WrappingPublicKeyId, DataValue::Str(value));
+                    }
+                    self.send_message(&response).await;
+                }
+                Ok(None) => {
+                    self.send_message(&error_response(&cv, CommunicationType::ErrorNotFound)).await;
+                }
+                Err(_) => {
+                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+                }
+            }
+            return;
+        }
+
+        if cv.is_type(CommunicationType::EncryptedMessage) {
+            let sender_id = cv.get_sender().to_string();
+            if data_string(&cv, DataType::SenderUserId).as_deref() != Some(sender_id.as_str()) {
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+                return;
+            }
+            let record = data_string(&cv, DataType::MessageId)
+                .zip(data_string(&cv, DataType::ConversationId))
+                .zip(data_string(&cv, DataType::SenderClientId))
+                .zip(data_string(&cv, DataType::RecipientClientId))
+                .zip(data_bytes(&cv, DataType::EncryptedPayload))
+                .map(|((((message_id, conversation_id), sender_client_id), recipient_client_id), encrypted_payload)| {
+                    StoredEncryptedMessage {
+                        message_id,
+                        conversation_id,
+                        sender_client_id,
+                        recipient_client_id,
+                        sender_user_id: data_string(&cv, DataType::SenderUserId),
+                        recipient_user_id: data_string(&cv, DataType::RecipientUserId),
+                        created_at: data_i64(&cv, DataType::CreatedAt).unwrap_or_else(now_millis_i64),
+                        encryption_version: data_i64(&cv, DataType::EncryptionVersion).unwrap_or(1),
+                        encrypted_payload,
+                    }
+                });
+
+            if let Some(record) = record {
+                let message_id = record.message_id.clone();
+                let conversation_id = record.conversation_id.clone();
+                let recipient_client_id = record.recipient_client_id.clone();
+                match e2ee_storage::put_encrypted_message(record) {
+                    Ok(()) => {
+                        self.send_message(&CommunicationValue::new(CommunicationType::EncryptedMessageAck)
+                            .with_id(cv.get_id())
+                            .with_receiver(cv.get_sender())
+                            .add_typed_default(DataType::MessageId, DataValue::Str(message_id))
+                            .add_typed_default(DataType::ConversationId, DataValue::Str(conversation_id))
+                            .add_typed_default(DataType::RecipientClientId, DataValue::Str(recipient_client_id))
+                            .add_typed_default(DataType::GetTime, DataValue::SignedNumber(now_millis_i64() as i128))
+                        ).await;
+                    }
+                    Err(_) => {
+                        self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+                    }
+                }
+            } else {
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+            }
+            return;
+        }
+
+        if cv.is_type(CommunicationType::EncryptedMessagesGet) {
+            let requester_user_id = cv.get_sender().to_string();
+            let limit = data_i64(&cv, DataType::Limit).map(|v| v as i64);
+            let since = data_i64(&cv, DataType::Since);
+            let conversation_id = data_string(&cv, DataType::ConversationId);
+            let peer_client_id = data_string(&cv, DataType::PeerClientId);
+
+            match e2ee_storage::get_encrypted_messages(EncryptedMessageQuery {
+                sender_user_id: data_string(&cv, DataType::SenderUserId),
+                recipient_client_id: None,
+                recipient_user_id: Some(requester_user_id.clone()),
+                conversation_id,
+                limit,
+                offset: since.map(|v| v.max(0)),
+            }) {
+                Ok(records) => {
+                    let messages = records
+                        .into_iter()
+                        .filter(|record| {
+                            peer_client_id
+                                .as_ref()
+                                .map(|peer| &record.sender_client_id == peer || &record.recipient_client_id == peer)
+                                .unwrap_or(true)
+                        })
+                        .map(|record| {
+                            typed_container(vec![
+                                (DataType::MessageId, DataValue::Str(record.message_id)),
+                                (DataType::ConversationId, DataValue::Str(record.conversation_id)),
+                                (DataType::SenderClientId, DataValue::Str(record.sender_client_id)),
+                                (DataType::RecipientClientId, DataValue::Str(record.recipient_client_id)),
+                                (DataType::SenderUserId, DataValue::Str(record.sender_user_id.unwrap_or_default())),
+                                (DataType::RecipientUserId, DataValue::Str(record.recipient_user_id.unwrap_or_default())),
+                                (DataType::CreatedAt, DataValue::SignedNumber(record.created_at as i128)),
+                                (DataType::EncryptionVersion, DataValue::SignedNumber(record.encryption_version as i128)),
+                                (DataType::EncryptedPayload, DataValue::Bytes(record.encrypted_payload)),
+                            ])
+                        })
+                        .collect::<Vec<_>>();
+
+                    self.send_message(&CommunicationValue::new(CommunicationType::EncryptedMessagesResponse)
+                        .with_id(cv.get_id())
+                        .with_receiver(cv.get_sender())
+                        .add_typed_default(DataType::Messages, DataValue::Array(messages))
+                        .add_typed_default(DataType::HasMore, DataValue::Bool(false))
+                    ).await;
+                }
+                Err(_) => {
+                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+                }
+            }
             return;
         }
 
@@ -327,259 +551,8 @@ impl ClientConnection {
 
         // Incoming storsed message: store for the recipient, attempt local delivery, notify sender.
         if cv.is_type(CommunicationType::MessageSend) {
-            let sender_id: u64 = cv.get_sender();
-
-            // parse receiver_id (the storage owner for this incoming message)
-            let receiver_id: i64 = if let Some(n) = cv.get_data(DataType::ReceiverId).as_number() {
-                n as i64
-            } else if let Some(s) = cv.get_data(DataType::ReceiverId).as_str() {
-                s.parse::<i64>().unwrap_or(0)
-            } else {
-                0
-            };
-
-            // parse send_time robustly (number or string), fallback to now
-            let send_time_val = cv.get_data(DataType::SendTime);
-            let now_i64 = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            let timestamp_i64 = if let Some(n) = send_time_val.as_number() {
-                n as i64
-            } else if let Some(s) = send_time_val.as_str() {
-                s.parse::<i64>().unwrap_or(now_i64)
-            } else {
-                now_i64
-            };
-            let timestamp_u128 = timestamp_i64 as u128;
-
-            // content may be missing; default to empty string
-            let content = cv
-                .get_data(DataType::Content)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-
-            let height = cv.get_data(DataType::Height).as_number().unwrap_or(0) as i64;
-
-            let is_local = iota_storage::users::user_manager::get_user(receiver_id).is_some();
-
-            if is_local {
-                // persist message for the receiver (storage_owner = receiver_id)
-                chat_files::add_message(
-                    timestamp_u128,
-                    false,
-                    receiver_id as i64,
-                    sender_id as i64,
-                    &content,
-                    height,
-                );
-            }
-
-            // persist message for the sender (storage_owner = sender_id)
-            chat_files::add_message(
-                timestamp_u128,
-                true,
-                sender_id as i64,
-                receiver_id as i64,
-                &content,
-                height,
-            );
-
-            // send confirmation back to sender
-            let conf_msg = CommunicationValue::new(CommunicationType::MessageSend)
-                .with_id(cv.get_id())
-                .with_receiver(sender_id as u64);
-            self.send_message(&conf_msg).await;
-
-            if !is_local {
-                let fw_msg = CommunicationValue::new(CommunicationType::MessageOtherIota)
-                    .with_id(cv.get_id())
-                    .with_receiver(receiver_id as u64)
-                    .with_sender(sender_id as u64)
-                    .add_typed_default(DataType::Height, DataValue::SignedNumber(height as i128))
-                    .add_typed_default(DataType::Content, DataValue::Str(content))
-                    .add_typed_default(
-                        DataType::SendTime,
-                        DataValue::SignedNumber(timestamp_i64 as i128),
-                    );
-
-                let other_iota_resp = self
-                    .clone()
-                    .await_response(&fw_msg, Some(Duration::from_secs(10)))
-                    .await;
-
-                if let Ok(resp) = other_iota_resp {
-                    let ms_raw = resp
-                        .get_data(DataType::MessageState)
-                        .as_string()
-                        .unwrap_or_else(|| "".to_string());
-                    let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
-
-                    let _ = chat_files::change_message_state(
-                        timestamp_i64,
-                        sender_id as i64,
-                        receiver_id as i64,
-                        ms.clone(),
-                    );
-
-                    self.send_message(
-                        &CommunicationValue::new(CommunicationType::MessageState)
-                            .with_id(cv.get_id())
-                            .with_receiver(sender_id as u64)
-                            .with_sender(receiver_id as u64)
-                            .add_typed_default(
-                                DataType::ChatPartnerId,
-                                DataValue::SignedNumber(receiver_id as i128),
-                            )
-                            .add_typed_default(
-                                DataType::SendTime,
-                                DataValue::SignedNumber(timestamp_i64 as i128),
-                            )
-                            .add_typed_default(
-                                DataType::MessageState,
-                                DataValue::Str(ms.as_str().to_string()),
-                            ),
-                    )
-                    .await;
-                } else {
-                    let _ = chat_files::change_message_state(
-                        timestamp_i64,
-                        sender_id as i64,
-                        receiver_id as i64,
-                        MessageState::Sent,
-                    );
-
-                    self.send_message(
-                        &CommunicationValue::new(CommunicationType::MessageState)
-                            .with_id(cv.get_id())
-                            .with_receiver(sender_id as u64)
-                            .with_sender(receiver_id as u64)
-                            .add_typed_default(
-                                DataType::ChatPartnerId,
-                                DataValue::SignedNumber(receiver_id as i128),
-                            )
-                            .add_typed_default(
-                                DataType::SendTime,
-                                DataValue::SignedNumber(timestamp_i64 as i128),
-                            )
-                            .add_typed_default(
-                                DataType::MessageState,
-                                DataValue::Str(MessageState::Sent.as_str().to_string()),
-                            ),
-                    )
-                    .await;
-                }
-                return;
-            } else {
-                // Build a live-delivery message for the local client (recipient)
-                let user_forward = CommunicationValue::new(CommunicationType::MessageLive)
-                    .with_id(cv.get_id())
-                    .with_receiver(receiver_id as u64)
-                    .add_typed_default(
-                        DataType::SenderId,
-                        DataValue::SignedNumber(sender_id as i128),
-                    )
-                    .add_typed_default(
-                        DataType::Message,
-                        typed_container(vec![
-                            (DataType::Content, DataValue::Str(content.clone())),
-                            (
-                                DataType::SendTime,
-                                DataValue::SignedNumber(timestamp_i64 as i128),
-                            ),
-                            (DataType::Height, DataValue::SignedNumber(height as i128)),
-                        ]),
-                    );
-
-                // Attempt delivery and await a response from the local client
-                let user_resp = self
-                    .clone()
-                    .await_response(&user_forward, Some(Duration::from_secs(10)))
-                    .await;
-
-                if let Ok(user_resp) = user_resp {
-                    let ms_raw = user_resp
-                        .get_data(DataType::MessageState)
-                        .as_string()
-                        .unwrap_or_else(|| "".to_string());
-                    let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
-
-                    // update stored message state for receiver
-                    let _ = chat_files::change_message_state(
-                        timestamp_i64,
-                        receiver_id as i64,
-                        sender_id as i64,
-                        ms.clone(),
-                    );
-
-                    // update stored message state for sender
-                    let _ = chat_files::change_message_state(
-                        timestamp_i64,
-                        sender_id as i64,
-                        receiver_id as i64,
-                        ms.clone(),
-                    );
-
-                    // notify original sender about the delivered/read state
-                    self.send_message(
-                        &CommunicationValue::new(CommunicationType::MessageState)
-                            .with_id(cv.get_id())
-                            .with_receiver(sender_id as u64)
-                            .with_sender(receiver_id as u64)
-                            .add_typed_default(
-                                DataType::ChatPartnerId,
-                                DataValue::SignedNumber(receiver_id as i128),
-                            )
-                            .add_typed_default(
-                                DataType::SendTime,
-                                DataValue::SignedNumber(timestamp_i64 as i128),
-                            )
-                            .add_typed_default(
-                                DataType::MessageState,
-                                DataValue::Str(ms.as_str().to_string()),
-                            ),
-                    )
-                    .await;
-                } else {
-                    // Delivery failed or timed out; mark as Sent
-                    let _ = chat_files::change_message_state(
-                        timestamp_i64,
-                        receiver_id as i64,
-                        sender_id as i64,
-                        MessageState::Sent,
-                    );
-
-                    let _ = chat_files::change_message_state(
-                        timestamp_i64,
-                        sender_id as i64,
-                        receiver_id as i64,
-                        MessageState::Sent,
-                    );
-
-                    // notify sender
-                    self.send_message(
-                        &CommunicationValue::new(CommunicationType::MessageState)
-                            .with_id(cv.get_id())
-                            .with_receiver(sender_id as u64)
-                            .with_sender(receiver_id as u64)
-                            .add_typed_default(
-                                DataType::SendTime,
-                                DataValue::SignedNumber(timestamp_i64 as i128),
-                            )
-                            .add_typed_default(
-                                DataType::ChatPartnerId,
-                                DataValue::SignedNumber(receiver_id as i128),
-                            )
-                            .add_typed_default(
-                                DataType::MessageState,
-                                DataValue::Str(MessageState::Sent.as_str().to_string()),
-                            ),
-                    )
-                    .await;
-                }
-                return;
-            }
+            self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+            return;
         }
 
         if cv.is_type(CommunicationType::MessageOtherIota) {
