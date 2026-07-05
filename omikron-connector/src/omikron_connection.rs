@@ -7,8 +7,7 @@ use iota_storage::util::chats_util::{self, get_user, mod_user};
 use iota_storage::util::communities_util::CommunitiesUtil;
 use iota_storage::util::config_util::{modify_config, CONFIG};
 use iota_storage::util::e2ee_storage::{
-    self, EncryptedDeviceSecretQuery, EncryptedMessageQuery,
-    StoredEncryptedDeviceSecret, StoredEncryptedMessage,
+    self, ChatSecretQuery, PendingChatSecretForward, StoredChatSecret,
 };
 use iota_util::crypto_helper::{self, keyring_from_base64};
 use iota_util::crypto_util::{self};
@@ -63,6 +62,57 @@ fn now_millis_i64() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn pending_chat_secret_forward_from_cv(
+    cv: &CommunicationValue,
+) -> Option<PendingChatSecretForward> {
+    Some(PendingChatSecretForward {
+        recipient_user_id: data_string(cv, DataType::RecipientUserId)?,
+        chat_id: data_string(cv, DataType::ChatId)?,
+        sender_user_id: data_string(cv, DataType::SenderUserId)?,
+        secret_id: data_string(cv, DataType::SecretId)?,
+        version: data_i64(cv, DataType::VersionNumber)?,
+        encrypted_secret: data_bytes(cv, DataType::EncryptedSecret)?,
+        kem_ciphertext: data_bytes(cv, DataType::KemCiphertext)?,
+        wrapping_scheme: data_string(cv, DataType::WrappingScheme)?,
+        created_at: data_i64(cv, DataType::CreatedAt).unwrap_or_else(now_millis_i64),
+    })
+}
+
+fn chat_secret_forward_cv(record: &PendingChatSecretForward) -> CommunicationValue {
+    CommunicationValue::new(CommunicationType::ChatSecretForward)
+        .with_sender(record.sender_user_id.parse::<u64>().unwrap_or(0))
+        .add_typed_default(DataType::ChatId, DataValue::Str(record.chat_id.clone()))
+        .add_typed_default(
+            DataType::SenderUserId,
+            DataValue::Str(record.sender_user_id.clone()),
+        )
+        .add_typed_default(
+            DataType::RecipientUserId,
+            DataValue::Str(record.recipient_user_id.clone()),
+        )
+        .add_typed_default(DataType::SecretId, DataValue::Str(record.secret_id.clone()))
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::SignedNumber(record.version as i128),
+        )
+        .add_typed_default(
+            DataType::EncryptedSecret,
+            DataValue::Bytes(record.encrypted_secret.clone()),
+        )
+        .add_typed_default(
+            DataType::KemCiphertext,
+            DataValue::Bytes(record.kem_ciphertext.clone()),
+        )
+        .add_typed_default(
+            DataType::WrappingScheme,
+            DataValue::Str(record.wrapping_scheme.clone()),
+        )
+        .add_typed_default(
+            DataType::CreatedAt,
+            DataValue::SignedNumber(record.created_at as i128),
+        )
 }
 
 fn error_response(request: &CommunicationValue, ty: CommunicationType) -> CommunicationValue {
@@ -563,7 +613,47 @@ impl OmikronConnection {
                 break;
             }
 
+            self.flush_pending_chat_secret_forwards().await;
             self.send_ping().await;
+        }
+    }
+
+    async fn forward_chat_secret(&self, cv: &CommunicationValue) -> bool {
+        self.await_response(cv, Some(Duration::from_secs(10)))
+            .await
+            .is_ok()
+    }
+
+    async fn store_pending_chat_secret_forward(&self, cv: &CommunicationValue) {
+        let Some(record) = pending_chat_secret_forward_from_cv(cv) else {
+            return;
+        };
+        let _ = e2ee_storage::put_pending_chat_secret_forward(record);
+    }
+
+    async fn flush_pending_chat_secret_forwards(&self) {
+        let Ok(records) = e2ee_storage::get_pending_chat_secret_forwards(100) else {
+            return;
+        };
+
+        for record in records {
+            let Ok(recipient) = record.recipient_user_id.parse::<u64>() else {
+                let _ = e2ee_storage::delete_pending_chat_secret_forward(
+                    &record.recipient_user_id,
+                    &record.chat_id,
+                    &record.secret_id,
+                );
+                continue;
+            };
+
+            let message = chat_secret_forward_cv(&record).with_receiver(recipient);
+            if self.forward_chat_secret(&message).await {
+                let _ = e2ee_storage::delete_pending_chat_secret_forward(
+                    &record.recipient_user_id,
+                    &record.chat_id,
+                    &record.secret_id,
+                );
+            }
         }
     }
 
@@ -590,7 +680,7 @@ impl OmikronConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::SetEncryptedDeviceSecret) {
+        if cv.is_type(CommunicationType::SetChatSecret) {
             let sender_id = cv.get_sender().to_string();
             if data_string(&cv, DataType::UserId).as_deref() != Some(sender_id.as_str()) {
                 self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
@@ -598,33 +688,34 @@ impl OmikronConnection {
             }
             let now = now_millis_i64();
             let record = data_string(&cv, DataType::UserId)
-                .zip(data_string(&cv, DataType::DeviceId))
+                .zip(data_string(&cv, DataType::ChatId))
                 .zip(data_string(&cv, DataType::SecretId))
                 .zip(data_i64(&cv, DataType::VersionNumber))
                 .zip(data_bytes(&cv, DataType::EncryptedSecret))
+                .zip(data_bytes(&cv, DataType::KemCiphertext))
                 .zip(data_string(&cv, DataType::WrappingScheme))
-                .map(|(((((user_id, device_id), secret_id), version), encrypted_secret), wrapping_scheme)| {
-                    StoredEncryptedDeviceSecret {
+                .map(|((((((user_id, chat_id), secret_id), version), encrypted_secret), kem_ciphertext), wrapping_scheme)| {
+                    StoredChatSecret {
                         user_id,
-                        device_id,
+                        chat_id,
                         secret_id,
                         version,
                         encrypted_secret,
-                        wrapping_public_key_id: data_string(&cv, DataType::WrappingPublicKeyId),
+                        kem_ciphertext,
                         wrapping_scheme,
                         created_at: data_i64(&cv, DataType::CreatedAt).unwrap_or(now),
                         updated_at: now,
                     }
                 });
 
-            match record.map(e2ee_storage::put_encrypted_device_secret) {
+            match record.map(e2ee_storage::put_chat_secret) {
                 Some(Ok(())) => self.send_message(&error_response(&cv, CommunicationType::Success)).await,
                 _ => self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await,
             }
             return;
         }
 
-        if cv.is_type(CommunicationType::GetEncryptedDeviceSecret) {
+        if cv.is_type(CommunicationType::GetChatSecret) {
             let Some(user_id) = data_string(&cv, DataType::UserId) else {
                 self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
                 return;
@@ -633,27 +724,29 @@ impl OmikronConnection {
                 self.send_message(&error_response(&cv, CommunicationType::ErrorNotFound)).await;
                 return;
             }
+            let Some(chat_id) = data_string(&cv, DataType::ChatId) else {
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+                return;
+            };
 
-            match e2ee_storage::get_encrypted_device_secret(EncryptedDeviceSecretQuery {
+            match e2ee_storage::get_chat_secret(ChatSecretQuery {
                 user_id,
-                device_id: data_string(&cv, DataType::DeviceId),
+                chat_id,
                 secret_id: data_string(&cv, DataType::SecretId),
             }) {
                 Ok(Some(record)) => {
-                    let mut response = CommunicationValue::new(CommunicationType::EncryptedDeviceSecretResponse)
+                    let response = CommunicationValue::new(CommunicationType::ChatSecretResponse)
                         .with_id(cv.get_id())
                         .with_receiver(cv.get_sender())
                         .add_typed_default(DataType::UserId, DataValue::Str(record.user_id))
-                        .add_typed_default(DataType::DeviceId, DataValue::Str(record.device_id))
+                        .add_typed_default(DataType::ChatId, DataValue::Str(record.chat_id))
                         .add_typed_default(DataType::SecretId, DataValue::Str(record.secret_id))
                         .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(record.version as i128))
                         .add_typed_default(DataType::EncryptedSecret, DataValue::Bytes(record.encrypted_secret))
+                        .add_typed_default(DataType::KemCiphertext, DataValue::Bytes(record.kem_ciphertext))
                         .add_typed_default(DataType::WrappingScheme, DataValue::Str(record.wrapping_scheme))
                         .add_typed_default(DataType::CreatedAt, DataValue::SignedNumber(record.created_at as i128))
                         .add_typed_default(DataType::UpdatedAt, DataValue::SignedNumber(record.updated_at as i128));
-                    if let Some(value) = record.wrapping_public_key_id {
-                        response = response.add_typed_default(DataType::WrappingPublicKeyId, DataValue::Str(value));
-                    }
                     self.send_message(&response).await;
                 }
                 Ok(None) => self.send_message(&error_response(&cv, CommunicationType::ErrorNotFound)).await,
@@ -662,115 +755,23 @@ impl OmikronConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::EncryptedMessage) {
+        if cv.is_type(CommunicationType::ChatSecretForward) {
             let sender_id = cv.get_sender().to_string();
-            if data_string(&cv, DataType::SenderUserId).as_deref() != Some(sender_id.as_str()) {
+            let recipient_user_id = data_string(&cv, DataType::RecipientUserId).unwrap_or_default();
+            if data_string(&cv, DataType::SenderUserId).as_deref() != Some(sender_id.as_str())
+                || recipient_user_id.is_empty()
+                || pending_chat_secret_forward_from_cv(&cv).is_none()
+            {
                 self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
                 return;
             }
-            let record = data_string(&cv, DataType::MessageId)
-                .zip(data_string(&cv, DataType::ConversationId))
-                .zip(data_string(&cv, DataType::SenderClientId))
-                .zip(data_string(&cv, DataType::RecipientClientId))
-                .zip(data_bytes(&cv, DataType::EncryptedPayload))
-                .map(|((((message_id, conversation_id), sender_client_id), recipient_client_id), encrypted_payload)| {
-                    StoredEncryptedMessage {
-                        message_id,
-                        conversation_id,
-                        sender_client_id,
-                        recipient_client_id,
-                        sender_user_id: data_string(&cv, DataType::SenderUserId),
-                        recipient_user_id: data_string(&cv, DataType::RecipientUserId),
-                        created_at: data_i64(&cv, DataType::CreatedAt).unwrap_or_else(now_millis_i64),
-                        encryption_version: data_i64(&cv, DataType::EncryptionVersion).unwrap_or(1),
-                        encrypted_payload,
-                    }
-                });
 
-            if let Some(record) = record {
-                let message_id = record.message_id.clone();
-                let conversation_id = record.conversation_id.clone();
-                let recipient_client_id = record.recipient_client_id.clone();
-                let sender_client_id = record.sender_client_id.clone();
-                let sender_user_id = record.sender_user_id.clone().unwrap_or_default();
-                let recipient_user_id = record.recipient_user_id.clone().unwrap_or_default();
-                match e2ee_storage::put_encrypted_message(record) {
-                    Ok(()) => {
-                        self.send_message(&CommunicationValue::new(CommunicationType::EncryptedMessageAck)
-                            .with_id(cv.get_id())
-                            .with_receiver(cv.get_sender())
-                            .add_typed_default(DataType::MessageId, DataValue::Str(message_id))
-                            .add_typed_default(DataType::ConversationId, DataValue::Str(conversation_id))
-                            .add_typed_default(DataType::RecipientClientId, DataValue::Str(recipient_client_id.clone()))
-                            .add_typed_default(DataType::GetTime, DataValue::SignedNumber(now_millis_i64() as i128))
-                        ).await;
-
-                        if !recipient_user_id.is_empty()
-                            && recipient_user_id != sender_user_id
-                            && recipient_client_id != sender_client_id
-                        {
-                            if cv.get_receiver().to_string() != recipient_user_id {
-                                self.send_message(&cv.clone().with_receiver(recipient_user_id.parse::<u64>().unwrap_or(0))).await;
-                            } else {
-                                self.send_message(&cv).await;
-                            }
-                        }
-                    }
-                    Err(_) => self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await,
-                }
+            let forward = cv.clone().with_receiver(recipient_user_id.parse::<u64>().unwrap_or(0));
+            if self.forward_chat_secret(&forward).await {
+                self.send_message(&error_response(&cv, CommunicationType::Success)).await;
             } else {
-                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
-            }
-            return;
-        }
-
-        if cv.is_type(CommunicationType::EncryptedMessagesGet) {
-            let requester_user_id = cv.get_sender().to_string();
-            let limit = data_i64(&cv, DataType::Limit).map(|v| v as i64);
-            let since = data_i64(&cv, DataType::Since);
-            let conversation_id = data_string(&cv, DataType::ConversationId);
-            let peer_client_id = data_string(&cv, DataType::PeerClientId);
-
-            match e2ee_storage::get_encrypted_messages(EncryptedMessageQuery {
-                sender_user_id: data_string(&cv, DataType::SenderUserId),
-                recipient_client_id: None,
-                recipient_user_id: Some(requester_user_id.clone()),
-                conversation_id,
-                limit,
-                offset: since.map(|v| v.max(0)),
-            }) {
-                Ok(records) => {
-                    let messages = records
-                        .into_iter()
-                        .filter(|record| {
-                            peer_client_id
-                                .as_ref()
-                                .map(|peer| &record.sender_client_id == peer || &record.recipient_client_id == peer)
-                                .unwrap_or(true)
-                        })
-                        .map(|record| {
-                            typed_container(vec![
-                                (DataType::MessageId, DataValue::Str(record.message_id)),
-                                (DataType::ConversationId, DataValue::Str(record.conversation_id)),
-                                (DataType::SenderClientId, DataValue::Str(record.sender_client_id)),
-                                (DataType::RecipientClientId, DataValue::Str(record.recipient_client_id)),
-                                (DataType::SenderUserId, DataValue::Str(record.sender_user_id.unwrap_or_default())),
-                                (DataType::RecipientUserId, DataValue::Str(record.recipient_user_id.unwrap_or_default())),
-                                (DataType::CreatedAt, DataValue::SignedNumber(record.created_at as i128)),
-                                (DataType::EncryptionVersion, DataValue::SignedNumber(record.encryption_version as i128)),
-                                (DataType::EncryptedPayload, DataValue::Bytes(record.encrypted_payload)),
-                            ])
-                        })
-                        .collect::<Vec<_>>();
-
-                    self.send_message(&CommunicationValue::new(CommunicationType::EncryptedMessagesResponse)
-                        .with_id(cv.get_id())
-                        .with_receiver(cv.get_sender())
-                        .add_typed_default(DataType::Messages, DataValue::Array(messages))
-                        .add_typed_default(DataType::HasMore, DataValue::Bool(false))
-                    ).await;
-                }
-                Err(_) => self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await,
+                self.store_pending_chat_secret_forward(&cv).await;
+                self.send_message(&error_response(&cv, CommunicationType::Success)).await;
             }
             return;
         }
