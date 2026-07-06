@@ -58,6 +58,7 @@ pub fn add_message(
     external_user: i64,
     message: &str,
     height: i64,
+    reply_to: Option<i64>,
 ) {
     let message_time = match i64::try_from(send_time) {
         Ok(v) => v,
@@ -78,8 +79,9 @@ pub fn add_message(
                 content,
                 sent_by_self,
                 message_state,
-                height
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                height,
+                reply_to
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#,
             params![
                 storage_owner,
@@ -93,6 +95,7 @@ pub fn add_message(
                 },
                 MessageState::Sending.as_str(),
                 height,
+                reply_to,
             ],
         )?;
         Ok(())
@@ -191,7 +194,8 @@ pub fn get_messages(
                 content,
                 sent_by_self,
                 message_state,
-                height
+                height,
+                reply_to
             FROM messages
             WHERE storage_owner = ?1
               AND external_user = ?2
@@ -208,21 +212,25 @@ pub fn get_messages(
                 let sent_by_self: i64 = row.get(2)?;
                 let message_state: String = row.get(3)?;
                 let height: i64 = row.get(4).unwrap_or(0);
-                Ok((message_time, content, sent_by_self, message_state, height))
+                let reply_to: Option<i64> = row.get(5).ok().flatten();
+                Ok((message_time, content, sent_by_self, message_state, height, reply_to))
             },
         )?;
 
         let mut out = array![];
         for row in rows {
             match row {
-                Ok((message_time, content, sent_by_self, message_state, height)) => {
-                    let msg = object! {
+                Ok((message_time, content, sent_by_self, message_state, height, reply_to)) => {
+                    let mut msg = object! {
                         "message_time" => message_time,
                         "content" => content,
                         "sent_by_self" => (sent_by_self != 0),
                         "message_state" => message_state,
                         "height" => height
                     };
+                    if let Some(rt) = reply_to {
+                        let _ = msg.insert("reply_to", rt);
+                    }
                     if let Err(e) = out.push(msg) {
                         // out.push returns a JsonError; log it instead of using `?` to avoid
                         // incompatible error conversions inside the DB closure.

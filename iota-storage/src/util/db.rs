@@ -162,6 +162,15 @@ pub fn create_general_messages_db() -> Result<Arc<Mutex<Connection>>, String> {
                 );
                 Ok(())
             });
+            // Attempt to add the reply_to column for backwards compatibility.
+            // This will fail if the column already exists, which is expected.
+            let _ = with_conn(&shared_conn, |conn| {
+                let _ = conn.execute(
+                    "ALTER TABLE messages ADD COLUMN reply_to INTEGER",
+                    [],
+                );
+                Ok(())
+            });
             Ok(shared_conn)
         }
         Err(e) => Err(e),

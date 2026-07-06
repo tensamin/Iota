@@ -622,6 +622,7 @@ impl ClientConnection {
                 .to_string();
 
             let height = cv.get_data(DataType::Height).as_number().unwrap_or(0) as i64;
+            let reply_to = cv.get_data(DataType::ReplyId).as_number().map(|n| n as i64);
 
             chat_files::add_message(
                 timestamp as u128,
@@ -630,6 +631,7 @@ impl ClientConnection {
                 *sender_id as i64,
                 &content,
                 height,
+                reply_to,
             );
 
             // Build user_forward using the parsed numeric timestamp and safe content string
@@ -642,14 +644,23 @@ impl ClientConnection {
                 )
                 .add_typed_default(
                     DataType::Message,
-                    typed_container(vec![
-                        (DataType::Content, DataValue::Str(content.clone())),
-                        (
-                            DataType::SendTime,
-                            DataValue::SignedNumber(timestamp as i128),
-                        ),
-                        (DataType::Height, DataValue::SignedNumber(height as i128)),
-                    ]),
+                    {
+                        let mut msg_fields = vec![
+                            (DataType::Content, DataValue::Str(content.clone())),
+                            (
+                                DataType::SendTime,
+                                DataValue::SignedNumber(timestamp as i128),
+                            ),
+                            (DataType::Height, DataValue::SignedNumber(height as i128)),
+                        ];
+                        if let Some(rt) = reply_to {
+                            msg_fields.push((
+                                DataType::ReplyId,
+                                DataValue::UnsignedNumber(rt as u64 as u128),
+                            ));
+                        }
+                        typed_container(msg_fields)
+                    },
                 );
 
             let user_resp = self

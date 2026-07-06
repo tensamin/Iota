@@ -1262,6 +1262,7 @@ impl OmikronConnection {
                 .to_string();
 
             let height = cv.get_data(DataType::Height).as_number().unwrap_or(0) as i64;
+            let reply_to = cv.get_data(DataType::ReplyId).as_number().map(|n| n as i64);
 
             let is_local = iota_storage::users::user_manager::get_user(receiver_id).is_some();
 
@@ -1274,6 +1275,7 @@ impl OmikronConnection {
                     sender_id as i64,
                     &content,
                     height,
+                    reply_to,
                 );
             }
 
@@ -1285,6 +1287,7 @@ impl OmikronConnection {
                 receiver_id as i64,
                 &content,
                 height,
+                reply_to,
             );
 
             // send confirmation back to sender
@@ -1294,7 +1297,7 @@ impl OmikronConnection {
             self.send_message(&conf_msg).await;
 
             if !is_local {
-                let fw_msg = CommunicationValue::new(CommunicationType::MessageOtherIota)
+                let mut fw_msg = CommunicationValue::new(CommunicationType::MessageOtherIota)
                     .with_id(cv.get_id())
                     .with_receiver(receiver_id as u64)
                     .with_sender(sender_id as u64)
@@ -1304,6 +1307,12 @@ impl OmikronConnection {
                         DataType::SendTime,
                         DataValue::SignedNumber(timestamp_i64 as i128),
                     );
+                if let Some(rt) = reply_to {
+                    fw_msg = fw_msg.add_typed_default(
+                        DataType::ReplyId,
+                        DataValue::UnsignedNumber(rt as u64 as u128),
+                    );
+                }
 
                 let other_iota_resp = self
                     .clone()
@@ -1383,14 +1392,23 @@ impl OmikronConnection {
                     )
                     .add_typed_default(
                         DataType::Message,
-                        typed_container(vec![
-                            (DataType::Content, DataValue::Str(content.clone())),
-                            (
-                                DataType::SendTime,
-                                DataValue::SignedNumber(timestamp_i64 as i128),
-                            ),
-                            (DataType::Height, DataValue::SignedNumber(height as i128)),
-                        ]),
+                        {
+                            let mut msg_fields = vec![
+                                (DataType::Content, DataValue::Str(content.clone())),
+                                (
+                                    DataType::SendTime,
+                                    DataValue::SignedNumber(timestamp_i64 as i128),
+                                ),
+                                (DataType::Height, DataValue::SignedNumber(height as i128)),
+                            ];
+                            if let Some(rt) = reply_to {
+                                msg_fields.push((
+                                    DataType::ReplyId,
+                                    DataValue::UnsignedNumber(rt as u64 as u128),
+                                ));
+                            }
+                            typed_container(msg_fields)
+                        },
                     );
 
                 // Attempt delivery and await a response from the local client
@@ -1520,6 +1538,7 @@ impl OmikronConnection {
                 .to_string();
 
             let height = cv.get_data(DataType::Height).as_number().unwrap_or(0) as i64;
+            let reply_to = cv.get_data(DataType::ReplyId).as_number().map(|n| n as i64);
 
             chat_files::add_message(
                 timestamp as u128,
@@ -1528,6 +1547,7 @@ impl OmikronConnection {
                 *sender_id as i64,
                 &content,
                 height,
+                reply_to,
             );
 
             // Build user_forward using the parsed numeric timestamp and safe content string
@@ -1540,14 +1560,23 @@ impl OmikronConnection {
                 )
                 .add_typed_default(
                     DataType::Message,
-                    typed_container(vec![
-                        (DataType::Content, DataValue::Str(content.clone())),
-                        (
-                            DataType::SendTime,
-                            DataValue::SignedNumber(timestamp as i128),
-                        ),
-                        (DataType::Height, DataValue::SignedNumber(height as i128)),
-                    ]),
+                    {
+                        let mut msg_fields = vec![
+                            (DataType::Content, DataValue::Str(content.clone())),
+                            (
+                                DataType::SendTime,
+                                DataValue::SignedNumber(timestamp as i128),
+                            ),
+                            (DataType::Height, DataValue::SignedNumber(height as i128)),
+                        ];
+                        if let Some(rt) = reply_to {
+                            msg_fields.push((
+                                DataType::ReplyId,
+                                DataValue::UnsignedNumber(rt as u64 as u128),
+                            ));
+                        }
+                        typed_container(msg_fields)
+                    },
                 );
 
             let user_resp = self
@@ -1675,6 +1704,12 @@ impl OmikronConnection {
                 container.push((DataType::MessageState, DataValue::Str(message_state)));
                 container.push((DataType::Height, DataValue::SignedNumber(height as i128)));
                 container.push((DataType::SentBySelf, DataValue::Bool(sent_by_self)));
+                if let Some(rt) = m["reply_to"].as_i64() {
+                    container.push((
+                        DataType::ReplyId,
+                        DataValue::UnsignedNumber(rt as u64 as u128),
+                    ));
+                }
                 msg_array.push(typed_container(container));
             }
 
