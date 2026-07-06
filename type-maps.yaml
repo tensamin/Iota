@@ -218,4 +218,3 @@ type_maps:
       SenderUserId: 152
       RecipientUserId: 153
       Recipients: 154
-      OwnCallSecret: 155
