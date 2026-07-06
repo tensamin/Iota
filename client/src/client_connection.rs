@@ -6,13 +6,14 @@ use iota_storage::util::chat_files::{MessageState, change_message_state};
 use iota_storage::util::chats_util::{get_user, mod_user};
 use iota_storage::util::communities_util::CommunitiesUtil;
 use iota_storage::util::config_util::CONFIG;
-use iota_storage::util::{chat_files, chats_util};
 use iota_storage::util::e2ee_storage::{self, ChatSecretQuery, StoredChatSecret};
+use iota_storage::util::{chat_files, chats_util};
 use iota_util::crypto_helper::keyring_from_base64;
 use iota_util::crypto_util::{self};
 use iota_util::file_util::{get_children, load_file, save_file};
 use mtp::client::{Receiver, Sender};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+use mtp::type_map::TypeMap;
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -43,12 +44,102 @@ fn data_i64(cv: &CommunicationValue, dt: DataType) -> Option<i64> {
     cv.get_data(dt)
         .as_number()
         .and_then(|n| i64::try_from(n).ok())
-        .or_else(|| cv.get_data(dt).as_signed_number().and_then(|n| i64::try_from(n).ok()))
+        .or_else(|| {
+            cv.get_data(dt)
+                .as_signed_number()
+                .and_then(|n| i64::try_from(n).ok())
+        })
         .or_else(|| cv.get_data(dt).as_str().and_then(|s| s.parse::<i64>().ok()))
 }
 
-fn data_bytes(cv: &CommunicationValue, dt: DataType) -> Option<Vec<u8>> {
-    cv.get_bytes(dt).map(|bytes| bytes.to_vec())
+#[derive(Debug, Clone)]
+struct ChatSecretRecipient {
+    user_id: String,
+    encrypted_secret: Vec<u8>,
+    kem_ciphertext: Vec<u8>,
+}
+
+fn recipient_from_value(value: &DataValue) -> Option<ChatSecretRecipient> {
+    let tm = TypeMap::latest();
+    let user_id = value
+        .get_field(DataType::UserId.to_id(&tm))?
+        .as_str()
+        .map(|s| s.to_string())
+        .or_else(|| {
+            value
+                .get_field(DataType::UserId.to_id(&tm))?
+                .as_number()
+                .map(|n| n.to_string())
+        })?;
+    let encrypted_secret = value
+        .get_field(DataType::EncryptedSecret.to_id(&tm))?
+        .as_bytes()?;
+    let kem_ciphertext = value
+        .get_field(DataType::KemCiphertext.to_id(&tm))?
+        .as_bytes()?;
+
+    Some(ChatSecretRecipient {
+        user_id,
+        encrypted_secret,
+        kem_ciphertext,
+    })
+}
+
+fn chat_secret_recipients(cv: &CommunicationValue) -> Option<Vec<ChatSecretRecipient>> {
+    let recipients = cv.get_data(DataType::Recipients).as_array()?;
+    let parsed = recipients
+        .iter()
+        .map(recipient_from_value)
+        .collect::<Option<Vec<_>>>()?;
+
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+fn set_chat_secret_cv_for_recipient(
+    source: &CommunicationValue,
+    recipient: &ChatSecretRecipient,
+) -> CommunicationValue {
+    let recipient_value = typed_container(vec![
+        (DataType::UserId, DataValue::Str(recipient.user_id.clone())),
+        (
+            DataType::EncryptedSecret,
+            DataValue::Bytes(recipient.encrypted_secret.clone()),
+        ),
+        (
+            DataType::KemCiphertext,
+            DataValue::Bytes(recipient.kem_ciphertext.clone()),
+        ),
+    ]);
+
+    CommunicationValue::new(CommunicationType::SetChatSecret)
+        .with_id(source.get_id())
+        .with_sender(source.get_sender())
+        .with_receiver(recipient.user_id.parse::<u64>().unwrap_or(0))
+        .add_typed_default(DataType::ChatId, source.get_data(DataType::ChatId).clone())
+        .add_typed_default(
+            DataType::SecretId,
+            source.get_data(DataType::SecretId).clone(),
+        )
+        .add_typed_default(
+            DataType::VersionNumber,
+            source.get_data(DataType::VersionNumber).clone(),
+        )
+        .add_typed_default(
+            DataType::WrappingScheme,
+            source.get_data(DataType::WrappingScheme).clone(),
+        )
+        .add_typed_default(
+            DataType::CreatedAt,
+            source.get_data(DataType::CreatedAt).clone(),
+        )
+        .add_typed_default(
+            DataType::Recipients,
+            DataValue::Array(vec![recipient_value]),
+        )
 }
 
 fn now_millis_i64() -> i64 {
@@ -179,55 +270,74 @@ impl ClientConnection {
 
         if cv.is_type(CommunicationType::SetChatSecret) {
             let sender_id = cv.get_sender().to_string();
-            if data_string(&cv, DataType::UserId).as_deref() != Some(sender_id.as_str()) {
-                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
-                return;
-            }
+            let recipients = match chat_secret_recipients(&cv) {
+                Some(recipients) => recipients,
+                None => {
+                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                        .await;
+                    return;
+                }
+            };
             let now = now_millis_i64();
-            let record = data_string(&cv, DataType::UserId)
-                .zip(data_string(&cv, DataType::ChatId))
-                .zip(data_string(&cv, DataType::SecretId))
-                .zip(data_i64(&cv, DataType::VersionNumber))
-                .zip(data_bytes(&cv, DataType::EncryptedSecret))
-                .zip(data_bytes(&cv, DataType::KemCiphertext))
-                .zip(data_string(&cv, DataType::WrappingScheme))
-                .map(|((((((user_id, chat_id), secret_id), version), encrypted_secret), kem_ciphertext), wrapping_scheme)| {
-                    StoredChatSecret {
-                        user_id,
-                        chat_id,
-                        secret_id,
-                        version,
-                        encrypted_secret,
-                        kem_ciphertext,
-                        wrapping_scheme,
-                        created_at: data_i64(&cv, DataType::CreatedAt).unwrap_or(now),
-                        updated_at: now,
-                    }
-                });
+            let chat_id = data_string(&cv, DataType::ChatId);
+            let secret_id = data_string(&cv, DataType::SecretId);
+            let version = data_i64(&cv, DataType::VersionNumber);
+            let wrapping_scheme = data_string(&cv, DataType::WrappingScheme);
+            let created_at = data_i64(&cv, DataType::CreatedAt).unwrap_or(now);
 
-            match record.map(e2ee_storage::put_chat_secret) {
-                Some(Ok(())) => {
-                    self.send_message(&error_response(&cv, CommunicationType::Success)).await;
-                }
-                _ => {
-                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+            let Some((((chat_id, secret_id), version), wrapping_scheme)) =
+                chat_id.zip(secret_id).zip(version).zip(wrapping_scheme)
+            else {
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                    .await;
+                return;
+            };
+
+            for recipient in recipients.iter().filter(|item| item.user_id == sender_id) {
+                if e2ee_storage::put_chat_secret(StoredChatSecret {
+                    user_id: recipient.user_id.clone(),
+                    chat_id: chat_id.clone(),
+                    secret_id: secret_id.clone(),
+                    version,
+                    encrypted_secret: recipient.encrypted_secret.clone(),
+                    kem_ciphertext: recipient.kem_ciphertext.clone(),
+                    wrapping_scheme: wrapping_scheme.clone(),
+                    created_at,
+                    updated_at: now,
+                })
+                .is_err()
+                {
+                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                        .await;
+                    return;
                 }
             }
+
+            for recipient in recipients.iter().filter(|item| item.user_id != sender_id) {
+                self.send_message(&set_chat_secret_cv_for_recipient(&cv, recipient))
+                    .await;
+            }
+
+            self.send_message(&error_response(&cv, CommunicationType::Success))
+                .await;
             return;
         }
 
         if cv.is_type(CommunicationType::GetChatSecret) {
             let Some(user_id) = data_string(&cv, DataType::UserId) else {
-                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                    .await;
                 return;
             };
             let sender_id = cv.get_sender().to_string();
             if user_id != sender_id {
-                self.send_message(&error_response(&cv, CommunicationType::ErrorNotFound)).await;
+                self.send_message(&error_response(&cv, CommunicationType::ErrorNotFound))
+                    .await;
                 return;
             }
             let Some(chat_id) = data_string(&cv, DataType::ChatId) else {
-                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                    .await;
                 return;
             };
 
@@ -243,19 +353,39 @@ impl ClientConnection {
                         .add_typed_default(DataType::UserId, DataValue::Str(record.user_id))
                         .add_typed_default(DataType::ChatId, DataValue::Str(record.chat_id))
                         .add_typed_default(DataType::SecretId, DataValue::Str(record.secret_id))
-                        .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(record.version as i128))
-                        .add_typed_default(DataType::EncryptedSecret, DataValue::Bytes(record.encrypted_secret))
-                        .add_typed_default(DataType::KemCiphertext, DataValue::Bytes(record.kem_ciphertext))
-                        .add_typed_default(DataType::WrappingScheme, DataValue::Str(record.wrapping_scheme))
-                        .add_typed_default(DataType::CreatedAt, DataValue::SignedNumber(record.created_at as i128))
-                        .add_typed_default(DataType::UpdatedAt, DataValue::SignedNumber(record.updated_at as i128));
+                        .add_typed_default(
+                            DataType::VersionNumber,
+                            DataValue::SignedNumber(record.version as i128),
+                        )
+                        .add_typed_default(
+                            DataType::EncryptedSecret,
+                            DataValue::Bytes(record.encrypted_secret),
+                        )
+                        .add_typed_default(
+                            DataType::KemCiphertext,
+                            DataValue::Bytes(record.kem_ciphertext),
+                        )
+                        .add_typed_default(
+                            DataType::WrappingScheme,
+                            DataValue::Str(record.wrapping_scheme),
+                        )
+                        .add_typed_default(
+                            DataType::CreatedAt,
+                            DataValue::SignedNumber(record.created_at as i128),
+                        )
+                        .add_typed_default(
+                            DataType::UpdatedAt,
+                            DataValue::SignedNumber(record.updated_at as i128),
+                        );
                     self.send_message(&response).await;
                 }
                 Ok(None) => {
-                    self.send_message(&error_response(&cv, CommunicationType::ErrorNotFound)).await;
+                    self.send_message(&error_response(&cv, CommunicationType::ErrorNotSet))
+                        .await;
                 }
                 Err(_) => {
-                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                        .await;
                 }
             }
             return;
@@ -267,10 +397,12 @@ impl ClientConnection {
             if data_string(&cv, DataType::SenderUserId).as_deref() != Some(sender_id.as_str())
                 || recipient_id.is_empty()
             {
-                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                    .await;
                 return;
             }
-            self.send_message(&cv.with_receiver(recipient_id.parse::<u64>().unwrap_or(0))).await;
+            self.send_message(&cv.with_receiver(recipient_id.parse::<u64>().unwrap_or(0)))
+                .await;
             return;
         }
 
@@ -459,7 +591,8 @@ impl ClientConnection {
 
         // Incoming storsed message: store for the recipient, attempt local delivery, notify sender.
         if cv.is_type(CommunicationType::MessageSend) {
-            self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData)).await;
+            self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                .await;
             return;
         }
 
