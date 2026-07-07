@@ -1164,7 +1164,14 @@ impl OmikronConnection {
                     msg_container.push((DataType::Content, DataValue::Str(content.clone())));
                     msg_container.push((DataType::MessageState, DataValue::Str(message_state)));
                     msg_container.push((DataType::Height, DataValue::SignedNumber(height as i128)));
-                    msg_container.push((DataType::SentBySelf, DataValue::Bool(sent_by_self)));
+                    msg_container.push((
+                        DataType::SenderId,
+                        DataValue::UnsignedNumber(if sent_by_self {
+                            user_id as u128
+                        } else {
+                            contact.user_id as u128
+                        }),
+                    ));
                     msg_array.push(typed_container(msg_container));
 
                     if msg_array.len() == 1 {
@@ -1390,26 +1397,23 @@ impl OmikronConnection {
                         DataType::SenderId,
                         DataValue::SignedNumber(sender_id as i128),
                     )
-                    .add_typed_default(
-                        DataType::Message,
-                        {
-                            let mut msg_fields = vec![
-                                (DataType::Content, DataValue::Str(content.clone())),
-                                (
-                                    DataType::SendTime,
-                                    DataValue::SignedNumber(timestamp_i64 as i128),
-                                ),
-                                (DataType::Height, DataValue::SignedNumber(height as i128)),
-                            ];
-                            if let Some(rt) = reply_to {
-                                msg_fields.push((
-                                    DataType::ReplyId,
-                                    DataValue::UnsignedNumber(rt as u64 as u128),
-                                ));
-                            }
-                            typed_container(msg_fields)
-                        },
-                    );
+                    .add_typed_default(DataType::Message, {
+                        let mut msg_fields = vec![
+                            (DataType::Content, DataValue::Str(content.clone())),
+                            (
+                                DataType::SendTime,
+                                DataValue::SignedNumber(timestamp_i64 as i128),
+                            ),
+                            (DataType::Height, DataValue::SignedNumber(height as i128)),
+                        ];
+                        if let Some(rt) = reply_to {
+                            msg_fields.push((
+                                DataType::ReplyId,
+                                DataValue::UnsignedNumber(rt as u64 as u128),
+                            ));
+                        }
+                        typed_container(msg_fields)
+                    });
 
                 // Attempt delivery and await a response from the local client
                 let user_resp = self
@@ -1558,26 +1562,23 @@ impl OmikronConnection {
                     DataType::SenderId,
                     DataValue::SignedNumber(*sender_id as i128),
                 )
-                .add_typed_default(
-                    DataType::Message,
-                    {
-                        let mut msg_fields = vec![
-                            (DataType::Content, DataValue::Str(content.clone())),
-                            (
-                                DataType::SendTime,
-                                DataValue::SignedNumber(timestamp as i128),
-                            ),
-                            (DataType::Height, DataValue::SignedNumber(height as i128)),
-                        ];
-                        if let Some(rt) = reply_to {
-                            msg_fields.push((
-                                DataType::ReplyId,
-                                DataValue::UnsignedNumber(rt as u64 as u128),
-                            ));
-                        }
-                        typed_container(msg_fields)
-                    },
-                );
+                .add_typed_default(DataType::Message, {
+                    let mut msg_fields = vec![
+                        (DataType::Content, DataValue::Str(content.clone())),
+                        (
+                            DataType::SendTime,
+                            DataValue::SignedNumber(timestamp as i128),
+                        ),
+                        (DataType::Height, DataValue::SignedNumber(height as i128)),
+                    ];
+                    if let Some(rt) = reply_to {
+                        msg_fields.push((
+                            DataType::ReplyId,
+                            DataValue::UnsignedNumber(rt as u64 as u128),
+                        ));
+                    }
+                    typed_container(msg_fields)
+                });
 
             let user_resp = self
                 .clone()
@@ -1703,7 +1704,14 @@ impl OmikronConnection {
                 ));
                 container.push((DataType::MessageState, DataValue::Str(message_state)));
                 container.push((DataType::Height, DataValue::SignedNumber(height as i128)));
-                container.push((DataType::SentBySelf, DataValue::Bool(sent_by_self)));
+                container.push((
+                    DataType::SenderId,
+                    DataValue::UnsignedNumber(if sent_by_self {
+                        my_id as u128
+                    } else {
+                        partner_id as u128
+                    }),
+                ));
                 if let Some(rt) = m["reply_to"].as_i64() {
                     container.push((
                         DataType::ReplyId,
