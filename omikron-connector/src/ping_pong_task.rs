@@ -2,6 +2,7 @@ use crate::omikron_connection::OmikronConnection;
 use dashmap::DashMap;
 use iota_state::APP_STATE;
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+use std::sync::atomic::Ordering;
 use std::sync::LazyLock;
 use std::time::Instant;
 use tokio::time::Duration;
@@ -16,6 +17,8 @@ impl OmikronConnection {
 
         PING_TIMES.retain(|_, v| v.elapsed() < Duration::from_secs(30));
 
+        self.missed_pongs.fetch_add(1, Ordering::Relaxed);
+
         let ping_message = CommunicationValue::new(CommunicationType::Ping)
             .with_id(id)
             .add_typed_default(
@@ -23,10 +26,12 @@ impl OmikronConnection {
                 DataValue::Array(vec![DataValue::SignedNumber(*self.last_ping.lock().await as i128)]),
             );
 
-        self.send_message(&ping_message).await;
+        let _ = self.send_message(&ping_message).await;
     }
 
     pub async fn handle_pong(&self, cv: &CommunicationValue) {
+        self.missed_pongs.store(0, Ordering::Relaxed);
+
         let id = cv.get_id();
 
         if let Some((_, send_time)) = PING_TIMES.remove(&id) {

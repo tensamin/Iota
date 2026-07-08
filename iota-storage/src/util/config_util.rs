@@ -51,17 +51,17 @@ impl Default for IotaConfig {
 }
 
 pub fn load_config() {
-    let s = load_file("", "config.json");
+    let s = load_file("", "config.yaml");
     if s.is_empty() {
         return;
     }
 
-    match serde_json::from_str::<IotaConfig>(&s) {
+    match serde_yaml::from_str::<IotaConfig>(&s) {
         Ok(parsed) => {
             CONFIG.store(Arc::new(parsed));
         }
         Err(e) => {
-            eprintln!("Failed to parse config.json: {}. Content: '{}'", e, s);
+            eprintln!("Failed to parse config.yaml: {}. Content: '{}'", e, s);
         }
     }
 }
@@ -72,8 +72,8 @@ pub fn clear_config() {
 }
 
 pub fn save_config() {
-    if let Ok(json) = serde_json::to_string(&**CONFIG.load()) {
-        save_file("", "config.json", &json);
+    if let Ok(yaml) = serde_yaml::to_string(&**CONFIG.load()) {
+        save_file("", "config.yaml", &yaml);
     }
 }
 

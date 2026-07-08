@@ -1,9 +1,7 @@
 use crate::util::db;
 use iota_logger::log;
-use json::{JsonValue, array, object};
 use rusqlite::params;
-use std::io;
-use std::sync::{Arc, LazyLock, Mutex};
+use crate::storage_error::StorageError;
 
 #[derive(PartialEq, Debug, Clone)]
 pub enum MessageState {
@@ -45,11 +43,202 @@ impl MessageState {
     }
 }
 
-// Shared DB created via helper.
-// The db helper constructs the messages sqlite file and ensures PRAGMAs and schema exist.
-static MESSAGES_DB: LazyLock<Arc<Mutex<rusqlite::Connection>>> = LazyLock::new(|| {
-    db::create_general_messages_db().expect("Failed to create or initialize general messages DB")
-});
+#[derive(Debug, Clone)]
+pub struct StoredMessage {
+    pub id: i64,
+    pub message_time: i64,
+    pub content: String,
+    pub edited: bool,
+    pub sent_by_self: bool,
+    pub message_state: String,
+    pub height: i64,
+    pub reply_to: Option<i64>,
+    pub reactions: Vec<String>,
+}
+
+/*
+ * Each edit is recorded in message_edits with the before/after content and a
+ * timestamp. Only the original sender (sent_by_self = 1) may edit.
+ */
+pub fn edit_message(
+    storage_owner: i64,
+    external_user: i64,
+    message_time: i64,
+    editor_id: i64,
+    new_content: &str,
+) -> Result<(), StorageError> {
+    db::with_db(|conn| {
+        let msg = conn.query_row(
+            r#"
+            SELECT id, content, sent_by_self
+            FROM messages
+            WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
+            ORDER BY id DESC LIMIT 1
+            "#,
+            params![storage_owner, external_user, message_time],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+
+        let (msg_id, old_content, sent_by_self) = msg;
+        if sent_by_self != 1 {
+            return Err(StorageError::Other(
+                "Only the original sender can edit this message".into(),
+            ));
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        conn.execute(
+            r#"
+            INSERT INTO message_edits (message_id, content_before, content_after, edited_at, edited_by)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![msg_id, old_content, new_content, now, editor_id],
+        )?;
+
+        conn.execute(
+            r#"
+            UPDATE messages
+            SET content = ?1, edited_count = edited_count + 1
+            WHERE id = ?2
+            "#,
+            params![new_content, msg_id],
+        )?;
+
+        Ok(())
+    })
+}
+
+pub fn hard_delete_message(storage_owner: i64, external_user: i64, message_time: i64) -> Result<(), StorageError> {
+    db::with_db(|conn| {
+        let msg_id: i64 = conn.query_row(
+            r#"
+            SELECT id FROM messages
+            WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
+            ORDER BY id DESC LIMIT 1
+            "#,
+            params![storage_owner, external_user, message_time],
+            |row| row.get(0),
+        )?;
+
+        conn.execute("DELETE FROM message_edits WHERE message_id = ?1", params![msg_id])?;
+        conn.execute("DELETE FROM reactions WHERE message_id = ?1", params![msg_id])?;
+        conn.execute("DELETE FROM messages WHERE id = ?1", params![msg_id])?;
+        Ok(())
+    })
+}
+
+/*
+ * Marks a message as deleted by the external user rather than removing the row,
+ * so the storage owner still sees a tombstone in the UI.
+ */
+pub fn flag_deleted_by_external(storage_owner: i64, external_user: i64, message_time: i64) -> Result<(), StorageError> {
+    db::with_db(|conn| {
+        let affected = conn.execute(
+            r#"
+            UPDATE messages
+            SET deleted_by_external = 1
+            WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
+            "#,
+            params![storage_owner, external_user, message_time],
+        )?;
+        if affected == 0 {
+            return Err(StorageError::Other("Message not found".into()));
+        }
+        Ok(())
+    })
+}
+
+/*
+ * Removes the edit trail but keeps the message with edited_count > 0 so
+ * the UI still shows the "edited" indicator.  Only the own user should
+ * call this.
+ */
+pub fn delete_edit_history(storage_owner: i64, external_user: i64, message_time: i64) -> Result<(), StorageError> {
+    db::with_db(|conn| {
+        let msg_id: i64 = conn.query_row(
+            r#"
+            SELECT id FROM messages
+            WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
+            ORDER BY id DESC LIMIT 1
+            "#,
+            params![storage_owner, external_user, message_time],
+            |row| row.get(0),
+        )?;
+
+        conn.execute("DELETE FROM message_edits WHERE message_id = ?1", params![msg_id])?;
+        Ok(())
+    })
+}
+
+pub fn add_reaction(
+    storage_owner: i64,
+    external_user: i64,
+    message_time: i64,
+    user_id: i64,
+    reaction: &str,
+) -> Result<(), StorageError> {
+    db::with_db(|conn| {
+        let msg_id: i64 = conn.query_row(
+            r#"
+            SELECT id FROM messages
+            WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
+            ORDER BY id DESC LIMIT 1
+            "#,
+            params![storage_owner, external_user, message_time],
+            |row| row.get(0),
+        )?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        conn.execute(
+            r#"
+            INSERT OR IGNORE INTO reactions (message_id, user_id, reaction, created_at)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+            params![msg_id, user_id, reaction, now],
+        )?;
+        Ok(())
+    })
+}
+
+pub fn remove_reaction(
+    storage_owner: i64,
+    external_user: i64,
+    message_time: i64,
+    user_id: i64,
+    reaction: &str,
+) -> Result<(), StorageError> {
+    db::with_db(|conn| {
+        let msg_id: i64 = conn.query_row(
+            r#"
+            SELECT id FROM messages
+            WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
+            ORDER BY id DESC LIMIT 1
+            "#,
+            params![storage_owner, external_user, message_time],
+            |row| row.get(0),
+        )?;
+
+        conn.execute(
+            "DELETE FROM reactions WHERE message_id = ?1 AND user_id = ?2 AND reaction = ?3",
+            params![msg_id, user_id, reaction],
+        )?;
+        Ok(())
+    })
+}
 
 pub fn add_message(
     send_time: u128,
@@ -68,19 +257,12 @@ pub fn add_message(
         }
     };
 
-    // Insert the message into the DB
-    let insert_result = db::with_conn(&MESSAGES_DB, |conn| {
+    if let Err(e) = db::with_db(|conn| {
         conn.execute(
             r#"
             INSERT INTO messages (
-                storage_owner,
-                external_user,
-                message_time,
-                content,
-                sent_by_self,
-                message_state,
-                height,
-                reply_to
+                storage_owner, external_user, message_time, content,
+                sent_by_self, message_state, height, reply_to
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#,
             params![
@@ -99,18 +281,13 @@ pub fn add_message(
             ],
         )?;
         Ok(())
-    });
-
-    if let Err(e) = insert_result {
+    }) {
         log!("Failed to insert message into sqlite: {}", e);
         return;
     }
 
-    // Update contacts table to reflect that this conversation exists and has a recent message.
-    // Use the Contact helper to set last_message_at to the message timestamp.
     let mut contact = crate::users::contact::Contact::new(external_user);
     contact.set_last_message_at(message_time);
-    // This will insert or update the contact for the storage owner.
     crate::util::chats_util::mod_user(storage_owner, &contact);
 }
 
@@ -119,25 +296,21 @@ pub fn change_message_state(
     storage_owner: i64,
     external_user: i64,
     new_state: MessageState,
-) -> io::Result<()> {
-    // Run the SELECT and UPDATE inside with_conn to centralize connection access.
-    let res: Result<(), String> = db::with_conn(&MESSAGES_DB, |conn| {
+) -> std::io::Result<()> {
+    db::with_db(|conn| {
         let current: Option<String> = match conn.query_row(
             r#"
             SELECT message_state
             FROM messages
-            WHERE storage_owner = ?1
-              AND external_user = ?2
-              AND message_time = ?3
-            ORDER BY id DESC
-            LIMIT 1
+            WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
+            ORDER BY id DESC LIMIT 1
             "#,
             params![storage_owner, external_user, timestamp],
             |row| row.get(0),
         ) {
             Ok(state) => Some(state),
             Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         };
 
         let Some(current_state_raw) = current else {
@@ -154,24 +327,45 @@ pub fn change_message_state(
             UPDATE messages
             SET message_state = ?1
             WHERE id = (
-                SELECT id
-                FROM messages
-                WHERE storage_owner = ?2
-                  AND external_user = ?3
-                  AND message_time = ?4
-                ORDER BY id DESC
-                LIMIT 1
+                SELECT id FROM messages
+                WHERE storage_owner = ?2 AND external_user = ?3 AND message_time = ?4
+                ORDER BY id DESC LIMIT 1
             )
             "#,
             params![upgraded, storage_owner, external_user, timestamp],
         )?;
         Ok(())
-    });
+    })
+    .map_err(|e: StorageError| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+}
 
-    match res {
-        Ok(_) => Ok(()),
-        Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+fn load_reactions(conn: &rusqlite::Connection, msg_ids: &[i64]) -> std::collections::HashMap<i64, Vec<String>> {
+    if msg_ids.is_empty() {
+        return std::collections::HashMap::new();
     }
+
+    let placeholders: Vec<String> = msg_ids.iter().enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect();
+    let query = format!(
+        "SELECT message_id, reaction || ':' || COUNT(*) FROM reactions WHERE message_id IN ({}) GROUP BY message_id, reaction",
+        placeholders.join(", ")
+    );
+
+    let mut map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(&query) {
+        let params: Vec<&dyn rusqlite::types::ToSql> = msg_ids.iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        }) {
+            for row in rows.flatten() {
+                map.entry(row.0).or_default().push(row.1);
+            }
+        }
+    }
+    map
 }
 
 pub fn get_messages(
@@ -179,26 +373,17 @@ pub fn get_messages(
     external_user: i64,
     loaded_messages: i64,
     amount: i64,
-) -> JsonValue {
-    let messages = array![];
-
+) -> Vec<StoredMessage> {
     if amount <= 0 || loaded_messages < 0 {
-        return messages;
+        return Vec::new();
     }
 
-    let res: Result<JsonValue, String> = db::with_conn(&MESSAGES_DB, |conn| {
+    match db::with_db(|conn| {
         let mut stmt = conn.prepare(
             r#"
-            SELECT
-                message_time,
-                content,
-                sent_by_self,
-                message_state,
-                height,
-                reply_to
+            SELECT id, message_time, content, sent_by_self, message_state, height, reply_to, edited_count
             FROM messages
-            WHERE storage_owner = ?1
-              AND external_user = ?2
+            WHERE storage_owner = ?1 AND external_user = ?2 AND deleted_by_external = 0
             ORDER BY message_time DESC, id DESC
             LIMIT ?3 OFFSET ?4
             "#,
@@ -207,49 +392,40 @@ pub fn get_messages(
         let rows = stmt.query_map(
             params![storage_owner, external_user, amount, loaded_messages],
             |row| {
-                let message_time: i64 = row.get(0)?;
-                let content: String = row.get(1)?;
-                let sent_by_self: i64 = row.get(2)?;
-                let message_state: String = row.get(3)?;
-                let height: i64 = row.get(4).unwrap_or(0);
-                let reply_to: Option<i64> = row.get(5).ok().flatten();
-                Ok((message_time, content, sent_by_self, message_state, height, reply_to))
+                Ok(StoredMessage {
+                    id: row.get(0)?,
+                    message_time: row.get(1)?,
+                    content: row.get(2)?,
+                    sent_by_self: row.get::<_, i64>(3)? != 0,
+                    message_state: row.get(4)?,
+                    height: row.get(5).unwrap_or(0),
+                    reply_to: row.get(6).ok().flatten(),
+                    edited: row.get::<_, i64>(7).unwrap_or(0) > 0,
+                    reactions: Vec::new(),
+                })
             },
         )?;
 
-        let mut out = array![];
+        let mut out = Vec::new();
         for row in rows {
             match row {
-                Ok((message_time, content, sent_by_self, message_state, height, reply_to)) => {
-                    let mut msg = object! {
-                        "message_time" => message_time,
-                        "content" => content,
-                        "sent_by_self" => (sent_by_self != 0),
-                        "message_state" => message_state,
-                        "height" => height
-                    };
-                    if let Some(rt) = reply_to {
-                        let _ = msg.insert("reply_to", rt);
-                    }
-                    if let Err(e) = out.push(msg) {
-                        // out.push returns a JsonError; log it instead of using `?` to avoid
-                        // incompatible error conversions inside the DB closure.
-                        log!("Failed to append message to output array: {:?}", e);
-                    }
-                }
-                Err(e) => {
-                    log!("Failed to read row from sqlite: {}", e);
-                }
+                Ok(msg) => out.push(msg),
+                Err(e) => log!("Failed to read row from sqlite: {}", e),
             }
         }
-        Ok(out)
-    });
 
-    match res {
+        let msg_ids: Vec<i64> = out.iter().map(|m| m.id).collect();
+        let reaction_map = load_reactions(conn, &msg_ids);
+        for msg in &mut out {
+            msg.reactions = reaction_map.get(&msg.id).cloned().unwrap_or_default();
+        }
+
+        Ok(out)
+    }) {
         Ok(v) => v,
         Err(e) => {
             log!("Failed to query messages: {}", e);
-            messages
+            Vec::new()
         }
     }
 }

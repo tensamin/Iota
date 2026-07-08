@@ -512,24 +512,18 @@ impl ClientConnection {
                 let messages = chat_files::get_messages(user_id, contact.user_id, 0, amount);
 
                 let mut msg_array = Vec::new();
-                for m in messages.members() {
-                    let message_time = m["message_time"].as_i64().unwrap_or(0);
-                    let content = m["content"].as_str().unwrap_or("").to_string();
-                    let sent_by_self = m["sent_by_self"].as_bool().unwrap_or(false);
-                    let height = m["height"].as_i64().unwrap_or(0);
-                    let message_state = m["message_state"].as_str().unwrap_or("").to_string();
-
+                for m in &messages {
                     let mut msg_container = Vec::new();
                     msg_container.push((
                         DataType::SendTime,
-                        DataValue::SignedNumber(message_time as i128),
+                        DataValue::SignedNumber(m.message_time as i128),
                     ));
-                    msg_container.push((DataType::Content, DataValue::Str(content.clone())));
-                    msg_container.push((DataType::MessageState, DataValue::Str(message_state)));
-                    msg_container.push((DataType::Height, DataValue::SignedNumber(height as i128)));
+                    msg_container.push((DataType::Content, DataValue::Str(m.content.clone())));
+                    msg_container.push((DataType::MessageState, DataValue::Str(m.message_state.clone())));
+                    msg_container.push((DataType::Height, DataValue::SignedNumber(m.height as i128)));
                     msg_container.push((
                         DataType::SenderId,
-                        DataValue::UnsignedNumber(if sent_by_self {
+                        DataValue::UnsignedNumber(if m.sent_by_self {
                             user_id as u128
                         } else {
                             contact.user_id as u128
@@ -538,13 +532,13 @@ impl ClientConnection {
                     msg_array.push(typed_container(msg_container));
 
                     if msg_array.len() == 1 {
-                        let sender_id = if sent_by_self {
+                        let sender_id = if m.sent_by_self {
                             user_id
                         } else {
                             contact.user_id
                         };
                         let mut last_msg = Vec::new();
-                        last_msg.push((DataType::Content, DataValue::Str(content)));
+                        last_msg.push((DataType::Content, DataValue::Str(m.content.clone())));
                         last_msg.push((
                             DataType::SenderId,
                             DataValue::SignedNumber(sender_id as i128),
@@ -749,12 +743,8 @@ impl ClientConnection {
                 amount as i64,
             );
             let mut msg_array: Vec<DataValue> = Vec::new();
-            for m in messages.members() {
-                let message_time: i64 = m["message_time"].as_i64().unwrap_or(0);
-                let content: String = m["content"].as_str().unwrap_or("").to_string();
-                let sent_by_self: bool = m["sent_by_self"].as_bool().unwrap_or(false);
-                let height: i64 = m["height"].as_i64().unwrap_or(0);
-                let sender_id: i64 = if sent_by_self {
+            for m in &messages {
+                let sender_id: i64 = if m.sent_by_self {
                     my_id as i64
                 } else {
                     if let Some(n) = cv.get_data(DataType::ChatPartnerId).as_number() {
@@ -765,23 +755,22 @@ impl ClientConnection {
                         partner_id as i64
                     }
                 };
-                let message_state: String = m["message_state"].as_str().unwrap_or("").to_string();
 
                 let mut container = Vec::new();
                 container.push((
                     DataType::SendTime,
-                    DataValue::SignedNumber(message_time as i128),
+                    DataValue::SignedNumber(m.message_time as i128),
                 ));
-                container.push((DataType::Content, DataValue::Str(content)));
+                container.push((DataType::Content, DataValue::Str(m.content.clone())));
                 container.push((
                     DataType::SenderId,
                     DataValue::SignedNumber(sender_id as i128),
                 ));
-                container.push((DataType::MessageState, DataValue::Str(message_state)));
-                container.push((DataType::Height, DataValue::SignedNumber(height as i128)));
+                container.push((DataType::MessageState, DataValue::Str(m.message_state.clone())));
+                container.push((DataType::Height, DataValue::SignedNumber(m.height as i128)));
                 container.push((
                     DataType::SenderId,
-                    DataValue::UnsignedNumber(if sent_by_self {
+                    DataValue::UnsignedNumber(if m.sent_by_self {
                         my_id as u128
                     } else {
                         partner_id as u128
@@ -883,18 +872,12 @@ impl ClientConnection {
             let mut comm_array = Vec::new();
             for c in CommunitiesUtil::get_communities(cv.get_sender() as i64) {
                 let mut container: Vec<(DataType, DataValue)> = Vec::new();
-                if let Some(address) = c["address"].as_str() {
-                    container.push((
-                        DataType::CommunityAddress,
-                        DataValue::Str(address.to_string()),
-                    ));
-                }
-                if let Some(title) = c["title"].as_str() {
-                    container.push((DataType::CommunityTitle, DataValue::Str(title.to_string())));
-                }
-                if let Some(position) = c["position"].as_str() {
-                    container.push((DataType::Position, DataValue::Str(position.to_string())));
-                }
+                container.push((
+                    DataType::CommunityAddress,
+                    DataValue::Str(c.address.clone()),
+                ));
+                container.push((DataType::CommunityTitle, DataValue::Str(c.title.clone())));
+                container.push((DataType::Position, DataValue::Str(c.position.clone())));
                 comm_array.push(typed_container(container));
             }
 

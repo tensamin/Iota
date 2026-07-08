@@ -16,11 +16,11 @@ use mtp::client::{Client, ClientConfig, Policy, Receiver, SendMode, Sender};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::{Keyring, PublicKeyBundle};
 use mtp::type_map::TypeMap;
-use std::collections::HashMap;
 use std::env;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, oneshot, watch, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -235,13 +235,15 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const TASK_MAX_AGE: Duration = Duration::from_secs(60);
+const MAX_MISSED_PONGS: u32 = 3;
+const MAX_CONCURRENT_HANDLERS: usize = 20;
 
 // ============================================================================
 // Waiting Task System
 // ============================================================================
 
 pub struct WaitingTask {
-    pub task: Box<dyn Fn(Arc<OmikronConnection>, CommunicationValue) -> bool + Send + Sync>,
+    pub task: Box<dyn FnOnce(Arc<OmikronConnection>, CommunicationValue) -> bool + Send + Sync>,
     pub inserted_at: Instant,
 }
 
@@ -284,6 +286,7 @@ impl ConnectionState {
 #[allow(dead_code)] // message_send_times is unused.
 pub struct OmikronConnection {
     state: Arc<RwLock<ConnectionState>>,
+    state_watch_tx: watch::Sender<ConnectionState>,
     sender: Arc<RwLock<Option<Arc<Sender>>>>,
     connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub last_ping: Arc<Mutex<i64>>,
@@ -292,16 +295,20 @@ pub struct OmikronConnection {
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     reconnect_on_close: Arc<RwLock<bool>>,
     auth_failure: Arc<RwLock<Option<String>>>,
-    pub app_challenges: Arc<RwLock<HashMap<u64, String>>>,
-    pub app_sessions: Arc<RwLock<HashMap<u64, (i64, String)>>>,
+    pub app_challenges: Arc<DashMap<u64, String>>,
+    pub app_sessions: Arc<DashMap<u64, (i64, String)>>,
+    pub(crate) missed_pongs: Arc<AtomicU32>,
+    handler_semaphore: Arc<Semaphore>,
 }
 
 impl OmikronConnection {
     pub fn new() -> Self {
         let (shutdown_tx, _) = watch::channel(false);
+        let (state_watch_tx, _) = watch::channel(ConnectionState::Disconnected);
 
         OmikronConnection {
             state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
+            state_watch_tx,
             sender: Arc::new(RwLock::new(None)),
             connection_loop_handle: Arc::new(Mutex::new(None)),
             last_ping: Arc::new(Mutex::new(-1)),
@@ -310,9 +317,16 @@ impl OmikronConnection {
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             reconnect_on_close: Arc::new(RwLock::new(true)),
             auth_failure: Arc::new(RwLock::new(None)),
-            app_challenges: Arc::new(RwLock::new(HashMap::new())),
-            app_sessions: Arc::new(RwLock::new(HashMap::new())),
+            app_challenges: Arc::new(DashMap::new()),
+            app_sessions: Arc::new(DashMap::new()),
+            missed_pongs: Arc::new(AtomicU32::new(0)),
+            handler_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS)),
         }
+    }
+
+    async fn set_state(&self, new_state: ConnectionState) {
+        *self.state.write().await = new_state;
+        let _ = self.state_watch_tx.send(new_state);
     }
 
     // -------------------------------------------------------------------------
@@ -364,7 +378,7 @@ impl OmikronConnection {
             sender.close();
         }
 
-        *self.state.write().await = ConnectionState::Disconnected;
+        self.set_state(ConnectionState::Disconnected).await;
         *self.sender.write().await = None;
     }
 
@@ -418,7 +432,7 @@ impl OmikronConnection {
     }
 
     async fn connect_once(self: Arc<Self>) -> Result<(), String> {
-        *self.state.write().await = ConnectionState::Connecting;
+        self.set_state(ConnectionState::Connecting).await;
         log_t!("omikron_connecting");
 
         let keyring = self.load_or_migrate_keyring().await;
@@ -467,7 +481,7 @@ impl OmikronConnection {
                 );
                 *self.reconnect_on_close.write().await = false;
                 *self.auth_failure.write().await = Some(reason.clone());
-                *self.state.write().await = ConnectionState::Disconnected;
+                self.set_state(ConnectionState::Disconnected).await;
                 return Err(reason);
             }
             Err(e) => return Err(format!("Connection failed: {}", e)),
@@ -482,7 +496,7 @@ impl OmikronConnection {
 
         let sender_arc = Arc::new(connection.sender);
         *self.sender.write().await = Some(sender_arc.clone());
-        *self.state.write().await = ConnectionState::Connected { identified: true };
+        self.set_state(ConnectionState::Connected { identified: true }).await;
 
         // Start read loop
         let mut receiver = connection.receiver;
@@ -507,7 +521,7 @@ impl OmikronConnection {
         // Wait for read loop to complete
         let result = read_handle.await;
         *self.sender.write().await = None;
-        *self.state.write().await = ConnectionState::Disconnected;
+        self.set_state(ConnectionState::Disconnected).await;
         {
             ACTIVE_TASKS.remove("Omikron Listener");
         }
@@ -547,7 +561,15 @@ impl OmikronConnection {
         let legacy = CONFIG.load().keyring.clone();
         let keyring = legacy
             .and_then(|b64| keyring_from_base64(&b64))
-            .unwrap_or_else(crypto_helper::generate_keyring);
+            .unwrap_or_else(|| {
+                log!(
+                    "WARNING: No existing keyring found. Neither {} nor config.json \
+                     contain a keyring; generating a new identity. If you already had \
+                     an Iota identity, restore {} from a backup to avoid losing access.",
+                    IOTA_KEYRING_PATH, IOTA_KEYRING_PATH
+                );
+                crypto_helper::generate_keyring()
+            });
 
         if let Err(e) = mtp::files::save_keyring(&keyring, IOTA_KEYRING_PATH) {
             log!("Failed to persist {}: {}", IOTA_KEYRING_PATH, e);
@@ -672,7 +694,23 @@ impl OmikronConnection {
             let result = receiver.receive().await;
             match result {
                 Ok(cv) => {
-                    self.clone().handle_message(cv).await;
+                    let msg_id = cv.get_id();
+                    if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
+                        if (task.task)(self.clone(), cv.clone()) {
+                            continue;
+                        }
+                    }
+                    if cv.is_type(CommunicationType::Pong) {
+                        self.handle_pong(&cv).await;
+                        continue;
+                    }
+
+                    let permit = self.handler_semaphore.clone().acquire_owned().await;
+                    let self_clone = self.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        self_clone.handle_message_impl(cv).await;
+                    });
                 }
                 Err(e) => {
                     self.fail_all_waiting_tasks(format!(
@@ -707,6 +745,17 @@ impl OmikronConnection {
                     break;
                 }
             } else {
+                break;
+            }
+
+            if self.missed_pongs.load(Ordering::Relaxed) > MAX_MISSED_PONGS {
+                log!(
+                    "Connection appears dead ({} consecutive missed pongs), closing sender",
+                    self.missed_pongs.load(Ordering::Relaxed)
+                );
+                if let Some(sender) = self.sender.read().await.as_ref() {
+                    sender.close();
+                }
                 break;
             }
 
@@ -754,8 +803,109 @@ impl OmikronConnection {
         }
     }
 
+    async fn forward_message_live(
+        &self,
+        message_id: u32,
+        receiver_id: u64,
+        sender_id: i64,
+        timestamp: i64,
+        content: &str,
+        height: i64,
+        reply_to: Option<i64>,
+    ) -> Option<MessageState> {
+        let mut msg_fields = vec![
+            (DataType::Content, DataValue::Str(content.to_string())),
+            (DataType::SendTime, DataValue::SignedNumber(timestamp as i128)),
+            (DataType::Height, DataValue::SignedNumber(height as i128)),
+        ];
+        if let Some(rt) = reply_to {
+            msg_fields.push((DataType::ReplyId, DataValue::UnsignedNumber(rt as u64 as u128)));
+        }
+
+        let user_forward = CommunicationValue::new(CommunicationType::MessageLive)
+            .with_id(message_id)
+            .with_receiver(receiver_id)
+            .add_typed_default(DataType::SenderId, DataValue::SignedNumber(sender_id as i128))
+            .add_typed_default(DataType::Message, typed_container(msg_fields));
+
+        match self.await_response(&user_forward, Some(Duration::from_secs(3))).await {
+            Ok(user_resp) => {
+                let ms_raw = user_resp
+                    .get_data(DataType::MessageState)
+                    .as_string()
+                    .unwrap_or_else(|| "".to_string());
+                Some(MessageState::from_str(&ms_raw).upgrade(MessageState::Received))
+            }
+            Err(_) => None,
+        }
+    }
+
+    async fn forward_to_remote_iota(
+        &self,
+        cv: &CommunicationValue,
+        sender_id: i64,
+        receiver_id: i64,
+        timestamp: i64,
+        content: &str,
+        height: i64,
+        reply_to: Option<i64>,
+    ) {
+        let mut fw_msg = CommunicationValue::new(CommunicationType::MessageOtherIota)
+            .with_id(cv.get_id())
+            .with_receiver(receiver_id as u64)
+            .with_sender(sender_id as u64)
+            .add_typed_default(DataType::Height, DataValue::SignedNumber(height as i128))
+            .add_typed_default(DataType::Content, DataValue::Str(content.to_string()))
+            .add_typed_default(DataType::SendTime, DataValue::SignedNumber(timestamp as i128));
+        if let Some(rt) = reply_to {
+            fw_msg = fw_msg.add_typed_default(
+                DataType::ReplyId,
+                DataValue::UnsignedNumber(rt as u64 as u128),
+            );
+        }
+
+        match self.await_response(&fw_msg, Some(Duration::from_secs(10))).await {
+            Ok(resp) => {
+                let ms_raw = resp
+                    .get_data(DataType::MessageState)
+                    .as_string()
+                    .unwrap_or_else(|| "".to_string());
+                let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
+
+                let _ = chat_files::change_message_state(
+                    timestamp, sender_id, receiver_id, ms.clone(),
+                );
+
+                let _ = self.send_message(
+                    &CommunicationValue::new(CommunicationType::MessageState)
+                        .with_id(cv.get_id())
+                        .with_receiver(sender_id as u64)
+                        .with_sender(receiver_id as u64)
+                        .add_typed_default(DataType::ChatPartnerId, DataValue::SignedNumber(receiver_id as i128))
+                        .add_typed_default(DataType::SendTime, DataValue::SignedNumber(timestamp as i128))
+                        .add_typed_default(DataType::MessageState, DataValue::Str(ms.as_str().to_string())),
+                ).await;
+            }
+            Err(_) => {
+                let _ = chat_files::change_message_state(
+                    timestamp, sender_id, receiver_id, MessageState::Sent,
+                );
+
+                let _ = self.send_message(
+                    &CommunicationValue::new(CommunicationType::MessageState)
+                        .with_id(cv.get_id())
+                        .with_receiver(sender_id as u64)
+                        .with_sender(receiver_id as u64)
+                        .add_typed_default(DataType::ChatPartnerId, DataValue::SignedNumber(receiver_id as i128))
+                        .add_typed_default(DataType::SendTime, DataValue::SignedNumber(timestamp as i128))
+                        .add_typed_default(DataType::MessageState, DataValue::Str(MessageState::Sent.as_str().to_string())),
+                ).await;
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
-    // Message Handling (Preserved from original)
+    // Message Handling — Dispatch
     // -------------------------------------------------------------------------
 
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
@@ -765,7 +915,6 @@ impl OmikronConnection {
 
         let msg_id = cv.get_id();
 
-        // Dispatch waiting task for this message id
         if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
             if (task.task)(self.clone(), cv.clone()) {
                 return;
@@ -777,677 +926,579 @@ impl OmikronConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::SetChatSecret) {
-            let sender_id = cv.get_sender().to_string();
-            let recipients = match chat_secret_recipients(&cv) {
-                Some(recipients) => recipients,
-                None => {
-                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
-                        .await;
+        self.clone().handle_message_impl(cv).await;
+    }
+
+    async fn handle_message_impl(self: Arc<Self>, cv: CommunicationValue) {
+        macro_rules! dispatch {
+            ($ty:ident, $method:ident) => {
+                if cv.is_type(CommunicationType::$ty) {
+                    self.clone().$method(&cv).await;
                     return;
                 }
             };
-            let now = now_millis_i64();
-            let chat_id = data_string(&cv, DataType::ChatId);
-            let secret_id = data_string(&cv, DataType::SecretId);
-            let version = data_i64(&cv, DataType::VersionNumber);
-            let wrapping_scheme = data_string(&cv, DataType::WrappingScheme);
-            let created_at = data_i64(&cv, DataType::CreatedAt).unwrap_or(now);
-
-            let Some((((chat_id, secret_id), version), wrapping_scheme)) =
-                chat_id.zip(secret_id).zip(version).zip(wrapping_scheme)
-            else {
-                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
-                    .await;
-                return;
-            };
-
-            for recipient in &recipients {
-                let recipient_id = recipient.user_id.parse::<i64>().unwrap_or(0);
-                let is_local = iota_storage::users::user_manager::get_user(recipient_id).is_some();
-
-                if is_local {
-                    if e2ee_storage::put_chat_secret(StoredChatSecret {
-                        user_id: recipient.user_id.clone(),
-                        chat_id: chat_id.clone(),
-                        secret_id: secret_id.clone(),
-                        version,
-                        encrypted_secret: recipient.encrypted_secret.clone(),
-                        kem_ciphertext: recipient.kem_ciphertext.clone(),
-                        wrapping_scheme: wrapping_scheme.clone(),
-                        created_at,
-                        updated_at: now,
-                    })
-                    .is_err()
-                    {
-                        self.send_message(&error_response(
-                            &cv,
-                            CommunicationType::ErrorInvalidData,
-                        ))
-                        .await;
-                        return;
-                    }
-                    continue;
-                }
-
-                if recipient.user_id != sender_id {
-                    let forward = set_chat_secret_cv_for_recipient(&cv, recipient);
-                    if !self.forward_chat_secret(&forward).await {
-                        self.store_pending_chat_secret_forward(&forward).await;
-                    }
-                }
-            }
-
-            self.send_message(&error_response(&cv, CommunicationType::Success))
-                .await;
-            return;
         }
 
-        if cv.is_type(CommunicationType::GetChatSecret) {
-            let Some(user_id) = data_string(&cv, DataType::UserId) else {
-                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
-                    .await;
-                return;
-            };
-            if user_id != cv.get_sender().to_string() {
-                self.send_message(&error_response(&cv, CommunicationType::ErrorNotFound))
-                    .await;
-                return;
-            }
-            let Some(chat_id) = data_string(&cv, DataType::ChatId) else {
-                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
-                    .await;
-                return;
-            };
+        dispatch!(SetChatSecret, handle_set_chat_secret);
+        dispatch!(GetChatSecret, handle_get_chat_secret);
+        dispatch!(ChatSecretForward, handle_chat_secret_forward);
+        dispatch!(AppIdentification, handle_app_identification);
+        dispatch!(AppChallengeResponse, handle_app_challenge_response);
+        dispatch!(SaveAppData, handle_save_app_data);
+        dispatch!(LoadAppData, handle_load_app_data);
+        dispatch!(CreateApp, handle_create_app);
+        dispatch!(DeleteApp, handle_delete_app);
+        dispatch!(ClientConnected, handle_client_connected);
+        dispatch!(MessageState, handle_message_state);
+        dispatch!(MessageSend, handle_message_send);
+        dispatch!(MessageOtherIota, handle_message_other_iota);
+        dispatch!(MessagesGet, handle_messages_get);
+        dispatch!(GetChats, handle_get_chats);
+        dispatch!(AddConversation, handle_add_conversation);
+        dispatch!(AddCommunity, handle_add_community);
+        dispatch!(GetCommunities, handle_get_communities);
+        dispatch!(RemoveCommunity, handle_remove_community);
+        dispatch!(GlobalSettingsSave, handle_global_settings_save);
+        dispatch!(GlobalSettingsLoad, handle_global_settings_load);
+        dispatch!(SettingsSave, handle_settings_save);
+        dispatch!(SettingsLoad, handle_settings_load);
+        dispatch!(SettingsList, handle_settings_list);
+    }
 
-            match e2ee_storage::get_chat_secret(ChatSecretQuery {
-                user_id,
-                chat_id,
-                secret_id: data_string(&cv, DataType::SecretId),
-            }) {
-                Ok(Some(record)) => {
-                    let response = CommunicationValue::new(CommunicationType::ChatSecretResponse)
-                        .with_id(cv.get_id())
-                        .with_receiver(cv.get_sender())
-                        .add_typed_default(DataType::UserId, DataValue::Str(record.user_id))
-                        .add_typed_default(DataType::ChatId, DataValue::Str(record.chat_id))
-                        .add_typed_default(DataType::SecretId, DataValue::Str(record.secret_id))
-                        .add_typed_default(
-                            DataType::VersionNumber,
-                            DataValue::SignedNumber(record.version as i128),
-                        )
-                        .add_typed_default(
-                            DataType::EncryptedSecret,
-                            DataValue::Bytes(record.encrypted_secret),
-                        )
-                        .add_typed_default(
-                            DataType::KemCiphertext,
-                            DataValue::Bytes(record.kem_ciphertext),
-                        )
-                        .add_typed_default(
-                            DataType::WrappingScheme,
-                            DataValue::Str(record.wrapping_scheme),
-                        )
-                        .add_typed_default(
-                            DataType::CreatedAt,
-                            DataValue::SignedNumber(record.created_at as i128),
-                        )
-                        .add_typed_default(
-                            DataType::UpdatedAt,
-                            DataValue::SignedNumber(record.updated_at as i128),
-                        );
-                    self.send_message(&response).await;
-                }
-                Ok(None) => {
-                    self.send_message(&error_response(&cv, CommunicationType::ErrorNotSet))
-                        .await
-                }
-                Err(_) => {
-                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
-                        .await
-                }
+    // -------------------------------------------------------------------------
+    // Message Handlers
+    // -------------------------------------------------------------------------
+
+    async fn handle_set_chat_secret(self: Arc<Self>, cv: &CommunicationValue) {
+        let sender_id = cv.get_sender().to_string();
+        let recipients = match chat_secret_recipients(cv) {
+            Some(recipients) => recipients,
+            None => {
+                let _ = self.send_message(&error_response(cv, CommunicationType::ErrorInvalidData)).await;
+                return;
             }
+        };
+        let now = now_millis_i64();
+        let chat_id = data_string(cv, DataType::ChatId);
+        let secret_id = data_string(cv, DataType::SecretId);
+        let version = data_i64(cv, DataType::VersionNumber);
+        let wrapping_scheme = data_string(cv, DataType::WrappingScheme);
+        let created_at = data_i64(cv, DataType::CreatedAt).unwrap_or(now);
+
+        let Some((((chat_id, secret_id), version), wrapping_scheme)) =
+            chat_id.zip(secret_id).zip(version).zip(wrapping_scheme)
+        else {
+            let _ = self.send_message(&error_response(cv, CommunicationType::ErrorInvalidData)).await;
             return;
-        }
+        };
 
-        if cv.is_type(CommunicationType::ChatSecretForward) {
-            let sender_id = cv.get_sender().to_string();
-            let recipient_user_id = data_string(&cv, DataType::RecipientUserId).unwrap_or_default();
-            if data_string(&cv, DataType::SenderUserId).as_deref() != Some(sender_id.as_str())
-                || recipient_user_id.is_empty()
-                || pending_chat_secret_forward_from_cv(&cv).is_none()
-            {
-                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
-                    .await;
-                return;
-            }
+        let mut non_local_forwards: Vec<CommunicationValue> = Vec::new();
 
-            let forward = cv
-                .clone()
-                .with_receiver(recipient_user_id.parse::<u64>().unwrap_or(0));
-            if self.forward_chat_secret(&forward).await {
-                self.send_message(&error_response(&cv, CommunicationType::Success))
-                    .await;
-            } else {
-                self.store_pending_chat_secret_forward(&cv).await;
-                self.send_message(&error_response(&cv, CommunicationType::Success))
-                    .await;
-            }
-            return;
-        }
+        for recipient in &recipients {
+            let recipient_id = recipient.user_id.parse::<i64>().unwrap_or(0);
+            let is_local = iota_storage::users::user_manager::get_user(recipient_id).is_some();
 
-        if cv.is_type(CommunicationType::AppIdentification) {
-            let sender_id = cv.get_sender();
-            let app_identifier = cv
-                .get_data(DataType::AppIdentifier)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let app_public_key = cv
-                .get_data(DataType::AppPublicKey)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let user_id = cv.get_data(DataType::UserId).as_number().unwrap_or(0) as i64;
-
-            let mut trusted = false;
-            if let Some(user) = iota_storage::users::user_manager::get_user(user_id) {
-                if let Some(pub_k) = user.trusted_apps.get(&app_identifier) {
-                    if pub_k == &app_public_key {
-                        trusted = true;
-                    }
-                }
-            }
-
-            if trusted {
-                let challenge = Uuid::new_v4().to_string();
-
-                self.app_challenges
-                    .write()
-                    .await
-                    .insert(sender_id, challenge.clone());
-                self.app_sessions
-                    .write()
-                    .await
-                    .insert(sender_id, (user_id, app_identifier.clone()));
-
-                if let Some(app_pub_bundle) =
-                    iota_util::crypto_helper::public_key_bundle_from_base64(&app_public_key)
+            if is_local {
+                if e2ee_storage::put_chat_secret(StoredChatSecret {
+                    user_id: recipient.user_id.clone(),
+                    chat_id: chat_id.clone(),
+                    secret_id: secret_id.clone(),
+                    version,
+                    encrypted_secret: recipient.encrypted_secret.clone(),
+                    kem_ciphertext: recipient.kem_ciphertext.clone(),
+                    wrapping_scheme: wrapping_scheme.clone(),
+                    created_at,
+                    updated_at: now,
+                })
+                .is_err()
                 {
-                    let kr_str = CONFIG.load().keyring.clone().unwrap_or_default();
-
-                    if let Some(keyring) = keyring_from_base64(&kr_str) {
-                        if let Ok(encrypted_challenge) =
-                            crypto_util::encrypt_challenge(&challenge, &app_pub_bundle)
-                        {
-                            let bundle = keyring.public_key_bundle();
-                            let pub_k_b64 = crypto_helper::public_key_bundle_to_base64(&bundle);
-
-                            let res = CommunicationValue::new(CommunicationType::AppChallenge)
-                                .with_id(cv.get_id())
-                                .with_receiver(sender_id)
-                                .add_typed_default(DataType::PublicKey, DataValue::Str(pub_k_b64))
-                                .add_typed_default(
-                                    DataType::Challenge,
-                                    DataValue::Str(encrypted_challenge),
-                                );
-
-                            self.send_message(&res).await;
-                            return;
-                        }
-                    }
+                    let _ = self.send_message(&error_response(
+                        cv,
+                        CommunicationType::ErrorInvalidData,
+                    )).await;
+                    return;
                 }
+                continue;
             }
 
-            let res = CommunicationValue::new(CommunicationType::ErrorInvalidChallenge)
-                .with_id(cv.get_id())
-                .with_receiver(sender_id);
-            self.send_message(&res).await;
+            if recipient.user_id != sender_id {
+                non_local_forwards
+                    .push(set_chat_secret_cv_for_recipient(cv, recipient));
+            }
+        }
+
+        if !non_local_forwards.is_empty() {
+            let mut handles = Vec::new();
+            for forward in &non_local_forwards {
+                let self_clone = self.clone();
+                let fwd = forward.clone();
+                handles.push(tokio::spawn(async move {
+                    self_clone.forward_chat_secret(&fwd).await
+                }));
+            }
+
+            for (forward, handle) in non_local_forwards.into_iter().zip(handles) {
+                match handle.await {
+                    Ok(true) => {}
+                    _ => self.store_pending_chat_secret_forward(&forward).await,
+                }
+            }
+        }
+
+        let _ = self.send_message(&error_response(cv, CommunicationType::Success)).await;
+    }
+
+    async fn handle_get_chat_secret(self: Arc<Self>, cv: &CommunicationValue) {
+        let Some(user_id) = data_string(cv, DataType::UserId) else {
+            let _ = self.send_message(&error_response(cv, CommunicationType::ErrorInvalidData)).await;
+            return;
+        };
+        if user_id != cv.get_sender().to_string() {
+            let _ = self.send_message(&error_response(cv, CommunicationType::ErrorNotFound)).await;
+            return;
+        }
+        let Some(chat_id) = data_string(cv, DataType::ChatId) else {
+            let _ = self.send_message(&error_response(cv, CommunicationType::ErrorInvalidData)).await;
+            return;
+        };
+
+        match e2ee_storage::get_chat_secret(ChatSecretQuery {
+            user_id,
+            chat_id,
+            secret_id: data_string(cv, DataType::SecretId),
+        }) {
+            Ok(Some(record)) => {
+                let response = CommunicationValue::new(CommunicationType::ChatSecretResponse)
+                    .with_id(cv.get_id())
+                    .with_receiver(cv.get_sender())
+                    .add_typed_default(DataType::UserId, DataValue::Str(record.user_id))
+                    .add_typed_default(DataType::ChatId, DataValue::Str(record.chat_id))
+                    .add_typed_default(DataType::SecretId, DataValue::Str(record.secret_id))
+                    .add_typed_default(
+                        DataType::VersionNumber,
+                        DataValue::SignedNumber(record.version as i128),
+                    )
+                    .add_typed_default(
+                        DataType::EncryptedSecret,
+                        DataValue::Bytes(record.encrypted_secret),
+                    )
+                    .add_typed_default(
+                        DataType::KemCiphertext,
+                        DataValue::Bytes(record.kem_ciphertext),
+                    )
+                    .add_typed_default(
+                        DataType::WrappingScheme,
+                        DataValue::Str(record.wrapping_scheme),
+                    )
+                    .add_typed_default(
+                        DataType::CreatedAt,
+                        DataValue::SignedNumber(record.created_at as i128),
+                    )
+                    .add_typed_default(
+                        DataType::UpdatedAt,
+                        DataValue::SignedNumber(record.updated_at as i128),
+                    );
+                let _ = self.send_message(&response).await;
+            }
+            Ok(None) => {
+                let _ = self.send_message(&error_response(cv, CommunicationType::ErrorNotSet)).await;
+            }
+            Err(_) => {
+                let _ = self.send_message(&error_response(cv, CommunicationType::ErrorInvalidData)).await;
+            }
+        }
+    }
+
+    async fn handle_chat_secret_forward(self: Arc<Self>, cv: &CommunicationValue) {
+        let sender_id = cv.get_sender().to_string();
+        let recipient_user_id = data_string(cv, DataType::RecipientUserId).unwrap_or_default();
+        if data_string(cv, DataType::SenderUserId).as_deref() != Some(sender_id.as_str())
+            || recipient_user_id.is_empty()
+            || pending_chat_secret_forward_from_cv(cv).is_none()
+        {
+            let _ = self.send_message(&error_response(cv, CommunicationType::ErrorInvalidData)).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::AppChallengeResponse) {
-            let sender_id = cv.get_sender();
-            let mut challenges = self.app_challenges.write().await;
-            if let Some(expected) = challenges.remove(&sender_id) {
-                if let DataValue::Str(response) = cv.get_data(DataType::Challenge) {
-                    if expected == *response {
-                        let res =
-                            CommunicationValue::new(CommunicationType::AppIdentificationResponse)
-                                .with_id(cv.get_id())
-                                .with_receiver(sender_id);
-                        self.send_message(&res).await;
+        let forward = cv
+            .clone()
+            .with_receiver(recipient_user_id.parse::<u64>().unwrap_or(0));
+        if self.forward_chat_secret(&forward).await {
+            let _ = self.send_message(&error_response(cv, CommunicationType::Success)).await;
+        } else {
+            self.store_pending_chat_secret_forward(cv).await;
+            let _ = self.send_message(&error_response(cv, CommunicationType::Success)).await;
+        }
+    }
+
+    async fn handle_app_identification(self: Arc<Self>, cv: &CommunicationValue) {
+        let sender_id = cv.get_sender();
+        let app_identifier = cv
+            .get_data(DataType::AppIdentifier)
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let app_public_key = cv
+            .get_data(DataType::AppPublicKey)
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let user_id = cv.get_data(DataType::UserId).as_number().unwrap_or(0) as i64;
+
+        let mut trusted = false;
+        if let Some(user) = iota_storage::users::user_manager::get_user(user_id) {
+            if let Some(pub_k) = user.trusted_apps.get(&app_identifier) {
+                if pub_k == &app_public_key {
+                    trusted = true;
+                }
+            }
+        }
+
+        if trusted {
+            let challenge = Uuid::new_v4().to_string();
+
+            self.app_challenges.insert(sender_id, challenge.clone());
+            self.app_sessions.insert(sender_id, (user_id, app_identifier.clone()));
+
+            if let Some(app_pub_bundle) =
+                iota_util::crypto_helper::public_key_bundle_from_base64(&app_public_key)
+            {
+                let kr_str = CONFIG.load().keyring.clone().unwrap_or_default();
+
+                if let Some(keyring) = keyring_from_base64(&kr_str) {
+                    if let Ok(encrypted_challenge) =
+                        crypto_util::encrypt_challenge(&challenge, &app_pub_bundle)
+                    {
+                        let bundle = keyring.public_key_bundle();
+                        let pub_k_b64 = crypto_helper::public_key_bundle_to_base64(&bundle);
+
+                        let res = CommunicationValue::new(CommunicationType::AppChallenge)
+                            .with_id(cv.get_id())
+                            .with_receiver(sender_id)
+                            .add_typed_default(DataType::PublicKey, DataValue::Str(pub_k_b64))
+                            .add_typed_default(
+                                DataType::Challenge,
+                                DataValue::Str(encrypted_challenge),
+                            );
+
+                        let _ = self.send_message(&res).await;
                         return;
                     }
                 }
             }
-            let res = CommunicationValue::new(CommunicationType::ErrorInvalidChallenge)
-                .with_id(cv.get_id())
-                .with_receiver(sender_id);
-            self.send_message(&res).await;
-            return;
         }
 
-        if cv.is_type(CommunicationType::SaveAppData) {
-            let sender_id = cv.get_sender();
-            let app_data = cv
-                .get_data(DataType::AppData)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+        let res = CommunicationValue::new(CommunicationType::ErrorInvalidChallenge)
+            .with_id(cv.get_id())
+            .with_receiver(sender_id);
+        let _ = self.send_message(&res).await;
+    }
 
-            let sessions = self.app_sessions.read().await;
-            if let Some((user_id, app_identifier)) = sessions.get(&sender_id) {
-                iota_storage::users::user_manager::save_app_data(
-                    *user_id,
-                    app_identifier,
-                    &app_data,
-                );
-            }
-
-            let res = CommunicationValue::new(CommunicationType::SaveAppData)
-                .with_id(cv.get_id())
-                .with_receiver(sender_id);
-            self.send_message(&res).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::LoadAppData) {
-            let sender_id = cv.get_sender();
-            let mut app_data = String::new();
-
-            let sessions = self.app_sessions.read().await;
-            if let Some((user_id, app_identifier)) = sessions.get(&sender_id) {
-                app_data =
-                    iota_storage::users::user_manager::load_app_data(*user_id, app_identifier);
-            }
-
-            let res = CommunicationValue::new(CommunicationType::LoadAppData)
-                .with_id(cv.get_id())
-                .with_receiver(sender_id)
-                .add_typed_default(DataType::AppData, DataValue::Str(app_data));
-            self.send_message(&res).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::CreateApp) {
-            let sender_id = cv.get_sender() as i64;
-            let app_identifier = cv
-                .get_data(DataType::AppIdentifier)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let app_public_key = cv
-                .get_data(DataType::AppPublicKey)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-
-            if !app_identifier.is_empty() && !app_public_key.is_empty() {
-                if let Some(mut user) = iota_storage::users::user_manager::get_user(sender_id) {
-                    if !user.trusted_apps.contains_key(&app_identifier) {
-                        user.trusted_apps.insert(app_identifier, app_public_key);
-                        iota_storage::users::user_manager::update_user(user);
-                    }
+    async fn handle_app_challenge_response(self: Arc<Self>, cv: &CommunicationValue) {
+        let sender_id = cv.get_sender();
+        if let Some((_, expected_challenge)) = self.app_challenges.remove(&sender_id) {
+            if let DataValue::Str(response) = cv.get_data(DataType::Challenge) {
+                if expected_challenge == *response {
+                    let res =
+                        CommunicationValue::new(CommunicationType::AppIdentificationResponse)
+                            .with_id(cv.get_id())
+                            .with_receiver(sender_id);
+                    let _ = self.send_message(&res).await;
+                    return;
                 }
             }
-
-            let res = CommunicationValue::new(CommunicationType::CreateApp)
-                .with_id(cv.get_id())
-                .with_receiver(sender_id as u64);
-            self.send_message(&res).await;
-            return;
         }
+        let res = CommunicationValue::new(CommunicationType::ErrorInvalidChallenge)
+            .with_id(cv.get_id())
+            .with_receiver(sender_id);
+        let _ = self.send_message(&res).await;
+    }
 
-        if cv.is_type(CommunicationType::DeleteApp) {
-            let sender_id = cv.get_sender() as i64;
-            let app_identifier = cv
-                .get_data(DataType::AppIdentifier)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+    async fn handle_save_app_data(self: Arc<Self>, cv: &CommunicationValue) {
+        let sender_id = cv.get_sender();
+        let app_data = cv
+            .get_data(DataType::AppData)
+            .as_str()
+            .unwrap_or("")
+            .to_string();
 
-            if !app_identifier.is_empty() {
-                if let Some(mut user) = iota_storage::users::user_manager::get_user(sender_id) {
-                    if user.trusted_apps.contains_key(&app_identifier) {
-                        user.trusted_apps.remove(&app_identifier);
-                        iota_storage::users::user_manager::update_user(user);
-                    }
-                }
-            }
-
-            let res = CommunicationValue::new(CommunicationType::DeleteApp)
-                .with_id(cv.get_id())
-                .with_receiver(sender_id as u64);
-            self.send_message(&res).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::ClientConnected) {
-            let user_id = cv.get_data(DataType::UserId).as_number().unwrap_or(0) as i64;
-            let _session_id = cv.get_data(DataType::SessionId).as_number().unwrap_or(0) as i64;
-
-            let contacts = chats_util::get_users(user_id);
-            let mut contacts_array = Vec::new();
-
-            for (i, contact) in contacts.iter().enumerate() {
-                let mut contact_container = Vec::new();
-                contact_container.push((
-                    DataType::UserId,
-                    DataValue::SignedNumber(contact.user_id as i128),
-                ));
-                contact_container.push((
-                    DataType::LastMessageAt,
-                    DataValue::SignedNumber(contact.last_message_at.unwrap_or(0) as i128),
-                ));
-
-                if let Some(ref name) = contact.user_name {
-                    contact_container.push((DataType::Username, DataValue::Str(name.clone())));
-                }
-
-                let amount = if i < 10 { 20 } else { 1 };
-                let messages = chat_files::get_messages(user_id, contact.user_id, 0, amount);
-
-                let mut msg_array = Vec::new();
-                for m in messages.members() {
-                    let message_time = m["message_time"].as_i64().unwrap_or(0);
-                    let content = m["content"].as_str().unwrap_or("").to_string();
-                    let sent_by_self = m["sent_by_self"].as_bool().unwrap_or(false);
-                    let height = m["height"].as_i64().unwrap_or(0);
-                    let message_state = m["message_state"].as_str().unwrap_or("").to_string();
-
-                    let mut msg_container = Vec::new();
-                    msg_container.push((
-                        DataType::SendTime,
-                        DataValue::SignedNumber(message_time as i128),
-                    ));
-                    msg_container.push((DataType::Content, DataValue::Str(content.clone())));
-                    msg_container.push((DataType::MessageState, DataValue::Str(message_state)));
-                    msg_container.push((DataType::Height, DataValue::SignedNumber(height as i128)));
-                    msg_container.push((
-                        DataType::SenderId,
-                        DataValue::UnsignedNumber(if sent_by_self {
-                            user_id as u128
-                        } else {
-                            contact.user_id as u128
-                        }),
-                    ));
-                    msg_array.push(typed_container(msg_container));
-
-                    if msg_array.len() == 1 {
-                        let sender_id = if sent_by_self {
-                            user_id
-                        } else {
-                            contact.user_id
-                        };
-                        let mut last_msg = Vec::new();
-                        last_msg.push((DataType::Content, DataValue::Str(content)));
-                        last_msg.push((
-                            DataType::SenderId,
-                            DataValue::SignedNumber(sender_id as i128),
-                        ));
-                        contact_container.push((DataType::LastMessage, typed_container(last_msg)));
-                    }
-                }
-                contact_container.push((DataType::Messages, DataValue::Array(msg_array)));
-                contacts_array.push(typed_container(contact_container));
-            }
-
-            let resp = CommunicationValue::new(CommunicationType::ClientConnected)
-                .with_id(cv.get_id())
-                .add_typed_default(DataType::Contacts, DataValue::Array(contacts_array));
-            self.send_message(&resp).await;
-            return;
-        }
-
-        // ************************************************ //
-        // Direct messages                                  //
-        // ************************************************ //
-
-        if cv.is_type(CommunicationType::MessageState) {
-            let sender_id = &cv.get_sender();
-            let receiver_id = match cv.get_data(DataType::ChatPartnerId).as_number() {
-                Some(id) => id,
-                _ => return,
-            };
-
-            // Parse send_time robustly: accept numeric or string, fallback to current time
-            let send_time_val = cv.get_data(DataType::SendTime);
-            let now_i64 = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            let timestamp_i64 = if let Some(n) = send_time_val.as_number() {
-                n as i64
-            } else if let Some(s) = send_time_val.as_str() {
-                s.parse::<i64>().unwrap_or(now_i64)
-            } else {
-                now_i64
-            };
-
-            let _ = chat_files::change_message_state(
-                timestamp_i64,
-                receiver_id as i64,
-                *sender_id as i64,
-                MessageState::from_str(cv.get_data(DataType::MessageState).as_str().unwrap_or("")),
+        if let Some(session) = self.app_sessions.get(&sender_id) {
+            let (user_id, app_identifier) = session.value();
+            iota_storage::users::user_manager::save_app_data(
+                *user_id,
+                app_identifier,
+                &app_data,
             );
         }
 
-        // Incoming storsed message: store for the recipient, attempt local delivery, notify sender.
-        if cv.is_type(CommunicationType::MessageSend) {
-            let sender_id: u64 = cv.get_sender();
+        let res = CommunicationValue::new(CommunicationType::SaveAppData)
+            .with_id(cv.get_id())
+            .with_receiver(sender_id);
+        let _ = self.send_message(&res).await;
+    }
 
-            // parse receiver_id (the storage owner for this incoming message)
-            let receiver_id: i64 = if let Some(n) = cv.get_data(DataType::ReceiverId).as_number() {
-                n as i64
-            } else if let Some(s) = cv.get_data(DataType::ReceiverId).as_str() {
-                s.parse::<i64>().unwrap_or(0)
-            } else {
-                0
-            };
+    async fn handle_load_app_data(self: Arc<Self>, cv: &CommunicationValue) {
+        let sender_id = cv.get_sender();
+        let mut app_data = String::new();
 
-            // parse send_time robustly (number or string), fallback to now
-            let send_time_val = cv.get_data(DataType::SendTime);
-            let now_i64 = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            let timestamp_i64 = if let Some(n) = send_time_val.as_number() {
-                n as i64
-            } else if let Some(s) = send_time_val.as_str() {
-                s.parse::<i64>().unwrap_or(now_i64)
-            } else {
-                now_i64
-            };
-            let timestamp_u128 = timestamp_i64 as u128;
+        if let Some(session) = self.app_sessions.get(&sender_id) {
+            let (user_id, app_identifier) = session.value();
+            app_data =
+                iota_storage::users::user_manager::load_app_data(*user_id, app_identifier);
+        }
 
-            // content may be missing; default to empty string
-            let content = cv
-                .get_data(DataType::Content)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+        let res = CommunicationValue::new(CommunicationType::LoadAppData)
+            .with_id(cv.get_id())
+            .with_receiver(sender_id)
+            .add_typed_default(DataType::AppData, DataValue::Str(app_data));
+        let _ = self.send_message(&res).await;
+    }
 
-            let height = cv.get_data(DataType::Height).as_number().unwrap_or(0) as i64;
-            let reply_to = cv.get_data(DataType::ReplyId).as_number().map(|n| n as i64);
+    async fn handle_create_app(self: Arc<Self>, cv: &CommunicationValue) {
+        let sender_id = cv.get_sender() as i64;
+        let app_identifier = cv
+            .get_data(DataType::AppIdentifier)
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let app_public_key = cv
+            .get_data(DataType::AppPublicKey)
+            .as_str()
+            .unwrap_or("")
+            .to_string();
 
-            let is_local = iota_storage::users::user_manager::get_user(receiver_id).is_some();
+        if !app_identifier.is_empty() && !app_public_key.is_empty() {
+            if let Some(mut user) = iota_storage::users::user_manager::get_user(sender_id) {
+                if !user.trusted_apps.contains_key(&app_identifier) {
+                    user.trusted_apps.insert(app_identifier, app_public_key);
+                    iota_storage::users::user_manager::update_user(user);
+                }
+            }
+        }
 
-            if is_local {
-                // persist message for the receiver (storage_owner = receiver_id)
-                chat_files::add_message(
-                    timestamp_u128,
-                    false,
-                    receiver_id as i64,
-                    sender_id as i64,
-                    &content,
-                    height,
-                    reply_to,
-                );
+        let res = CommunicationValue::new(CommunicationType::CreateApp)
+            .with_id(cv.get_id())
+            .with_receiver(sender_id as u64);
+        let _ = self.send_message(&res).await;
+    }
+
+    async fn handle_delete_app(self: Arc<Self>, cv: &CommunicationValue) {
+        let sender_id = cv.get_sender() as i64;
+        let app_identifier = cv
+            .get_data(DataType::AppIdentifier)
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        if !app_identifier.is_empty() {
+            if let Some(mut user) = iota_storage::users::user_manager::get_user(sender_id) {
+                if user.trusted_apps.contains_key(&app_identifier) {
+                    user.trusted_apps.remove(&app_identifier);
+                    iota_storage::users::user_manager::update_user(user);
+                }
+            }
+        }
+
+        let res = CommunicationValue::new(CommunicationType::DeleteApp)
+            .with_id(cv.get_id())
+            .with_receiver(sender_id as u64);
+        let _ = self.send_message(&res).await;
+    }
+
+    async fn handle_client_connected(self: Arc<Self>, cv: &CommunicationValue) {
+        let user_id = cv.get_data(DataType::UserId).as_number().unwrap_or(0) as i64;
+        let _session_id = cv.get_data(DataType::SessionId).as_number().unwrap_or(0) as i64;
+
+        let contacts = chats_util::get_users(user_id);
+        let mut contacts_array = Vec::new();
+
+        for (i, contact) in contacts.iter().enumerate() {
+            let mut contact_container = Vec::new();
+            contact_container.push((
+                DataType::UserId,
+                DataValue::SignedNumber(contact.user_id as i128),
+            ));
+            contact_container.push((
+                DataType::LastMessageAt,
+                DataValue::SignedNumber(contact.last_message_at.unwrap_or(0) as i128),
+            ));
+
+            if let Some(ref name) = contact.user_name {
+                contact_container.push((DataType::Username, DataValue::Str(name.clone())));
             }
 
-            // persist message for the sender (storage_owner = sender_id)
+            let amount = if i < 10 { 20 } else { 1 };
+            let messages = chat_files::get_messages(user_id, contact.user_id, 0, amount);
+
+            let mut msg_array = Vec::new();
+            for m in &messages {
+                let mut msg_container = Vec::new();
+                msg_container.push((
+                    DataType::SendTime,
+                    DataValue::SignedNumber(m.message_time as i128),
+                ));
+                msg_container.push((DataType::Content, DataValue::Str(m.content.clone())));
+                msg_container.push((DataType::MessageState, DataValue::Str(m.message_state.clone())));
+                msg_container.push((DataType::Height, DataValue::SignedNumber(m.height as i128)));
+                msg_container.push((
+                    DataType::SenderId,
+                    DataValue::UnsignedNumber(if m.sent_by_self {
+                        user_id as u128
+                    } else {
+                        contact.user_id as u128
+                    }),
+                ));
+                msg_array.push(typed_container(msg_container));
+
+                if msg_array.len() == 1 {
+                    let sender_id = if m.sent_by_self {
+                        user_id
+                    } else {
+                        contact.user_id
+                    };
+                    let mut last_msg = Vec::new();
+                    last_msg.push((DataType::Content, DataValue::Str(m.content.clone())));
+                    last_msg.push((
+                        DataType::SenderId,
+                        DataValue::SignedNumber(sender_id as i128),
+                    ));
+                    contact_container.push((DataType::LastMessage, typed_container(last_msg)));
+                }
+            }
+            contact_container.push((DataType::Messages, DataValue::Array(msg_array)));
+            contacts_array.push(typed_container(contact_container));
+        }
+
+        let resp = CommunicationValue::new(CommunicationType::ClientConnected)
+            .with_id(cv.get_id())
+            .add_typed_default(DataType::Contacts, DataValue::Array(contacts_array));
+        let _ = self.send_message(&resp).await;
+    }
+
+    async fn handle_message_state(self: Arc<Self>, cv: &CommunicationValue) {
+        let sender_id = &cv.get_sender();
+        let receiver_id = match cv.get_data(DataType::ChatPartnerId).as_number() {
+            Some(id) => id,
+            _ => return,
+        };
+
+        let timestamp_i64 = if let Some(n) = cv.get_data(DataType::SendTime).as_number() {
+            n as i64
+        } else if let Some(s) = cv.get_data(DataType::SendTime).as_str() {
+            s.parse::<i64>().unwrap_or_else(|_| now_millis_i64())
+        } else {
+            now_millis_i64()
+        };
+
+        let _ = chat_files::change_message_state(
+            timestamp_i64,
+            receiver_id as i64,
+            *sender_id as i64,
+            MessageState::from_str(cv.get_data(DataType::MessageState).as_str().unwrap_or("")),
+        );
+    }
+
+    async fn handle_message_send(self: Arc<Self>, cv: &CommunicationValue) {
+        let sender_id: u64 = cv.get_sender();
+
+        let receiver_id: i64 = if let Some(n) = cv.get_data(DataType::ReceiverId).as_number() {
+            n as i64
+        } else if let Some(s) = cv.get_data(DataType::ReceiverId).as_str() {
+            s.parse::<i64>().unwrap_or(0)
+        } else {
+            0
+        };
+
+        let timestamp_i64 = if let Some(n) = cv.get_data(DataType::SendTime).as_number() {
+            n as i64
+        } else if let Some(s) = cv.get_data(DataType::SendTime).as_str() {
+            s.parse::<i64>().unwrap_or_else(|_| now_millis_i64())
+        } else {
+            now_millis_i64()
+        };
+        let timestamp_u128 = timestamp_i64 as u128;
+
+        let content = cv
+            .get_data(DataType::Content)
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        let height = cv.get_data(DataType::Height).as_number().unwrap_or(0) as i64;
+        let reply_to = cv.get_data(DataType::ReplyId).as_number().map(|n| n as i64);
+
+        let is_local = iota_storage::users::user_manager::get_user(receiver_id).is_some();
+
+        if is_local {
             chat_files::add_message(
                 timestamp_u128,
-                true,
-                sender_id as i64,
+                false,
                 receiver_id as i64,
+                sender_id as i64,
                 &content,
                 height,
                 reply_to,
             );
+        }
 
-            // send confirmation back to sender
-            let conf_msg = CommunicationValue::new(CommunicationType::MessageSend)
-                .with_id(cv.get_id())
-                .with_receiver(sender_id as u64);
-            self.send_message(&conf_msg).await;
+        chat_files::add_message(
+            timestamp_u128,
+            true,
+            sender_id as i64,
+            receiver_id as i64,
+            &content,
+            height,
+            reply_to,
+        );
 
-            if !is_local {
-                let mut fw_msg = CommunicationValue::new(CommunicationType::MessageOtherIota)
-                    .with_id(cv.get_id())
-                    .with_receiver(receiver_id as u64)
-                    .with_sender(sender_id as u64)
-                    .add_typed_default(DataType::Height, DataValue::SignedNumber(height as i128))
-                    .add_typed_default(DataType::Content, DataValue::Str(content))
-                    .add_typed_default(
-                        DataType::SendTime,
-                        DataValue::SignedNumber(timestamp_i64 as i128),
-                    );
-                if let Some(rt) = reply_to {
-                    fw_msg = fw_msg.add_typed_default(
-                        DataType::ReplyId,
-                        DataValue::UnsignedNumber(rt as u64 as u128),
-                    );
-                }
+        let conf_msg = CommunicationValue::new(CommunicationType::MessageSend)
+            .with_id(cv.get_id())
+            .with_receiver(sender_id as u64);
+        let _ = self.send_message(&conf_msg).await;
 
-                let other_iota_resp = self
-                    .clone()
-                    .await_response(&fw_msg, Some(Duration::from_secs(10)))
-                    .await;
-
-                if let Ok(resp) = other_iota_resp {
-                    let ms_raw = resp
-                        .get_data(DataType::MessageState)
-                        .as_string()
-                        .unwrap_or_else(|| "".to_string());
-                    let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
-
+        if !is_local {
+            self.forward_to_remote_iota(
+                cv,
+                sender_id as i64,
+                receiver_id,
+                timestamp_i64,
+                &content,
+                height,
+                reply_to,
+            )
+            .await;
+        } else {
+            match self
+                .forward_message_live(
+                    cv.get_id(),
+                    receiver_id as u64,
+                    sender_id as i64,
+                    timestamp_i64,
+                    &content,
+                    height,
+                    reply_to,
+                )
+                .await
+            {
+                Some(ms) => {
                     let _ = chat_files::change_message_state(
                         timestamp_i64,
-                        sender_id as i64,
-                        receiver_id as i64,
-                        ms.clone(),
-                    );
-
-                    self.send_message(
-                        &CommunicationValue::new(CommunicationType::MessageState)
-                            .with_id(cv.get_id())
-                            .with_receiver(sender_id as u64)
-                            .with_sender(receiver_id as u64)
-                            .add_typed_default(
-                                DataType::ChatPartnerId,
-                                DataValue::SignedNumber(receiver_id as i128),
-                            )
-                            .add_typed_default(
-                                DataType::SendTime,
-                                DataValue::SignedNumber(timestamp_i64 as i128),
-                            )
-                            .add_typed_default(
-                                DataType::MessageState,
-                                DataValue::Str(ms.as_str().to_string()),
-                            ),
-                    )
-                    .await;
-                } else {
-                    let _ = chat_files::change_message_state(
-                        timestamp_i64,
-                        sender_id as i64,
-                        receiver_id as i64,
-                        MessageState::Sent,
-                    );
-
-                    self.send_message(
-                        &CommunicationValue::new(CommunicationType::MessageState)
-                            .with_id(cv.get_id())
-                            .with_receiver(sender_id as u64)
-                            .with_sender(receiver_id as u64)
-                            .add_typed_default(
-                                DataType::ChatPartnerId,
-                                DataValue::SignedNumber(receiver_id as i128),
-                            )
-                            .add_typed_default(
-                                DataType::SendTime,
-                                DataValue::SignedNumber(timestamp_i64 as i128),
-                            )
-                            .add_typed_default(
-                                DataType::MessageState,
-                                DataValue::Str(MessageState::Sent.as_str().to_string()),
-                            ),
-                    )
-                    .await;
-                }
-                return;
-            } else {
-                // Build a live-delivery message for the local client (recipient)
-                let user_forward = CommunicationValue::new(CommunicationType::MessageLive)
-                    .with_id(cv.get_id())
-                    .with_receiver(receiver_id as u64)
-                    .add_typed_default(
-                        DataType::SenderId,
-                        DataValue::SignedNumber(sender_id as i128),
-                    )
-                    .add_typed_default(DataType::Message, {
-                        let mut msg_fields = vec![
-                            (DataType::Content, DataValue::Str(content.clone())),
-                            (
-                                DataType::SendTime,
-                                DataValue::SignedNumber(timestamp_i64 as i128),
-                            ),
-                            (DataType::Height, DataValue::SignedNumber(height as i128)),
-                        ];
-                        if let Some(rt) = reply_to {
-                            msg_fields.push((
-                                DataType::ReplyId,
-                                DataValue::UnsignedNumber(rt as u64 as u128),
-                            ));
-                        }
-                        typed_container(msg_fields)
-                    });
-
-                // Attempt delivery and await a response from the local client
-                let user_resp = self
-                    .clone()
-                    .await_response(&user_forward, Some(Duration::from_secs(3)))
-                    .await;
-
-                if let Ok(user_resp) = user_resp {
-                    let ms_raw = user_resp
-                        .get_data(DataType::MessageState)
-                        .as_string()
-                        .unwrap_or_else(|| "".to_string());
-                    let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
-
-                    // update stored message state for receiver
-                    let _ = chat_files::change_message_state(
-                        timestamp_i64,
-                        receiver_id as i64,
+                        receiver_id,
                         sender_id as i64,
                         ms.clone(),
                     );
-
-                    // update stored message state for sender
                     let _ = chat_files::change_message_state(
                         timestamp_i64,
                         sender_id as i64,
-                        receiver_id as i64,
+                        receiver_id,
                         ms.clone(),
                     );
-
-                    // notify original sender about the delivered/read state (if read receipts are enabled)
                     if is_read_receipts_enabled().await {
-                        self.send_message(
-                            &CommunicationValue::new(CommunicationType::MessageState)
+                        let _ = self
+                            .send_message(
+                                &CommunicationValue::new(
+                                    CommunicationType::MessageState,
+                                )
                                 .with_id(cv.get_id())
                                 .with_receiver(sender_id as u64)
                                 .with_sender(receiver_id as u64)
@@ -1463,37 +1514,36 @@ impl OmikronConnection {
                                     DataType::MessageState,
                                     DataValue::Str(ms.as_str().to_string()),
                                 ),
-                        )
-                        .await;
+                            )
+                            .await;
                     }
-                } else {
-                    // Delivery failed or timed out; mark as Sent
+                }
+                None => {
                     let _ = chat_files::change_message_state(
                         timestamp_i64,
-                        receiver_id as i64,
+                        receiver_id,
                         sender_id as i64,
                         MessageState::Sent,
                     );
-
                     let _ = chat_files::change_message_state(
                         timestamp_i64,
                         sender_id as i64,
-                        receiver_id as i64,
+                        receiver_id,
                         MessageState::Sent,
                     );
-
-                    // Send push notification to Omega since user is offline
-                    let push_msg = CommunicationValue::new(CommunicationType::PushNotification)
-                        .with_receiver(receiver_id as u64)
-                        .add_typed_default(
-                            DataType::SenderId,
-                            DataValue::SignedNumber(sender_id as i128),
-                        );
-                    self.send_message(&push_msg).await;
-
-                    // notify sender
-                    self.send_message(
-                        &CommunicationValue::new(CommunicationType::MessageState)
+                    let push_msg =
+                        CommunicationValue::new(CommunicationType::PushNotification)
+                            .with_receiver(receiver_id as u64)
+                            .add_typed_default(
+                                DataType::SenderId,
+                                DataValue::SignedNumber(sender_id as i128),
+                            );
+                    let _ = self.send_message(&push_msg).await;
+                    let _ = self
+                        .send_message(
+                            &CommunicationValue::new(
+                                CommunicationType::MessageState,
+                            )
                             .with_id(cv.get_id())
                             .with_receiver(sender_id as u64)
                             .with_sender(receiver_id as u64)
@@ -1507,91 +1557,61 @@ impl OmikronConnection {
                             )
                             .add_typed_default(
                                 DataType::MessageState,
-                                DataValue::Str(MessageState::Sent.as_str().to_string()),
+                                DataValue::Str(
+                                    MessageState::Sent.as_str().to_string(),
+                                ),
                             ),
-                    )
-                    .await;
+                        )
+                        .await;
                 }
-                return;
             }
         }
+    }
 
-        if cv.is_type(CommunicationType::MessageOtherIota) {
-            let sender_id = &cv.get_sender();
-            let receiver_id = &cv.get_receiver();
+    async fn handle_message_other_iota(self: Arc<Self>, cv: &CommunicationValue) {
+        let sender_id = &cv.get_sender();
+        let receiver_id = &cv.get_receiver();
 
-            // parse send_time safely (number or string), fallback to now
-            let send_time_val = cv.get_data(DataType::SendTime);
-            let now_i64 = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            let timestamp = if let Some(n) = send_time_val.as_number() {
-                n as i64
-            } else if let Some(s) = send_time_val.as_str() {
-                s.parse::<i64>().unwrap_or(now_i64)
-            } else {
-                now_i64
-            };
+        let timestamp = if let Some(n) = cv.get_data(DataType::SendTime).as_number() {
+            n as i64
+        } else if let Some(s) = cv.get_data(DataType::SendTime).as_str() {
+            s.parse::<i64>().unwrap_or_else(|_| now_millis_i64())
+        } else {
+            now_millis_i64()
+        };
 
-            // content may be missing or non-string; default to empty string
-            let content = cv
-                .get_data(DataType::Content)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+        let content = cv
+            .get_data(DataType::Content)
+            .as_str()
+            .unwrap_or("")
+            .to_string();
 
-            let height = cv.get_data(DataType::Height).as_number().unwrap_or(0) as i64;
-            let reply_to = cv.get_data(DataType::ReplyId).as_number().map(|n| n as i64);
+        let height = cv.get_data(DataType::Height).as_number().unwrap_or(0) as i64;
+        let reply_to = cv.get_data(DataType::ReplyId).as_number().map(|n| n as i64);
 
-            chat_files::add_message(
-                timestamp as u128,
-                false,
-                *receiver_id as i64,
+        chat_files::add_message(
+            timestamp as u128,
+            false,
+            *receiver_id as i64,
+            *sender_id as i64,
+            &content,
+            height,
+            reply_to,
+        );
+
+        match self
+            .forward_message_live(
+                cv.get_id(),
+                *receiver_id,
                 *sender_id as i64,
+                timestamp,
                 &content,
                 height,
                 reply_to,
-            );
-
-            // Build user_forward using the parsed numeric timestamp and safe content string
-            let user_forward = CommunicationValue::new(CommunicationType::MessageLive)
-                .with_id(cv.get_id())
-                .with_receiver(*receiver_id)
-                .add_typed_default(
-                    DataType::SenderId,
-                    DataValue::SignedNumber(*sender_id as i128),
-                )
-                .add_typed_default(DataType::Message, {
-                    let mut msg_fields = vec![
-                        (DataType::Content, DataValue::Str(content.clone())),
-                        (
-                            DataType::SendTime,
-                            DataValue::SignedNumber(timestamp as i128),
-                        ),
-                        (DataType::Height, DataValue::SignedNumber(height as i128)),
-                    ];
-                    if let Some(rt) = reply_to {
-                        msg_fields.push((
-                            DataType::ReplyId,
-                            DataValue::UnsignedNumber(rt as u64 as u128),
-                        ));
-                    }
-                    typed_container(msg_fields)
-                });
-
-            let user_resp = self
-                .clone()
-                .await_response(&user_forward, Some(Duration::from_secs(3)))
-                .await;
-
-            if let Ok(user_resp) = user_resp {
-                let ms_raw = user_resp
-                    .get_data(DataType::MessageState)
-                    .as_string()
-                    .unwrap_or_else(|| "".to_string());
-                let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
-
+            )
+            .await
+        {
+            Some(ms) => {
                 let _ = change_message_state(
                     timestamp,
                     *receiver_id as i64,
@@ -1599,9 +1619,8 @@ impl OmikronConnection {
                     ms.clone(),
                 );
 
-                // notify original sender about the delivered/read state (if read receipts are enabled)
                 if is_read_receipts_enabled().await {
-                    self.send_message(
+                    let _ = self.send_message(
                         &CommunicationValue::new(CommunicationType::MessageState)
                             .with_id(cv.get_id())
                             .with_receiver(*sender_id)
@@ -1618,11 +1637,10 @@ impl OmikronConnection {
                                 DataType::MessageState,
                                 DataValue::Str(ms.as_str().to_string()),
                             ),
-                    )
-                    .await;
+                    ).await;
                 }
-            } else {
-                // Delivery timed out/failed — update stored state and notify sender with numeric timestamp
+            }
+            None => {
                 let _ = chat_files::change_message_state(
                     timestamp,
                     *receiver_id as i64,
@@ -1630,16 +1648,16 @@ impl OmikronConnection {
                     MessageState::Sent,
                 );
 
-                // Send push notification to Omega since user is offline
-                let push_msg = CommunicationValue::new(CommunicationType::PushNotification)
-                    .with_receiver(*receiver_id)
-                    .add_typed_default(
-                        DataType::SenderId,
-                        DataValue::SignedNumber(*sender_id as i128),
-                    );
-                self.send_message(&push_msg).await;
+                let push_msg =
+                    CommunicationValue::new(CommunicationType::PushNotification)
+                        .with_receiver(*receiver_id)
+                        .add_typed_default(
+                            DataType::SenderId,
+                            DataValue::SignedNumber(*sender_id as i128),
+                        );
+                let _ = self.send_message(&push_msg).await;
 
-                self.send_message(
+                let _ = self.send_message(
                     &CommunicationValue::new(CommunicationType::MessageState)
                         .with_id(cv.get_id())
                         .with_receiver(*sender_id)
@@ -1656,225 +1674,223 @@ impl OmikronConnection {
                             DataType::MessageState,
                             DataValue::Str(MessageState::Sent.as_str().to_string()),
                         ),
-                )
-                .await;
+                ).await;
             }
-            return;
         }
+    }
 
-        if cv.is_type(CommunicationType::MessagesGet) {
-            let my_id = cv.get_sender();
-            let partner_id = cv.get_data(DataType::UserId).as_number().unwrap_or(0);
-            let offset = cv.get_data(DataType::Offset).as_number().unwrap_or(0);
-            let amount = cv.get_data(DataType::Amount).as_number().unwrap_or(0);
-            let messages = chat_files::get_messages(
-                my_id as i64,
-                partner_id as i64,
-                offset as i64,
-                amount as i64,
-            );
-            let mut msg_array: Vec<DataValue> = Vec::new();
-            for m in messages.members() {
-                let message_time: i64 = m["message_time"].as_i64().unwrap_or(0);
-                let content: String = m["content"].as_str().unwrap_or("").to_string();
-                let sent_by_self: bool = m["sent_by_self"].as_bool().unwrap_or(false);
-                let height: i64 = m["height"].as_i64().unwrap_or(0);
-                let sender_id: i64 = if sent_by_self {
-                    my_id as i64
+    async fn handle_messages_get(self: Arc<Self>, cv: &CommunicationValue) {
+        let my_id = cv.get_sender();
+        let partner_id = cv.get_data(DataType::UserId).as_number().unwrap_or(0);
+        let offset = cv.get_data(DataType::Offset).as_number().unwrap_or(0);
+        let amount = cv.get_data(DataType::Amount).as_number().unwrap_or(0);
+        let messages = chat_files::get_messages(
+            my_id as i64,
+            partner_id as i64,
+            offset as i64,
+            amount as i64,
+        );
+        let mut msg_array: Vec<DataValue> = Vec::new();
+        for m in &messages {
+            let sender_id: i64 = if m.sent_by_self {
+                my_id as i64
+            } else {
+                if let Some(n) = cv.get_data(DataType::ChatPartnerId).as_number() {
+                    n as i64
+                } else if let Some(s) = cv.get_data(DataType::ChatPartnerId).as_str() {
+                    s.parse::<i64>().unwrap_or(partner_id as i64)
                 } else {
-                    if let Some(n) = cv.get_data(DataType::ChatPartnerId).as_number() {
-                        n as i64
-                    } else if let Some(s) = cv.get_data(DataType::ChatPartnerId).as_str() {
-                        s.parse::<i64>().unwrap_or(partner_id as i64)
-                    } else {
-                        partner_id as i64
-                    }
-                };
-                let message_state: String = m["message_state"].as_str().unwrap_or("").to_string();
-
-                let mut container = Vec::new();
-                container.push((
-                    DataType::SendTime,
-                    DataValue::SignedNumber(message_time as i128),
-                ));
-                container.push((DataType::Content, DataValue::Str(content)));
-                container.push((
-                    DataType::SenderId,
-                    DataValue::SignedNumber(sender_id as i128),
-                ));
-                container.push((DataType::MessageState, DataValue::Str(message_state)));
-                container.push((DataType::Height, DataValue::SignedNumber(height as i128)));
-                container.push((
-                    DataType::SenderId,
-                    DataValue::UnsignedNumber(if sent_by_self {
-                        my_id as u128
-                    } else {
-                        partner_id as u128
-                    }),
-                ));
-                if let Some(rt) = m["reply_to"].as_i64() {
-                    container.push((
-                        DataType::ReplyId,
-                        DataValue::UnsignedNumber(rt as u64 as u128),
-                    ));
+                    partner_id as i64
                 }
-                msg_array.push(typed_container(container));
-            }
-
-            let resp = CommunicationValue::new(CommunicationType::MessagesGet)
-                .with_id(cv.get_id())
-                .with_receiver(my_id)
-                .add_typed_default(DataType::Messages, DataValue::Array(msg_array));
-
-            self.send_message(&resp).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::GetChats) {
-            let user_id = cv.get_sender();
-            let users = chats_util::get_users(user_id as i64);
-            let mut user_array = Vec::new();
-            for user in users {
-                let mut container = Vec::new();
-                container.push((
-                    DataType::UserId,
-                    DataValue::SignedNumber(user.user_id as i128),
-                ));
-                if let Some(name) = user.user_name {
-                    container.push((DataType::Username, DataValue::Str(name)));
-                }
-                if let Some(ts) = user.last_message_at {
-                    container.push((DataType::LastMessageAt, DataValue::SignedNumber(ts as i128)));
-                }
-                user_array.push(typed_container(container));
-            }
-            let resp = CommunicationValue::new(CommunicationType::GetChats)
-                .with_id(cv.get_id())
-                .with_receiver(user_id)
-                .add_typed_default(DataType::UserIds, DataValue::Array(user_array));
-            self.send_message(&resp).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::AddConversation) {
-            let user_id = cv.get_sender();
-            let other_id = match cv.get_data(DataType::ChatPartnerId).as_number() {
-                Some(n) => n as i64,
-                None => cv
-                    .get_data(DataType::ChatPartnerId)
-                    .as_str()
-                    .unwrap_or("0")
-                    .parse()
-                    .unwrap_or(0),
-            };
-            let mut contact = get_user(user_id as i64, other_id).unwrap_or(Contact::new(other_id));
-
-            if let Some(name) = cv.get_data(DataType::ChatPartnerName).as_str() {
-                contact.user_name = Some(name.to_string());
-            }
-
-            contact.set_last_message_at(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64,
-            );
-            mod_user(user_id as i64, &contact);
-            let resp = CommunicationValue::new(CommunicationType::AddConversation)
-                .with_id(cv.get_id())
-                .with_receiver(user_id);
-            self.send_message(&resp).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::AddCommunity) {
-            CommunitiesUtil::add_community(
-                cv.get_sender() as i64,
-                cv.get_data(DataType::CommunityAddress)
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
-                cv.get_data(DataType::CommunityTitle)
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
-                cv.get_data(DataType::Position)
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
-            );
-            let resp = CommunicationValue::new(CommunicationType::AddCommunity)
-                .with_id(cv.get_id())
-                .with_receiver(cv.get_sender());
-            self.send_message(&resp).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::GetCommunities) {
-            let mut comm_array = Vec::new();
-            for c in CommunitiesUtil::get_communities(cv.get_sender() as i64) {
-                let mut container: Vec<(DataType, DataValue)> = Vec::new();
-                if let Some(address) = c["address"].as_str() {
-                    container.push((
-                        DataType::CommunityAddress,
-                        DataValue::Str(address.to_string()),
-                    ));
-                }
-                if let Some(title) = c["title"].as_str() {
-                    container.push((DataType::CommunityTitle, DataValue::Str(title.to_string())));
-                }
-                if let Some(position) = c["position"].as_str() {
-                    container.push((DataType::Position, DataValue::Str(position.to_string())));
-                }
-                comm_array.push(typed_container(container));
-            }
-
-            let resp = CommunicationValue::new(CommunicationType::GetCommunities)
-                .with_id(cv.get_id())
-                .with_receiver(cv.get_sender())
-                .add_typed_default(DataType::Communities, DataValue::Array(comm_array));
-            self.send_message(&resp).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::RemoveCommunity) {
-            CommunitiesUtil::remove_community(
-                cv.get_sender() as i64,
-                cv.get_data(DataType::CommunityAddress)
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
-            );
-            let resp = CommunicationValue::new(CommunicationType::RemoveCommunity)
-                .with_id(cv.get_id())
-                .with_receiver(cv.get_sender());
-            self.send_message(&resp).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::GlobalSettingsSave) {
-            let my_id = cv.get_sender();
-            let Some(settings_value) = cv.get_data(DataType::Payload).as_str() else {
-                let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                    .with_id(cv.get_id())
-                    .with_receiver(my_id)
-                    .add_typed_default(
-                        DataType::Message,
-                        DataValue::Str("Missing settings payload".to_string()),
-                    );
-                self.send_message(&response).await;
-                return;
             };
 
-            save_file(
-                &format!("users/{}", my_id),
-                "global.settings",
-                settings_value,
-            );
+            let mut container = Vec::new();
+            container.push((
+                DataType::SendTime,
+                DataValue::SignedNumber(m.message_time as i128),
+            ));
+            container.push((DataType::Content, DataValue::Str(m.content.clone())));
+            container.push((
+                DataType::SenderId,
+                DataValue::SignedNumber(sender_id as i128),
+            ));
+            container.push((DataType::MessageState, DataValue::Str(m.message_state.clone())));
+            container.push((DataType::Height, DataValue::SignedNumber(m.height as i128)));
+            container.push((
+                DataType::SenderId,
+                DataValue::UnsignedNumber(if m.sent_by_self {
+                    my_id as u128
+                } else {
+                    partner_id as u128
+                }),
+            ));
+            if let Some(rt) = m.reply_to {
+                container.push((
+                    DataType::ReplyId,
+                    DataValue::UnsignedNumber(rt as u64 as u128),
+                ));
+            }
+            msg_array.push(typed_container(container));
+        }
 
-            let mut response = CommunicationValue::new(CommunicationType::GlobalSettingsSave)
+        let resp = CommunicationValue::new(CommunicationType::MessagesGet)
+            .with_id(cv.get_id())
+            .with_receiver(my_id)
+            .add_typed_default(DataType::Messages, DataValue::Array(msg_array));
+
+        let _ = self.send_message(&resp).await;
+    }
+
+    async fn handle_get_chats(self: Arc<Self>, cv: &CommunicationValue) {
+        let user_id = cv.get_sender();
+        let users = chats_util::get_users(user_id as i64);
+        let mut user_array = Vec::new();
+        for user in users {
+            let mut container = Vec::new();
+            container.push((
+                DataType::UserId,
+                DataValue::SignedNumber(user.user_id as i128),
+            ));
+            if let Some(name) = user.user_name {
+                container.push((DataType::Username, DataValue::Str(name)));
+            }
+            if let Some(ts) = user.last_message_at {
+                container.push((DataType::LastMessageAt, DataValue::SignedNumber(ts as i128)));
+            }
+            user_array.push(typed_container(container));
+        }
+        let resp = CommunicationValue::new(CommunicationType::GetChats)
+            .with_id(cv.get_id())
+            .with_receiver(user_id)
+            .add_typed_default(DataType::UserIds, DataValue::Array(user_array));
+        let _ = self.send_message(&resp).await;
+    }
+
+    async fn handle_add_conversation(self: Arc<Self>, cv: &CommunicationValue) {
+        let user_id = cv.get_sender();
+        let other_id = match cv.get_data(DataType::ChatPartnerId).as_number() {
+            Some(n) => n as i64,
+            None => cv
+                .get_data(DataType::ChatPartnerId)
+                .as_str()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0),
+        };
+        let mut contact = get_user(user_id as i64, other_id).unwrap_or(Contact::new(other_id));
+
+        if let Some(name) = cv.get_data(DataType::ChatPartnerName).as_str() {
+            contact.user_name = Some(name.to_string());
+        }
+
+        contact.set_last_message_at(now_millis_i64());
+        mod_user(user_id as i64, &contact);
+        let resp = CommunicationValue::new(CommunicationType::AddConversation)
+            .with_id(cv.get_id())
+            .with_receiver(user_id);
+        let _ = self.send_message(&resp).await;
+    }
+
+    async fn handle_add_community(self: Arc<Self>, cv: &CommunicationValue) {
+        CommunitiesUtil::add_community(
+            cv.get_sender() as i64,
+            cv.get_data(DataType::CommunityAddress)
+                .as_str()
+                .unwrap()
+                .to_string(),
+            cv.get_data(DataType::CommunityTitle)
+                .as_str()
+                .unwrap()
+                .to_string(),
+            cv.get_data(DataType::Position)
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+        let resp = CommunicationValue::new(CommunicationType::AddCommunity)
+            .with_id(cv.get_id())
+            .with_receiver(cv.get_sender());
+        let _ = self.send_message(&resp).await;
+    }
+
+    async fn handle_get_communities(self: Arc<Self>, cv: &CommunicationValue) {
+        let mut comm_array = Vec::new();
+        for c in CommunitiesUtil::get_communities(cv.get_sender() as i64) {
+            let mut container: Vec<(DataType, DataValue)> = Vec::new();
+            container.push((
+                DataType::CommunityAddress,
+                DataValue::Str(c.address.clone()),
+            ));
+            container.push((DataType::CommunityTitle, DataValue::Str(c.title.clone())));
+            container.push((DataType::Position, DataValue::Str(c.position.clone())));
+            comm_array.push(typed_container(container));
+        }
+
+        let resp = CommunicationValue::new(CommunicationType::GetCommunities)
+            .with_id(cv.get_id())
+            .with_receiver(cv.get_sender())
+            .add_typed_default(DataType::Communities, DataValue::Array(comm_array));
+        let _ = self.send_message(&resp).await;
+    }
+
+    async fn handle_remove_community(self: Arc<Self>, cv: &CommunicationValue) {
+        CommunitiesUtil::remove_community(
+            cv.get_sender() as i64,
+            cv.get_data(DataType::CommunityAddress)
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+        let resp = CommunicationValue::new(CommunicationType::RemoveCommunity)
+            .with_id(cv.get_id())
+            .with_receiver(cv.get_sender());
+        let _ = self.send_message(&resp).await;
+    }
+
+    async fn handle_global_settings_save(self: Arc<Self>, cv: &CommunicationValue) {
+        let my_id = cv.get_sender();
+        let Some(settings_value) = cv.get_data(DataType::Payload).as_str() else {
+            let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                .with_id(cv.get_id())
                 .with_receiver(my_id)
-                .with_id(cv.get_id());
+                .add_typed_default(
+                    DataType::Message,
+                    DataValue::Str("Missing settings payload".to_string()),
+                );
+            let _ = self.send_message(&response).await;
+            return;
+        };
+
+        save_file(
+            &format!("users/{}", my_id),
+            "global.settings",
+            settings_value,
+        );
+
+        let mut response = CommunicationValue::new(CommunicationType::GlobalSettingsSave)
+            .with_receiver(my_id)
+            .with_id(cv.get_id());
+
+        if let Some(session_id) = cv.get_data(DataType::SessionId).as_number() {
+            response = response.add_typed_default(
+                DataType::SessionId,
+                DataValue::SignedNumber(session_id as i128),
+            );
+        }
+
+        let _ = self.send_message(&response).await;
+    }
+
+    async fn handle_global_settings_load(self: Arc<Self>, cv: &CommunicationValue) {
+        let my_id = cv.get_sender();
+        let path = format!("users/{}", my_id);
+        let name = "global.settings";
+
+        if !has_file(&path, name) {
+            let mut response = CommunicationValue::new(CommunicationType::ErrorNotFound)
+                .with_id(cv.get_id())
+                .with_receiver(my_id)
+                .add_typed_default(DataType::Path, DataValue::Str(name.to_string()));
 
             if let Some(session_id) = cv.get_data(DataType::SessionId).as_number() {
                 response = response.add_typed_default(
@@ -1883,126 +1899,182 @@ impl OmikronConnection {
                 );
             }
 
-            self.send_message(&response).await;
+            let _ = self.send_message(&response).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::GlobalSettingsLoad) {
-            let my_id = cv.get_sender();
-            let path = format!("users/{}", my_id);
-            let name = "global.settings";
+        let settings_value_str = load_file(&path, name);
+        let mut response = CommunicationValue::new(CommunicationType::GlobalSettingsLoad)
+            .with_id(cv.get_id())
+            .with_receiver(my_id)
+            .add_typed_default(DataType::Payload, DataValue::Str(settings_value_str));
 
-            if !has_file(&path, name) {
-                let mut response = CommunicationValue::new(CommunicationType::ErrorNotFound)
-                    .with_id(cv.get_id())
-                    .with_receiver(my_id)
-                    .add_typed_default(DataType::Path, DataValue::Str(name.to_string()));
+        if let Some(session_id) = cv.get_data(DataType::SessionId).as_number() {
+            response = response.add_typed_default(
+                DataType::SessionId,
+                DataValue::SignedNumber(session_id as i128),
+            );
+        }
 
-                if let Some(session_id) = cv.get_data(DataType::SessionId).as_number() {
-                    response = response.add_typed_default(
-                        DataType::SessionId,
-                        DataValue::SignedNumber(session_id as i128),
-                    );
-                }
+        let _ = self.send_message(&response).await;
+    }
 
-                self.send_message(&response).await;
-                return;
-            }
-
-            let settings_value_str = load_file(&path, name);
-            let mut response = CommunicationValue::new(CommunicationType::GlobalSettingsLoad)
+    async fn handle_settings_save(self: Arc<Self>, cv: &CommunicationValue) {
+        let my_id = cv.get_sender();
+        let Some(session_id) = cv.get_data(DataType::SessionId).as_number() else {
+            let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
                 .with_id(cv.get_id())
                 .with_receiver(my_id)
-                .add_typed_default(DataType::Payload, DataValue::Str(settings_value_str));
-
-            if let Some(session_id) = cv.get_data(DataType::SessionId).as_number() {
-                response = response.add_typed_default(
+                .add_typed_default(
+                    DataType::Message,
+                    DataValue::Str("Missing session_id".to_string()),
+                );
+            let _ = self.send_message(&response).await;
+            return;
+        };
+        if session_id == 0 || session_id > 1_000_000 {
+            let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                .with_id(cv.get_id())
+                .with_receiver(my_id)
+                .add_typed_default(
+                    DataType::Message,
+                    DataValue::Str("Invalid session_id".to_string()),
+                )
+                .add_typed_default(
                     DataType::SessionId,
                     DataValue::SignedNumber(session_id as i128),
                 );
-            }
+            let _ = self.send_message(&response).await;
+            return;
+        }
+        let Some(settings_name) = cv.get_data(DataType::SettingsName).as_str() else {
+            let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                .with_id(cv.get_id())
+                .with_receiver(my_id)
+                .add_typed_default(
+                    DataType::Message,
+                    DataValue::Str("Missing settings_name".to_string()),
+                )
+                .add_typed_default(
+                    DataType::SessionId,
+                    DataValue::SignedNumber(session_id as i128),
+                );
+            let _ = self.send_message(&response).await;
+            return;
+        };
+        let Some(settings_value) = cv.get_data(DataType::Payload).as_str() else {
+            let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                .with_id(cv.get_id())
+                .with_receiver(my_id)
+                .add_typed_default(
+                    DataType::Message,
+                    DataValue::Str("Missing settings payload".to_string()),
+                )
+                .add_typed_default(
+                    DataType::SessionId,
+                    DataValue::SignedNumber(session_id as i128),
+                );
+            let _ = self.send_message(&response).await;
+            return;
+        };
 
-            self.send_message(&response).await;
+        if !settings_name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+            || settings_name.contains("..")
+        {
+            let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                .with_id(cv.get_id())
+                .with_receiver(my_id)
+                .add_typed_default(
+                    DataType::Message,
+                    DataValue::Str("Invalid settings_name".to_string()),
+                )
+                .add_typed_default(
+                    DataType::SettingsName,
+                    DataValue::Str(settings_name.to_string()),
+                )
+                .add_typed_default(
+                    DataType::SessionId,
+                    DataValue::SignedNumber(session_id as i128),
+                );
+            let _ = self.send_message(&response).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::SettingsSave) {
-            let my_id = cv.get_sender();
-            let Some(session_id) = cv.get_data(DataType::SessionId).as_number() else {
-                let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                    .with_id(cv.get_id())
-                    .with_receiver(my_id)
-                    .add_typed_default(
-                        DataType::Message,
-                        DataValue::Str("Missing session_id".to_string()),
-                    );
-                self.send_message(&response).await;
-                return;
-            };
-            let Some(settings_name) = cv.get_data(DataType::SettingsName).as_str() else {
-                let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                    .with_id(cv.get_id())
-                    .with_receiver(my_id)
-                    .add_typed_default(
-                        DataType::Message,
-                        DataValue::Str("Missing settings_name".to_string()),
-                    )
-                    .add_typed_default(
-                        DataType::SessionId,
-                        DataValue::SignedNumber(session_id as i128),
-                    );
-                self.send_message(&response).await;
-                return;
-            };
-            let Some(settings_value) = cv.get_data(DataType::Payload).as_str() else {
-                let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                    .with_id(cv.get_id())
-                    .with_receiver(my_id)
-                    .add_typed_default(
-                        DataType::Message,
-                        DataValue::Str("Missing settings payload".to_string()),
-                    )
-                    .add_typed_default(
-                        DataType::SessionId,
-                        DataValue::SignedNumber(session_id as i128),
-                    );
-                self.send_message(&response).await;
-                return;
-            };
+        save_file(
+            &format!("users/{}/settings/{}/", my_id, session_id),
+            &format!("{}.settings", settings_name),
+            settings_value,
+        );
 
-            if !settings_name
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
-                || settings_name.contains("..")
-            {
-                let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                    .with_id(cv.get_id())
-                    .with_receiver(my_id)
-                    .add_typed_default(
-                        DataType::Message,
-                        DataValue::Str("Invalid settings_name".to_string()),
-                    )
-                    .add_typed_default(
-                        DataType::SettingsName,
-                        DataValue::Str(settings_name.to_string()),
-                    )
-                    .add_typed_default(
-                        DataType::SessionId,
-                        DataValue::SignedNumber(session_id as i128),
-                    );
-                self.send_message(&response).await;
-                return;
-            }
-
-            save_file(
-                &format!("users/{}/settings/{}/", my_id, session_id),
-                &format!("{}.settings", settings_name),
-                settings_value,
+        let response = CommunicationValue::new(CommunicationType::SettingsSave)
+            .with_receiver(my_id)
+            .with_id(cv.get_id())
+            .add_typed_default(
+                DataType::SettingsName,
+                DataValue::Str(settings_name.to_string()),
+            )
+            .add_typed_default(
+                DataType::SessionId,
+                DataValue::SignedNumber(session_id as i128),
             );
 
-            let response = CommunicationValue::new(CommunicationType::SettingsSave)
-                .with_receiver(my_id)
+        let _ = self.send_message(&response).await;
+    }
+
+    async fn handle_settings_load(self: Arc<Self>, cv: &CommunicationValue) {
+        let my_id = cv.get_sender();
+        let Some(session_id) = cv.get_data(DataType::SessionId).as_number() else {
+            let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
                 .with_id(cv.get_id())
+                .with_receiver(my_id)
+                .add_typed_default(
+                    DataType::Message,
+                    DataValue::Str("Missing session_id".to_string()),
+                );
+            let _ = self.send_message(&response).await;
+            return;
+        };
+        if session_id == 0 || session_id > 1_000_000 {
+            let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                .with_id(cv.get_id())
+                .with_receiver(my_id)
+                .add_typed_default(
+                    DataType::Message,
+                    DataValue::Str("Invalid session_id".to_string()),
+                );
+            let _ = self.send_message(&response).await;
+            return;
+        }
+        let Some(settings_name) = cv.get_data(DataType::SettingsName).as_str() else {
+            let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                .with_id(cv.get_id())
+                .with_receiver(my_id)
+                .add_typed_default(
+                    DataType::Message,
+                    DataValue::Str("Missing settings_name".to_string()),
+                )
+                .add_typed_default(
+                    DataType::SessionId,
+                    DataValue::SignedNumber(session_id as i128),
+                );
+            let _ = self.send_message(&response).await;
+            return;
+        };
+
+        if !settings_name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+            || settings_name.contains("..")
+        {
+            let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                .with_id(cv.get_id())
+                .with_receiver(my_id)
+                .add_typed_default(
+                    DataType::Message,
+                    DataValue::Str("Invalid settings_name".to_string()),
+                )
                 .add_typed_default(
                     DataType::SettingsName,
                     DataValue::Str(settings_name.to_string()),
@@ -2011,87 +2083,16 @@ impl OmikronConnection {
                     DataType::SessionId,
                     DataValue::SignedNumber(session_id as i128),
                 );
-
-            self.send_message(&response).await;
+            let _ = self.send_message(&response).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::SettingsLoad) {
-            let my_id = cv.get_sender();
-            let Some(session_id) = cv.get_data(DataType::SessionId).as_number() else {
-                let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                    .with_id(cv.get_id())
-                    .with_receiver(my_id)
-                    .add_typed_default(
-                        DataType::Message,
-                        DataValue::Str("Missing session_id".to_string()),
-                    );
-                self.send_message(&response).await;
-                return;
-            };
-            let Some(settings_name) = cv.get_data(DataType::SettingsName).as_str() else {
-                let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                    .with_id(cv.get_id())
-                    .with_receiver(my_id)
-                    .add_typed_default(
-                        DataType::Message,
-                        DataValue::Str("Missing settings_name".to_string()),
-                    )
-                    .add_typed_default(
-                        DataType::SessionId,
-                        DataValue::SignedNumber(session_id as i128),
-                    );
-                self.send_message(&response).await;
-                return;
-            };
-
-            if !settings_name
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
-                || settings_name.contains("..")
-            {
-                let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                    .with_id(cv.get_id())
-                    .with_receiver(my_id)
-                    .add_typed_default(
-                        DataType::Message,
-                        DataValue::Str("Invalid settings_name".to_string()),
-                    )
-                    .add_typed_default(
-                        DataType::SettingsName,
-                        DataValue::Str(settings_name.to_string()),
-                    )
-                    .add_typed_default(
-                        DataType::SessionId,
-                        DataValue::SignedNumber(session_id as i128),
-                    );
-                self.send_message(&response).await;
-                return;
-            }
-
-            let settings_file = format!("{}.settings", settings_name);
-            let settings_path = format!("users/{}/settings/{}/", my_id, session_id);
-            if !has_file(&settings_path, &settings_file) {
-                let response = CommunicationValue::new(CommunicationType::ErrorNotFound)
-                    .with_id(cv.get_id())
-                    .with_receiver(my_id)
-                    .add_typed_default(
-                        DataType::SettingsName,
-                        DataValue::Str(settings_name.to_string()),
-                    )
-                    .add_typed_default(
-                        DataType::SessionId,
-                        DataValue::SignedNumber(session_id as i128),
-                    );
-                self.send_message(&response).await;
-                return;
-            }
-
-            let settings_value_str = load_file(&settings_path, &settings_file);
-            let response = CommunicationValue::new(CommunicationType::SettingsLoad)
+        let settings_file = format!("{}.settings", settings_name);
+        let settings_path = format!("users/{}/settings/{}/", my_id, session_id);
+        if !has_file(&settings_path, &settings_file) {
+            let response = CommunicationValue::new(CommunicationType::ErrorNotFound)
                 .with_id(cv.get_id())
                 .with_receiver(my_id)
-                .add_typed_default(DataType::Payload, DataValue::Str(settings_value_str))
                 .add_typed_default(
                     DataType::SettingsName,
                     DataValue::Str(settings_name.to_string()),
@@ -2100,59 +2101,78 @@ impl OmikronConnection {
                     DataType::SessionId,
                     DataValue::SignedNumber(session_id as i128),
                 );
-
-            self.send_message(&response).await;
+            let _ = self.send_message(&response).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::SettingsList) {
-            let my_id = cv.get_sender();
-            let Some(session_id) = cv.get_data(DataType::SessionId).as_number() else {
-                let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                    .with_id(cv.get_id())
-                    .with_receiver(my_id)
-                    .add_typed_default(
-                        DataType::Message,
-                        DataValue::Str("Missing session_id".to_string()),
-                    );
-                self.send_message(&response).await;
-                return;
-            };
+        let settings_value_str = load_file(&settings_path, &settings_file);
+        let response = CommunicationValue::new(CommunicationType::SettingsLoad)
+            .with_id(cv.get_id())
+            .with_receiver(my_id)
+            .add_typed_default(DataType::Payload, DataValue::Str(settings_value_str))
+            .add_typed_default(
+                DataType::SettingsName,
+                DataValue::Str(settings_name.to_string()),
+            )
+            .add_typed_default(
+                DataType::SessionId,
+                DataValue::SignedNumber(session_id as i128),
+            );
 
-            let settings = get_children(&format!("users/{}/settings/{}/", my_id, session_id));
-            let mut settings_json = Vec::new();
-            for s in settings {
-                let s = s.replace(".settings", "");
-                if s.is_empty() {
-                    continue;
-                }
-                let _ = settings_json.push(DataValue::Str(s));
-            }
-            let response = CommunicationValue::new(CommunicationType::SettingsList)
+        let _ = self.send_message(&response).await;
+    }
+
+    async fn handle_settings_list(self: Arc<Self>, cv: &CommunicationValue) {
+        let my_id = cv.get_sender();
+        let Some(session_id) = cv.get_data(DataType::SessionId).as_number() else {
+            let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
                 .with_id(cv.get_id())
                 .with_receiver(my_id)
-                .add_typed_default(DataType::Settings, DataValue::Array(settings_json))
                 .add_typed_default(
-                    DataType::SessionId,
-                    DataValue::SignedNumber(session_id as i128),
+                    DataType::Message,
+                    DataValue::Str("Missing session_id".to_string()),
                 );
-
-            self.send_message(&response).await;
+            let _ = self.send_message(&response).await;
+            return;
+        };
+        if session_id == 0 || session_id > 1_000_000 {
+            let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                .with_id(cv.get_id())
+                .with_receiver(my_id)
+                .add_typed_default(
+                    DataType::Message,
+                    DataValue::Str("Invalid session_id".to_string()),
+                );
+            let _ = self.send_message(&response).await;
             return;
         }
+
+        let settings = get_children(&format!("users/{}/settings/{}/", my_id, session_id));
+        let mut settings_json = Vec::new();
+        for s in settings {
+            let s = s.replace(".settings", "");
+            if s.is_empty() {
+                continue;
+            }
+            let _ = settings_json.push(DataValue::Str(s));
+        }
+        let response = CommunicationValue::new(CommunicationType::SettingsList)
+            .with_id(cv.get_id())
+            .with_receiver(my_id)
+            .add_typed_default(DataType::Settings, DataValue::Array(settings_json))
+            .add_typed_default(
+                DataType::SessionId,
+                DataValue::SignedNumber(session_id as i128),
+            );
+
+        let _ = self.send_message(&response).await;
     }
 
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
 
-    pub async fn send_message(&self, cv: &CommunicationValue) {
-        if let Err(err) = self.send_message_result(cv).await {
-            log_t!("send_message_failed", err);
-        }
-    }
-
-    async fn send_message_result(&self, cv: &CommunicationValue) -> Result<(), String> {
+    pub async fn send_message(&self, cv: &CommunicationValue) -> Result<(), String> {
         let sender_guard = self.sender.read().await;
         if let Some(sender) = sender_guard.as_ref() {
             if !sender.is_open() {
@@ -2216,24 +2236,21 @@ impl OmikronConnection {
         cv: &CommunicationValue,
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, rx) = oneshot::channel();
         let msg_id = cv.get_id();
 
         WAITING_TASKS.insert(
             msg_id,
             WaitingTask {
                 task: Box::new(move |_, response_cv| {
-                    let inner_tx = tx.clone();
-                    tokio::spawn(async move {
-                        let _ = inner_tx.send(response_cv).await;
-                    });
+                    let _ = tx.send(response_cv);
                     true
                 }),
                 inserted_at: Instant::now(),
             },
         );
 
-        if let Err(send_err) = self.send_message_result(cv).await {
+        if let Err(send_err) = self.send_message(cv).await {
             WAITING_TASKS.remove(&msg_id);
             return Err(format!(
                 "Request send failed (msg_id={}, reason={})",
@@ -2243,8 +2260,8 @@ impl OmikronConnection {
 
         let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
 
-        match tokio::time::timeout(timeout, rx.recv()).await {
-            Ok(Some(response_cv)) => {
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(response_cv)) => {
                 let is_error = response_cv.is_type(CommunicationType::Error)
                     || response_cv.is_type(CommunicationType::ErrorInternal)
                     || response_cv.is_type(CommunicationType::ErrorNotFound)
@@ -2265,7 +2282,7 @@ impl OmikronConnection {
                     Ok(response_cv)
                 }
             }
-            Ok(_) => {
+            Ok(Err(_)) => {
                 WAITING_TASKS.remove(&msg_id);
                 Err("Channel closed while awaiting response".to_string())
             }
@@ -2284,27 +2301,30 @@ impl OmikronConnection {
     }
 
     pub async fn await_connection(&self, timeout_duration: Option<Duration>) -> Result<(), String> {
-        if self.state.read().await.is_connected() {
+        let mut rx = self.state_watch_tx.subscribe();
+        if rx.borrow().is_connected() {
             return Ok(());
         }
 
         let timeout = timeout_duration.unwrap_or(CONNECTION_TIMEOUT);
-        let start = Instant::now();
 
-        loop {
-            if self.state.read().await.is_connected() {
-                return Ok(());
+        let result: Result<(), String> = tokio::time::timeout(timeout, async {
+            loop {
+                rx.changed().await.map_err(|_| "State watch channel closed".to_string())?;
+                if rx.borrow().is_connected() {
+                    return Ok(());
+                }
             }
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "Connection not established within {} seconds",
+                timeout.as_secs()
+            )
+        })?;
 
-            if start.elapsed() >= timeout {
-                return Err(format!(
-                    "Connection not established within {} seconds",
-                    timeout.as_secs()
-                ));
-            }
-
-            sleep(Duration::from_millis(100)).await;
-        }
+        result
     }
 
     pub async fn has_auth_failure(&self) -> bool {

@@ -1,24 +1,13 @@
 use crate::users::contact::Contact;
 use crate::util::db;
 use rusqlite::params;
-use std::sync::{Arc, LazyLock, Mutex};
 
-/// Shared DB connection for contacts/messages (created by db helper).
-static MESSAGES_DB: LazyLock<Arc<Mutex<rusqlite::Connection>>> = LazyLock::new(|| {
-    db::create_general_messages_db().expect("Failed to create or initialize general messages DB")
-});
-
-/// Insert or update a contact for the given storage owner.
 pub fn mod_user(storage_owner: i64, contact: &Contact) {
-    if let Err(e) = db::with_conn(&MESSAGES_DB, |conn| {
+    if let Err(e) = db::with_db(|conn| {
         conn.execute(
             r#"
-            INSERT INTO contacts (
-                storage_owner,
-                user_id,
-                user_name,
-                last_message_at
-            ) VALUES (?1, ?2, ?3, ?4)
+            INSERT INTO contacts (storage_owner, user_id, user_name, last_message_at)
+            VALUES (?1, ?2, ?3, ?4)
             ON CONFLICT(storage_owner, user_id) DO UPDATE SET
                 user_name = excluded.user_name,
                 last_message_at = excluded.last_message_at
@@ -27,7 +16,7 @@ pub fn mod_user(storage_owner: i64, contact: &Contact) {
                 storage_owner,
                 contact.user_id,
                 contact.user_name.clone(),
-                contact.last_message_at
+                contact.last_message_at,
             ],
         )?;
         Ok(())
@@ -36,9 +25,8 @@ pub fn mod_user(storage_owner: i64, contact: &Contact) {
     }
 }
 
-/// Retrieve a single contact for storage_owner/user_id.
 pub fn get_user(storage_owner: i64, user_id: i64) -> Option<Contact> {
-    let res: Result<Option<Contact>, String> = db::with_conn(&MESSAGES_DB, |conn| {
+    match db::with_db(|conn| {
         match conn.query_row(
             r#"
             SELECT user_id, user_name, last_message_at
@@ -48,23 +36,18 @@ pub fn get_user(storage_owner: i64, user_id: i64) -> Option<Contact> {
             "#,
             params![storage_owner, user_id],
             |r| {
-                let user_id: i64 = r.get(0)?;
-                let user_name: Option<String> = r.get(1)?;
-                let last_message_at: Option<i64> = r.get(2)?;
                 Ok(Contact {
-                    user_id,
-                    user_name,
-                    last_message_at,
+                    user_id: r.get(0)?,
+                    user_name: r.get(1)?,
+                    last_message_at: r.get(2)?,
                 })
             },
         ) {
             Ok(c) => Ok(Some(c)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
-    });
-
-    match res {
+    }) {
         Ok(opt) => opt,
         Err(e) => {
             eprintln!("Error querying user in get_user: {}", e);
@@ -73,11 +56,8 @@ pub fn get_user(storage_owner: i64, user_id: i64) -> Option<Contact> {
     }
 }
 
-/// Retrieve all contacts for a storage owner, ordered by last_message_at desc / user_id asc.
 pub fn get_users(storage_owner: i64) -> Vec<Contact> {
-    let contacts_out = Vec::new();
-
-    let res: Result<Vec<Contact>, String> = db::with_conn(&MESSAGES_DB, |conn| {
+    match db::with_db(|conn| {
         let mut stmt = conn.prepare(
             r#"
             SELECT user_id, user_name, last_message_at
@@ -91,13 +71,10 @@ pub fn get_users(storage_owner: i64) -> Vec<Contact> {
         )?;
 
         let rows = stmt.query_map(params![storage_owner], |r| {
-            let user_id: i64 = r.get(0)?;
-            let user_name: Option<String> = r.get(1)?;
-            let last_message_at: Option<i64> = r.get(2)?;
             Ok(Contact {
-                user_id,
-                user_name,
-                last_message_at,
+                user_id: r.get(0)?,
+                user_name: r.get(1)?,
+                last_message_at: r.get(2)?,
             })
         })?;
 
@@ -109,13 +86,11 @@ pub fn get_users(storage_owner: i64) -> Vec<Contact> {
             }
         }
         Ok(out)
-    });
-
-    match res {
+    }) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Failed to query contacts in get_users: {}", e);
-            contacts_out
+            Vec::new()
         }
     }
 }
