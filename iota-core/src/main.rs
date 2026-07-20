@@ -88,6 +88,9 @@ async fn main() {
         if let Err(_) = user_manager::load_users().await {
             log_t!("user_load_failed");
         }
+        if let Err(e) = iota_storage::util::settings::migrate_legacy_files() {
+            log!("Failed to migrate legacy settings: {}", e);
+        }
 
         let mut sb = "".to_string();
 
@@ -102,7 +105,11 @@ async fn main() {
         }
         log!(
             "IOTA ID:  {}",
-            CONFIG.load().iota_id.map(|id| id.to_string()).unwrap_or_else(|| "N/A".to_string())
+            CONFIG
+                .load()
+                .iota_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "N/A".to_string())
         );
         log!("User IDS: {}", sb);
 
@@ -121,7 +128,7 @@ async fn main() {
             sb1 = sb1 + ",";
         }
         log!("Community IDS: {}", sb1); */
-        let _port = CONFIG.load().port;
+        let port = CONFIG.load().port;
         let mut _ip = "0.0.0.0".to_string();
         for iface in pnet::datalink::interfaces() {
             let iface: NetworkInterface = iface;
@@ -133,23 +140,15 @@ async fn main() {
                 }
             }
         }
-        /* Community port activation is used for activating the port for communities.
-         * Code is currently commented because communities have not been implemented yet.
-        if start(port).await {
-            log_t!("community_active", ip, port.to_string());
-        } else {
-            if port < 1024 {
-                log_t!("community_start_error_admin", port.to_string());
-            } else {
-                log_t!("community_start_error", port.to_string());
-            }
-        } */
         if !has_dir("web") {
             download_and_extract_zip(
                 "https://omega.tensamin.net/api/download/iota_frontend",
                 "web",
             )
             .await;
+        }
+        if !web_server::start(port).await {
+            log!("Failed to start the MTP web server on port {}", port);
         }
         let _ = omikron::omikron_connection::get_omikron_connection().await;
 
@@ -162,7 +161,9 @@ async fn main() {
             if OMIKRON_CONNECTION.has_auth_failure().await {
                 if let Some(reason) = OMIKRON_CONNECTION.get_auth_failure().await {
                     log!("Authentication failed: {}", reason);
-                    log!("Use /reconnect to try again or /regenerate private-key to create a new key pair");
+                    log!(
+                        "Use /reconnect to try again or /regenerate private-key to create a new key pair"
+                    );
                     OMIKRON_CONNECTION.clear_auth_failure().await;
                 }
             }

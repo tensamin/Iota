@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git" }
-mtp-crypto = { git = "https://git.methanium.net/Methanium/mtp.git", features = ["pqc"] }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", features = [
+    "crypto"
+] }
 
 reqwest = "0.13.2"
 tokio = { version = "1.50.0", features = ["full"] }

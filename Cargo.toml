@@ -1,3 +1,19 @@
 [workspace]
-members = ["iota-storage", "client", "iota-auth", "other-iota", "iota-updater", "iota-terms", "iota-state", "iota-cli", "iota-core", "omikron-connector", "web-server", "web-ui", "iota-logger", "iota-util"]
+members = [
+    "iota-storage",
+    "iota-connection",
+    "client",
+    "iota-auth",
+    "other-iota",
+    "iota-updater",
+    "iota-terms",
+    "iota-state",
+    "iota-cli",
+    "iota-core",
+    "omikron-connector",
+    "web-server",
+    "web-ui",
+    "iota-logger",
+    "iota-util",
+]
 resolver = "3"

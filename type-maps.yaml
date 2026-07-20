@@ -148,6 +148,7 @@ type_maps:
       MessageReactionAdd: 146
       MessageReactionRemove: 147
       MessageReactionLive: 148
+      MessageDeleteLive: 150
     DataTypes:
       ErrorType: 32
       ErrorProtocol: 33
@@ -169,7 +170,7 @@ type_maps:
       CallState: 49
       ScreenShare: 50
       PrivateKeyHash: 51
-      Accepted: 52
+      # Accepted: 52 now part of default MTP
       AcceptedProfiles: 53
       DeniedProfiles: 54
       Content: 55

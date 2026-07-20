@@ -1,0 +1,9 @@
+[package]
+name = "iota-connection"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iota-storage = { path = "../iota-storage" }
+iota-util = { path = "../iota-util" }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git" }

@@ -1,7 +1,7 @@
+use crate::storage_error::StorageError;
 use crate::util::db;
 use iota_logger::log;
 use rusqlite::params;
-use crate::storage_error::StorageError;
 
 #[derive(PartialEq, Debug, Clone)]
 pub enum MessageState {
@@ -53,7 +53,13 @@ pub struct StoredMessage {
     pub message_state: String,
     pub height: i64,
     pub reply_to: Option<i64>,
-    pub reactions: Vec<String>,
+    pub reactions: Vec<StoredReaction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredReaction {
+    pub reaction: String,
+    pub user_id: i64,
 }
 
 /*
@@ -66,6 +72,48 @@ pub fn edit_message(
     message_time: i64,
     editor_id: i64,
     new_content: &str,
+) -> Result<(), StorageError> {
+    update_message_content(
+        storage_owner,
+        external_user,
+        message_time,
+        editor_id,
+        new_content,
+        true,
+    )
+}
+
+/* Applies an edit received from the message sender to the recipient's copy. */
+pub fn apply_remote_edit(
+    storage_owner: i64,
+    external_user: i64,
+    message_time: i64,
+    editor_id: i64,
+    new_content: &str,
+) -> Result<(), StorageError> {
+    if editor_id != external_user {
+        return Err(StorageError::Other(
+            "Remote editor does not match chat partner".into(),
+        ));
+    }
+
+    update_message_content(
+        storage_owner,
+        external_user,
+        message_time,
+        editor_id,
+        new_content,
+        false,
+    )
+}
+
+fn update_message_content(
+    storage_owner: i64,
+    external_user: i64,
+    message_time: i64,
+    editor_id: i64,
+    new_content: &str,
+    require_sent_by_self: bool,
 ) -> Result<(), StorageError> {
     db::with_db(|conn| {
         let msg = conn.query_row(
@@ -86,9 +134,14 @@ pub fn edit_message(
         )?;
 
         let (msg_id, old_content, sent_by_self) = msg;
-        if sent_by_self != 1 {
+        if require_sent_by_self && sent_by_self != 1 {
             return Err(StorageError::Other(
                 "Only the original sender can edit this message".into(),
+            ));
+        }
+        if !require_sent_by_self && sent_by_self != 0 {
+            return Err(StorageError::Other(
+                "Remote edits may only update received messages".into(),
             ));
         }
 
@@ -118,7 +171,11 @@ pub fn edit_message(
     })
 }
 
-pub fn hard_delete_message(storage_owner: i64, external_user: i64, message_time: i64) -> Result<(), StorageError> {
+pub fn hard_delete_message(
+    storage_owner: i64,
+    external_user: i64,
+    message_time: i64,
+) -> Result<(), StorageError> {
     db::with_db(|conn| {
         let msg_id: i64 = conn.query_row(
             r#"
@@ -130,9 +187,66 @@ pub fn hard_delete_message(storage_owner: i64, external_user: i64, message_time:
             |row| row.get(0),
         )?;
 
-        conn.execute("DELETE FROM message_edits WHERE message_id = ?1", params![msg_id])?;
-        conn.execute("DELETE FROM reactions WHERE message_id = ?1", params![msg_id])?;
+        conn.execute(
+            "DELETE FROM message_edits WHERE message_id = ?1",
+            params![msg_id],
+        )?;
+        conn.execute(
+            "DELETE FROM reactions WHERE message_id = ?1",
+            params![msg_id],
+        )?;
         conn.execute("DELETE FROM messages WHERE id = ?1", params![msg_id])?;
+        Ok(())
+    })
+}
+
+/* Deletes a message from the sender's local copy after checking ownership. */
+pub fn delete_message(
+    storage_owner: i64,
+    external_user: i64,
+    message_time: i64,
+) -> Result<(), StorageError> {
+    ensure_message_direction(storage_owner, external_user, message_time, true)?;
+    hard_delete_message(storage_owner, external_user, message_time)
+}
+
+/* Flags the recipient's local copy after validating its sender, preserving its history. */
+pub fn apply_remote_delete(
+    storage_owner: i64,
+    external_user: i64,
+    message_time: i64,
+    sender_id: i64,
+) -> Result<(), StorageError> {
+    if sender_id != external_user {
+        return Err(StorageError::Other(
+            "Remote sender does not match chat partner".into(),
+        ));
+    }
+    ensure_message_direction(storage_owner, external_user, message_time, false)?;
+    flag_deleted_by_external(storage_owner, external_user, message_time)
+}
+
+fn ensure_message_direction(
+    storage_owner: i64,
+    external_user: i64,
+    message_time: i64,
+    expected_sent_by_self: bool,
+) -> Result<(), StorageError> {
+    db::with_db(|conn| {
+        let sent_by_self: i64 = conn.query_row(
+            r#"
+            SELECT sent_by_self FROM messages
+            WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
+            ORDER BY id DESC LIMIT 1
+            "#,
+            params![storage_owner, external_user, message_time],
+            |row| row.get(0),
+        )?;
+        if (sent_by_self != 0) != expected_sent_by_self {
+            return Err(StorageError::Other(
+                "Message sender is not authorized".into(),
+            ));
+        }
         Ok(())
     })
 }
@@ -141,7 +255,11 @@ pub fn hard_delete_message(storage_owner: i64, external_user: i64, message_time:
  * Marks a message as deleted by the external user rather than removing the row,
  * so the storage owner still sees a tombstone in the UI.
  */
-pub fn flag_deleted_by_external(storage_owner: i64, external_user: i64, message_time: i64) -> Result<(), StorageError> {
+pub fn flag_deleted_by_external(
+    storage_owner: i64,
+    external_user: i64,
+    message_time: i64,
+) -> Result<(), StorageError> {
     db::with_db(|conn| {
         let affected = conn.execute(
             r#"
@@ -163,7 +281,11 @@ pub fn flag_deleted_by_external(storage_owner: i64, external_user: i64, message_
  * the UI still shows the "edited" indicator.  Only the own user should
  * call this.
  */
-pub fn delete_edit_history(storage_owner: i64, external_user: i64, message_time: i64) -> Result<(), StorageError> {
+pub fn delete_edit_history(
+    storage_owner: i64,
+    external_user: i64,
+    message_time: i64,
+) -> Result<(), StorageError> {
     db::with_db(|conn| {
         let msg_id: i64 = conn.query_row(
             r#"
@@ -175,7 +297,10 @@ pub fn delete_edit_history(storage_owner: i64, external_user: i64, message_time:
             |row| row.get(0),
         )?;
 
-        conn.execute("DELETE FROM message_edits WHERE message_id = ?1", params![msg_id])?;
+        conn.execute(
+            "DELETE FROM message_edits WHERE message_id = ?1",
+            params![msg_id],
+        )?;
         Ok(())
     })
 }
@@ -339,26 +464,39 @@ pub fn change_message_state(
     .map_err(|e: StorageError| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
 }
 
-fn load_reactions(conn: &rusqlite::Connection, msg_ids: &[i64]) -> std::collections::HashMap<i64, Vec<String>> {
+fn load_reactions(
+    conn: &rusqlite::Connection,
+    msg_ids: &[i64],
+) -> std::collections::HashMap<i64, Vec<StoredReaction>> {
     if msg_ids.is_empty() {
         return std::collections::HashMap::new();
     }
 
-    let placeholders: Vec<String> = msg_ids.iter().enumerate()
+    let placeholders: Vec<String> = msg_ids
+        .iter()
+        .enumerate()
         .map(|(i, _)| format!("?{}", i + 1))
         .collect();
     let query = format!(
-        "SELECT message_id, reaction || ':' || COUNT(*) FROM reactions WHERE message_id IN ({}) GROUP BY message_id, reaction",
+        "SELECT message_id, reaction, user_id FROM reactions WHERE message_id IN ({}) ORDER BY created_at ASC, id ASC",
         placeholders.join(", ")
     );
 
-    let mut map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<i64, Vec<StoredReaction>> =
+        std::collections::HashMap::new();
     if let Ok(mut stmt) = conn.prepare(&query) {
-        let params: Vec<&dyn rusqlite::types::ToSql> = msg_ids.iter()
+        let params: Vec<&dyn rusqlite::types::ToSql> = msg_ids
+            .iter()
             .map(|id| id as &dyn rusqlite::types::ToSql)
             .collect();
         if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                StoredReaction {
+                    reaction: row.get(1)?,
+                    user_id: row.get(2)?,
+                },
+            ))
         }) {
             for row in rows.flatten() {
                 map.entry(row.0).or_default().push(row.1);

@@ -1,5 +1,5 @@
 use crate::util::db;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use std::sync::{Arc, LazyLock, Mutex};
 
 pub type StorageError = String;
@@ -226,9 +226,7 @@ fn chat_secret_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChatS
     })
 }
 
-fn pending_forward_from_row(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<PendingChatSecretForward> {
+fn pending_forward_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingChatSecretForward> {
     Ok(PendingChatSecretForward {
         recipient_user_id: row.get(0)?,
         chat_id: row.get(1)?,

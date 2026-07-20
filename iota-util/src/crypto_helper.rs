@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use mtp_crypto::{Keyring, PublicKeyBundle};
+use mtp::crypto::{Keyring, PublicKeyBundle};
 
 pub fn generate_keyring() -> Keyring {
     Keyring::generate()
@@ -24,5 +24,5 @@ pub fn public_key_bundle_from_base64(s: &str) -> Option<PublicKeyBundle> {
 }
 
 pub fn hex_hash(input: &str) -> String {
-    hex::encode(mtp_crypto::sha256(input.as_bytes()))
+    hex::encode(mtp::crypto::sha256(input.as_bytes()))
 }

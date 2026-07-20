@@ -3,8 +3,8 @@ use crate::util::db;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use iota_util::crypto_helper::{self, hex_hash, keyring_from_base64, public_key_bundle_to_base64};
 use iota_util::file_util::{load_file, save_file};
-use rusqlite::params;
 use rand_core::{OsRng, RngCore};
+use rusqlite::params;
 
 pub fn add_user(user: UserProfile) {
     if let Err(e) = db::with_db(|conn| {
@@ -166,9 +166,8 @@ pub fn get_users() -> Vec<UserProfile> {
 
 fn load_trusted_apps(user_id: i64) -> std::collections::HashMap<String, String> {
     match db::with_db(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT app_id, app_secret FROM trusted_apps WHERE user_id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT app_id, app_secret FROM trusted_apps WHERE user_id = ?1")?;
         let rows = stmt.query_map(params![user_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -191,7 +190,10 @@ fn load_trusted_apps(user_id: i64) -> std::collections::HashMap<String, String> 
 
 pub fn remove_user(user_id: i64) {
     if let Err(e) = db::with_db(|conn| {
-        conn.execute("DELETE FROM trusted_apps WHERE user_id = ?1", params![user_id])?;
+        conn.execute(
+            "DELETE FROM trusted_apps WHERE user_id = ?1",
+            params![user_id],
+        )?;
         conn.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
         Ok(())
     }) {

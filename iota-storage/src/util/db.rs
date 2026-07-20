@@ -64,6 +64,30 @@ fn db_file_path(db_name: &str) -> String {
 
 fn run_migrations(pool: &r2d2::Pool<SqliteManager>) -> Result<(), StorageError> {
     let conn = pool.get().map_err(|e| StorageError::Pool(e.to_string()))?;
+    run_migrations_on_connection(&conn)
+}
+
+/*
+ * Older builds could apply a schema change without advancing user_version.
+ * Check each added column so those databases can resume upgrading.
+ */
+fn add_column_if_missing(
+    conn: &Connection,
+    column: &str,
+    definition: &str,
+) -> Result<(), StorageError> {
+    let mut statement =
+        conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
+    let exists = statement.exists([column])?;
+
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE messages ADD COLUMN {definition};"))?;
+    }
+
+    Ok(())
+}
+
+fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
     let current_version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap_or(0);
@@ -78,8 +102,7 @@ fn run_migrations(pool: &r2d2::Pool<SqliteManager>) -> Result<(), StorageError> 
                 message_time INTEGER NOT NULL,
                 content TEXT NOT NULL,
                 sent_by_self INTEGER NOT NULL,
-                message_state TEXT NOT NULL,
-                height INTEGER NOT NULL DEFAULT 0
+                message_state TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_messages_lookup
                 ON messages (storage_owner, external_user, message_time DESC);
@@ -129,29 +152,28 @@ fn run_migrations(pool: &r2d2::Pool<SqliteManager>) -> Result<(), StorageError> 
     }
 
     if current_version < 2 {
-        conn.execute_batch(
-            r#"
-            ALTER TABLE messages ADD COLUMN height INTEGER NOT NULL DEFAULT 0;
-            PRAGMA user_version = 2;
-            "#,
-        )?;
+        add_column_if_missing(conn, "height", "height INTEGER NOT NULL DEFAULT 0")?;
+        conn.execute_batch("PRAGMA user_version = 2;")?;
     }
 
     if current_version < 3 {
-        conn.execute_batch(
-            r#"
-            ALTER TABLE messages ADD COLUMN reply_to INTEGER;
-            PRAGMA user_version = 3;
-            "#,
-        )?;
+        add_column_if_missing(conn, "reply_to", "reply_to INTEGER")?;
+        conn.execute_batch("PRAGMA user_version = 3;")?;
     }
 
     if current_version < 4 {
+        add_column_if_missing(
+            conn,
+            "edited_count",
+            "edited_count INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            conn,
+            "deleted_by_external",
+            "deleted_by_external INTEGER NOT NULL DEFAULT 0",
+        )?;
         conn.execute_batch(
             r#"
-            ALTER TABLE messages ADD COLUMN edited_count INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE messages ADD COLUMN deleted_by_external INTEGER NOT NULL DEFAULT 0;
-
             CREATE TABLE IF NOT EXISTS message_edits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_id INTEGER NOT NULL REFERENCES messages(id),
@@ -175,6 +197,24 @@ fn run_migrations(pool: &r2d2::Pool<SqliteManager>) -> Result<(), StorageError> 
                 ON reactions (message_id, reaction);
 
             PRAGMA user_version = 4;
+            "#,
+        )?;
+    }
+
+    if current_version < 5 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS settings (
+                user_id INTEGER NOT NULL,
+                session_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (user_id, session_id, name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_settings_lookup
+                ON settings (user_id, session_id, name);
+
+            PRAGMA user_version = 5;
             "#,
         )?;
     }
@@ -220,4 +260,41 @@ where
 /// Legacy - kept for e2ee_storage which uses its own DB.
 pub fn create_general_messages_db() -> Result<Arc<std::sync::Mutex<Connection>>, String> {
     create_shared_connection(DB_NAME, "")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resumes_migration_when_height_exists_before_its_version() -> Result<(), StorageError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                storage_owner INTEGER NOT NULL,
+                external_user INTEGER NOT NULL,
+                message_time INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                sent_by_self INTEGER NOT NULL,
+                message_state TEXT NOT NULL
+            );
+            ALTER TABLE messages ADD COLUMN height INTEGER NOT NULL DEFAULT 0;
+            PRAGMA user_version = 1;
+            "#,
+        )?;
+
+        run_migrations_on_connection(&conn)?;
+
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 5);
+        for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
+            let mut statement =
+                conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
+            assert!(statement.exists([column])?);
+        }
+
+        Ok(())
+    }
 }

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+iota-connection = { path = "../iota-connection" }
 iota-logger = { path = "../iota-logger" }
 iota-state = { path = "../iota-state" }
 iota-storage = { path = "../iota-storage" }

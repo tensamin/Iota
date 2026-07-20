@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use mtp_crypto::{EncryptionType, Keyring, PublicKeyBundle, encrypt_for, decrypt_with};
+use mtp::crypto::{EncryptionType, Keyring, PublicKeyBundle, decrypt_with, encrypt_for};
 
 #[derive(Clone, Copy, Debug)]
 pub enum DataFormat {
@@ -22,13 +22,8 @@ pub fn encrypt(
     .map_err(|e| format!("encryption error: {:?}", e))
 }
 
-pub fn decrypt(
-    ciphertext: &[u8],
-    aad: &[u8],
-    keyring: &Keyring,
-) -> Result<Vec<u8>, String> {
-    decrypt_with(ciphertext, keyring, aad)
-        .map_err(|e| format!("decryption error: {:?}", e))
+pub fn decrypt(ciphertext: &[u8], aad: &[u8], keyring: &Keyring) -> Result<Vec<u8>, String> {
+    decrypt_with(ciphertext, keyring, aad).map_err(|e| format!("decryption error: {:?}", e))
 }
 
 pub fn encrypt_challenge(
@@ -39,12 +34,10 @@ pub fn encrypt_challenge(
     Ok(STANDARD.encode(&blob))
 }
 
-pub fn decrypt_challenge(
-    encrypted: &str,
-    keyring: &Keyring,
-) -> Result<String, String> {
-    let blob =
-        STANDARD.decode(encrypted).map_err(|e| format!("base64 decode error: {}", e))?;
+pub fn decrypt_challenge(encrypted: &str, keyring: &Keyring) -> Result<String, String> {
+    let blob = STANDARD
+        .decode(encrypted)
+        .map_err(|e| format!("base64 decode error: {}", e))?;
     let pt = decrypt(&blob, b"challenge", keyring)?;
     String::from_utf8(pt).map_err(|e| format!("utf8 decode error: {}", e))
 }
