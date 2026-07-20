@@ -6,7 +6,7 @@ use tokio::time::{Duration, sleep};
 use iota_state::{ACTIVE_TASKS, APP_STATE, AppState, RELOAD, SHUTDOWN};
 
 use iota_cli::screens::main_screen::MainScreen;
-use iota_cli::ui::start_tui;
+use iota_cli::{ipc_client::IpcClient, ui::start_tui};
 use iota_logger::{self as logger, language_creator};
 use iota_logger::{log, log_t};
 use iota_storage::users::user_manager;
@@ -22,7 +22,10 @@ async fn main() {
         *RELOAD.write().await = false;
         *SHUTDOWN.write().await = false;
 
-        let ui = start_tui();
+        let ipc = IpcClient::connect("/run/iota/iota.sock")
+            .await
+            .expect("iota-daemon must be running before starting iota-core");
+        let ui = start_tui(ipc);
 
         let (eula, tos_pp) = match consent_state::check(ui.clone()).await {
             Ok(v) => v,

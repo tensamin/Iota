@@ -1,14 +1,12 @@
 use crate::ui::UI;
 use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyModifiers, poll, read};
-use iota_state::{RELOAD, SHUTDOWN, UNIQUE};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 pub fn setup_input_handler(ui: Arc<UI>) {
     tokio::spawn(async move {
         loop {
-            if *SHUTDOWN.read().await {
+            if ui.is_shutdown() {
                 break;
             }
 
@@ -27,7 +25,6 @@ pub fn setup_input_handler(ui: Arc<UI>) {
             match event_result {
                 Ok(Some(key_event)) => {
                     handle_input(key_event, ui.clone()).await;
-                    UNIQUE.store(true, Ordering::Relaxed);
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -43,11 +40,11 @@ pub async fn handle_input(key: KeyEvent, ui: Arc<UI>) {
     match (key.code, key.modifiers) {
         (crossterm::event::KeyCode::Char('q'), KeyModifiers::CONTROL)
         | (crossterm::event::KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-            *SHUTDOWN.write().await = true;
+            ui.request_shutdown();
         }
         (crossterm::event::KeyCode::Char('r'), KeyModifiers::CONTROL) => {
-            *RELOAD.write().await = true;
-            *SHUTDOWN.write().await = true;
+            let _ = ui.send_restart().await;
+            ui.request_shutdown();
         }
         _ => {
             ui.handle_input(key).await;

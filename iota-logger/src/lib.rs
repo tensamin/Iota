@@ -10,11 +10,13 @@ use std::{
 use mtp::codec::{CommunicationValue, DataTypeId, DataValue, Version};
 use ratatui::style::Color;
 
-use iota_state::{APP_STATE, UNIQUE, UiLogEntry};
+use iota_state::{UNIQUE, UiLogEntry};
+use tokio::sync::broadcast;
 pub mod language_creator;
 pub mod language_manager;
 
 static LOGGER: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
+static LOG_BROADCASTER: OnceLock<broadcast::Sender<UiLogEntry>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[allow(unused)]
@@ -51,9 +53,15 @@ struct LogMessage {
     message: Option<String>,
 }
 
+/* The logger owns file persistence while consumers receive rendered entries
+ * through a process-local broadcast subscription. */
 pub fn startup() {
     let (tx, rx) = mpsc::channel::<LogMessage>();
-    LOGGER.set(tx).expect("Logger already initialized");
+    if LOGGER.set(tx).is_err() {
+        return;
+    }
+    let (broadcast_tx, _) = broadcast::channel(512);
+    let _ = LOG_BROADCASTER.set(broadcast_tx.clone());
 
     thread::spawn(move || {
         let working_dir = iota_util::file_util::get_directory();
@@ -106,10 +114,13 @@ pub fn startup() {
                 is_error: msg.is_error,
             };
 
-            let mut state = APP_STATE.lock().unwrap();
-            state.push_log(entry);
+            let _ = broadcast_tx.send(entry);
         }
     });
+}
+
+pub fn subscribe() -> Option<broadcast::Receiver<UiLogEntry>> {
+    LOG_BROADCASTER.get().map(broadcast::Sender::subscribe)
 }
 
 fn format_timestamp_inline(timestamp_ms: u128) -> String {

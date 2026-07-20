@@ -1,0 +1,8 @@
+[package]
+name = "iota"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iota-cli = { path = "../iota-cli" }
+tokio = { version = "1.50.0", features = ["full"] }

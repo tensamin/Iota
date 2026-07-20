@@ -8,10 +8,6 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    ttp = {
-      url = "git+https://git.methanium.net/tensamin/ttp.git";
-      flake = false;
-    };
   };
 
   outputs = inputs @ {
@@ -19,7 +15,6 @@
     nixpkgs,
     flake-parts,
     rust-overlay,
-    ttp,
     ...
   }:
     flake-parts.lib.mkFlake {inherit inputs;} {
@@ -47,9 +42,10 @@
         packages = {
           default = self'.packages.iota;
           iota = pkgs.rustPlatform.buildRustPackage {
-            pname = "iota";
+            pname = "iota-daemon";
             version = "0.1.0";
             src = ./.;
+            cargoBuildFlags = ["-p" "iota-daemon"];
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -57,15 +53,9 @@
             nativeBuildInputs = with pkgs; [cmake perl pkg-config];
             buildInputs = with pkgs; [openssl sqlite];
             dontUseCmakeConfigure = true;
-            preConfigure = ''
-              if [ -d ../cargo-vendor-dir/ttp-core-0.1.0 ]; then
-                cp ${ttp}/ttp-codec.json ../cargo-vendor-dir/ttp-codec.json
-              fi
-            '';
             postInstall = ''
-              mv $out/bin/iota-core $out/bin/iota
               for f in $out/bin/*; do
-                if [ "$(basename "$f")" != "iota" ]; then
+                if [ "$(basename "$f")" != "iota-daemon" ]; then
                   rm "$f"
                 fi
               done
@@ -95,8 +85,7 @@
             then cfg.settingsFile
             else pkgs.writeText "iota-config.json" (builtins.toJSON cfg.settings);
 
-          descriptionText = "Tensamin Iota";
-          #+ lib.optionalString cfg.useTmux " (attach TUI: tmux -S ${cfg.dataDir}/tmux.sock attach -t iota)";
+          descriptionText = "Tensamin Iota daemon";
         in {
           options.services.iota = {
             enable = lib.mkEnableOption "Enable the Iota service.";
@@ -132,12 +121,6 @@
               description = "Whether to open the firewall for ports used by Iota.";
             };
 
-            ttpBind = lib.mkOption {
-              type = lib.types.str;
-              default = "0.0.0.0";
-              description = "IP address to bind the TTP/QUIC server to.";
-            };
-
             bindAddress = lib.mkOption {
               type = lib.types.str;
               default = "0.0.0.0";
@@ -148,12 +131,6 @@
               type = lib.types.package;
               default = defaultPackage;
               description = "The Iota package to use.";
-            };
-
-            useTmux = lib.mkOption {
-              type = lib.types.bool;
-              default = true;
-              description = "Whether to run Iota inside a tmux session for shared TUI access.";
             };
 
             settings = lib.mkOption {
@@ -181,19 +158,7 @@
 
             users.groups.iota = {};
 
-            systemd.services.iota = let
-              iotaTmuxCmd = pkgs.writeShellScript "iota-tmux-cmd" ''
-                mkdir -p ${cfg.dataDir}
-                echo "[$(date)] Running Iota..."
-                ${cfg.package}/bin/iota
-                status=$?
-                echo ""
-                echo "[$(date)] Iota exited with status: $status"
-                echo "Press any key to exit..."
-                read -r -n 1
-                exit $status
-              '';
-            in {
+            systemd.services.iota = {
               description = descriptionText;
               wantedBy = ["multi-user.target"];
               after = ["network.target"];
@@ -205,29 +170,7 @@
                   Group = "iota";
                   WorkingDirectory = cfg.dataDir;
 
-                  ExecStart =
-                    if cfg.useTmux
-                    then
-                      pkgs.writeShellScript "iota-start" ''
-                        set -e
-                        export TMUX_TMPDIR=${cfg.dataDir}
-                        ${pkgs.coreutils}/bin/mkdir -p ${cfg.dataDir}
-                        ${pkgs.coreutils}/bin/chown iota:iota ${cfg.dataDir}
-
-                        echo "[iota-start] Creating tmux session..."
-                        if ! ${pkgs.tmux}/bin/tmux -S ${cfg.dataDir}/tmux.sock new-session -d -s iota "${iotaTmuxCmd}"; then
-                          echo "[iota-start] ERROR: tmux new-session failed"
-                          exit 1
-                        fi
-                        echo "[iota-start] tmux session created, waiting..."
-                        echo "[iota-start] Run 'tmux -S ${cfg.dataDir}/tmux.sock attach -t iota' to attach to the tmux session."
-
-                        while ${pkgs.tmux}/bin/tmux -S ${cfg.dataDir}/tmux.sock has-session -t iota 2>/dev/null; do
-                          sleep 2
-                        done
-                        echo "[iota-start] tmux session ended"
-                      ''
-                    else "${cfg.package}/bin/iota";
+                  ExecStart = "${cfg.package}/bin/iota-daemon";
 
                   ExecStartPre = [
                     ("+"
@@ -245,6 +188,8 @@
 
                   Restart = "always";
                   RestartSec = "5s";
+                  RuntimeDirectory = "iota";
+                  RuntimeDirectoryMode = "0750";
 
                   AmbientCapabilities = ["CAP_NET_BIND_SERVICE"];
                   CapabilityBoundingSet = ["CAP_NET_BIND_SERVICE"];
@@ -262,8 +207,8 @@
                   LockPersonality = true;
                   MemoryDenyWriteExecute = true;
                   Environment = [
-                    "TTP_BIND=${cfg.ttpBind}"
                     "BIND_ADDRESS=${cfg.bindAddress}"
+                    "IOTA_SOCKET=/run/iota/iota.sock"
                   ];
                 }
                 // lib.optionalAttrs (cfg.environmentFiles != []) {

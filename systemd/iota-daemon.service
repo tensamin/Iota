@@ -1,0 +1,16 @@
+[Unit]
+Description=Tensamin Iota daemon
+After=network-online.target
+Wants=network-online.target
+Requires=iota-daemon.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/iota-daemon
+Restart=on-failure
+RuntimeDirectory=iota
+RuntimeDirectoryMode=0750
+Environment=IOTA_SOCKET=/run/iota/iota.sock
+
+[Install]
+WantedBy=multi-user.target

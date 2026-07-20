@@ -1,0 +1,12 @@
+[Unit]
+Description=Tensamin Iota daemon IPC socket
+
+[Socket]
+ListenStream=/run/iota/iota.sock
+SocketMode=0660
+SocketUser=iota
+SocketGroup=iota
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

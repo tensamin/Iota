@@ -1,15 +1,17 @@
 use crate::{
     input_handler::setup_input_handler, interaction_result::InteractionResult,
-    screens::screens::Screen,
+    ipc_client::IpcClient, screens::screens::Screen,
 };
 use crossterm::event::KeyEvent;
-use iota_state::{ACTIVE_TASKS, SHUTDOWN, UNIQUE};
 use once_cell::sync::Lazy;
 use ratatui::{Terminal, backend::CrosstermBackend, init};
 use std::{
     collections::VecDeque,
     io::Stdout,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{sync::RwLock, time::Instant};
@@ -19,14 +21,15 @@ use tokio::{sync::RwLock, time::Instant};
 pub static FPS: Lazy<RwLock<(f64, f64)>> = Lazy::new(|| RwLock::new((0.0, 0.0)));
 
 pub struct UI {
+    ipc: Arc<IpcClient>,
+    shutdown: AtomicBool,
     pub terminal: Arc<Mutex<Terminal<CrosstermBackend<Stdout>>>>,
     screen_stack: Arc<RwLock<Vec<Box<dyn Screen>>>>,
 }
 
-pub fn start_tui() -> Arc<UI> {
-    let ui = Arc::new(UI::new());
+pub fn start_tui(ipc: Arc<IpcClient>) -> Arc<UI> {
+    let ui = Arc::new(UI::new(ipc));
     let uic = ui.clone();
-    ACTIVE_TASKS.insert("UI Renderer".to_string());
     tokio::spawn(async move {
         let mut last_render = Instant::now();
 
@@ -39,11 +42,11 @@ pub fn start_tui() -> Arc<UI> {
         let mut skipped = 0;
 
         loop {
-            if *SHUTDOWN.read().await {
+            if uic.is_shutdown() {
                 break;
             }
 
-            if skipped > 5 || UNIQUE.load(Ordering::Relaxed) {
+            if skipped > 5 {
                 uic.render().await;
 
                 skip_samples.push_back(skipped);
@@ -88,25 +91,45 @@ pub fn start_tui() -> Arc<UI> {
                 *FPS.write().await = (avg_fps, avg_skips_percentage);
 
                 last_render = Instant::now();
-                UNIQUE.store(false, Ordering::Relaxed);
             } else {
                 skipped += 1;
             }
             tokio::time::sleep(Duration::from_millis(16)).await;
         }
-        ACTIVE_TASKS.remove("UI Renderer");
         ratatui::restore();
     });
     setup_input_handler(ui.clone());
     ui
 }
 impl UI {
-    pub fn new() -> Self {
+    pub fn new(ipc: Arc<IpcClient>) -> Self {
         let terminal = init();
         Self {
+            ipc,
+            shutdown: AtomicBool::new(false),
             terminal: Arc::new(Mutex::new(terminal)),
             screen_stack: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    pub fn ipc(&self) -> Arc<IpcClient> {
+        self.ipc.clone()
+    }
+
+    pub fn client_state(&self) -> iota_state::ClientState {
+        self.ipc.state()
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    pub async fn send_restart(&self) -> std::io::Result<()> {
+        self.ipc.send_command(0, "restart".into()).await
     }
 
     pub async fn set_screen(&self, screen: Box<dyn Screen>) {
@@ -140,7 +163,7 @@ impl UI {
                 stack.pop();
 
                 if stack.is_empty() {
-                    *SHUTDOWN.write().await = true;
+                    self.request_shutdown();
                 }
             }
             InteractionResult::Handled => {}

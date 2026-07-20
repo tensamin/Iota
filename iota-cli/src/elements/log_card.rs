@@ -1,9 +1,8 @@
-use crate::app_state::APP_STATE;
 use crate::elements::elements::{Element, InteractableElement, JoinableElement};
 use crate::interaction_result::InteractionResult;
 use crate::util::borders::draw_block_joins;
 use crossterm::event::{KeyCode, KeyEvent};
-use iota_logger::PrintType;
+use iota_state::{ClientState, UiLogEntry};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -12,60 +11,9 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 use std::any::Any;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-#[derive(Clone, Debug)]
-pub struct UiLogEntry {
-    pub timestamp_ms: u128,
-    pub sender: PrintType,
-    pub message: String,
-    pub is_error: bool,
-}
-
-impl UiLogEntry {
-    pub fn format_timestamp(&self) -> String {
-        let secs = (self.timestamp_ms / 1000) as i64;
-        let hours = (secs / 3600) % 24;
-        let minutes = (secs / 60) % 60;
-        let seconds = secs % 60;
-        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
-    }
-}
-
-impl From<LogEntry> for UiLogEntry {
-    fn from(entry: LogEntry) -> Self {
-        Self {
-            timestamp_ms: entry.timestamp_ms,
-            sender: entry.sender,
-            message: entry.message,
-            is_error: entry.is_error,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct LogEntry {
-    pub timestamp_ms: u128,
-    pub sender: PrintType,
-    pub message: String,
-    pub is_error: bool,
-}
-
-impl LogEntry {
-    pub fn new(sender: PrintType, message: String, is_error: bool) -> Self {
-        Self {
-            timestamp_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-            sender,
-            message,
-            is_error,
-        }
-    }
-}
 
 pub struct LogCard {
+    state: ClientState,
     focused: bool,
     selected: bool,
     scroll_offset: usize,
@@ -76,8 +24,9 @@ pub struct LogCard {
 }
 
 impl LogCard {
-    pub fn new() -> Self {
+    pub fn new(state: ClientState) -> Self {
         Self {
+            state,
             focused: false,
             selected: false,
             scroll_offset: 0,
@@ -89,21 +38,17 @@ impl LogCard {
     }
 
     fn get_logs(&self) -> Vec<UiLogEntry> {
-        let state = APP_STATE.lock().unwrap();
+        let state = self
+            .state
+            .app
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         state
             .get_logs()
             .iter()
             .map(|e| UiLogEntry {
                 timestamp_ms: e.timestamp_ms,
-                sender: match e.sender.as_str() {
-                    "Call" => PrintType::Call,
-                    "Client" => PrintType::Client,
-                    "Iota" => PrintType::Iota,
-                    "Omikron" => PrintType::Omikron,
-                    "Omega" => PrintType::Omega,
-                    "Command" => PrintType::Command,
-                    _ => PrintType::General,
-                },
+                sender: e.sender.clone(),
                 message: e.message.clone(),
                 is_error: e.is_error,
             })
@@ -196,10 +141,22 @@ impl LogCard {
                 line.push_str(&timestamp);
             }
 
-            result.push((line, entry.sender.prefix_color(), entry.is_error));
+            result.push((line, Self::sender_color(&entry.sender), entry.is_error));
         }
 
         result
+    }
+
+    fn sender_color(sender: &str) -> Color {
+        match sender {
+            "Call" => Color::Magenta,
+            "Client" => Color::Green,
+            "Iota" => Color::Yellow,
+            "Omikron" => Color::Blue,
+            "Omega" => Color::Cyan,
+            "Command" => Color::LightGreen,
+            _ => Color::LightCyan,
+        }
     }
 
     fn build_all_lines(

@@ -3,16 +3,26 @@ name = "iota-cli"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+legacy-commands = [
+    "dep:iota-logger",
+    "dep:iota-storage",
+    "dep:iota-util",
+    "dep:mtp",
+    "dep:omikron-connector",
+]
+
 [dependencies]
-iota-logger = { path = "../iota-logger" }
+iota-logger = { path = "../iota-logger", optional = true }
 iota-state = { path = "../iota-state" }
-iota-storage = { path = "../iota-storage" }
+iota-storage = { path = "../iota-storage", optional = true }
 iota-terms = { path = "../iota-terms" }
-iota-util = { path = "../iota-util" }
-omikron-connector = { path = "../omikron-connector" }
+ iota-util = { path = "../iota-util", optional = true }
+iota-ipc = { path = "../iota-ipc" }
+omikron-connector = { path = "../omikron-connector", optional = true }
 
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", optional = true }
 
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git" }
 
 actix-web = { version = "4", features = ["rustls-0_23"] }
 actix-web-actors = "4"
@@ -56,7 +66,6 @@ sysinfo = "0.38.3"
 tokio = { version = "1.50.0", features = ["full"] }
 tokio-tungstenite = { version = "*", features = ["native-tls"] }
 tungstenite = "*"
-uuid = { version = "*", features = ["v4"] }
 walkdir = "2.5.0"
 warp = "*"
 x448 = { version = "*" }

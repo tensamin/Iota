@@ -1,10 +1,17 @@
 use crossterm::event::{KeyCode, KeyEvent};
-use iota_logger::{log, log_command, log_cv};
+#[cfg(feature = "legacy-commands")]
+use iota_logger::{log, log_cv};
+#[cfg(feature = "legacy-commands")]
 use iota_state::{ACTIVE_TASKS, RELOAD, SHUTDOWN};
+#[cfg(feature = "legacy-commands")]
 use iota_storage::users::{user_manager, user_profile::UserProfile};
+#[cfg(feature = "legacy-commands")]
 use iota_storage::util::config_util::modify_config;
+#[cfg(feature = "legacy-commands")]
 use iota_util::file_util;
+#[cfg(feature = "legacy-commands")]
 use mtp::codec::{CommunicationType, CommunicationValue};
+#[cfg(feature = "legacy-commands")]
 use omikron_connector::omikron_connection::OMIKRON_CONNECTION;
 use ratatui::{
     Frame,
@@ -13,7 +20,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
-use uuid::Uuid;
 
 use std::{
     any::Any,
@@ -25,11 +31,12 @@ use tokio::time::Instant;
 use crate::{
     elements::elements::{Element, InteractableElement, JoinableElement},
     interaction_result::InteractionResult,
-    ui::FPS,
+    ipc_client::IpcClient,
     util::borders::draw_block_joins,
 };
 
 pub struct ConsoleCard {
+    ipc: Arc<IpcClient>,
     focused: bool,
     pub title: String,
     pub content: String,
@@ -44,8 +51,9 @@ pub struct ConsoleCard {
 }
 
 impl ConsoleCard {
-    pub fn new(title: &str, content: &str) -> Self {
+    pub fn new(title: &str, content: &str, ipc: Arc<IpcClient>) -> Self {
         ConsoleCard {
+            ipc,
             focused: false,
             title: title.to_string(),
             content: content.to_string(),
@@ -290,22 +298,17 @@ impl InteractableElement for ConsoleCard {
         match key.code {
             KeyCode::Enter => {
                 if self.content.is_empty() {
-                    log!("");
                     return InteractionResult::Handled;
                 }
 
                 let command = self.content.clone();
-                let id = Uuid::new_v4();
-                let id = id.to_string();
-                let id = id.split_at(8).0;
-                let task_id = format!("command_{}_{}", command, id);
-                ACTIVE_TASKS.insert(task_id.clone());
-
-                log_command!("{}", command);
-
+                let ipc = self.ipc.clone();
+                let seq = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
                 tokio::spawn(async move {
-                    run_command(&command).await;
-                    ACTIVE_TASKS.remove(&task_id);
+                    let _ = ipc.send_command(seq, command).await;
                 });
 
                 self.content.clear();
@@ -379,6 +382,7 @@ impl InteractableElement for ConsoleCard {
     }
 }
 
+#[cfg(feature = "legacy-commands")]
 pub async fn run_command(command: &str) {
     let parts = command.split(" ").collect::<Vec<&str>>();
 
@@ -503,6 +507,7 @@ pub async fn run_command(command: &str) {
     }
 }
 
+#[cfg(feature = "legacy-commands")]
 pub async fn ping(time: u64) {
     let conn = OMIKRON_CONNECTION.clone();
 

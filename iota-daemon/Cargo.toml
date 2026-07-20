@@ -1,0 +1,14 @@
+[package]
+name = "iota-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iota-daemon-lib = { path = "../iota-daemon-lib" }
+iota-ipc = { path = "../iota-ipc" }
+iota-logger = { path = "../iota-logger" }
+iota-state = { path = "../iota-state" }
+iota-storage = { path = "../iota-storage" }
+omikron-connector = { path = "../omikron-connector" }
+web-server = { path = "../web-server" }
+tokio = { version = "1.50.0", features = ["full"] }

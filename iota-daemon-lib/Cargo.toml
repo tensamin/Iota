@@ -1,0 +1,15 @@
+[package]
+name = "iota-daemon-lib"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iota-ipc = { path = "../iota-ipc" }
+iota-logger = { path = "../iota-logger" }
+iota-state = { path = "../iota-state" }
+iota-storage = { path = "../iota-storage" }
+iota-util = { path = "../iota-util" }
+omikron-connector = { path = "../omikron-connector" }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git" }
+sysinfo = "0.38.3"
+tokio = { version = "1.50.0", features = ["full"] }

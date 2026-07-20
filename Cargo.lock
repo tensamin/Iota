@@ -2086,6 +2086,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "iota"
+version = "0.1.0"
+dependencies = [
+ "iota-cli",
+ "tokio",
+]
+
+[[package]]
 name = "iota-auth"
 version = "0.1.0"
 dependencies = [
@@ -2151,6 +2159,7 @@ dependencies = [
  "hkdf 0.12.4",
  "hyper",
  "hyper-util",
+ "iota-ipc",
  "iota-logger",
  "iota-state",
  "iota-storage",
@@ -2178,7 +2187,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tungstenite",
- "uuid",
  "walkdir",
  "warp",
  "x448",
@@ -2195,27 +2203,41 @@ dependencies = [
 ]
 
 [[package]]
-name = "iota-core"
+name = "iota-daemon"
 version = "0.1.0"
 dependencies = [
- "dashmap",
- "iota-cli",
+ "iota-daemon-lib",
+ "iota-ipc",
  "iota-logger",
  "iota-state",
  "iota-storage",
- "iota-terms",
- "iota-updater",
- "iota-util",
- "json",
- "mtp",
  "omikron-connector",
- "once_cell",
- "pnet",
- "ratatui",
- "reqwest",
  "tokio",
  "web-server",
- "web-ui",
+]
+
+[[package]]
+name = "iota-daemon-lib"
+version = "0.1.0"
+dependencies = [
+ "iota-ipc",
+ "iota-logger",
+ "iota-state",
+ "iota-storage",
+ "iota-util",
+ "mtp",
+ "omikron-connector",
+ "sysinfo",
+ "tokio",
+]
+
+[[package]]
+name = "iota-ipc"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2228,6 +2250,7 @@ dependencies = [
  "mtp",
  "once_cell",
  "ratatui",
+ "tokio",
 ]
 
 [[package]]
@@ -2238,6 +2261,7 @@ dependencies = [
  "json",
  "mtp",
  "once_cell",
+ "serde",
  "sysinfo",
  "tokio",
 ]
@@ -4805,9 +4829,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.0"
+version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d988bcd52dbe076d3d46903332f58c912b87a2c49b1428419a5845154762ffee"
+checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
  "bytes",
  "libc",

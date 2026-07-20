@@ -42,10 +42,12 @@ pub fn decrypt_challenge(encrypted: &str, keyring: &Keyring) -> Result<String, S
     String::from_utf8(pt).map_err(|e| format!("utf8 decode error: {}", e))
 }
 
-pub fn export(data: &[u8], format: DataFormat) -> String {
+pub fn export(data: &[u8], format: DataFormat) -> Result<String, String> {
     match format {
-        DataFormat::Raw => String::from_utf8_lossy(data).to_string(),
-        DataFormat::Base64 => STANDARD.encode(data),
-        DataFormat::Hex => hex::encode(data),
+        DataFormat::Raw => {
+            String::from_utf8(data.to_vec()).map_err(|error| format!("utf8 decode error: {error}"))
+        }
+        DataFormat::Base64 => Ok(STANDARD.encode(data)),
+        DataFormat::Hex => Ok(hex::encode(data)),
     }
 }

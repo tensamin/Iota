@@ -1,12 +1,66 @@
 use dashmap::DashSet;
 use json::{JsonValue, object};
+#[cfg(feature = "legacy-globals")]
 use once_cell::sync::Lazy;
 use std::collections::VecDeque;
-use std::sync::{Arc, LazyLock, Mutex, atomic::AtomicBool};
+#[cfg(feature = "legacy-globals")]
+use std::sync::LazyLock;
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
+#[cfg(feature = "legacy-globals")]
 use std::thread;
+#[cfg(feature = "legacy-globals")]
 use std::time::Duration;
+#[cfg(feature = "legacy-globals")]
 use sysinfo::{RefreshKind, System};
 use tokio::sync::RwLock;
+
+/* Process-owned daemon state and TUI-local state must be separate because IPC,
+ * rather than shared memory, is the boundary between the two binaries. */
+#[derive(Clone)]
+pub struct DaemonState {
+    pub app: Arc<Mutex<AppState>>,
+    pub shutdown: Arc<RwLock<bool>>,
+    pub reload: Arc<RwLock<bool>>,
+    pub active_tasks: Arc<DashSet<String>>,
+}
+
+impl DaemonState {
+    pub fn new() -> Self {
+        Self {
+            app: Arc::new(Mutex::new(AppState::new())),
+            shutdown: Arc::new(RwLock::new(false)),
+            reload: Arc::new(RwLock::new(false)),
+            active_tasks: Arc::new(DashSet::new()),
+        }
+    }
+}
+
+impl Default for DaemonState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/* The TUI keeps only the daemon data it renders. This state is never shared
+ * with the daemon and is populated from daemon IPC messages. */
+#[derive(Clone)]
+pub struct ClientState {
+    pub app: Arc<Mutex<AppState>>,
+}
+
+impl ClientState {
+    pub fn new() -> Self {
+        Self {
+            app: Arc::new(Mutex::new(AppState::new())),
+        }
+    }
+}
+
+impl Default for ClientState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub const MAX_POINTS: usize = 1000;
 pub const MAX_LOGS: usize = 100;
@@ -148,13 +202,22 @@ impl AppState {
     }
 }
 
+#[cfg(feature = "legacy-globals")]
+#[deprecated(note = "use DaemonState or ClientState")]
 pub static APP_STATE: LazyLock<Arc<Mutex<AppState>>> =
     LazyLock::new(|| Arc::new(Mutex::new(AppState::new())));
 
+#[cfg(feature = "legacy-globals")]
+#[deprecated(note = "use DaemonState")]
 pub static SHUTDOWN: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
+#[cfg(feature = "legacy-globals")]
+#[deprecated(note = "use DaemonState")]
 pub static RELOAD: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(true));
+#[cfg(feature = "legacy-globals")]
+#[deprecated(note = "use DaemonState")]
 pub static ACTIVE_TASKS: Lazy<DashSet<String>> = Lazy::new(|| DashSet::new());
 
+#[cfg(feature = "legacy-globals")]
 pub fn setup() {
     ACTIVE_TASKS.insert("System info loader".to_string());
     tokio::spawn(async move {

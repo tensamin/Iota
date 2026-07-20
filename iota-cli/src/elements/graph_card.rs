@@ -1,7 +1,7 @@
 use std::{any::Any, sync::Arc};
 
 use crossterm::event::KeyEvent;
-use iota_state::APP_STATE;
+use iota_state::ClientState;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -34,11 +34,29 @@ impl GRAPHS {
         }
     }
 
-    pub fn get_graph(&self) -> Vec<(f64, f64)> {
+    pub fn get_graph(&self, state: &ClientState) -> Vec<(f64, f64)> {
         match self {
-            GRAPHS::Ram => APP_STATE.lock().unwrap().with_width(28).ram.clone(),
-            GRAPHS::Cpu => APP_STATE.lock().unwrap().with_width(28).cpu.clone(),
-            GRAPHS::Ping => APP_STATE.lock().unwrap().with_width(28).ping.clone(),
+            GRAPHS::Ram => state
+                .app
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .with_width(28)
+                .ram
+                .clone(),
+            GRAPHS::Cpu => state
+                .app
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .with_width(28)
+                .cpu
+                .clone(),
+            GRAPHS::Ping => state
+                .app
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .with_width(28)
+                .ping
+                .clone(),
         }
     }
 
@@ -54,6 +72,7 @@ impl GRAPHS {
 #[allow(unused)]
 pub struct GraphCard {
     ui: Arc<UI>,
+    state: ClientState,
     graph_type: GRAPHS,
 
     focused: bool,
@@ -66,9 +85,10 @@ pub struct GraphCard {
 }
 
 impl GraphCard {
-    pub fn new(ui: Arc<UI>, graph_type: GRAPHS, title: String) -> Self {
+    pub fn new(ui: Arc<UI>, state: ClientState, graph_type: GRAPHS, title: String) -> Self {
         Self {
             ui,
+            state,
             graph_type,
             focused: false,
             title,
@@ -93,7 +113,7 @@ impl Element for GraphCard {
 
     fn render(&self, f: &mut Frame, r: Rect) {
         if self.open {
-            let graph = self.graph_type.get_graph();
+            let graph = self.graph_type.get_graph(&self.state);
             let unit = self.graph_type.get_unit();
             let min_x = graph.first().map(|(x, _)| *x).unwrap_or(0.0);
             let max_x = graph.last().map(|(x, _)| *x).unwrap_or(100.0);

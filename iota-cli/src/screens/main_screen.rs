@@ -36,22 +36,23 @@ impl MainScreen {
             vec![Some(1), Some(4)],
         ];
 
-        let mut log_card = LogCard::new();
+        let state = ui.client_state();
+        let mut log_card = LogCard::new(state.clone());
         log_card.set_borders(Borders::TOP.union(Borders::RIGHT).union(Borders::LEFT));
-        let mut console_card = ConsoleCard::new("Console", "");
+        let mut console_card = ConsoleCard::new("Console", "", ui.ipc());
         console_card.set_joins(Borders::TOP);
 
         elements.push(Box::new(log_card));
         elements.push(Box::new(console_card));
 
-        let mut ram_graph = GraphCard::new(ui.clone(), GRAPHS::Ram, "RAM".into());
+        let mut ram_graph = GraphCard::new(ui.clone(), state.clone(), GRAPHS::Ram, "RAM".into());
         ram_graph.set_borders(Borders::TOP.union(Borders::LEFT).union(Borders::RIGHT));
         elements.push(Box::new(ram_graph));
-        let mut cpu_graph = GraphCard::new(ui.clone(), GRAPHS::Cpu, "CPU".into());
+        let mut cpu_graph = GraphCard::new(ui.clone(), state.clone(), GRAPHS::Cpu, "CPU".into());
         cpu_graph.set_borders(Borders::TOP.union(Borders::LEFT).union(Borders::RIGHT));
         cpu_graph.set_joins(Borders::TOP);
         elements.push(Box::new(cpu_graph));
-        let mut ping_graph = GraphCard::new(ui.clone(), GRAPHS::Ping, "Ping".into());
+        let mut ping_graph = GraphCard::new(ui.clone(), state, GRAPHS::Ping, "Ping".into());
         ping_graph.set_joins(Borders::TOP);
         elements.push(Box::new(ping_graph));
 

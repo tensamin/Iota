@@ -18,5 +18,6 @@ pub mod util {
 }
 pub mod app_state;
 pub mod input_handler;
+pub mod ipc_client;
 pub mod interaction_result;
 pub mod ui;
