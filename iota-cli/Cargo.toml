@@ -17,7 +17,7 @@ iota-logger = { path = "../iota-logger", optional = true }
 iota-state = { path = "../iota-state" }
 iota-storage = { path = "../iota-storage", optional = true }
 iota-terms = { path = "../iota-terms" }
- iota-util = { path = "../iota-util", optional = true }
+iota-util = { path = "../iota-util", optional = true }
 iota-ipc = { path = "../iota-ipc" }
 omikron-connector = { path = "../omikron-connector", optional = true }
 
@@ -64,6 +64,7 @@ strum = "0.27.2"
 strum_macros = "0.27.2"
 sysinfo = "0.38.3"
 tokio = { version = "1.50.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = { version = "*", features = ["native-tls"] }
 tungstenite = "*"
 walkdir = "2.5.0"

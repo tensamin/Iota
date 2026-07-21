@@ -38,10 +38,13 @@
         rustToolchain = rustPkgs.rust-bin.stable.latest.default.override {
           extensions = ["rust-src" "rust-analyzer" "clippy" "rustfmt"];
         };
+        commonBuildInputs = with pkgs; [openssl sqlite];
+        commonNativeBuildInputs = with pkgs; [cmake perl pkg-config];
       in {
         packages = {
-          default = self'.packages.iota;
-          iota = pkgs.rustPlatform.buildRustPackage {
+          default = self'.packages.iota-daemon;
+
+          iota-daemon = pkgs.rustPlatform.buildRustPackage {
             pname = "iota-daemon";
             version = "0.1.0";
             src = ./.;
@@ -50,8 +53,8 @@
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
             };
-            nativeBuildInputs = with pkgs; [cmake perl pkg-config];
-            buildInputs = with pkgs; [openssl sqlite];
+            nativeBuildInputs = commonNativeBuildInputs;
+            buildInputs = commonBuildInputs;
             dontUseCmakeConfigure = true;
             postInstall = ''
               for f in $out/bin/*; do
@@ -62,11 +65,36 @@
             '';
             passthru.dataDir = "/var/lib/iota";
           };
+
+          iota-ui = pkgs.rustPlatform.buildRustPackage {
+            pname = "iota-ui";
+            version = "0.1.0";
+            src = ./.;
+            cargoBuildFlags = ["-p" "iota"];
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            nativeBuildInputs = commonNativeBuildInputs;
+            buildInputs = commonBuildInputs;
+            dontUseCmakeConfigure = true;
+            postInstall = ''
+              for f in $out/bin/*; do
+                if [ "$(basename "$f")" != "iota" ]; then
+                  rm "$f"
+                fi
+              done
+              # Rename to avoid confusion
+              if [ -f "$out/bin/iota" ]; then
+                mv "$out/bin/iota" "$out/bin/iota-ui"
+              fi
+            '';
+          };
         };
 
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [rustToolchain git cmake perl pkg-config];
-          buildInputs = with pkgs; [openssl sqlite];
+          buildInputs = commonBuildInputs;
         };
       };
 
@@ -78,7 +106,7 @@
           ...
         }: let
           cfg = config.services.iota;
-          defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default or (throw "iota: no pre-built package for system ${pkgs.stdenv.hostPlatform.system}");
+          defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.iota-daemon or (throw "iota: no pre-built package for system ${pkgs.stdenv.hostPlatform.system}");
 
           configFile =
             if cfg.settingsFile != null
@@ -158,14 +186,27 @@
 
             users.groups.iota = {};
 
-            systemd.services.iota = {
+            systemd.sockets.iota-daemon = {
+              description = "${descriptionText} IPC socket";
+              wantedBy = ["sockets.target"];
+              socketConfig = {
+                ListenStream = "/run/iota/iota.sock";
+                SocketMode = "0660";
+                SocketUser = "iota";
+                SocketGroup = "iota";
+                Backlog = 5;
+                RemoveOnStop = "true";
+              };
+            };
+
+            systemd.services.iota-daemon = {
               description = descriptionText;
-              wantedBy = ["multi-user.target"];
               after = ["network.target"];
+              requires = ["iota-daemon.socket"];
 
               serviceConfig =
                 {
-                  Type = "simple";
+                  Type = "notify";
                   User = "iota";
                   Group = "iota";
                   WorkingDirectory = cfg.dataDir;
@@ -186,10 +227,18 @@
                       '')
                   ];
 
-                  Restart = "always";
+                  Restart = "on-failure";
                   RestartSec = "5s";
                   RuntimeDirectory = "iota";
                   RuntimeDirectoryMode = "0750";
+
+                  # Exit code 75 = restart requested
+                  RestartPreventExitStatus = "0";
+                  RestartForceExitStatus = "75";
+
+                  TimeoutStopSec = "10";
+                  KillMode = "mixed";
+                  KillSignal = "SIGTERM";
 
                   AmbientCapabilities = ["CAP_NET_BIND_SERVICE"];
                   CapabilityBoundingSet = ["CAP_NET_BIND_SERVICE"];

@@ -1,6 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use iota_logger::{PrintType, log, log_cv, log_t};
-use iota_state::{RELOAD, SHUTDOWN};
 use iota_storage::users::user_manager::{add_user, save_users};
 use iota_storage::users::user_profile::UserProfile;
 use iota_util::crypto_helper::{self, hex_hash, public_key_bundle_to_base64};
@@ -81,8 +80,6 @@ pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>
         log_t!("User creation: Response returned none");
         return (None, None);
     }
-    *SHUTDOWN.write().await = true;
-    *RELOAD.write().await = true;
     log!("Created User");
     save_file(
         "",

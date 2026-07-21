@@ -37,16 +37,19 @@ jobs:
           DOCKER_PASSWD="$(printf '%s' "$DOCKER_PASSWD" | tr -d '\r\n')"
           printf '%s' "$DOCKER_PASSWD" | nix-shell -p docker --run "docker login docker.io --username \"$DOCKER_USER\" --password-stdin"
 
-      - name: Build & Push
+      - name: Build & Push Docker image
         run: |
           nix-shell -p docker --run "docker build -f dockerfile -t tensamin/iota:latest . && docker push tensamin/iota:latest"
 
-      - name: Build release binary
+      - name: Build release binaries
         run: |
           set -eu
 
-          nix build .#iota --print-build-logs
-          install -Dm755 result/bin/iota dist/iota
+          nix build .#iota-daemon --print-build-logs
+          install -Dm755 result/bin/iota-daemon dist/iota-daemon
+
+          nix build .#iota-ui --print-build-logs
+          install -Dm755 result/bin/iota-ui dist/iota-ui
 
       - name: Read release metadata
         id: version
@@ -55,7 +58,7 @@ jobs:
         run: |
           set -eu
 
-          VERSION="$(nix eval --raw .#iota.version)"
+          VERSION="$(nix eval --raw .#iota-daemon.version)"
           SHORT_SHA="$(git rev-parse --short=7 HEAD)"
 
           case "$RELEASE_TYPE" in
@@ -73,18 +76,15 @@ jobs:
               ;;
           esac
 
-          ASSET_PATH="dist/iota"
-          ASSET_NAME="iota"
-          test -x "$ASSET_PATH"
-
           echo "version=$VERSION" >> "$FORGEJO_OUTPUT"
           echo "tag=$TAG" >> "$FORGEJO_OUTPUT"
           echo "title=$TAG" >> "$FORGEJO_OUTPUT"
           echo "prerelease=$PRERELEASE" >> "$FORGEJO_OUTPUT"
-          echo "asset_path=$ASSET_PATH" >> "$FORGEJO_OUTPUT"
-          echo "asset_name=$ASSET_NAME" >> "$FORGEJO_OUTPUT"
 
-      - name: Create release and upload binary
+          test -x "dist/iota-daemon"
+          test -x "dist/iota-ui"
+
+      - name: Create release and upload binaries
         env:
           TOKEN: ${{ forgejo.token }}
           API: ${{ forgejo.api_url }}
@@ -93,8 +93,6 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
           TITLE: ${{ steps.version.outputs.title }}
           PRERELEASE: ${{ steps.version.outputs.prerelease }}
-          ASSET_PATH: ${{ steps.version.outputs.asset_path }}
-          ASSET_NAME: ${{ steps.version.outputs.asset_name }}
           DESCRIPTION: ${{ inputs.description }}
         run: |
           nix-shell -p curl jq --run '
@@ -122,7 +120,11 @@ jobs:
               RELEASE_ID="$(echo "$RELEASE_JSON" | jq -r .id)"
             fi
 
-            curl -fsS -X POST "$API/repos/$REPO/releases/$RELEASE_ID/assets?name=$ASSET_NAME" \
+            curl -fsS -X POST "$API/repos/$REPO/releases/$RELEASE_ID/assets?name=iota-daemon" \
               -H "Authorization: token $TOKEN" \
-              -F "attachment=@$ASSET_PATH"
+              -F "attachment=@dist/iota-daemon"
+
+            curl -fsS -X POST "$API/repos/$REPO/releases/$RELEASE_ID/assets?name=iota-ui" \
+              -H "Authorization: token $TOKEN" \
+              -F "attachment=@dist/iota-ui"
           '

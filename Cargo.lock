@@ -2091,6 +2091,7 @@ version = "0.1.0"
 dependencies = [
  "iota-cli",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -2186,6 +2187,7 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "tungstenite",
  "walkdir",
  "warp",
@@ -2213,6 +2215,7 @@ dependencies = [
  "iota-storage",
  "omikron-connector",
  "tokio",
+ "tokio-util",
  "web-server",
 ]
 
@@ -2220,15 +2223,19 @@ dependencies = [
 name = "iota-daemon-lib"
 version = "0.1.0"
 dependencies = [
+ "dashmap",
  "iota-ipc",
  "iota-logger",
  "iota-state",
  "iota-storage",
  "iota-util",
+ "libc",
  "mtp",
  "omikron-connector",
  "sysinfo",
  "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -3082,6 +3089,7 @@ dependencies = [
  "reqwest",
  "sha2 0.10.9",
  "tokio",
+ "tokio-util",
  "uuid",
  "x448",
 ]
@@ -4898,6 +4906,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -5263,10 +5272,10 @@ dependencies = [
  "bytes",
  "http 1.4.2",
  "iota-logger",
- "iota-state",
  "iota-util",
  "mtp",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

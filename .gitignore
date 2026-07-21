@@ -2,3 +2,8 @@ target
 logs
 agreements
 languages/
+.envrc
+.direnv
+config.json
+*.mk
+*.sqlite*

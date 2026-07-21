@@ -6,6 +6,7 @@ use crate::{
         log_card::LogCard,
     },
     interaction_result::InteractionResult,
+    ipc_client::IpcConnectionState,
     screens::screens::{NavDirection, Screen},
     ui::UI,
 };
@@ -16,6 +17,7 @@ use ratatui::{
     layout::{Constraint, Layout, Margin, Rect},
     widgets::{Block, Borders},
 };
+use tokio::sync::watch;
 
 use std::{any::Any, sync::Arc};
 
@@ -24,6 +26,7 @@ pub struct MainScreen {
     nav_grid: Vec<Vec<Option<usize>>>,
     selected_coords: (usize, usize),
     graphs_open: bool,
+    connection_status_rx: watch::Receiver<IpcConnectionState>,
 }
 
 impl MainScreen {
@@ -58,11 +61,14 @@ impl MainScreen {
 
         let graphs_open = true;
 
+        let connection_status_rx = ui.ipc().connection_status();
+
         let mut screen = MainScreen {
             elements,
             nav_grid,
             selected_coords: (1, 0),
             graphs_open,
+            connection_status_rx,
         };
         screen.focus_current();
         screen
@@ -147,6 +153,40 @@ impl MainScreen {
 
         self.focus_current();
     }
+
+    /// Cycle focus between unique elements in the navigation grid.
+    fn navigate_focus(&mut self, forward: bool) {
+        // Collect unique elements in grid order.
+        let mut positions: Vec<(usize, usize)> = Vec::new(); // (row, col)
+        let mut seen: Vec<Option<usize>> = Vec::new();
+        for (y, row) in self.nav_grid.iter().enumerate() {
+            for (x, elem_opt) in row.iter().enumerate() {
+                if elem_opt.is_some() && !seen.contains(elem_opt) {
+                    seen.push(*elem_opt);
+                    positions.push((y, x));
+                }
+            }
+        }
+
+        let current = self.selected_coords;
+        let current_pos = positions
+            .iter()
+            .position(|&(r, c)| r == current.0 && c == current.1);
+
+        let next_pos = if let Some(idx) = current_pos {
+            if forward {
+                (idx + 1) % positions.len()
+            } else {
+                (idx + positions.len() - 1) % positions.len()
+            }
+        } else {
+            0
+        };
+
+        self.unfocus_current(self.selected_coords.0, self.selected_coords.1);
+        self.selected_coords = positions[next_pos];
+        self.focus_current();
+    }
 }
 
 impl Screen for MainScreen {
@@ -159,7 +199,21 @@ impl Screen for MainScreen {
     }
 
     fn render(&self, f: &mut Frame, rect: Rect) {
-        let main_block = Block::default().title("Main").borders(Borders::ALL);
+        let status = self.connection_status_rx.borrow();
+        let status_text = match &*status {
+            IpcConnectionState::Connected => "Connected".to_string(),
+            IpcConnectionState::Connecting => "Connecting...".to_string(),
+            IpcConnectionState::Reconnecting { attempt } => {
+                format!("Reconnecting (attempt {})...", attempt)
+            }
+            IpcConnectionState::Incompatible { message } => {
+                format!("Incompatible: {}", message)
+            }
+            IpcConnectionState::Disconnected => "Disconnected".to_string(),
+        };
+        let main_block = Block::default()
+            .title(format!("Main [{}]", status_text))
+            .borders(Borders::ALL);
         f.render_widget(main_block, rect);
 
         let inner = rect.inner(Margin {
@@ -215,10 +269,14 @@ impl Screen for MainScreen {
 
     fn handle_input(&mut self, event: KeyEvent) -> InteractionResult {
         match event.code {
-            KeyCode::Up => self.navigate(NavDirection::Up),
-            KeyCode::Down => self.navigate(NavDirection::Down),
-            KeyCode::Left => self.navigate(NavDirection::Left),
-            KeyCode::Right => self.navigate(NavDirection::Right),
+            KeyCode::Tab => {
+                self.navigate_focus(true);
+                return InteractionResult::Handled;
+            }
+            KeyCode::BackTab => {
+                self.navigate_focus(false);
+                return InteractionResult::Handled;
+            }
             KeyCode::Enter | KeyCode::Char(' ') if self.selected_coords.1 == 1 => {
                 self.graphs_open = !self.graphs_open;
                 for element in self.elements.iter_mut() {
@@ -232,7 +290,17 @@ impl Screen for MainScreen {
                 let (y, x) = self.selected_coords;
                 if let Some(Some(index)) = self.nav_grid.get(y).and_then(|r| r.get(x)) {
                     if let Some(el) = self.elements.get_mut(*index) {
-                        return el.interact(event);
+                        let result = el.interact(event);
+                        if matches!(result, InteractionResult::Unhandled) {
+                            match event.code {
+                                KeyCode::Up => self.navigate(NavDirection::Up),
+                                KeyCode::Down => self.navigate(NavDirection::Down),
+                                KeyCode::Left => self.navigate(NavDirection::Left),
+                                KeyCode::Right => self.navigate(NavDirection::Right),
+                                _ => {}
+                            }
+                        }
+                        return result;
                     }
                 }
             }

@@ -6,6 +6,7 @@ ListenStream=/run/iota/iota.sock
 SocketMode=0660
 SocketUser=iota
 SocketGroup=iota
+Backlog=5
 RemoveOnStop=true
 
 [Install]

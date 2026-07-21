@@ -5,12 +5,22 @@ Wants=network-online.target
 Requires=iota-daemon.socket
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=/usr/bin/iota-daemon
 Restart=on-failure
+RestartSec=5s
 RuntimeDirectory=iota
 RuntimeDirectoryMode=0750
 Environment=IOTA_SOCKET=/run/iota/iota.sock
+
+# Exit code 75 = restart requested (daemon-specific convention)
+RestartPreventExitStatus=0
+RestartForceExitStatus=75
+
+# Graceful shutdown
+TimeoutStopSec=10
+KillMode=mixed
+KillSignal=SIGTERM
 
 [Install]
 WantedBy=multi-user.target

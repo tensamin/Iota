@@ -153,7 +153,7 @@ async fn main() {
         if !web_server::start(port).await {
             log!("Failed to start the MTP web server on port {}", port);
         }
-        let _ = omikron::omikron_connection::get_omikron_connection().await;
+        let _ = omikron::omikron_connection::get_omikron_connection(tokio_util::sync::CancellationToken::new()).await;
 
         log_t!("setup_completed");
         loop {

@@ -1,18 +1,4 @@
 use crossterm::event::{KeyCode, KeyEvent};
-#[cfg(feature = "legacy-commands")]
-use iota_logger::{log, log_cv};
-#[cfg(feature = "legacy-commands")]
-use iota_state::{ACTIVE_TASKS, RELOAD, SHUTDOWN};
-#[cfg(feature = "legacy-commands")]
-use iota_storage::users::{user_manager, user_profile::UserProfile};
-#[cfg(feature = "legacy-commands")]
-use iota_storage::util::config_util::modify_config;
-#[cfg(feature = "legacy-commands")]
-use iota_util::file_util;
-#[cfg(feature = "legacy-commands")]
-use mtp::codec::{CommunicationType, CommunicationValue};
-#[cfg(feature = "legacy-commands")]
-use omikron_connector::omikron_connection::OMIKRON_CONNECTION;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -47,7 +33,7 @@ pub struct ConsoleCard {
 
     cursor: Arc<Mutex<bool>>,
     last_swap: Arc<Mutex<Instant>>,
-    tab_index: usize,
+    pending_restore: Arc<Mutex<Option<String>>>,
 }
 
 impl ConsoleCard {
@@ -62,7 +48,7 @@ impl ConsoleCard {
             joins: Borders::NONE,
             cursor: Arc::new(Mutex::new(true)),
             last_swap: Arc::new(Mutex::new(Instant::now())),
-            tab_index: 0,
+            pending_restore: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -112,12 +98,12 @@ impl ConsoleCard {
                     spans.push(Span::styled(" ", Style::default().fg(Color::White)));
                 }
                 spans.push(Span::styled(
-                    "send command (<help> for info)",
+                    "send command (/help for info)",
                     Style::default().fg(Color::DarkGray),
                 ));
             } else {
                 spans.push(Span::styled(
-                    " send command (<help> for info)",
+                    " send command (/help for info)",
                     Style::default().fg(Color::DarkGray),
                 ));
             }
@@ -295,6 +281,12 @@ impl InteractableElement for ConsoleCard {
     }
 
     fn interact(&mut self, key: KeyEvent) -> InteractionResult {
+        // Check if a previously failed command should be restored.
+        if let Some(restored) = self.pending_restore.lock().unwrap().take() {
+            self.content = restored;
+            self.cursor_position = self.content.chars().count();
+        }
+
         match key.code {
             KeyCode::Enter => {
                 if self.content.is_empty() {
@@ -303,17 +295,15 @@ impl InteractableElement for ConsoleCard {
 
                 let command = self.content.clone();
                 let ipc = self.ipc.clone();
-                let seq = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
+                let restore = self.pending_restore.clone();
                 tokio::spawn(async move {
-                    let _ = ipc.send_command(seq, command).await;
+                    if ipc.send_command(0, command.clone()).await.is_err() {
+                        *restore.lock().unwrap() = Some(command);
+                    }
                 });
 
                 self.content.clear();
                 self.cursor_position = 0;
-                self.tab_index = 0;
                 InteractionResult::Handled
             }
             KeyCode::Backspace => {
@@ -350,14 +340,7 @@ impl InteractableElement for ConsoleCard {
                 self.cursor_position = self.content.chars().count();
                 InteractionResult::Handled
             }
-            KeyCode::Tab => {
-                if let Some(prefix) = self.current_prefix() {
-                    if prefix == "/" {
-                        self.tab_index = self.tab_index.saturating_add(1);
-                    }
-                }
-                InteractionResult::Handled
-            }
+            KeyCode::Tab | KeyCode::BackTab => InteractionResult::Unhandled,
             _ => {
                 if let Some(c) = key.code.as_char() {
                     self.insert_at_cursor(c);
@@ -379,146 +362,5 @@ impl InteractableElement for ConsoleCard {
 
     fn focus(&mut self, f: bool) {
         self.focused = f;
-    }
-}
-
-#[cfg(feature = "legacy-commands")]
-pub async fn run_command(command: &str) {
-    let parts = command.split(" ").collect::<Vec<&str>>();
-
-    match parts.as_slice() {
-        ["tasks"] => {
-            let active_tasks: Vec<String> =
-                ACTIVE_TASKS.clone().iter().map(|v| v.to_string()).collect();
-            let info = if *SHUTDOWN.read().await && *RELOAD.read().await {
-                "Rebooting, "
-            } else if *SHUTDOWN.read().await {
-                "Shutting , "
-            } else {
-                ""
-            };
-            log!("{}Active tasks: {:?}", info, active_tasks);
-        }
-        ["fps"] => {
-            let (fps, skips) = *FPS.read().await;
-            log!("{:.1} FPS with {:.1}% of attempts skipped", fps, skips);
-        }
-
-        ["help"] => {
-            log!("Available commands: tasks, fps, ping, user, reconnect, regenerate");
-        }
-
-        ["help", "tasks"] => {
-            log!("Tasks command usage: tasks");
-        }
-        ["help", "fps"] => {
-            log!("FPS command usage: fps");
-        }
-        ["help", "ping"] => {
-            log!("Ping command usage: ping [time]");
-        }
-        ["help", "user"] => {
-            log!("User command usage: user add <username> | user remove <username> | user list");
-        }
-        ["help", "reconnect"] => {
-            log!("Reconnect command usage: reconnect. Retry connecting to the Omikron server");
-        }
-        ["help", "regenerate"] => {
-            log!(
-                "Regenerate command usage: regenerate keys. Generate a new Iota key pair and reconnect"
-            );
-        }
-
-        ["ping"] => {
-            ping(20).await;
-        }
-        ["ping", time] => {
-            let time = time.parse::<u64>().unwrap_or(20);
-            ping(time).await;
-        }
-        ["user", "add", username] => {
-            if let (Some(user), Some(_)) = omikron_connector::user_ops::create_user(username).await
-            {
-                log!("Created user {}", user.user_id);
-            } else {
-                log!("User creation: Failed to create user. See errors above.");
-            }
-        }
-        ["user", "remove", username] => {
-            if let Some(user) = user_manager::get_user_by_username(username) {
-                let msg = CommunicationValue::new(CommunicationType::DeleteUser)
-                    .with_sender(user.user_id as u64);
-                let _ = OMIKRON_CONNECTION.send_message(&msg).await;
-                user_manager::remove_user(user.user_id);
-                log!("Removed user {}", user.user_id);
-            } else {
-                log!("User removal: Username doesn't exist");
-            }
-        }
-        ["user", "list"] => {
-            let users: Vec<UserProfile> = user_manager::get_users();
-            for user in users {
-                let storage = file_util::get_designed_storage(user.user_id);
-                log!(
-                    "> Username: {}, ID: {}, created at: {}, storage: {}",
-                    user.username,
-                    user.user_id,
-                    user.created_at,
-                    storage
-                );
-            }
-        }
-        ["user", "info", username] => {
-            if let Some(user) = user_manager::get_user_by_username(username) {
-                user_manager::remove_user(user.user_id);
-                log!("Removed user {}", user.user_id);
-            } else {
-                log!("User info: Username doesn't exist");
-            }
-        }
-        ["reconnect"] => {
-            log!("Reconnecting to Omikron server...");
-            OMIKRON_CONNECTION.reconnect().await;
-            log!("Reconnected to Omikron server");
-        }
-        ["regenerate", "keys"] => {
-            log!("Regenerating Iota key pair...");
-            modify_config(|cfg| {
-                cfg.public_key = None;
-                cfg.private_key = None;
-                cfg.iota_id = None;
-            });
-            log!("Key pair regenerated. Reconnecting to Omikron server...");
-            OMIKRON_CONNECTION.reconnect().await;
-            log!("Reconnected with new key pair");
-        }
-        ["reload"] | ["restart"] => {
-            log!("Restarting");
-            *RELOAD.write().await = true;
-            *SHUTDOWN.write().await = true;
-        }
-        ["shutdown"] | ["stop"] => {
-            log!("Shutting down");
-            *SHUTDOWN.write().await = true;
-        }
-        _ => {
-            log!("Unknown command");
-        }
-    }
-}
-
-#[cfg(feature = "legacy-commands")]
-pub async fn ping(time: u64) {
-    let conn = OMIKRON_CONNECTION.clone();
-
-    let response_cv = conn
-        .await_response(
-            &CommunicationValue::new(CommunicationType::Ping),
-            Some(Duration::from_secs(time)),
-        )
-        .await;
-    match response_cv {
-        Ok(response) => log_cv!(response),
-        Err(err) => log!("Ping error: {:?}", err),
     }
 }

@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use iota_logger::{log, log_cv_in, log_cv_out, log_t};
-use iota_state::{ACTIVE_TASKS, SHUTDOWN};
+use iota_state::ACTIVE_TASKS;
 use iota_storage::util::chat_files::{self, MessageState, change_message_state};
 use iota_storage::util::config_util::{CONFIG, modify_config};
 use iota_storage::util::e2ee_storage::{self, PendingChatSecretForward, StoredChatSecret};
@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::omega_discovery;
@@ -161,10 +162,15 @@ pub struct OmikronConnection {
     pub app_sessions: Arc<DashMap<u64, (i64, String)>>,
     pub(crate) missed_pongs: Arc<AtomicU32>,
     handler_semaphore: Arc<Semaphore>,
+    cancellation: CancellationToken,
 }
 
 impl OmikronConnection {
     pub fn new() -> Self {
+        Self::with_cancellation(CancellationToken::new())
+    }
+
+    pub fn with_cancellation(cancellation: CancellationToken) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
         let (state_watch_tx, _) = watch::channel(ConnectionState::Disconnected);
 
@@ -183,6 +189,7 @@ impl OmikronConnection {
             app_sessions: Arc::new(DashMap::new()),
             missed_pongs: Arc::new(AtomicU32::new(0)),
             handler_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS)),
+            cancellation,
         }
     }
 
@@ -237,7 +244,7 @@ impl OmikronConnection {
         }
 
         if let Some(sender) = self.sender.read().await.as_ref() {
-            sender.close();
+            sender.close().await;
         }
 
         self.set_state(ConnectionState::Disconnected).await;
@@ -250,7 +257,7 @@ impl OmikronConnection {
         let mut shutdown_rx = shutdown_rx;
 
         loop {
-            if *shutdown_rx.borrow() || *SHUTDOWN.read().await {
+            if *shutdown_rx.borrow() || self.cancellation.is_cancelled() {
                 log_t!("omikron_connection_loop_shutdown");
                 break;
             }
@@ -621,7 +628,7 @@ impl OmikronConnection {
                     self.missed_pongs.load(Ordering::Relaxed)
                 );
                 if let Some(sender) = self.sender.read().await.as_ref() {
-                    sender.close();
+                    sender.close().await;
                 }
                 break;
             }
@@ -1750,7 +1757,7 @@ impl OmikronConnection {
             if !sender.is_open() {
                 drop(sender_guard);
                 if let Some(sender) = self.sender.write().await.take() {
-                    sender.close();
+                    sender.close().await;
                 }
                 self.fail_all_waiting_tasks(format!(
                     "Send failed: connection closed (connection_id={})",
@@ -1933,11 +1940,12 @@ pub static OMIKRON_CONNECTION: LazyLock<Arc<OmikronConnection>> = LazyLock::new(
     conn
 });
 
-pub async fn get_omikron_connection() -> Arc<OmikronConnection> {
-    let conn = OMIKRON_CONNECTION.clone();
-
+pub async fn get_omikron_connection(
+    cancellation: CancellationToken,
+) -> Option<Arc<OmikronConnection>> {
+    let conn = Arc::new(OmikronConnection::with_cancellation(cancellation));
     conn.connect().await;
-    conn
+    Some(conn)
 }
 
 impl iota_connection::connection_handler::ConnectionHandler for OmikronConnection {

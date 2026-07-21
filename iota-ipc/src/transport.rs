@@ -41,19 +41,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::{read_msg, write_msg};
-    use crate::protocol::ClientMessage;
+    use crate::protocol::{ClientMessage, LocalRequest, RequestEnvelope};
 
     #[tokio::test]
     async fn round_trips_framed_messages() {
         let (mut writer, mut reader) = tokio::io::duplex(1024);
-        let message = ClientMessage::Command {
-            seq: 4,
-            line: "help".into(),
-        };
+        let message = ClientMessage::Request(RequestEnvelope {
+            request_id: 4,
+            protocol_version: 2,
+            request: LocalRequest::GetStatus,
+        });
         write_msg(&mut writer, &message)
             .await
             .expect("write succeeds");
         let received: ClientMessage = read_msg(&mut reader).await.expect("read succeeds");
-        assert!(matches!(received, ClientMessage::Command { seq: 4, line } if line == "help"));
+        assert!(matches!(received, ClientMessage::Request(req) if req.request_id == 4));
     }
 }

@@ -1,11 +1,10 @@
 use bytes::Bytes;
 use iota_logger::log;
-use iota_state::{ACTIVE_TASKS, SHUTDOWN};
 use iota_util::file_util::load_file_vec;
 use mtp::host::HostConfig;
 use mtp::webserver::{Http3Request, Http3Response, MTPWebServer, WebServerConfig};
 use std::net::{IpAddr, Ipv4Addr};
-use tokio::time::{Duration, sleep};
+use tokio_util::sync::CancellationToken;
 
 const CERT_PATH: &str = "certs/cert.pem";
 const KEY_PATH: &str = "certs/cert.key";
@@ -63,7 +62,7 @@ fn content_type(name: &str) -> &'static str {
     }
 }
 
-pub async fn start(port: u16) -> bool {
+pub async fn start(port: u16, cancellation: CancellationToken) -> bool {
     let certificate = match tokio::fs::read(CERT_PATH).await {
         Ok(certificate) => certificate,
         Err(error) => {
@@ -102,7 +101,6 @@ pub async fn start(port: u16) -> bool {
 
     log!("MTP web server running on port {}", port);
     tokio::spawn(async move {
-        ACTIVE_TASKS.insert("WebServer".into());
         loop {
             tokio::select! {
                 result = server.accept() => {
@@ -112,22 +110,12 @@ pub async fn start(port: u16) -> bool {
                         Err(error) => log!("MTP webserver connection failed: {}", error),
                     }
                 }
-                _ = wait_for_shutdown() => {
+                _ = cancellation.cancelled() => {
                     server.shutdown().await;
                     break;
                 }
             }
         }
-        ACTIVE_TASKS.remove("WebServer");
     });
     true
-}
-
-async fn wait_for_shutdown() {
-    loop {
-        if *SHUTDOWN.read().await {
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
 }

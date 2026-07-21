@@ -10,16 +10,18 @@ fn socket_path() -> PathBuf {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let path = socket_path();
-    let ipc = match IpcClient::connect(&path).await {
+    let ipc = match IpcClient::connect_or_activate(&path).await {
         Ok(client) => client,
         Err(error) => {
             eprintln!(
                 "Cannot connect to iota-daemon at {}: {error}",
                 path.display()
             );
+            eprintln!("Ensure iota-daemon.socket is enabled or iota-daemon is running.");
             std::process::exit(1);
         }
     };
+    ipc.spawn_reconnector();
     let ui = start_tui(ipc);
     ui.set_screen(Box::new(MainScreen::new(ui.clone()).await))
         .await;
