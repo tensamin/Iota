@@ -1,7 +1,5 @@
 use iota_cli::{
-    ipc_client::IpcClient,
-    screens::main_screen::MainScreen,
-    theme,
+    ipc_client::IpcClient, screens::main_screen::MainScreen, theme,
     ui::start_bootstrap_tui_with_theme,
 };
 use iota_ipc::{LocalRequest, ResponseResult};
@@ -32,13 +30,28 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), StartupError> {
     let invocation =
         CliInvocation::parse(std::env::args().skip(1)).map_err(StartupError::InvalidCommand)?;
-    let mut endpoints_iter = iota_paths::daemon_endpoints().into_iter();
-    let local_endpoint = endpoints_iter
-        .next()
-        .expect("path layer always returns an endpoint");
-    let system_endpoint = endpoints_iter
-        .next()
-        .unwrap_or_else(|| local_endpoint.clone());
+    let local_endpoint = match iota_paths::IotaPaths::resolve(iota_paths::Scope::User)
+        .map_err(|error| StartupError::Other(format!("Cannot resolve user IPC path: {error}")))?
+        .ipc_endpoint
+    {
+        iota_paths::IpcEndpoint::UnixSocket(path) => path,
+        iota_paths::IpcEndpoint::WindowsPipe(name) => {
+            return Err(StartupError::Other(format!(
+                "Windows IPC endpoint {name} is not supported by this client build"
+            )));
+        }
+    };
+    let system_endpoint = match iota_paths::IotaPaths::resolve(iota_paths::Scope::System)
+        .map_err(|error| StartupError::Other(format!("Cannot resolve system IPC path: {error}")))?
+        .ipc_endpoint
+    {
+        iota_paths::IpcEndpoint::UnixSocket(path) => path,
+        iota_paths::IpcEndpoint::WindowsPipe(name) => {
+            return Err(StartupError::Other(format!(
+                "Windows IPC endpoint {name} is not supported by this client build"
+            )));
+        }
+    };
     let endpoints = daemon_setup_flow::DaemonEndpoints {
         local: local_endpoint,
         system: system_endpoint,

@@ -10,8 +10,33 @@ use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
-    logger::startup();
-    iota_storage::util::config_util::load_config();
+    let scope = match std::env::var("IOTA_DEPLOYMENT_MODE").ok().as_deref() {
+        Some("system_socket_activated") | Some("system_always_on") => iota_paths::Scope::System,
+        _ => iota_paths::Scope::User,
+    };
+    let paths = match iota_paths::IotaPaths::resolve(scope) {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("Cannot resolve Iota paths: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = paths.migrate_legacy_layout() {
+        eprintln!("Cannot migrate legacy Iota layout: {error}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = paths.prepare_writable_directories() {
+        eprintln!("Cannot prepare Iota directories: {error}");
+        return ExitCode::FAILURE;
+    }
+    iota_util::file_util::configure_storage_directory(paths.storage_dir.clone());
+    iota_storage::util::config_util::configure_config_path(paths.config_file.clone());
+    iota_storage::util::config_util::load_config_from(&paths.config_file);
+    omikron_connector::omikron_connection::configure_identity_path(paths.keyring_file());
+    match paths.scope {
+        iota_paths::Scope::User => logger::startup_with_log_dir(Some(paths.log_dir.clone())),
+        iota_paths::Scope::System => logger::startup_with_log_dir(None),
+    }
 
     let runtime = Arc::new(DaemonRuntime::new());
     // --- IPC infrastructure ---
@@ -36,7 +61,13 @@ async fn main() -> ExitCode {
 
     // Bind before migration and service startup: a successful bind is the
     // readiness boundary visible to clients and socket activation.
-    let socket = iota_paths::socket_path(iota_paths::SocketScope::User);
+    let socket = match &paths.ipc_endpoint {
+        iota_paths::IpcEndpoint::UnixSocket(path) => path.clone(),
+        iota_paths::IpcEndpoint::WindowsPipe(_) => {
+            eprintln!("Windows named-pipe daemon transport is not implemented yet");
+            return ExitCode::FAILURE;
+        }
+    };
     let omikron = match omikron_connector::omikron_connection::connect_initial(
         runtime.cancellation.clone(),
         runtime.state.active_tasks.clone(),
@@ -65,18 +96,22 @@ async fn main() -> ExitCode {
         }
     };
     let services = DaemonServices::new(omikron);
-    let ipc_server =
-        match IpcServer::bind(socket, runtime.clone(), services, log_tx.clone(), state_rx).await {
-            Ok(server) => server,
-            Err(error) => {
-                eprintln!("Cannot bind daemon IPC socket: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-    eprintln!(
-        "iota-daemon IPC listener ready at {}",
-        iota_paths::socket_path(iota_paths::SocketScope::User).display()
-    );
+    let ipc_server = match IpcServer::bind(
+        socket.clone(),
+        runtime.clone(),
+        services,
+        log_tx.clone(),
+        state_rx,
+    )
+    .await
+    {
+        Ok(server) => server,
+        Err(error) => {
+            eprintln!("Cannot bind daemon IPC socket: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("iota-daemon IPC listener ready at {}", socket.display());
     runtime.set_component_healthy(iota_ipc::ComponentId::Ipc, None);
     let listener_runtime = runtime.clone();
     runtime
@@ -128,13 +163,17 @@ async fn main() -> ExitCode {
             .parse()
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         port: web.port,
-        asset_dir: std::path::PathBuf::from(web.asset_dir),
+        asset_dir: resolve_config_path(&paths.config_file, &web.asset_dir, &paths.asset_dir),
         tls: web
             .certificate
             .zip(web.key)
             .map(|(certificate, key)| web_server::TlsConfig {
-                certificate: certificate.into(),
-                key: key.into(),
+                certificate: resolve_config_path(
+                    &paths.config_file,
+                    &certificate,
+                    &paths.config_dir,
+                ),
+                key: resolve_config_path(&paths.config_file, &key, &paths.config_dir),
             }),
         required: web.required,
     };
@@ -195,4 +234,23 @@ async fn main() -> ExitCode {
     let exit_code = reason.exit_code();
     log!("iota-daemon exited (code: {})", exit_code);
     ExitCode::from(exit_code as u8)
+}
+
+fn resolve_config_path(
+    config_file: &std::path::Path,
+    value: &str,
+    default: &std::path::Path,
+) -> std::path::PathBuf {
+    if value.is_empty() {
+        return default.to_path_buf();
+    }
+    let path = std::path::PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        config_file
+            .parent()
+            .expect("absolute configuration file has a parent")
+            .join(path)
+    }
 }

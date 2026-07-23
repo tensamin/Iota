@@ -3,6 +3,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use sysinfo::System;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -40,34 +41,19 @@ pub fn delete_user_directory(user_id: i64) {
 }
 
 pub fn load_file_buf(path: &str, name: &str) -> io::Result<BufReader<File>> {
-    let dir = Path::new(&get_directory()).join(path);
-    let file_path = dir.join(name);
-
-    // Ensure the directory exists, create if necessary
-    if !dir.exists() {
-        if let Err(_) = fs::create_dir_all(&dir) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Directory creation failed",
-            ));
-        }
-    }
-
-    // Create the file if it doesn't exist
-    if !file_path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "File creation failed",
-        ));
-    }
+    let file_path = storage_file(path, name)?;
 
     // Open the file and return a BufReader for efficient reading
     let file = File::open(&file_path)?;
     Ok(BufReader::new(file))
 }
 pub fn has_file(path: &str, name: &str) -> bool {
-    let dir = Path::new(&get_directory()).join(path);
-    let file_path = dir.join(name);
+    let Ok(file_path) = storage_file(path, name) else {
+        return false;
+    };
+    let Some(dir) = file_path.parent() else {
+        return false;
+    };
 
     if !dir.exists() {
         return false;
@@ -80,7 +66,9 @@ pub fn has_file(path: &str, name: &str) -> bool {
     true
 }
 pub fn has_dir(path: &str) -> bool {
-    let dir = Path::new(&get_directory()).join(path);
+    let Ok(dir) = storage_child(path) else {
+        return false;
+    };
 
     if !dir.exists() {
         return false;
@@ -90,8 +78,12 @@ pub fn has_dir(path: &str) -> bool {
 }
 
 pub fn load_file(path: &str, name: &str) -> String {
-    let dir = Path::new(&get_directory()).join(path);
-    let file_path = dir.join(name);
+    let Ok(file_path) = storage_file(path, name) else {
+        return String::new();
+    };
+    let Some(dir) = file_path.parent() else {
+        return String::new();
+    };
 
     if !dir.exists() {
         return String::new();
@@ -109,15 +101,17 @@ pub fn load_file(path: &str, name: &str) -> String {
 }
 
 pub fn load_file_vec(path: &str, name: &str) -> Result<Vec<u8>, std::io::Error> {
-    let dir = Path::new(&get_directory()).join(path);
-    let file_path = dir.join(name);
-
-    std::fs::read(file_path)
+    std::fs::read(storage_file(path, name)?)
 }
 
 pub fn save_file(path: &str, name: &str, value: &str) {
-    let dir = Path::new(&get_directory()).join(path);
-    let file_path = dir.join(name);
+    let Ok(file_path) = storage_file(path, name) else {
+        eprintln!("[IMPORTANT] Refusing unsafe storage path");
+        return;
+    };
+    let Some(dir) = file_path.parent() else {
+        return;
+    };
 
     if !dir.exists() {
         if let Err(e) = fs::create_dir_all(&dir) {
@@ -149,7 +143,9 @@ pub fn save_file(path: &str, name: &str, value: &str) {
 }
 
 pub fn get_children(path: &str) -> Vec<String> {
-    let dir = Path::new(&get_directory()).join(path);
+    let Ok(dir) = storage_child(path) else {
+        return Vec::new();
+    };
     let mut children = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries {
@@ -161,8 +157,61 @@ pub fn get_children(path: &str) -> Vec<String> {
     children
 }
 
+static STORAGE_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set by the daemon immediately after resolving `IotaPaths`.  This keeps the
+/// legacy storage helpers working while preventing them from independently
+/// discovering a different (user-scope) directory in a system daemon.
+pub fn configure_storage_directory(path: PathBuf) {
+    let _ = STORAGE_DIRECTORY.set(path);
+}
+
+pub fn storage_directory() -> PathBuf {
+    STORAGE_DIRECTORY.get().cloned().unwrap_or_else(|| {
+        iota_paths::IotaPaths::resolve(iota_paths::Scope::User)
+            .expect("resolve Iota user paths")
+            .storage_dir
+    })
+}
+
+/// Resolve a user supplied storage fragment without allowing it to escape the
+/// resolved storage root.  Legacy call sites may use nested fragments, but
+/// never absolute paths or `..` components.
+pub fn storage_child(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let path = path.as_ref();
+    if path.is_absolute()
+        || path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsafe storage path",
+        ));
+    }
+    Ok(storage_directory().join(path))
+}
+
+pub fn storage_file(path: impl AsRef<Path>, name: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let name = name.as_ref();
+    if name.components().count() != 1 || name.is_absolute() || name == Path::new(".") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsafe storage file name",
+        ));
+    }
+    storage_child(path).map(|dir| dir.join(name))
+}
+
 pub fn get_directory() -> String {
-    iota_paths::data_dir().to_string_lossy().to_string()
+    // Legacy helpers are storage-only.  Configuration, keys, logs and runtime
+    // files must use their dedicated path APIs instead.
+    storage_directory().to_string_lossy().into_owned()
 }
 
 // Helper to download the zip file content to a file on disk

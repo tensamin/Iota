@@ -108,22 +108,26 @@
           cfg = config.services.iota;
           defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.iota-daemon or (throw "iota: no pre-built package for system ${pkgs.stdenv.hostPlatform.system}");
 
+          configFormat = pkgs.formats.yaml {};
           configFile =
             if cfg.settingsFile != null
             then cfg.settingsFile
-            else pkgs.writeText "iota-config.json" (builtins.toJSON cfg.settings);
+            else configFormat.generate "iota-config.yaml" cfg.settings;
 
           descriptionText = "Tensamin Iota daemon";
         in {
           options.services.iota = {
             enable = lib.mkEnableOption "Enable the Iota service.";
 
-            dataDir = lib.mkOption {
+            stateDir = lib.mkOption {
               type = lib.types.str;
-              default = cfg.package.passthru.dataDir or "/var/lib/iota";
-              defaultText = lib.literalExpression ''config.services.iota.package.passthru.dataDir or "/var/lib/iota"'';
-              description = "Directory where Iota stores its data, config, and certificates.";
+              default = "/var/lib/iota";
+              description = "Persistent mutable Iota state.";
             };
+            cacheDir = lib.mkOption { type = lib.types.str; default = "/var/cache/iota"; };
+            runtimeDir = lib.mkOption { type = lib.types.str; default = "/run/iota"; };
+            logDir = lib.mkOption { type = lib.types.str; default = "/var/log/iota"; };
+            assetDir = lib.mkOption { type = lib.types.str; default = "${cfg.package}/share/iota/web"; };
 
             certFile = lib.mkOption {
               type = lib.types.nullOr lib.types.path;
@@ -164,13 +168,13 @@
             settings = lib.mkOption {
               type = lib.types.attrs;
               default = {};
-              description = "Configuration attributes for Iota, written to config.json.";
+              description = "Configuration attributes for Iota, written to YAML.";
             };
 
             settingsFile = lib.mkOption {
               type = lib.types.nullOr lib.types.path;
               default = null;
-              description = "Path to an existing config.json file to use instead of generating from settings.";
+              description = "Path to an existing YAML file to use instead of generating from settings.";
             };
           };
 
@@ -178,7 +182,7 @@
             users.users.iota = {
               isSystemUser = true;
               group = "iota";
-              home = cfg.dataDir;
+              home = cfg.stateDir;
               createHome = true;
               description = "Iota service user";
               shell = pkgs.bash;
@@ -194,6 +198,7 @@
                 SocketMode = "0660";
                 SocketUser = "iota";
                 SocketGroup = "iota";
+                DirectoryMode = "0750";
                 Backlog = 5;
                 RemoveOnStop = "true";
                 NonBlocking = true;
@@ -210,28 +215,18 @@
                   Type = "simple";
                   User = "iota";
                   Group = "iota";
-                  WorkingDirectory = cfg.dataDir;
-
                   ExecStart = "${cfg.package}/bin/iota-daemon";
-
-                  ExecStartPre = [
-                    ("+"
-                      + pkgs.writeShellScript "iota-setup" ''
-                        mkdir -p ${cfg.dataDir}/certs
-
-                        ${lib.optionalString (cfg.certFile != null) "ln -sf ${cfg.certFile} ${cfg.dataDir}/certs/cert.pem"}
-                        ${lib.optionalString (cfg.keyFile != null) "ln -sf ${cfg.keyFile} ${cfg.dataDir}/certs/cert.key"}
-
-                        install -m 644 ${configFile} ${cfg.dataDir}/config.json
-
-                        chown -R iota:iota ${cfg.dataDir}
-                      '')
-                  ];
 
                   Restart = "on-failure";
                   RestartSec = "5s";
                   RuntimeDirectory = "iota";
                   RuntimeDirectoryMode = "0750";
+                  StateDirectory = "iota";
+                  StateDirectoryMode = "0750";
+                  CacheDirectory = "iota";
+                  CacheDirectoryMode = "0750";
+                  LogsDirectory = "iota";
+                  LogsDirectoryMode = "0750";
 
                   # Exit code 75 = restart requested
                   RestartPreventExitStatus = "0";
@@ -248,7 +243,8 @@
                   ProtectHome = true;
                   PrivateTmp = true;
                   NoNewPrivileges = true;
-                  ReadWritePaths = [cfg.dataDir];
+                  ReadWritePaths = [cfg.stateDir cfg.cacheDir cfg.runtimeDir cfg.logDir];
+                  ReadOnlyPaths = [configFile cfg.assetDir];
                   ProtectKernelTunables = true;
                   ProtectKernelModules = true;
                   ProtectControlGroups = true;
@@ -259,7 +255,14 @@
                   Environment = [
                     "BIND_ADDRESS=${cfg.bindAddress}"
                     "IOTA_SOCKET=/run/iota/iota.sock"
-                    "IOTA_DATA_DIR=${cfg.dataDir}"
+                    "IOTA_CONFIG_FILE=${configFile}"
+                    "IOTA_STATE_DIR=${cfg.stateDir}"
+                    "IOTA_CACHE_DIR=${cfg.cacheDir}"
+                    "IOTA_RUNTIME_DIR=${cfg.runtimeDir}"
+                    "IOTA_LOG_DIR=${cfg.logDir}"
+                    "IOTA_ASSET_DIR=${cfg.assetDir}"
+                    "IOTA_DEPLOYMENT_MODE=system_socket_activated"
+                    "IOTA_SUPERVISOR=systemd"
                   ];
                 }
                 // lib.optionalAttrs (cfg.environmentFiles != []) {

@@ -23,7 +23,16 @@ async fn main() {
         *state.reload.write().await = false;
         *state.shutdown.write().await = false;
 
-        let ipc = IpcClient::connect("/run/iota/iota.sock")
+        let socket = match iota_paths::IotaPaths::resolve(iota_paths::Scope::User)
+            .expect("resolve Iota user paths")
+            .ipc_endpoint
+        {
+            iota_paths::IpcEndpoint::UnixSocket(path) => path,
+            iota_paths::IpcEndpoint::WindowsPipe(_) => {
+                panic!("Windows IPC client transport is not implemented yet")
+            }
+        };
+        let ipc = IpcClient::connect(socket)
             .await
             .expect("iota-daemon must be running before starting iota-core");
         let session = start_tui(ipc).expect("interactive terminal initialization failed");

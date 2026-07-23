@@ -81,7 +81,7 @@ pub fn install_linux_bundle_with_operator(bundle: &Path, operator: Option<&str>)
     ] {
         install(
             &staging.path().join("systemd").join(unit),
-            &format!("/etc/systemd/system/{unit}"),
+            &format!("/usr/local/lib/systemd/system/{unit}"),
             "0644",
         )?;
     }
@@ -114,7 +114,7 @@ pub fn install_linux_bundle_with_operator(bundle: &Path, operator: Option<&str>)
                 "{}/current/bin/iota-daemon",
                 iota_paths::install_root().display()
             ),
-            "/usr/local/lib/iota/iota-daemon",
+            "/usr/local/libexec/iota/iota-daemon",
         ],
     )?;
     run("systemd-sysusers", &[])?;
@@ -130,8 +130,12 @@ pub fn install_linux_bundle_with_operator(bundle: &Path, operator: Option<&str>)
     run("systemctl", &["enable", "--now", "iota-daemon.socket"])?;
     run("systemctl", &["is-active", "iota-daemon.socket"])?;
     run("systemctl", &["is-enabled", "iota-daemon.socket"])?;
-    if !Path::new("/run/iota/iota.sock").exists() {
-        bail!("systemd socket is active but /run/iota/iota.sock was not created");
+    let socket = iota_paths::socket_path(iota_paths::Scope::System);
+    if !socket.exists() {
+        bail!(
+            "systemd socket is active but {} was not created",
+            socket.display()
+        );
     }
     Ok(())
 }
@@ -175,7 +179,7 @@ mod tests {
         let service = include_str!("../../systemd/iota-daemon.service");
         let socket = include_str!("../../systemd/iota-daemon.socket");
         let sysusers = include_str!("../../systemd/sysusers.d/iota.conf");
-        assert!(service.contains("ExecStart=/usr/local/lib/iota/iota-daemon"));
+        assert!(service.contains("ExecStart=/usr/local/libexec/iota/iota-daemon"));
         assert!(service.contains("User=iota"));
         assert!(service.contains("Group=iota"));
         assert!(socket.contains("SocketUser=iota"));

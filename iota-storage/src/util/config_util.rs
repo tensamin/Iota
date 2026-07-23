@@ -1,8 +1,10 @@
 use arc_swap::ArcSwap;
-use iota_util::file_util::{load_file, save_file};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 pub static CONFIG: Lazy<ArcSwap<IotaConfig>> =
     Lazy::new(|| ArcSwap::new(Arc::new(IotaConfig::default())));
@@ -19,11 +21,11 @@ pub struct IotaConfig {
     pub omikron_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub omikron_port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub keyring: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub public_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub private_key: Option<String>,
     #[serde(default = "default_read_receipts_enabled")]
     pub read_receipts_enabled: bool,
@@ -61,7 +63,7 @@ fn default_web_bind() -> String {
     "127.0.0.1".into()
 }
 fn default_web_asset_dir() -> String {
-    "web".into()
+    String::new()
 }
 impl Default for WebSettings {
     fn default() -> Self {
@@ -102,17 +104,27 @@ impl Default for IotaConfig {
 }
 
 pub fn load_config() {
-    let s = load_file("", "config.yaml");
-    if s.is_empty() {
-        return;
-    }
+    load_config_from(&default_config_path());
+}
+
+/// Loading is intentionally side-effect free: a missing configuration means
+/// documented defaults, not a newly-created file.
+pub fn load_config_from(path: &Path) {
+    let s = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            eprintln!("Failed to read {}: {error}", path.display());
+            return;
+        }
+    };
 
     match serde_yaml::from_str::<IotaConfig>(&s) {
         Ok(parsed) => {
             CONFIG.store(Arc::new(parsed));
         }
         Err(e) => {
-            eprintln!("Failed to parse config.yaml: {}. Content: '{}'", e, s);
+            eprintln!("Failed to parse {}: {e}", path.display());
         }
     }
 }
@@ -123,9 +135,35 @@ pub fn clear_config() {
 }
 
 pub fn save_config() {
+    save_config_to(&default_config_path());
+}
+
+pub fn save_config_to(path: &Path) {
     if let Ok(yaml) = serde_yaml::to_string(&**CONFIG.load()) {
-        save_file("", "config.yaml", &yaml);
+        if let Some(parent) = path.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                eprintln!(
+                    "Cannot create configuration directory {}: {error}",
+                    parent.display()
+                );
+                return;
+            }
+        }
+        let temporary = path.with_extension("yaml.tmp");
+        if let Err(error) = fs::write(&temporary, yaml).and_then(|_| fs::rename(&temporary, path)) {
+            eprintln!("Cannot save {}: {error}", path.display());
+            let _ = fs::remove_file(temporary);
+        }
     }
+}
+
+fn default_config_path() -> PathBuf {
+    if let Some(path) = CONFIG_PATH.get() {
+        return path.clone();
+    }
+    iota_paths::IotaPaths::resolve(iota_paths::Scope::User)
+        .expect("resolve Iota user paths")
+        .config_file
 }
 
 pub fn modify_config(f: impl FnOnce(&mut IotaConfig)) {
@@ -133,4 +171,9 @@ pub fn modify_config(f: impl FnOnce(&mut IotaConfig)) {
     f(&mut cfg);
     CONFIG.store(Arc::new(cfg));
     save_config();
+}
+static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn configure_config_path(path: PathBuf) {
+    let _ = CONFIG_PATH.set(path);
 }

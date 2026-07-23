@@ -387,8 +387,7 @@ impl IpcClient {
             };
             match result {
                 Ok(message) => self.apply(message).await,
-                Err(error) => {
-                    eprintln!("IPC reader for generation {generation} stopped: {error}");
+                Err(_) => {
                     self.mark_disconnected(generation).await;
                     break;
                 }

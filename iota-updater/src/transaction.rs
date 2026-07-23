@@ -9,22 +9,32 @@ use std::{
 pub struct UpdateTransaction {
     pub root: PathBuf,
     pub staging: PathBuf,
+    pub lock_file: PathBuf,
 }
 impl UpdateTransaction {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         Self {
             staging: root.join(".staging"),
+            lock_file: root.join("update.lock"),
             root,
         }
     }
+    pub fn from_paths(paths: &iota_paths::IotaPaths) -> Result<Self> {
+        Ok(Self {
+            root: paths.install_root.clone(),
+            staging: paths.update_staging_dir(),
+            lock_file: paths.update_lock_file().map_err(|e| anyhow::anyhow!(e))?,
+        })
+    }
     pub fn acquire(&self) -> Result<fs::File> {
-        fs::create_dir_all(&self.root)?;
-        let path = self.root.join("update.lock");
+        if let Some(parent) = self.lock_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(path)
+            .open(&self.lock_file)
             .context("update already in progress")?;
         Ok(file)
     }

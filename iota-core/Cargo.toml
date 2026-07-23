@@ -12,6 +12,7 @@ iota-storage = { path = "../iota-storage" }
 iota-terms = { path = "../iota-terms" }
 iota-updater = { path = "../iota-updater" }
 iota-util = { path = "../iota-util" }
+iota-paths = { path = "../iota-paths" }
 omikron-connector = { path = "../omikron-connector" }
 web-server = { path = "../web-server" }
 web-ui = { path = "../web-ui" }

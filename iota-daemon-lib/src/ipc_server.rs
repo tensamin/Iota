@@ -44,10 +44,22 @@ impl IpcServer {
         let listener = match activated_listener()? {
             Some(listener) => listener,
             None => {
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
+                let parent = path.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "IPC socket has no parent directory",
+                    )
+                })?;
+                if !parent.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("IPC runtime directory does not exist: {}", parent.display()),
+                    ));
                 }
-                let lock_path = path.with_extension("sock.lock");
+                let lock_path = path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("/tmp"))
+                    .join("daemon.lock");
                 let lock = File::options()
                     .create(true)
                     .mode(0o600)

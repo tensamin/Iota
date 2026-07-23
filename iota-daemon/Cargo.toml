@@ -10,6 +10,7 @@ iota-logger = { path = "../iota-logger" }
 iota-state = { path = "../iota-state" }
 iota-paths = { path = "../iota-paths" }
 iota-storage = { path = "../iota-storage" }
+iota-util = { path = "../iota-util" }
 omikron-connector = { path = "../omikron-connector" }
 web-server = { path = "../web-server" }
 tokio = { version = "1.50.0", features = ["full"] }

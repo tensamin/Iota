@@ -1,7 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    path::Path,
     sync::{OnceLock, atomic::Ordering, mpsc},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -56,6 +55,15 @@ struct LogMessage {
 /* The logger owns file persistence while consumers receive rendered entries
  * through a process-local broadcast subscription. */
 pub fn startup() {
+    startup_with_log_dir(Some(
+        iota_paths::IotaPaths::resolve(iota_paths::Scope::User)
+            .expect("resolve Iota user paths")
+            .log_dir,
+    ));
+}
+
+/// `None` keeps logging on stderr only (the systemd default).
+pub fn startup_with_log_dir(log_dir: Option<std::path::PathBuf>) {
     let (tx, rx) = mpsc::channel::<LogMessage>();
     if LOGGER.set(tx).is_err() {
         return;
@@ -64,22 +72,15 @@ pub fn startup() {
     let _ = LOG_BROADCASTER.set(broadcast_tx.clone());
 
     thread::spawn(move || {
-        let working_dir = iota_util::file_util::get_directory();
-        let base_dir = Path::new(&working_dir);
-        let log_dir = base_dir.join("logs");
-        fs::create_dir_all(&log_dir).expect("Failed to create log directory");
-
-        let start_ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let path = log_dir.join(format!("log_{}.txt", start_ts));
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .expect("Failed to open log file");
+        let mut file = log_dir.and_then(|log_dir| {
+            fs::create_dir_all(&log_dir).ok()?;
+            let start_ts = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join(format!("log_{start_ts}.txt")))
+                .ok()
+        });
 
         for msg in rx {
             let resolved_message = if let Some(key) = msg.translation_key {
@@ -105,7 +106,9 @@ pub fn startup() {
             );
             let line2 = format!("    {}", timestamp);
 
-            let _ = writeln!(file, "{}\n{}", line1, line2);
+            if let Some(file) = file.as_mut() {
+                let _ = writeln!(file, "{}\n{}", line1, line2);
+            }
 
             let _ = writeln!(std::io::stderr(), "{}\n{}", line1, line2);
 

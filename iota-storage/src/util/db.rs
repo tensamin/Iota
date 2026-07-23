@@ -1,4 +1,3 @@
-use iota_util::file_util::get_directory;
 use once_cell::sync::Lazy;
 use r2d2::ManageConnection;
 use rusqlite::Connection;
@@ -56,10 +55,12 @@ where
     f(&conn)
 }
 
-fn db_file_path(db_name: &str) -> String {
-    let mut p = PathBuf::from(get_directory());
-    p.push(format!("{db_name}.sqlite3"));
-    p.to_string_lossy().to_string()
+fn db_file_path(db_name: &str) -> PathBuf {
+    let storage_dir = iota_util::file_util::storage_directory();
+    // Creating storage belongs to initialization/connection setup, never to a
+    // configuration read.
+    std::fs::create_dir_all(&storage_dir).expect("create Iota storage directory");
+    storage_dir.join(format!("{db_name}.sqlite3"))
 }
 
 fn run_migrations(pool: &r2d2::Pool<SqliteManager>) -> Result<(), StorageError> {

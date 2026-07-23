@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 iota-logger = { path = "../iota-logger" }
+iota-paths = { path = "../iota-paths" }
 
 mtp = { git = "https://git.methanium.net/Methanium/mtp.git" }
 

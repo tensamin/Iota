@@ -7,6 +7,7 @@ edition = "2024"
 iota-logger = { path = "../iota-logger" }
 iota-state = { path = "../iota-state" }
 iota-util = { path = "../iota-util" }
+iota-paths = { path = "../iota-paths" }
 
 mtp = { git = "https://git.methanium.net/Methanium/mtp.git" }
 

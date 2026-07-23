@@ -10,6 +10,7 @@ use mtp::client::{Client, ClientConfig, Policy, Receiver, SendMode, Sender};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::{Keyring, PublicKeyBundle};
 use std::env;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -92,6 +93,19 @@ async fn is_read_receipts_enabled() -> bool {
 // ============================================================================
 
 const IOTA_KEYRING_PATH: &str = "iota.mk";
+static IDENTITY_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Must be called by the daemon before any Omikron connection is attempted.
+/// It keeps identity material independent from the working directory.
+pub fn configure_identity_path(path: PathBuf) {
+    let _ = IDENTITY_PATH.set(path);
+}
+fn identity_path() -> &'static Path {
+    IDENTITY_PATH
+        .get()
+        .map(PathBuf::as_path)
+        .unwrap_or_else(|| Path::new(IOTA_KEYRING_PATH))
+}
 const OMIKRON_PUBLIC_KEY_PATH: &str = "omikron.mpkb";
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
@@ -436,7 +450,8 @@ impl OmikronConnection {
      * that still read it directly.
      */
     async fn load_or_migrate_keyring(&self) -> Keyring {
-        if let Ok(kr) = mtp::files::load_keyring_raw(IOTA_KEYRING_PATH) {
+        let path = identity_path();
+        if let Ok(kr) = mtp::files::load_keyring_raw(path) {
             return kr;
         }
 
@@ -448,18 +463,18 @@ impl OmikronConnection {
                     "WARNING: No existing keyring found. Neither {} nor config.json \
                      contain a keyring; generating a new identity. If you already had \
                      an Iota identity, restore {} from a backup to avoid losing access.",
-                    IOTA_KEYRING_PATH,
-                    IOTA_KEYRING_PATH
+                    path.display(),
+                    path.display()
                 );
                 crypto_helper::generate_keyring()
             });
 
-        if let Err(e) = mtp::files::save_keyring_raw(&keyring, IOTA_KEYRING_PATH) {
-            log!("Failed to persist {}: {}", IOTA_KEYRING_PATH, e);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
-
-        let b64 = crypto_helper::keyring_to_base64(&keyring);
-        modify_config(|cfg| cfg.keyring = Some(b64));
+        if let Err(e) = mtp::files::save_keyring_raw(&keyring, path) {
+            log!("Failed to persist {}: {}", path.display(), e);
+        }
 
         keyring
     }
@@ -1050,9 +1065,7 @@ impl OmikronConnection {
             if let Some(app_pub_bundle) =
                 iota_util::crypto_helper::public_key_bundle_from_base64(&app_public_key)
             {
-                let kr_str = CONFIG.load().keyring.clone().unwrap_or_default();
-
-                if let Some(keyring) = keyring_from_base64(&kr_str) {
+                if let Ok(keyring) = mtp::files::load_keyring_raw(identity_path()) {
                     if let Ok(encrypted_challenge) =
                         crypto_util::encrypt_challenge(&challenge, &app_pub_bundle)
                     {

@@ -2222,6 +2222,7 @@ dependencies = [
  "dashmap",
  "iota-cli",
  "iota-logger",
+ "iota-paths",
  "iota-state",
  "iota-storage",
  "iota-terms",
@@ -2250,6 +2251,7 @@ dependencies = [
  "iota-paths",
  "iota-state",
  "iota-storage",
+ "iota-util",
  "omikron-connector",
  "tokio",
  "tokio-util",
@@ -2301,6 +2303,7 @@ dependencies = [
 name = "iota-logger"
 version = "0.1.0"
 dependencies = [
+ "iota-paths",
  "iota-state",
  "iota-util",
  "json",
@@ -2345,6 +2348,7 @@ dependencies = [
  "hex",
  "hkdf 0.12.4",
  "iota-logger",
+ "iota-paths",
  "iota-state",
  "iota-util",
  "json",
@@ -2390,6 +2394,7 @@ dependencies = [
  "hex",
  "hkdf 0.12.4",
  "iota-logger",
+ "iota-paths",
  "json",
  "mtp",
  "once_cell",
