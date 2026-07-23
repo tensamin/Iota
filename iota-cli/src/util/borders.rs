@@ -3,13 +3,20 @@ use ratatui::prelude::*;
 use ratatui::style::Style;
 use ratatui::widgets::Borders;
 
-fn set_join_char(frame: &mut Frame, x: u16, y: u16, c: char) {
-    frame
-        .buffer_mut()
-        .set_string(x, y, c.to_string(), Style::default());
+fn set_join_char(frame: &mut Frame, x: u16, y: u16, c: char, style: Style) {
+    frame.buffer_mut().set_string(x, y, c.to_string(), style);
 }
 
-pub fn draw_block_joins(frame: &mut Frame, area: Rect, borders: Borders, joins: Borders) {
+pub fn draw_block_joins(
+    frame: &mut Frame,
+    area: Rect,
+    borders: Borders,
+    joins: Borders,
+    style: Style,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let x0 = area.x;
     let y0 = area.y;
     let x1 = area.x + area.width - 1;
@@ -22,7 +29,7 @@ pub fn draw_block_joins(frame: &mut Frame, area: Rect, borders: Borders, joins: 
             (false, true) => '┬',
             (false, false) => '┌',
         };
-        set_join_char(frame, x0, y0, top_left);
+        set_join_char(frame, x0, y0, top_left, style);
     }
 
     if borders.contains(Borders::TOP) && borders.contains(Borders::RIGHT) {
@@ -32,7 +39,7 @@ pub fn draw_block_joins(frame: &mut Frame, area: Rect, borders: Borders, joins: 
             (false, true) => '┬',
             (false, false) => '┐',
         };
-        set_join_char(frame, x1, y0, top_right);
+        set_join_char(frame, x1, y0, top_right, style);
     }
 
     if borders.contains(Borders::BOTTOM) && borders.contains(Borders::LEFT) {
@@ -45,7 +52,7 @@ pub fn draw_block_joins(frame: &mut Frame, area: Rect, borders: Borders, joins: 
             (false, true) => '┴',
             (false, false) => '└',
         };
-        set_join_char(frame, x0, y1, bottom_left);
+        set_join_char(frame, x0, y1, bottom_left, style);
     }
 
     if borders.contains(Borders::BOTTOM) && borders.contains(Borders::RIGHT) {
@@ -58,6 +65,6 @@ pub fn draw_block_joins(frame: &mut Frame, area: Rect, borders: Borders, joins: 
             (false, true) => '┴',
             (false, false) => '┘',
         };
-        set_join_char(frame, x1, y1, bottom_right);
+        set_join_char(frame, x1, y1, bottom_right, style);
     }
 }

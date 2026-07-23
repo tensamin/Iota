@@ -2,9 +2,10 @@ pub mod protocol;
 pub mod transport;
 
 pub use protocol::{
-    ClientMessage, DaemonMessage, HelloAck, LogEntry, StateSnapshot, MetricSample,
-    RequestEnvelope, ResponseEnvelope, ResponseResult, LocalRequest, IpcErrorCode,
-    ConnectionStatus, StartupPhase, LifecycleEvent,
+    ClientMessage, ComponentHealth, ComponentId, ConnectionStatus, DaemonMessage, DeploymentMode,
+    ExitIntent, HealthStatus, HelloAck, IpcErrorCode, LifecycleEvent, LifecyclePhase, LocalRequest,
+    LogEntry, MetricSample, RequestEnvelope, ResponseEnvelope, ResponseResult, StartupPhase,
+    StateSnapshot, SupervisorKind,
 };
 pub use transport::{read_msg, write_msg};
 

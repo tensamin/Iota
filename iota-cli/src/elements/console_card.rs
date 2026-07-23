@@ -2,7 +2,6 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
@@ -18,6 +17,7 @@ use crate::{
     elements::elements::{Element, InteractableElement, JoinableElement},
     interaction_result::InteractionResult,
     ipc_client::IpcClient,
+    render_context::RenderContext,
     util::borders::draw_block_joins,
 };
 
@@ -34,6 +34,7 @@ pub struct ConsoleCard {
     cursor: Arc<Mutex<bool>>,
     last_swap: Arc<Mutex<Instant>>,
     pending_restore: Arc<Mutex<Option<String>>>,
+    pending_confirmation: Option<String>,
 }
 
 impl ConsoleCard {
@@ -49,6 +50,7 @@ impl ConsoleCard {
             cursor: Arc::new(Mutex::new(true)),
             last_swap: Arc::new(Mutex::new(Instant::now())),
             pending_restore: Arc::new(Mutex::new(None)),
+            pending_confirmation: None,
         }
     }
 
@@ -85,26 +87,25 @@ impl ConsoleCard {
         }
     }
 
-    fn cursor_spans(&self) -> Vec<Span<'static>> {
+    fn cursor_spans(&self, theme: &crate::theme::ResolvedTheme) -> Vec<Span<'static>> {
         let cursor_visible = self.cursor_visible();
-        let cursor_style = Style::default().fg(Color::White).bg(Color::DarkGray);
         let mut spans = Vec::new();
 
         if self.content.is_empty() {
             if self.focused {
                 if cursor_visible {
-                    spans.push(Span::styled(" ", cursor_style));
+                    Self::push_cursor(&mut spans, theme);
                 } else {
-                    spans.push(Span::styled(" ", Style::default().fg(Color::White)));
+                    spans.push(Span::styled(" ", theme.console.text));
                 }
                 spans.push(Span::styled(
                     "send command (/help for info)",
-                    Style::default().fg(Color::DarkGray),
+                    theme.console.hint,
                 ));
             } else {
                 spans.push(Span::styled(
                     " send command (/help for info)",
-                    Style::default().fg(Color::DarkGray),
+                    theme.console.hint,
                 ));
             }
             return spans;
@@ -119,52 +120,64 @@ impl ConsoleCard {
         if prefix_len > 0 && before.len() >= prefix_len {
             let prefix = &before[..prefix_len];
             let rest = &before[prefix_len..];
-            spans.push(Span::styled(
-                prefix.to_string(),
-                Self::style_for_part(true, false, false),
-            ));
+            spans.push(Span::styled(prefix.to_string(), theme.console.prefix));
             if !rest.is_empty() {
-                spans.push(Span::styled(
-                    rest.to_string(),
-                    Style::default().fg(Color::White),
-                ));
+                spans.push(Span::styled(rest.to_string(), theme.console.text));
             }
         } else if !before.is_empty() {
-            spans.push(Span::styled(
-                before.clone(),
-                Style::default().fg(Color::White),
-            ));
+            spans.push(Span::styled(before.clone(), theme.console.text));
         }
 
         if cursor_visible {
-            spans.push(Span::styled(" ", cursor_style));
+            Self::push_cursor(&mut spans, theme);
         }
 
         if !after.is_empty() {
-            spans.push(Span::styled(after, Style::default().fg(Color::White)));
+            spans.push(Span::styled(after, theme.console.text));
         }
 
         spans
     }
 
-    fn style_for_part(is_prefix: bool, is_hint: bool, is_error: bool) -> Style {
-        if is_error {
-            return Style::default().fg(Color::Red);
+    fn push_cursor(spans: &mut Vec<Span<'static>>, theme: &crate::theme::ResolvedTheme) {
+        match &theme.console.cursor {
+            crate::theme::CursorPresentation::StyledCell(style) => {
+                spans.push(Span::styled(" ", *style))
+            }
+            crate::theme::CursorPresentation::Character { glyph, style } => {
+                spans.push(Span::styled(*glyph, *style))
+            }
         }
-
-        if is_hint {
-            return Style::default().fg(Color::DarkGray);
-        }
-
-        if is_prefix {
-            return Style::default().fg(Color::DarkGray);
-        }
-
-        Style::default().fg(Color::White)
     }
 
-    fn render_cursor_spans(&self) -> Vec<Span<'static>> {
-        self.cursor_spans()
+    fn render_cursor_spans(&self, theme: &crate::theme::ResolvedTheme) -> Vec<Span<'static>> {
+        if let Some(command) = &self.pending_confirmation {
+            return vec![Span::styled(
+                format!("Confirm `{command}`? [y/N]"),
+                theme.console.confirmation,
+            )];
+        }
+        self.cursor_spans(theme)
+    }
+
+    fn is_destructive(command: &str) -> bool {
+        matches!(
+            command.trim_start_matches('/').trim(),
+            "restart" | "reload" | "stop" | "shutdown" | "regenerate keys"
+        ) || command
+            .trim_start_matches('/')
+            .trim_start()
+            .starts_with("user remove ")
+    }
+
+    fn dispatch_command(&self, command: String) {
+        let ipc = self.ipc.clone();
+        let restore = self.pending_restore.clone();
+        tokio::spawn(async move {
+            if ipc.send_command(0, command.clone()).await.is_err() {
+                *restore.lock().unwrap() = Some(command);
+            }
+        });
     }
 
     fn move_cursor_left(&mut self) {
@@ -212,28 +225,34 @@ impl Element for ConsoleCard {
         self
     }
 
-    fn render(&self, f: &mut Frame, r: Rect) {
+    fn render(&self, f: &mut Frame, r: Rect, context: &RenderContext<'_>) {
         let block = Block::default()
             .borders(self.borders)
             .title(self.title.clone())
-            .title_style(Style::default().fg(Color::White))
+            .title_style(context.theme.console.title)
             .border_style(if self.focused {
-                Style::default().fg(Color::Yellow)
+                context.theme.console.focused_border
             } else {
-                Style::default()
+                context.theme.console.border
             })
-            .style(if self.focused {
-                Style::default().fg(Color::White)
-            } else {
-                Style::default()
-            });
+            .style(context.theme.console.text);
 
-        let spans = self.render_cursor_spans();
+        let spans = self.render_cursor_spans(context.theme);
         let par = Paragraph::new(Line::from(spans))
             .block(block)
             .scroll((0, 0));
         f.render_widget(par, r);
-        draw_block_joins(f, r, self.borders, self.joins);
+        draw_block_joins(
+            f,
+            r,
+            self.borders,
+            self.joins,
+            if self.focused {
+                context.theme.borders.focused
+            } else {
+                context.theme.borders.normal
+            },
+        );
     }
 }
 
@@ -287,6 +306,13 @@ impl InteractableElement for ConsoleCard {
             self.cursor_position = self.content.chars().count();
         }
 
+        if let Some(command) = self.pending_confirmation.take() {
+            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                self.dispatch_command(command);
+            }
+            return InteractionResult::Handled;
+        }
+
         match key.code {
             KeyCode::Enter => {
                 if self.content.is_empty() {
@@ -294,16 +320,13 @@ impl InteractableElement for ConsoleCard {
                 }
 
                 let command = self.content.clone();
-                let ipc = self.ipc.clone();
-                let restore = self.pending_restore.clone();
-                tokio::spawn(async move {
-                    if ipc.send_command(0, command.clone()).await.is_err() {
-                        *restore.lock().unwrap() = Some(command);
-                    }
-                });
-
                 self.content.clear();
                 self.cursor_position = 0;
+                if Self::is_destructive(&command) {
+                    self.pending_confirmation = Some(command);
+                } else {
+                    self.dispatch_command(command);
+                }
                 InteractionResult::Handled
             }
             KeyCode::Backspace => {

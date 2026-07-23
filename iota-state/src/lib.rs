@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 #[cfg(feature = "legacy-globals")]
 use sysinfo::{RefreshKind, System};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex as TokioMutex, RwLock};
 
 /* Process-owned daemon state and TUI-local state must be separate because IPC,
  * rather than shared memory, is the boundary between the two binaries. */
@@ -45,13 +45,13 @@ impl Default for DaemonState {
  * with the daemon and is populated from daemon IPC messages. */
 #[derive(Clone)]
 pub struct ClientState {
-    pub app: Arc<Mutex<AppState>>,
+    pub app: Arc<TokioMutex<AppState>>,
 }
 
 impl ClientState {
     pub fn new() -> Self {
         Self {
-            app: Arc::new(Mutex::new(AppState::new())),
+            app: Arc::new(TokioMutex::new(AppState::new())),
         }
     }
 }
@@ -94,6 +94,7 @@ pub struct AppState {
     pub net_up: Vec<(f64, f64)>,
     pub net_down: Vec<(f64, f64)>,
     pub sys_info: String,
+    next_sample_id: u64,
 }
 
 impl AppState {
@@ -106,6 +107,7 @@ impl AppState {
             net_up: Vec::new(),
             net_down: Vec::new(),
             sys_info: String::from("Loading..."),
+            next_sample_id: 0,
         }
     }
 
@@ -121,38 +123,49 @@ impl AppState {
     }
 
     pub fn push_cpu(&mut self, pt: (f64, f64)) {
-        self.cpu.push(pt);
+        let x = self.next_sample();
+        self.cpu.push((x, pt.1));
         if self.cpu.len() > MAX_POINTS {
             self.cpu.remove(0);
         }
     }
 
     pub fn push_ram(&mut self, pt: (f64, f64)) {
-        self.ram.push(pt);
+        let x = self.next_sample();
+        self.ram.push((x, pt.1));
         if self.ram.len() > MAX_POINTS {
             self.ram.remove(0);
         }
     }
 
     pub fn push_ping_val(&mut self, pt: f64) {
-        self.ping.push((self.ping.len() as f64, pt));
+        let x = self.next_sample();
+        self.ping.push((x, pt));
         if self.ping.len() > MAX_POINTS {
             self.ping.remove(0);
         }
     }
 
     pub fn push_net_up(&mut self, pt: (f64, f64)) {
-        self.net_up.push(pt);
+        let x = self.next_sample();
+        self.net_up.push((x, pt.1));
         if self.net_up.len() > MAX_POINTS {
             self.net_up.remove(0);
         }
     }
 
     pub fn push_net_down(&mut self, pt: (f64, f64)) {
-        self.net_down.push(pt);
+        let x = self.next_sample();
+        self.net_down.push((x, pt.1));
         if self.net_down.len() > MAX_POINTS {
             self.net_down.remove(0);
         }
+    }
+
+    fn next_sample(&mut self) -> f64 {
+        let value = self.next_sample_id as f64;
+        self.next_sample_id = self.next_sample_id.saturating_add(1);
+        value
     }
 
     pub fn to_json(&self) -> JsonValue {
@@ -218,15 +231,16 @@ pub static RELOAD: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(true));
 pub static ACTIVE_TASKS: Lazy<DashSet<String>> = Lazy::new(|| DashSet::new());
 
 #[cfg(feature = "legacy-globals")]
-pub fn setup() {
-    ACTIVE_TASKS.insert("System info loader".to_string());
+pub fn setup(state: &DaemonState) {
+    state.active_tasks.insert("System info loader".to_string());
+    let state = state.clone();
     tokio::spawn(async move {
         let mut sys = System::new_with_specifics(RefreshKind::everything());
         let mut last_total_received = 0u64;
         let mut last_total_transmitted = 0u64;
         let mut counter = 0.0;
         loop {
-            if *SHUTDOWN.read().await {
+            if *state.shutdown.read().await {
                 break;
             }
             sys.refresh_all();
@@ -258,7 +272,7 @@ pub fn setup() {
             let net_up = delta_transmitted as f64;
 
             {
-                let mut st = APP_STATE.lock().unwrap();
+                let mut st = state.app.lock().unwrap();
                 st.push_cpu((counter, tcpu as f64));
                 st.push_ram((counter, ram));
                 st.push_net_down((counter, net_down));
@@ -274,6 +288,21 @@ pub fn setup() {
                 thread::sleep(Duration::from_millis(5));
             }
         }
-        ACTIVE_TASKS.remove("System info loader");
+        state.active_tasks.remove("System info loader");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metric_coordinates_remain_monotonic_after_history_rollover() {
+        let mut state = AppState::new();
+        for value in 0..(MAX_POINTS + 25) {
+            state.push_ping_val(value as f64);
+        }
+        assert_eq!(state.ping.len(), MAX_POINTS);
+        assert!(state.ping.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
 }

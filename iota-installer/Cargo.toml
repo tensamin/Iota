@@ -1,0 +1,11 @@
+[package]
+name = "iota-installer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+tempfile = "3"
+zip = "6"
+serde_json = "1"
+iota-paths = { path = "../iota-paths" }

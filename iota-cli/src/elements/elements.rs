@@ -3,14 +3,16 @@ use std::any::Any;
 use crossterm::event::KeyEvent;
 use ratatui::{Frame, layout::Rect, widgets::Borders};
 
-use crate::{interaction_result::InteractionResult, screens::screens::Screen};
+use crate::{
+    interaction_result::InteractionResult, render_context::RenderContext, screens::screens::Screen,
+};
 
 #[allow(unused)]
 pub trait Element: Send + Sync + Any {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
-    fn render(&self, f: &mut Frame, r: Rect);
+    fn render(&self, f: &mut Frame, r: Rect, context: &RenderContext<'_>);
 }
 
 #[allow(unused)]

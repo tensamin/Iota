@@ -12,9 +12,9 @@ pub async fn check(ui: Arc<UI>) -> Result<(bool, bool), String> {
     let mut state = ConsentState::load_state();
 
     ensure_initial_consent(ui.clone(), &mut state).await?;
-    if ensure_updates(ui, &mut state).await.is_err() {
-        // We don't stop the program if updates fail, as long as we have initial consent
-    };
+    // A mandatory document update is a hard bootstrap gate. In particular,
+    // refusing it must not allow service setup or daemon access to continue.
+    ensure_updates(ui, &mut state).await?;
 
     state = state.sanitize();
     state.save_state();
@@ -22,8 +22,23 @@ pub async fn check(ui: Arc<UI>) -> Result<(bool, bool), String> {
     Ok((state.accepted_eula, state.accepted_tos && state.accepted_pp))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NonInteractiveConsent {
+    Accepted,
+    RequiresInteractiveAcceptance,
+}
+
+pub fn non_interactive_consent() -> NonInteractiveConsent {
+    let state = ConsentState::load_state();
+    if state.accepted_eula && state.accepted_tos && state.accepted_pp {
+        NonInteractiveConsent::Accepted
+    } else {
+        NonInteractiveConsent::RequiresInteractiveAcceptance
+    }
+}
+
 async fn ensure_initial_consent(ui: Arc<UI>, state: &mut ConsentState) -> Result<(), String> {
-    if state.accepted_eula {
+    if state.accepted_eula && state.accepted_tos && state.accepted_pp {
         return Ok(());
     }
 
@@ -35,7 +50,7 @@ async fn ensure_initial_consent(ui: Arc<UI>, state: &mut ConsentState) -> Result
 
     let (tx, rx) = oneshot::channel();
 
-    ui.set_screen(Box::new(TermsCheckerScreen::new(ui.clone(), Some(tx))))
+    ui.set_screen(Box::new(TermsCheckerScreen::new(Some(tx))))
         .await;
 
     let result = rx.await.unwrap_or(UserChoice::Deny);

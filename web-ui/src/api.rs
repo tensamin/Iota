@@ -1,8 +1,10 @@
 use crate::server::is_local_network;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
-use iota_storage::util::config_util::{modify_config, CONFIG};
+use iota_state::DaemonState;
+use iota_storage::util::config_util::{CONFIG, modify_config};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 pub fn api_config(cfg: &mut web::ServiceConfig) {
     cfg.service(
@@ -148,31 +150,37 @@ async fn users_add(
         _ => return error(),
     };
 
-    if let (Some(user), Some(_)) = omikron_connector::user_ops::create_user(username).await {
-        let val = user.frontend().to_string();
-        let s_val: Value = serde_json::from_str(&val).unwrap_or(Value::Null);
-        HttpResponse::Ok().json(s_val)
-    } else {
-        error()
-    }
+    // The legacy web API is intentionally quarantined until it can use the
+    // daemon's authenticated command/service boundary. It must not create a
+    // second connector or mutate daemon storage directly.
+    let _ = username;
+    error()
 }
 
-async fn shutdown(req: HttpRequest, ssl: web::Data<bool>) -> impl Responder {
+async fn shutdown(
+    req: HttpRequest,
+    ssl: web::Data<bool>,
+    state: web::Data<Arc<DaemonState>>,
+) -> impl Responder {
     if !is_allowed_req(&req, *ssl.get_ref()) {
         return forbidden();
     }
 
-    *iota_state::SHUTDOWN.write().await = true;
+    *state.shutdown.write().await = true;
     success()
 }
 
-async fn reload(req: HttpRequest, ssl: web::Data<bool>) -> impl Responder {
+async fn reload(
+    req: HttpRequest,
+    ssl: web::Data<bool>,
+    state: web::Data<Arc<DaemonState>>,
+) -> impl Responder {
     if !is_allowed_req(&req, *ssl.get_ref()) {
         return forbidden();
     }
 
-    *iota_state::SHUTDOWN.write().await = true;
-    *iota_state::RELOAD.write().await = true;
+    *state.shutdown.write().await = true;
+    *state.reload.write().await = true;
 
     success()
 }

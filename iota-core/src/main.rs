@@ -3,7 +3,7 @@ use iota_updater::check_update;
 use pnet::datalink::NetworkInterface;
 use tokio::time::{Duration, sleep};
 
-use iota_state::{ACTIVE_TASKS, APP_STATE, AppState, RELOAD, SHUTDOWN};
+use iota_state::{AppState, DaemonState};
 
 use iota_cli::screens::main_screen::MainScreen;
 use iota_cli::{ipc_client::IpcClient, ui::start_tui};
@@ -12,27 +12,29 @@ use iota_logger::{log, log_t};
 use iota_storage::users::user_manager;
 use iota_storage::util::config_util::CONFIG;
 use iota_util::file_util::{download_and_extract_zip, has_dir};
-use omikron_connector as omikron;
-use omikron_connector::omikron_connection::OMIKRON_CONNECTION;
+use std::sync::Arc;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 #[allow(unused_must_use, dead_code, unused_assignments)]
 async fn main() {
-    while *RELOAD.read().await {
-        *RELOAD.write().await = false;
-        *SHUTDOWN.write().await = false;
+    let state = Arc::new(DaemonState::new());
+
+    while *state.reload.read().await {
+        *state.reload.write().await = false;
+        *state.shutdown.write().await = false;
 
         let ipc = IpcClient::connect("/run/iota/iota.sock")
             .await
             .expect("iota-daemon must be running before starting iota-core");
-        let ui = start_tui(ipc);
+        let session = start_tui(ipc).expect("interactive terminal initialization failed");
+        let ui = session.ui();
 
         let (eula, tos_pp) = match consent_state::check(ui.clone()).await {
             Ok(v) => v,
             Err(e) => {
-                *SHUTDOWN.write().await = true;
+                *state.shutdown.write().await = true;
                 loop {
-                    if ACTIVE_TASKS.is_empty() {
+                    if state.active_tasks.is_empty() {
                         break;
                     }
                     sleep(Duration::from_millis(100)).await;
@@ -43,9 +45,9 @@ async fn main() {
         };
 
         if !eula {
-            *SHUTDOWN.write().await = true;
+            *state.shutdown.write().await = true;
             loop {
-                if ACTIVE_TASKS.is_empty() {
+                if state.active_tasks.is_empty() {
                     break;
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -55,9 +57,9 @@ async fn main() {
             return;
         }
         if !tos_pp {
-            *SHUTDOWN.write().await = true;
+            *state.shutdown.write().await = true;
             loop {
-                if ACTIVE_TASKS.is_empty() {
+                if state.active_tasks.is_empty() {
                     break;
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -70,7 +72,7 @@ async fn main() {
             return;
         }
         check_update();
-        iota_state::setup();
+        iota_state::setup(&state);
 
         let main_screen = MainScreen::new(ui.clone()).await;
         ui.set_screen(Box::new(main_screen)).await;
@@ -88,7 +90,7 @@ async fn main() {
         iota_storage::util::config_util::load_config();
 
         // USER MANAGEMENT
-        if let Err(_) = user_manager::load_users().await {
+        if let Err(_) = user_manager::load_users_sync() {
             log_t!("user_load_failed");
         }
         if let Err(e) = iota_storage::util::settings::migrate_legacy_files() {
@@ -153,29 +155,17 @@ async fn main() {
         if !web_server::start(port).await {
             log!("Failed to start the MTP web server on port {}", port);
         }
-        let _ = omikron::omikron_connection::get_omikron_connection(tokio_util::sync::CancellationToken::new()).await;
-
         log_t!("setup_completed");
         loop {
-            if *SHUTDOWN.read().await {
+            if *state.shutdown.read().await {
                 break;
-            }
-
-            if OMIKRON_CONNECTION.has_auth_failure().await {
-                if let Some(reason) = OMIKRON_CONNECTION.get_auth_failure().await {
-                    log!("Authentication failed: {}", reason);
-                    log!(
-                        "Use /reconnect to try again or /regenerate private-key to create a new key pair"
-                    );
-                    OMIKRON_CONNECTION.clear_auth_failure().await;
-                }
             }
 
             sleep(Duration::from_millis(500)).await;
         }
-        if *RELOAD.read().await {
+        if *state.reload.read().await {
             loop {
-                if ACTIVE_TASKS.is_empty() {
+                if state.active_tasks.is_empty() {
                     break;
                 }
                 sleep(Duration::from_secs(1)).await;
@@ -184,9 +174,8 @@ async fn main() {
             user_manager::clear();
             // Commhnities have not been implemented yet.
             /*community_manager::clear();*/
-            *APP_STATE.lock().unwrap() = AppState::new();
+            *state.app.lock().unwrap() = AppState::new();
         }
-        ui.terminal.lock().unwrap().clear();
-        ui.terminal.lock().unwrap().flush();
+        let _ = session.shutdown().await;
     }
 }

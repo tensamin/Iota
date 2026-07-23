@@ -5,9 +5,12 @@ Description=Tensamin Iota daemon IPC socket
 ListenStream=/run/iota/iota.sock
 SocketMode=0660
 SocketUser=iota
-SocketGroup=iota
+DirectoryMode=0755
+SocketGroup=iota-operators
 Backlog=5
 RemoveOnStop=true
+NonBlocking=true
+# Enabling this socket starts the daemon on demand when a client connects.
 
 [Install]
 WantedBy=sockets.target

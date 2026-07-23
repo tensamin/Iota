@@ -196,6 +196,7 @@
                 SocketGroup = "iota";
                 Backlog = 5;
                 RemoveOnStop = "true";
+                NonBlocking = true;
               };
             };
 
@@ -206,7 +207,7 @@
 
               serviceConfig =
                 {
-                  Type = "notify";
+                  Type = "simple";
                   User = "iota";
                   Group = "iota";
                   WorkingDirectory = cfg.dataDir;
@@ -258,6 +259,7 @@
                   Environment = [
                     "BIND_ADDRESS=${cfg.bindAddress}"
                     "IOTA_SOCKET=/run/iota/iota.sock"
+                    "IOTA_DATA_DIR=${cfg.dataDir}"
                   ];
                 }
                 // lib.optionalAttrs (cfg.environmentFiles != []) {

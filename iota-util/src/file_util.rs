@@ -162,10 +162,7 @@ pub fn get_children(path: &str) -> Vec<String> {
 }
 
 pub fn get_directory() -> String {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .to_string_lossy()
-        .to_string()
+    iota_paths::data_dir().to_string_lossy().to_string()
 }
 
 // Helper to download the zip file content to a file on disk

@@ -13,6 +13,8 @@ pub struct IotaConfig {
     pub iota_id: Option<u64>,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default)]
+    pub web: WebSettings,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub omikron_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -25,6 +27,54 @@ pub struct IotaConfig {
     pub private_key: Option<String>,
     #[serde(default = "default_read_receipts_enabled")]
     pub read_receipts_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebMode {
+    Disabled,
+    Loopback,
+    Network,
+}
+impl Default for WebMode {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSettings {
+    #[serde(default)]
+    pub mode: WebMode,
+    #[serde(default = "default_web_bind")]
+    pub bind: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default = "default_web_asset_dir")]
+    pub asset_dir: String,
+    pub certificate: Option<String>,
+    pub key: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+fn default_web_bind() -> String {
+    "127.0.0.1".into()
+}
+fn default_web_asset_dir() -> String {
+    "web".into()
+}
+impl Default for WebSettings {
+    fn default() -> Self {
+        Self {
+            mode: WebMode::default(),
+            bind: default_web_bind(),
+            port: default_port(),
+            asset_dir: default_web_asset_dir(),
+            certificate: None,
+            key: None,
+            required: false,
+        }
+    }
 }
 
 const fn default_port() -> u16 {
@@ -40,6 +90,7 @@ impl Default for IotaConfig {
         Self {
             iota_id: None,
             port: default_port(),
+            web: WebSettings::default(),
             omikron_host: None,
             omikron_port: None,
             keyring: None,

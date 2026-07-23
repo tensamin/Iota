@@ -2,7 +2,7 @@ use crate::api::api_config;
 use crate::web_path_parser;
 use actix_web::{App, HttpServer, dev::ServerHandle, web};
 use iota_logger::log;
-use iota_state::{ACTIVE_TASKS, SHUTDOWN};
+use iota_state::DaemonState;
 use iota_util::file_util::load_file_buf;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -16,20 +16,23 @@ use std::{
 
 use tokio::sync::oneshot;
 
-pub async fn start(port: u16) -> bool {
+pub async fn start(port: u16, state: Arc<DaemonState>) -> bool {
     let (tx, rx) = oneshot::channel::<ServerHandle>();
 
     let bind_addr = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_string());
     let bind_ip: std::net::IpAddr = bind_addr.parse().expect("Invalid BIND_ADDRESS");
 
+    let server_state = state.clone();
     let _ = tokio::spawn(async move {
         let server = match load_tls_config() {
             Ok(Some(tls_config)) => {
                 log!("HTTPS (HTTP/2) Server running on {}:{}", bind_addr, port);
                 let _config = (*tls_config).clone();
+                let app_state = server_state.clone();
                 HttpServer::new(move || {
                     App::new()
                         .app_data(web::Data::new(true))
+                        .app_data(web::Data::from(app_state.clone()))
                         .configure(api_config)
                         .default_service(web::to(web_path_parser::handle))
                 })
@@ -39,9 +42,11 @@ pub async fn start(port: u16) -> bool {
             }
             Ok(_) => {
                 log!("HTTP Server running on {}:{}", bind_addr, port);
+                let app_state = server_state.clone();
                 HttpServer::new(move || {
                     App::new()
                         .app_data(web::Data::new(false))
+                        .app_data(web::Data::from(app_state.clone()))
                         .configure(api_config)
                         .default_service(web::to(web_path_parser::handle))
                 })
@@ -58,15 +63,15 @@ pub async fn start(port: u16) -> bool {
         let server_handle = server.handle();
         tx.send(server_handle).unwrap();
 
-        ACTIVE_TASKS.insert("WebServer".into());
+        server_state.active_tasks.insert("WebServer".into());
         server.await.unwrap();
-        ACTIVE_TASKS.remove("WebServer");
+        server_state.active_tasks.remove("WebServer");
         log!("Web Server shutdown complete.");
     });
 
     if let Ok(server_handle) = rx.await {
         tokio::spawn(async move {
-            wait_for_shutdown(server_handle).await;
+            wait_for_shutdown(server_handle, state).await;
         });
         true
     } else {
@@ -74,9 +79,9 @@ pub async fn start(port: u16) -> bool {
     }
 }
 
-async fn wait_for_shutdown(server_handle: ServerHandle) {
+async fn wait_for_shutdown(server_handle: ServerHandle, state: Arc<DaemonState>) {
     loop {
-        if *SHUTDOWN.read().await {
+        if *state.shutdown.read().await {
             log!("Shutdown signal received.");
             server_handle.stop(true).await;
             break;

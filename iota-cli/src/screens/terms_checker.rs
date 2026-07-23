@@ -1,22 +1,19 @@
 use crate::{
+    controls::choice::{ChoiceKind, ChoiceVisualState, render_choice_line},
     interaction_result::InteractionResult,
+    render_context::RenderContext,
     screens::{md_viewer::FileViewer, screens::Screen},
-    ui::UI,
-    util::{
-        buttons::{checkbox, draw_buttons},
-        terms_focus::Focus,
-    },
+    util::{buttons::draw_buttons, terms_focus::Focus},
 };
 use crossterm::event::{KeyCode, KeyEvent};
 use iota_terms::{TermsType, get_link, get_terms};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph},
 };
-use std::{any::Any, pin::Pin, sync::Arc};
+use std::{any::Any, pin::Pin};
 use tokio::sync::oneshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,9 +23,7 @@ pub enum UserChoice {
     AcceptAll,
 }
 
-#[allow(dead_code)] // ui is unused
 pub struct TermsCheckerScreen {
-    _ui: Arc<UI>,
     sender: Option<oneshot::Sender<UserChoice>>,
 
     eula: bool,
@@ -39,9 +34,8 @@ pub struct TermsCheckerScreen {
 }
 
 impl TermsCheckerScreen {
-    pub fn new(ui: Arc<UI>, sender: Option<oneshot::Sender<UserChoice>>) -> Self {
+    pub fn new(sender: Option<oneshot::Sender<UserChoice>>) -> Self {
         Self {
-            _ui: ui,
             sender,
             eula: false,
             tos: false,
@@ -59,7 +53,7 @@ impl Screen for TermsCheckerScreen {
         self
     }
 
-    fn render(&self, f: &mut Frame, size: Rect) {
+    fn render(&self, f: &mut Frame, size: Rect, context: &RenderContext<'_>) {
         let mut needed_height = 5;
 
         if size.height < 6 || size.width < 27 {
@@ -169,9 +163,36 @@ impl Screen for TermsCheckerScreen {
             )
         };
         let mut text_lines = vec![
-            checkbox(eula_text, self.eula, self.focus == Focus::Eula, true),
-            checkbox(tos_text, self.tos, self.focus == Focus::Tos, self.eula),
-            checkbox(pp_text, self.pp, self.focus == Focus::Pp, self.eula),
+            render_choice_line(
+                eula_text,
+                ChoiceKind::Checkbox,
+                ChoiceVisualState {
+                    selected: self.eula,
+                    focused: self.focus == Focus::Eula,
+                    enabled: true,
+                },
+                context.theme,
+            ),
+            render_choice_line(
+                tos_text,
+                ChoiceKind::Checkbox,
+                ChoiceVisualState {
+                    selected: self.tos,
+                    focused: self.focus == Focus::Tos,
+                    enabled: self.eula,
+                },
+                context.theme,
+            ),
+            render_choice_line(
+                pp_text,
+                ChoiceKind::Checkbox,
+                ChoiceVisualState {
+                    selected: self.pp,
+                    focused: self.focus == Focus::Pp,
+                    enabled: self.eula,
+                },
+                context.theme,
+            ),
             Line::from(""),
             Line::from("¹ Necessary– required to run the program"),
             Line::from("² Optional – required only for Tensamin services"),
@@ -191,19 +212,19 @@ impl Screen for TermsCheckerScreen {
 
         if size.width < 60 || size.height < needed_height as u16 {
             let width_style = if size.width > 76 {
-                Style::default().fg(Color::Green)
+                context.theme.status.success
             } else if size.width >= 60 {
-                Style::default().fg(Color::Yellow)
+                context.theme.status.warning
             } else {
-                Style::default().fg(Color::Red)
+                context.theme.status.error
             };
 
             let height_style = if size.height > 19 {
-                Style::default().fg(Color::Green)
+                context.theme.status.success
             } else if size.height >= 13 {
-                Style::default().fg(Color::Yellow)
+                context.theme.status.warning
             } else {
-                Style::default().fg(Color::Red)
+                context.theme.status.error
             };
 
             let warning_text = Text::from(vec![
@@ -245,6 +266,7 @@ impl Screen for TermsCheckerScreen {
             true,
             false,
             true,
+            context.theme,
         );
     }
 

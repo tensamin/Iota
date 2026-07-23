@@ -7,11 +7,16 @@ use ratatui::{
 };
 use std::{any::Any, time::Duration};
 
-use crate::{interaction_result::InteractionResult, screens::screens::Screen};
+use crate::{
+    interaction_result::InteractionResult,
+    render_context::RenderContext,
+    screens::screens::Screen,
+    theme::{ResolvedTheme, TextSemantics, ThemeName},
+};
 
 pub struct FileViewer {
     title: String,
-    text: Vec<DisplayLine>,
+    content: String,
     scroll: u16,
     scroll_x: u16,
 }
@@ -24,8 +29,8 @@ impl Screen for FileViewer {
         self
     }
 
-    fn render(&self, f: &mut Frame, rect: Rect) {
-        self.draw(f, rect);
+    fn render(&self, f: &mut Frame, rect: Rect, context: &RenderContext<'_>) {
+        self.draw(f, rect, context.theme);
     }
 
     fn handle_input(&mut self, event: KeyEvent) -> InteractionResult {
@@ -52,7 +57,7 @@ impl FileViewer {
     pub fn new(title: String, content: &str) -> Self {
         Self {
             title,
-            text: parse_document(content.to_owned()),
+            content: content.to_owned(),
             scroll: 0,
             scroll_x: 0,
         }
@@ -62,7 +67,7 @@ impl FileViewer {
             terminal
                 .draw(|f| {
                     let area = f.area();
-                    self.draw(f, area);
+                    self.draw(f, area, &crate::theme::resolve(ThemeName::Ansi));
                 })
                 .unwrap();
 
@@ -77,12 +82,13 @@ impl FileViewer {
         }
         terminal
     }
-    fn draw(&self, f: &mut Frame, area: Rect) {
+    fn draw(&self, f: &mut Frame, area: Rect, theme: &ResolvedTheme) {
         use ratatui::text::Text;
 
         let mut rendered_lines = Vec::new();
+        let text = parse_document(&self.content, theme);
 
-        for display_line in &self.text {
+        for display_line in &text {
             if display_line.scrollable {
                 let content: String = display_line
                     .line
@@ -153,7 +159,7 @@ impl FileViewer {
         }
     }
 }
-fn parse_document(input: String) -> Vec<DisplayLine> {
+fn parse_document(input: &str, theme: &ResolvedTheme) -> Vec<DisplayLine> {
     let mut lines_vec = Vec::new();
     let mut in_code_block = false;
     let liness: Vec<String> = input.lines().map(String::from).collect();
@@ -172,7 +178,7 @@ fn parse_document(input: String) -> Vec<DisplayLine> {
             lines_vec.push(DisplayLine {
                 line: Line::from(Span::styled(
                     format!("────────{}────────", code),
-                    Style::default().fg(Color::DarkGray),
+                    theme.markdown.divider,
                 )),
                 scrollable: false,
             });
@@ -182,10 +188,7 @@ fn parse_document(input: String) -> Vec<DisplayLine> {
 
         if in_code_block {
             lines_vec.push(DisplayLine {
-                line: Line::from(Span::styled(
-                    raw.to_string(),
-                    Style::default().fg(Color::Yellow),
-                )),
+                line: Line::from(Span::styled(raw.to_string(), theme.markdown.code)),
                 scrollable: false,
             });
             i += 1;
@@ -195,9 +198,13 @@ fn parse_document(input: String) -> Vec<DisplayLine> {
             lines_vec.push(DisplayLine {
                 line: Line::from(Span::styled(
                     raw.trim_start_matches("### ").to_string(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    theme.apply_text_semantics(
+                        theme.markdown.heading,
+                        TextSemantics {
+                            bold: true,
+                            underline: false,
+                        },
+                    ),
                 )),
                 scrollable: false,
             });
@@ -208,9 +215,13 @@ fn parse_document(input: String) -> Vec<DisplayLine> {
             lines_vec.push(DisplayLine {
                 line: Line::from(Span::styled(
                     raw.trim_start_matches("## ").to_string(),
-                    Style::default()
-                        .fg(Color::LightCyan)
-                        .add_modifier(Modifier::BOLD),
+                    theme.apply_text_semantics(
+                        theme.markdown.heading,
+                        TextSemantics {
+                            bold: true,
+                            underline: false,
+                        },
+                    ),
                 )),
                 scrollable: false,
             });
@@ -221,9 +232,13 @@ fn parse_document(input: String) -> Vec<DisplayLine> {
             lines_vec.push(DisplayLine {
                 line: Line::from(Span::styled(
                     raw.trim_start_matches("# ").to_string(),
-                    Style::default()
-                        .fg(Color::Gray)
-                        .add_modifier(Modifier::BOLD),
+                    theme.apply_text_semantics(
+                        theme.markdown.heading,
+                        TextSemantics {
+                            bold: true,
+                            underline: false,
+                        },
+                    ),
                 )),
                 scrollable: false,
             });
@@ -254,13 +269,13 @@ fn parse_document(input: String) -> Vec<DisplayLine> {
             }
 
             let table = parse_table(&table_lines.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-            lines_vec.extend(table_to_lines(table));
+            lines_vec.extend(table_to_lines(table, theme));
             i = j;
             continue;
         }
 
         lines_vec.push(DisplayLine {
-            line: Line::from(parse_inline(raw.as_str())),
+            line: Line::from(parse_inline(raw.as_str(), theme)),
             scrollable: false,
         });
         i += 1;
@@ -269,7 +284,7 @@ fn parse_document(input: String) -> Vec<DisplayLine> {
     lines_vec
 }
 
-fn parse_inline(input: &str) -> Vec<Span<'static>> {
+fn parse_inline(input: &str, theme: &ResolvedTheme) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut buf = String::new();
 
@@ -294,7 +309,11 @@ fn parse_inline(input: &str) -> Vec<Span<'static>> {
         };
 
         if let Some(kind) = toggle {
-            flush_span(&mut spans, &mut buf, current_style(bold, underline, code));
+            flush_span(
+                &mut spans,
+                &mut buf,
+                current_style(bold, underline, code, theme),
+            );
 
             match kind {
                 "bold" => bold = !bold,
@@ -308,24 +327,21 @@ fn parse_inline(input: &str) -> Vec<Span<'static>> {
         buf.push(c);
     }
 
-    flush_span(&mut spans, &mut buf, current_style(bold, underline, code));
+    flush_span(
+        &mut spans,
+        &mut buf,
+        current_style(bold, underline, code, theme),
+    );
     spans
 }
 
-fn current_style(bold: bool, underline: bool, code: bool) -> Style {
-    let mut style = Style::default();
-
-    if bold {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    if underline {
-        style = style.add_modifier(Modifier::UNDERLINED);
-    }
-    if code {
-        style = style.fg(Color::Yellow);
-    }
-
-    style
+fn current_style(bold: bool, underline: bool, code: bool, theme: &ResolvedTheme) -> Style {
+    let base = if code {
+        theme.markdown.code
+    } else {
+        theme.markdown.normal
+    };
+    theme.apply_text_semantics(base, TextSemantics { bold, underline })
 }
 #[derive(Clone)]
 pub struct DisplayLine {
@@ -333,7 +349,7 @@ pub struct DisplayLine {
     scrollable: bool,
 }
 
-fn table_to_lines(table: Vec<Vec<String>>) -> Vec<DisplayLine> {
+fn table_to_lines(table: Vec<Vec<String>>, theme: &ResolvedTheme) -> Vec<DisplayLine> {
     if table.len() < 2 {
         return vec![];
     }
@@ -377,7 +393,7 @@ fn table_to_lines(table: Vec<Vec<String>>) -> Vec<DisplayLine> {
                 .join("─┼─");
 
             lines.push(DisplayLine {
-                line: Line::from(Span::styled(divider, Style::default().fg(Color::DarkGray))),
+                line: Line::from(Span::styled(divider, theme.markdown.divider)),
                 scrollable: true,
             });
             continue;
@@ -403,11 +419,15 @@ fn table_to_lines(table: Vec<Vec<String>>) -> Vec<DisplayLine> {
             }
 
             let style = if row_idx == 0 {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                theme.apply_text_semantics(
+                    theme.markdown.table_header,
+                    TextSemantics {
+                        bold: true,
+                        underline: false,
+                    },
+                )
             } else {
-                Style::default().fg(Color::Green)
+                theme.markdown.table_text
             };
 
             lines.push(DisplayLine {

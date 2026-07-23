@@ -1,16 +1,54 @@
 use crate::elements::elements::{Element, InteractableElement, JoinableElement};
-use crate::interaction_result::InteractionResult;
 use crate::util::borders::draw_block_joins;
+use crate::{interaction_result::InteractionResult, render_context::RenderContext};
 use crossterm::event::{KeyCode, KeyEvent};
 use iota_state::{ClientState, UiLogEntry};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
 use std::any::Any;
+use unicode_width::UnicodeWidthChar;
+
+#[derive(Clone, Copy)]
+enum LogSource {
+    Call,
+    Client,
+    Iota,
+    Omikron,
+    Omega,
+    Command,
+    Other,
+}
+
+impl LogSource {
+    fn from_sender(sender: &str) -> Self {
+        match sender {
+            "Call" => Self::Call,
+            "Client" => Self::Client,
+            "Iota" => Self::Iota,
+            "Omikron" => Self::Omikron,
+            "Omega" => Self::Omega,
+            "Command" => Self::Command,
+            _ => Self::Other,
+        }
+    }
+
+    fn style(self, theme: &crate::theme::ResolvedTheme) -> Style {
+        match self {
+            Self::Call => theme.logs.call,
+            Self::Client => theme.logs.client,
+            Self::Iota => theme.logs.iota,
+            Self::Omikron => theme.logs.omikron,
+            Self::Omega => theme.logs.omega,
+            Self::Command => theme.logs.command,
+            Self::Other => theme.logs.other,
+        }
+    }
+}
 
 pub struct LogCard {
     state: ClientState,
@@ -38,11 +76,10 @@ impl LogCard {
     }
 
     fn get_logs(&self) -> Vec<UiLogEntry> {
-        let state = self
-            .state
-            .app
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = match self.state.app.try_lock() {
+            Ok(state) => state,
+            Err(_) => return Vec::new(),
+        };
         state
             .get_logs()
             .iter()
@@ -64,7 +101,7 @@ impl LogCard {
         let mut last_boundary = 0usize;
 
         for (idx, ch) in s.char_indices() {
-            let char_width = if ch.is_ascii() { 1 } else { 2 };
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
             if current_width + char_width > max_width {
                 if last_boundary == 0 {
                     return idx + ch.len_utf8();
@@ -78,7 +115,7 @@ impl LogCard {
         s.len()
     }
 
-    fn wrap_entry(entry: &UiLogEntry, available_width: usize) -> Vec<(String, Color, bool)> {
+    fn wrap_entry(entry: &UiLogEntry, available_width: usize) -> Vec<(String, LogSource, bool)> {
         let mut result = Vec::new();
 
         let timestamp = entry.format_timestamp();
@@ -141,29 +178,17 @@ impl LogCard {
                 line.push_str(&timestamp);
             }
 
-            result.push((line, Self::sender_color(&entry.sender), entry.is_error));
+            result.push((line, LogSource::from_sender(&entry.sender), entry.is_error));
         }
 
         result
-    }
-
-    fn sender_color(sender: &str) -> Color {
-        match sender {
-            "Call" => Color::Magenta,
-            "Client" => Color::Green,
-            "Iota" => Color::Yellow,
-            "Omikron" => Color::Blue,
-            "Omega" => Color::Cyan,
-            "Command" => Color::LightGreen,
-            _ => Color::LightCyan,
-        }
     }
 
     fn build_all_lines(
         &self,
         entries: Vec<UiLogEntry>,
         width: usize,
-    ) -> Vec<(String, Color, bool)> {
+    ) -> Vec<(String, LogSource, bool)> {
         let mut lines = Vec::new();
 
         for entry in entries {
@@ -269,23 +294,33 @@ impl Element for LogCard {
         self
     }
 
-    fn render(&self, f: &mut Frame, area: Rect) {
+    fn render(&self, f: &mut Frame, area: Rect, context: &RenderContext<'_>) {
         let entries = self.get_logs();
 
         let block = Block::default()
             .title(self.build_title())
             .borders(self.borders)
             .border_style(if self.focused {
-                Style::default().fg(Color::Yellow)
+                context.theme.logs.focused_border
             } else {
-                Style::default()
+                context.theme.logs.border
             });
 
         let inner_area = block.inner(area);
         f.render_widget(block, area);
 
         if inner_area.width == 0 || inner_area.height == 0 {
-            draw_block_joins(f, area, self.borders, self.joins);
+            draw_block_joins(
+                f,
+                area,
+                self.borders,
+                self.joins,
+                if self.focused {
+                    context.theme.borders.focused
+                } else {
+                    context.theme.borders.normal
+                },
+            );
             return;
         }
 
@@ -298,7 +333,7 @@ impl Element for LogCard {
 
         let rendered_lines: Vec<Line> = visible_lines
             .iter()
-            .map(|(line, prefix_color, is_error)| {
+            .map(|(line, source, is_error)| {
                 let mut spans = Vec::new();
 
                 let (prefix, rest) = Self::split_line_prefix(line);
@@ -306,24 +341,25 @@ impl Element for LogCard {
                 if !prefix.is_empty() {
                     spans.push(Span::styled(
                         prefix.to_string(),
-                        Style::default().fg(*prefix_color),
+                        source.style(context.theme),
                     ));
                 }
 
                 let (content, timestamp) = Self::split_timestamp_suffix(rest);
-                let text_color = if *is_error { Color::Red } else { Color::White };
+                let text_style = if *is_error {
+                    context.theme.logs.error
+                } else {
+                    context.theme.logs.text
+                };
 
                 if !content.is_empty() {
-                    spans.push(Span::styled(
-                        content.to_string(),
-                        Style::default().fg(text_color),
-                    ));
+                    spans.push(Span::styled(content.to_string(), text_style));
                 }
 
                 if !timestamp.is_empty() {
                     spans.push(Span::styled(
                         timestamp.to_string(),
-                        Style::default().fg(Color::DarkGray),
+                        context.theme.logs.timestamp,
                     ));
                 }
 
@@ -341,7 +377,17 @@ impl Element for LogCard {
             f.render_widget(Paragraph::new(line.clone()), line_area);
         }
 
-        draw_block_joins(f, area, self.borders, self.joins);
+        draw_block_joins(
+            f,
+            area,
+            self.borders,
+            self.joins,
+            if self.focused {
+                context.theme.borders.focused
+            } else {
+                context.theme.borders.normal
+            },
+        );
     }
 }
 

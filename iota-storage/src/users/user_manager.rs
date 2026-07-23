@@ -242,7 +242,7 @@ pub fn save_users() {
     // No-op: users are auto-saved via SQLite.
 }
 
-pub async fn load_users() -> std::io::Result<()> {
+pub fn load_users_sync() -> std::io::Result<()> {
     // Users are loaded from SQLite on demand. This function is kept for API compat.
     // If we need to migrate from a legacy users.json file, we can do so here.
     let content = load_file("", "users.json");

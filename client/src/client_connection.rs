@@ -2,7 +2,6 @@ use dashmap::DashMap;
 use iota_connection::message_common::*;
 use iota_connection::message_handlers;
 use iota_logger::{log_cv_in, log_cv_out, log_t};
-use iota_state::SHUTDOWN;
 use iota_storage::util::chat_files::{self, MessageState, change_message_state};
 use iota_storage::util::config_util::CONFIG;
 use iota_storage::util::e2ee_storage::{self, StoredChatSecret};
@@ -31,6 +30,7 @@ pub struct ClientConnection {
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     pub waiting_tasks:
         DashMap<u32, Box<dyn Fn(Arc<ClientConnection>, CommunicationValue) -> bool + Send + Sync>>,
+    shutdown: Arc<RwLock<bool>>,
 }
 
 impl ClientConnection {
@@ -45,6 +45,7 @@ impl ClientConnection {
             u32,
             Box<dyn Fn(Arc<ClientConnection>, CommunicationValue) -> bool + Send + Sync>,
         >,
+        shutdown: Arc<RwLock<bool>>,
     ) -> Self {
         Self {
             sender,
@@ -54,6 +55,7 @@ impl ClientConnection {
             connection_id,
             shutdown_tx,
             waiting_tasks,
+            shutdown,
         }
     }
 
@@ -61,7 +63,7 @@ impl ClientConnection {
         let self_clone = self.clone();
         tokio::spawn(async move {
             while let Ok(cv) = self_clone.receiver.receive().await {
-                if *SHUTDOWN.read().await {
+                if *self_clone.shutdown.read().await {
                     return;
                 }
 

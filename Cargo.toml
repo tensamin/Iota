@@ -18,5 +18,9 @@ members = [
     "web-ui",
     "iota-logger",
     "iota-util",
+    "iota-process-manager",
+    "iota-paths",
+    "iota-installer",
+    "iota-core",
 ]
 resolver = "3"

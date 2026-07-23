@@ -1,144 +1,262 @@
 use crate::{
-    input_handler::setup_input_handler, interaction_result::InteractionResult,
-    ipc_client::IpcClient, screens::screens::Screen,
+    input_handler::setup_input_handler,
+    interaction_result::InteractionResult,
+    ipc_client::IpcClient,
+    render_context::RenderContext,
+    screens::screens::Screen,
+    theme::{self, ResolvedTheme, ThemeName},
 };
 use crossterm::event::KeyEvent;
 use once_cell::sync::Lazy;
-use ratatui::{Terminal, backend::CrosstermBackend, init};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
-    collections::VecDeque,
+    io,
     io::Stdout,
+    panic::PanicHookInfo,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
-use tokio::{sync::RwLock, time::Instant};
+use tokio::sync::{Notify, RwLock};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// UI state and rendering
 
 pub static FPS: Lazy<RwLock<(f64, f64)>> = Lazy::new(|| RwLock::new((0.0, 0.0)));
 
 pub struct UI {
-    ipc: Arc<IpcClient>,
-    shutdown: AtomicBool,
+    ipc: RwLock<Option<Arc<IpcClient>>>,
+    shutdown_on_empty: bool,
+    cancellation: CancellationToken,
     pub terminal: Arc<Mutex<Terminal<CrosstermBackend<Stdout>>>>,
     screen_stack: Arc<RwLock<Vec<Box<dyn Screen>>>>,
+    theme: RwLock<Arc<ResolvedTheme>>,
+    pub(crate) invalidation: Notify,
+    failure: Arc<Mutex<Option<String>>>,
 }
 
-pub fn start_tui(ipc: Arc<IpcClient>) -> Arc<UI> {
-    let ui = Arc::new(UI::new(ipc));
+pub fn start_tui(ipc: Arc<IpcClient>) -> io::Result<TuiSession> {
+    start_tui_with_theme(ipc, theme::resolve(ThemeName::Ansi))
+}
+
+pub fn start_tui_with_theme(ipc: Arc<IpcClient>, theme: ResolvedTheme) -> io::Result<TuiSession> {
+    start_session(UI::new(Some(ipc), true, theme)?)
+}
+
+pub fn start_bootstrap_tui() -> io::Result<TuiSession> {
+    start_bootstrap_tui_with_theme(theme::resolve(ThemeName::Ansi))
+}
+
+pub fn start_bootstrap_tui_with_theme(theme: ResolvedTheme) -> io::Result<TuiSession> {
+    start_session(UI::new(None, false, theme)?)
+}
+
+fn start_session(ui: UI) -> io::Result<TuiSession> {
+    let ui = Arc::new(ui);
     let uic = ui.clone();
-    tokio::spawn(async move {
-        let mut last_render = Instant::now();
-
-        let mut fps_samples: VecDeque<f64> = VecDeque::with_capacity(20);
-        let mut skip_samples: VecDeque<u16> = VecDeque::with_capacity(20);
-
-        let mut fps_sum = 0.0;
-        let mut skip_sum: u32 = 0;
-
-        let mut skipped = 0;
-
-        loop {
-            if uic.is_shutdown() {
-                break;
+    let renderer_task = tokio::spawn(async move {
+        let cancellation = uic.cancellation_token();
+        let result: io::Result<()> = loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => break Ok(()),
+                _ = uic.invalidation.notified() => { if !uic.is_shutdown() { uic.render().await?; } },
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => { if !uic.is_shutdown() { uic.render().await?; } },
             }
-
-            if skipped > 5 {
-                uic.render().await;
-
-                skip_samples.push_back(skipped);
-                skip_sum += skipped as u32;
-
-                if skip_samples.len() > 20 {
-                    if let Some(old) = skip_samples.pop_front() {
-                        skip_sum -= old as u32;
-                    }
-                }
-
-                skipped = 0;
-
-                let elapsed = last_render.elapsed().as_secs_f64();
-                if elapsed > 0.0 {
-                    let fps = 1.0 / elapsed;
-
-                    fps_samples.push_back(fps);
-                    fps_sum += fps;
-
-                    if fps_samples.len() > 20 {
-                        if let Some(old) = fps_samples.pop_front() {
-                            fps_sum -= old;
-                        }
-                    }
-                }
-
-                let avg_fps = if !fps_samples.is_empty() {
-                    fps_sum / fps_samples.len() as f64
-                } else {
-                    0.0
-                };
-
-                let avg_skips_percentage = if !skip_samples.is_empty() {
-                    let avg_skipped = skip_sum as f64 / skip_samples.len() as f64;
-                    let total_iterations = avg_skipped + 1.0;
-                    (avg_skipped / total_iterations) * 100.0
-                } else {
-                    0.0
-                };
-
-                *FPS.write().await = (avg_fps, avg_skips_percentage);
-
-                last_render = Instant::now();
-            } else {
-                skipped += 1;
-            }
-            tokio::time::sleep(Duration::from_millis(16)).await;
+        };
+        if let Err(error) = &result {
+            *uic.failure.lock().unwrap() = Some(error.to_string());
+            uic.request_shutdown();
         }
-        ratatui::restore();
+        result
     });
-    setup_input_handler(ui.clone());
-    ui
+    let input_task = setup_input_handler(ui.clone());
+    // Some terminals deliver Ctrl+C as SIGINT even while crossterm is in raw
+    // mode. Keep this independent of key-event handling for bootstrap work.
+    let signal_task = {
+        #[cfg(unix)]
+        {
+            let signal_ui = ui.clone();
+            Some(tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    signal_ui.request_shutdown();
+                }
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    };
+    let previous_hook = Arc::new(Mutex::new(Some(std::panic::take_hook())));
+    let hook_for_panic = previous_hook.clone();
+    std::panic::set_hook(Box::new(move |info: &PanicHookInfo<'_>| {
+        ratatui::restore();
+        if let Some(hook) = hook_for_panic.lock().unwrap().as_ref() {
+            hook(info);
+        }
+    }));
+    Ok(TuiSession {
+        ui,
+        renderer_task,
+        input_task,
+        signal_task,
+        restored: AtomicBool::new(false),
+        previous_hook,
+    })
+}
+
+pub struct TuiSession {
+    ui: Arc<UI>,
+    renderer_task: JoinHandle<io::Result<()>>,
+    input_task: JoinHandle<Result<(), String>>,
+    signal_task: Option<JoinHandle<()>>,
+    restored: AtomicBool,
+    previous_hook: Arc<Mutex<Option<Box<dyn Fn(&PanicHookInfo<'_>) + Send + Sync + 'static>>>>,
+}
+
+impl TuiSession {
+    pub fn ui(&self) -> Arc<UI> {
+        self.ui.clone()
+    }
+    pub async fn shutdown(mut self) -> Option<String> {
+        self.ui.request_shutdown();
+        // Restore raw-mode state before waiting on cooperative tasks.  A
+        // misbehaving task must never leave the invoking shell unusable.
+        self.restore_terminal_once();
+        let renderer =
+            tokio::time::timeout(std::time::Duration::from_secs(2), &mut self.renderer_task).await;
+        let input =
+            tokio::time::timeout(std::time::Duration::from_secs(2), &mut self.input_task).await;
+        if renderer.is_err() {
+            self.renderer_task.abort();
+        }
+        if input.is_err() {
+            self.input_task.abort();
+        }
+        if let Some(task) = self.signal_task.as_mut() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.restore_panic_hook();
+        match renderer {
+            Err(_) => Some("renderer did not stop within 2 seconds".into()),
+            Ok(Err(error)) => Some(format!("renderer task failed: {error}")),
+            Ok(Ok(Err(error))) => Some(error.to_string()),
+            Ok(Ok(Ok(()))) => match input {
+                Err(_) => Some("input handler did not stop within 2 seconds".into()),
+                Ok(Err(error)) => Some(format!("input handler failed: {error}")),
+                Ok(Ok(Err(error))) => Some(error),
+                Ok(Ok(Ok(()))) => None,
+            },
+        }
+    }
+    fn restore_terminal_once(&self) {
+        if !self.restored.swap(true, Ordering::AcqRel) {
+            ratatui::restore();
+        }
+    }
+    fn restore_panic_hook(&self) {
+        if let Some(hook) = self.previous_hook.lock().unwrap().take() {
+            std::panic::set_hook(hook);
+        }
+    }
+}
+impl Drop for TuiSession {
+    fn drop(&mut self) {
+        self.ui.request_shutdown();
+        self.renderer_task.abort();
+        self.input_task.abort();
+        if let Some(task) = self.signal_task.as_ref() {
+            task.abort();
+        }
+        self.restore_panic_hook();
+        self.restore_terminal_once();
+    }
 }
 impl UI {
-    pub fn new(ipc: Arc<IpcClient>) -> Self {
-        let terminal = init();
-        Self {
-            ipc,
-            shutdown: AtomicBool::new(false),
+    pub(crate) fn new(
+        ipc: Option<Arc<IpcClient>>,
+        shutdown_on_empty: bool,
+        theme: ResolvedTheme,
+    ) -> io::Result<Self> {
+        let terminal = ratatui::try_init()?;
+        Ok(Self {
+            ipc: RwLock::new(ipc),
+            shutdown_on_empty,
+            cancellation: CancellationToken::new(),
             terminal: Arc::new(Mutex::new(terminal)),
             screen_stack: Arc::new(RwLock::new(Vec::new())),
-        }
+            theme: RwLock::new(Arc::new(theme)),
+            invalidation: Notify::new(),
+            failure: Arc::new(Mutex::new(None)),
+        })
     }
 
-    pub fn ipc(&self) -> Arc<IpcClient> {
-        self.ipc.clone()
+    pub async fn ipc(&self) -> Option<Arc<IpcClient>> {
+        self.ipc.read().await.clone()
     }
 
-    pub fn client_state(&self) -> iota_state::ClientState {
-        self.ipc.state()
+    pub async fn client_state(&self) -> Option<iota_state::ClientState> {
+        self.ipc.read().await.as_ref().map(|ipc| ipc.state())
+    }
+
+    pub async fn attach_daemon(&self, ipc: Arc<IpcClient>) {
+        *self.ipc.write().await = Some(ipc);
+    }
+
+    pub async fn set_theme(&self, theme: ResolvedTheme) {
+        *self.theme.write().await = Arc::new(theme);
+        self.invalidate();
+    }
+    pub async fn theme_name(&self) -> ThemeName {
+        self.theme.read().await.name
     }
 
     pub fn is_shutdown(&self) -> bool {
-        self.shutdown.load(Ordering::Relaxed)
+        self.cancellation.is_cancelled()
     }
 
     pub fn request_shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+        self.cancellation.cancel();
+        self.invalidate();
+    }
+    pub fn invalidate(&self) {
+        self.invalidation.notify_one();
+    }
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|f| f.clone())
+    }
+    pub async fn handle_paste(&self, _text: String) {
+        self.invalidate();
     }
 
-    pub async fn send_restart(&self) -> std::io::Result<()> {
-        self.ipc.send_command(0, "restart".into()).await
+    /// Lets bootstrap operations race their work against Ctrl+C without
+    /// blocking the input task or leaving the terminal in raw mode.
+    pub async fn wait_for_shutdown(&self) {
+        self.cancellation.cancelled().await;
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 
     pub async fn set_screen(&self, screen: Box<dyn Screen>) {
         self.screen_stack.write().await.push(screen);
+        self.invalidate();
     }
     pub async fn replace_screen(&self, screen: Box<dyn Screen>) {
         let mut stack = self.screen_stack.write().await;
-        stack.pop();
+        stack.clear();
         stack.push(screen);
+        self.invalidate();
+    }
+    pub async fn set_root_screen(&self, screen: Box<dyn Screen>) {
+        let mut stack = self.screen_stack.write().await;
+        stack.clear();
+        stack.push(screen);
+        self.invalidate();
     }
     pub async fn handle_input(self: Arc<Self>, key_event: KeyEvent) {
         let result = {
@@ -155,30 +273,41 @@ impl UI {
             }
             InteractionResult::OpenFutureScreen { screen: fut } => {
                 let ui = self.clone();
-                let screen = fut.await;
-                ui.set_screen(screen).await;
+                tokio::select! {
+                    screen = fut => ui.set_screen(screen).await,
+                    _ = ui.cancellation.cancelled() => return,
+                }
             }
             InteractionResult::CloseScreen => {
                 let mut stack = self.screen_stack.write().await;
                 stack.pop();
 
-                if stack.is_empty() {
+                if stack.is_empty() && self.shutdown_on_empty {
                     self.request_shutdown();
                 }
             }
             InteractionResult::Handled => {}
             InteractionResult::Unhandled => {}
         }
+        self.invalidate();
     }
 
-    pub async fn render(&self) {
+    pub async fn render(&self) -> io::Result<()> {
+        let theme = self.theme.read().await.clone();
+        let context = RenderContext {
+            theme: theme.as_ref(),
+        };
+        // The renderer is the only task that takes the terminal lock.  Screen
+        // mutations use the stack lock briefly before invalidating a frame.
         if let Some(screen) = self.screen_stack.read().await.last() {
-            let mut terminal = self.terminal.lock().unwrap();
-            terminal
-                .draw(|f| {
-                    screen.render(f, f.area());
-                })
-                .unwrap();
+            let mut terminal = self
+                .terminal
+                .lock()
+                .map_err(|_| io::Error::other("terminal mutex poisoned"))?;
+            terminal.draw(|f| {
+                screen.render(f, f.area(), &context);
+            })?;
         }
+        Ok(())
     }
 }

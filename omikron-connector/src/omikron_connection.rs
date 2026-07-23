@@ -1,6 +1,6 @@
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use iota_logger::{log, log_cv_in, log_cv_out, log_t};
-use iota_state::ACTIVE_TASKS;
+use iota_state::AppState;
 use iota_storage::util::chat_files::{self, MessageState, change_message_state};
 use iota_storage::util::config_util::{CONFIG, modify_config};
 use iota_storage::util::e2ee_storage::{self, PendingChatSecretForward, StoredChatSecret};
@@ -19,6 +19,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::client::{OmikronClient, OmikronError};
 use crate::omega_discovery;
 
 use iota_connection::message_common::*;
@@ -106,7 +107,7 @@ const MAX_CONCURRENT_HANDLERS: usize = 20;
 // ============================================================================
 
 pub struct WaitingTask {
-    pub task: Box<dyn FnOnce(Arc<OmikronConnection>, CommunicationValue) -> bool + Send + Sync>,
+    pub task: Box<dyn FnOnce(CommunicationValue) -> bool + Send + Sync>,
     pub inserted_at: Instant,
 }
 
@@ -163,14 +164,20 @@ pub struct OmikronConnection {
     pub(crate) missed_pongs: Arc<AtomicU32>,
     handler_semaphore: Arc<Semaphore>,
     cancellation: CancellationToken,
+    pub(crate) active_tasks: Arc<DashSet<String>>,
+    pub(crate) app: Arc<std::sync::Mutex<AppState>>,
 }
 
 impl OmikronConnection {
-    pub fn new() -> Self {
-        Self::with_cancellation(CancellationToken::new())
+    pub fn new(active_tasks: Arc<DashSet<String>>, app: Arc<std::sync::Mutex<AppState>>) -> Self {
+        Self::with_cancellation(CancellationToken::new(), active_tasks, app)
     }
 
-    pub fn with_cancellation(cancellation: CancellationToken) -> Self {
+    pub fn with_cancellation(
+        cancellation: CancellationToken,
+        active_tasks: Arc<DashSet<String>>,
+        app: Arc<std::sync::Mutex<AppState>>,
+    ) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
         let (state_watch_tx, _) = watch::channel(ConnectionState::Disconnected);
 
@@ -190,6 +197,8 @@ impl OmikronConnection {
             missed_pongs: Arc::new(AtomicU32::new(0)),
             handler_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS)),
             cancellation,
+            active_tasks,
+            app,
         }
     }
 
@@ -388,7 +397,7 @@ impl OmikronConnection {
         *self.heartbeat_handle.lock().await = Some(heartbeat_handle);
 
         {
-            ACTIVE_TASKS.insert("Omikron Listener".to_string());
+            self.active_tasks.insert("Omikron Listener".to_string());
         }
 
         // Wait for read loop to complete
@@ -396,7 +405,7 @@ impl OmikronConnection {
         *self.sender.write().await = None;
         self.set_state(ConnectionState::Disconnected).await;
         {
-            ACTIVE_TASKS.remove("Omikron Listener");
+            self.active_tasks.remove("Omikron Listener");
         }
 
         if let Some(handle) = self.heartbeat_handle.lock().await.take() {
@@ -570,7 +579,7 @@ impl OmikronConnection {
                 Ok(cv) => {
                     let msg_id = cv.get_id();
                     if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
-                        if (task.task)(self.clone(), cv.clone()) {
+                        if (task.task)(cv.clone()) {
                             continue;
                         }
                     }
@@ -832,7 +841,7 @@ impl OmikronConnection {
         let msg_id = cv.get_id();
 
         if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
-            if (task.task)(self.clone(), cv.clone()) {
+            if (task.task)(cv.clone()) {
                 return;
             }
         }
@@ -1797,7 +1806,7 @@ impl OmikronConnection {
                 let response = CommunicationValue::new(CommunicationType::ErrorInternal)
                     .with_id(key)
                     .add_typed_default(DataType::Message, DataValue::Str(reason.clone()));
-                let _ = (waiting_task.task)(OMIKRON_CONNECTION.clone(), response);
+                let _ = (waiting_task.task)(response);
             }
         }
     }
@@ -1821,7 +1830,7 @@ impl OmikronConnection {
         WAITING_TASKS.insert(
             msg_id,
             WaitingTask {
-                task: Box::new(move |_, response_cv| {
+                task: Box::new(move |response_cv| {
                     let _ = tx.send(response_cv);
                     true
                 }),
@@ -1932,20 +1941,26 @@ impl OmikronConnection {
 // Global Instance
 // ============================================================================
 
-pub static OMIKRON_CONNECTION: LazyLock<Arc<OmikronConnection>> = LazyLock::new(|| {
-    let conn = Arc::new(OmikronConnection::new());
-
-    start_task_cleanup_loop();
-
-    conn
-});
-
-pub async fn get_omikron_connection(
+pub async fn connect_initial(
     cancellation: CancellationToken,
-) -> Option<Arc<OmikronConnection>> {
-    let conn = Arc::new(OmikronConnection::with_cancellation(cancellation));
+    active_tasks: Arc<DashSet<String>>,
+    app: Arc<std::sync::Mutex<AppState>>,
+) -> Result<Arc<OmikronConnection>, crate::client::OmikronStartupError> {
+    let conn = Arc::new(OmikronConnection::with_cancellation(
+        cancellation,
+        active_tasks,
+        app,
+    ));
     conn.connect().await;
-    Some(conn)
+    match conn.await_connection(Some(CONNECTION_TIMEOUT)).await {
+        Ok(()) => Ok(conn),
+        Err(_) if conn.has_auth_failure().await => {
+            Err(crate::client::OmikronStartupError::Authentication)
+        }
+        Err(_) => {
+            Err(crate::client::OmikronStartupError::InitialConnectionTimeout { connection: conn })
+        }
+    }
 }
 
 impl iota_connection::connection_handler::ConnectionHandler for OmikronConnection {
@@ -1971,5 +1986,58 @@ impl iota_connection::connection_handler::ConnectionHandler for OmikronConnectio
 
     async fn stop(&self) {
         OmikronConnection::stop(self).await
+    }
+}
+
+#[async_trait::async_trait]
+impl OmikronClient for OmikronConnection {
+    async fn send_message(&self, value: &CommunicationValue) -> Result<(), OmikronError> {
+        Self::send_message(self, value)
+            .await
+            .map_err(OmikronError::Disconnected)
+    }
+
+    async fn await_response(
+        &self,
+        value: &CommunicationValue,
+        timeout: Duration,
+    ) -> Result<CommunicationValue, OmikronError> {
+        Self::await_response(self, value, Some(timeout))
+            .await
+            .map_err(|error| {
+                if error.contains("timed out") {
+                    OmikronError::Timeout(error)
+                } else {
+                    OmikronError::Disconnected(error)
+                }
+            })
+    }
+
+    async fn reconnect(&self) -> Result<(), OmikronError> {
+        let this = Arc::new(Self {
+            state: self.state.clone(),
+            state_watch_tx: self.state_watch_tx.clone(),
+            sender: self.sender.clone(),
+            connection_loop_handle: self.connection_loop_handle.clone(),
+            last_ping: self.last_ping.clone(),
+            heartbeat_handle: self.heartbeat_handle.clone(),
+            connection_id: self.connection_id,
+            shutdown_tx: self.shutdown_tx.clone(),
+            reconnect_on_close: self.reconnect_on_close.clone(),
+            auth_failure: self.auth_failure.clone(),
+            app_challenges: self.app_challenges.clone(),
+            app_sessions: self.app_sessions.clone(),
+            missed_pongs: self.missed_pongs.clone(),
+            handler_semaphore: self.handler_semaphore.clone(),
+            cancellation: self.cancellation.clone(),
+            active_tasks: self.active_tasks.clone(),
+            app: self.app.clone(),
+        });
+        Self::reconnect(&this).await;
+        Ok(())
+    }
+
+    async fn is_connected(&self) -> bool {
+        Self::is_connected(self).await
     }
 }

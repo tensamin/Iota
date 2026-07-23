@@ -6,7 +6,8 @@ use crate::{
         log_card::LogCard,
     },
     interaction_result::InteractionResult,
-    ipc_client::IpcConnectionState,
+    ipc_client::{DaemonStatus, IpcConnectionState},
+    render_context::RenderContext,
     screens::screens::{NavDirection, Screen},
     ui::UI,
 };
@@ -27,6 +28,7 @@ pub struct MainScreen {
     selected_coords: (usize, usize),
     graphs_open: bool,
     connection_status_rx: watch::Receiver<IpcConnectionState>,
+    daemon_status_rx: watch::Receiver<DaemonStatus>,
 }
 
 impl MainScreen {
@@ -39,10 +41,17 @@ impl MainScreen {
             vec![Some(1), Some(4)],
         ];
 
-        let state = ui.client_state();
+        let state = ui
+            .client_state()
+            .await
+            .expect("MainScreen requires an attached daemon");
         let mut log_card = LogCard::new(state.clone());
         log_card.set_borders(Borders::TOP.union(Borders::RIGHT).union(Borders::LEFT));
-        let mut console_card = ConsoleCard::new("Console", "", ui.ipc());
+        let ipc = ui
+            .ipc()
+            .await
+            .expect("MainScreen requires an attached daemon");
+        let mut console_card = ConsoleCard::new("Console", "", ipc.clone());
         console_card.set_joins(Borders::TOP);
 
         elements.push(Box::new(log_card));
@@ -61,7 +70,8 @@ impl MainScreen {
 
         let graphs_open = true;
 
-        let connection_status_rx = ui.ipc().connection_status();
+        let connection_status_rx = ipc.connection_status();
+        let daemon_status_rx = ipc.daemon_status();
 
         let mut screen = MainScreen {
             elements,
@@ -69,6 +79,7 @@ impl MainScreen {
             selected_coords: (1, 0),
             graphs_open,
             connection_status_rx,
+            daemon_status_rx,
         };
         screen.focus_current();
         screen
@@ -198,22 +209,46 @@ impl Screen for MainScreen {
         self
     }
 
-    fn render(&self, f: &mut Frame, rect: Rect) {
-        let status = self.connection_status_rx.borrow();
-        let status_text = match &*status {
+    fn render(&self, f: &mut Frame, rect: Rect, context: &RenderContext<'_>) {
+        // A watch Ref blocks senders until it is dropped.  Rendering may do
+        // terminal I/O, so retain only owned snapshots for the whole frame.
+        let status = self.connection_status_rx.borrow().clone();
+        let daemon = self.daemon_status_rx.borrow().clone();
+        let status_text = match status {
             IpcConnectionState::Connected => "Connected".to_string(),
             IpcConnectionState::Connecting => "Connecting...".to_string(),
             IpcConnectionState::Reconnecting { attempt } => {
                 format!("Reconnecting (attempt {})...", attempt)
             }
             IpcConnectionState::Incompatible { message } => {
-                format!("Incompatible: {}", message)
+                format!("Incompatible protocol: {}", message)
+            }
+            IpcConnectionState::Failed { message } => {
+                format!("Connection failed: {}", message)
             }
             IpcConnectionState::Disconnected => "Disconnected".to_string(),
         };
+        let readiness = daemon
+            .startup_phase
+            .map(|phase| format!("{:?}", phase))
+            .unwrap_or_else(|| "Waiting for status".into());
+        let health = daemon
+            .degraded_reason
+            .as_deref()
+            .map(|reason| format!(" — {reason}"))
+            .unwrap_or_default();
+        let version = if daemon.version.is_empty() {
+            String::new()
+        } else {
+            format!(" v{}", daemon.version)
+        };
         let main_block = Block::default()
-            .title(format!("Main [{}]", status_text))
-            .borders(Borders::ALL);
+            .title(format!(
+                "Iota{version} [{status_text}; {readiness}{health}]"
+            ))
+            .borders(Borders::ALL)
+            .border_style(context.theme.borders.normal)
+            .title_style(context.theme.borders.title);
         f.render_widget(main_block, rect);
 
         let inner = rect.inner(Margin {
@@ -221,7 +256,11 @@ impl Screen for MainScreen {
             horizontal: 1,
         });
 
-        let graphs_width = if self.graphs_open { 30 } else { 2 };
+        let graphs_width = if self.graphs_open && inner.width >= 70 {
+            30
+        } else {
+            2
+        };
         let main_width = inner.width.saturating_sub(graphs_width);
 
         let horizontal_chunks = Layout::default()
@@ -239,11 +278,11 @@ impl Screen for MainScreen {
             Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).split(left_area);
 
         if let Some(log) = self.elements.get(0) {
-            log.as_element().render(f, left_rows[0]);
+            log.as_element().render(f, left_rows[0], context);
         }
 
         if let Some(console) = self.elements.get(1) {
-            console.as_element().render(f, left_rows[1]);
+            console.as_element().render(f, left_rows[1], context);
         }
 
         let graph_elements: Vec<_> = self
@@ -262,7 +301,7 @@ impl Screen for MainScreen {
             .split(right_area);
 
             for (el, area) in graph_elements.iter().zip(graph_chunks.iter()) {
-                el.as_element().render(f, *area);
+                el.as_element().render(f, *area, context);
             }
         }
     }

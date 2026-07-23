@@ -8,21 +8,22 @@ use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use rand_core::{OsRng, RngCore};
 use std::time::Duration;
 
+use crate::OmikronClient;
 use crate::omega_discovery;
-use crate::omikron_connection::OMIKRON_CONNECTION;
 
-pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>) {
+pub async fn create_user(
+    connection: &dyn OmikronClient,
+    username: &str,
+) -> (Option<UserProfile>, Option<String>) {
     let register_communication_value = CommunicationValue::new(CommunicationType::GetRegister);
 
-    let connection = OMIKRON_CONNECTION.clone();
-
     let response_communication_value = match connection
-        .await_response(&register_communication_value, Some(Duration::from_secs(20)))
+        .await_response(&register_communication_value, Duration::from_secs(20))
         .await
     {
         Ok(communication_value) => communication_value,
         Err(e) => {
-            log_t!("User creation: {}", e);
+            log_t!("User creation: {}", e.to_string());
             return (None, None);
         }
     };
@@ -68,7 +69,7 @@ pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>
         .add_typed_default(DataType::ResetToken, DataValue::Str(reset_token));
 
     let response_communication_value = connection
-        .await_response(&communication_value, Some(Duration::from_secs(20)))
+        .await_response(&communication_value, Duration::from_secs(20))
         .await;
 
     if let Ok(response) = response_communication_value {
@@ -84,13 +85,15 @@ pub async fn create_user(username: &str) -> (Option<UserProfile>, Option<String>
     save_file(
         "",
         &format!("{}.tu", username),
-        &format!("{}@{}::{}", user_id, omega_discovery::omega_host(), keyring_b64),
+        &format!(
+            "{}@{}::{}",
+            user_id,
+            omega_discovery::omega_host(),
+            keyring_b64
+        ),
     );
 
     add_user(user_profile.clone());
     save_users();
-    (
-        Some(user_profile),
-        Some(keyring_b64),
-    )
+    (Some(user_profile), Some(keyring_b64))
 }

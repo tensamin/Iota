@@ -5,6 +5,7 @@ pub mod elements {
     pub mod log_card;
 }
 pub mod screens {
+    pub mod daemon_setup;
     pub mod main_screen;
     pub mod md_viewer;
     pub mod screens;
@@ -17,7 +18,12 @@ pub mod util {
     pub mod terms_focus;
 }
 pub mod app_state;
+pub mod controls;
 pub mod input_handler;
-pub mod ipc_client;
 pub mod interaction_result;
+pub mod ipc_client;
+pub mod layout;
+pub mod render_context;
+pub mod theme;
 pub mod ui;
+pub use ui::TuiSession;

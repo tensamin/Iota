@@ -97,15 +97,17 @@ pub fn startup() {
                 format!("{} ", msg.prefix)
             };
 
-            let _ = writeln!(
-                file,
+            let line1 = format!(
                 "{} {}{}",
                 fixed_box(&msg.timestamp_ms.to_string(), 13),
                 prefix,
                 resolved_message
             );
+            let line2 = format!("    {}", timestamp);
 
-            let _ = writeln!(file, "    {}", timestamp);
+            let _ = writeln!(file, "{}\n{}", line1, line2);
+
+            let _ = writeln!(std::io::stderr(), "{}\n{}", line1, line2);
 
             let entry = UiLogEntry {
                 timestamp_ms: msg.timestamp_ms,

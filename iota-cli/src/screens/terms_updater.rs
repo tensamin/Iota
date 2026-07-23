@@ -1,11 +1,10 @@
 use crate::screens::terms_checker::UserChoice;
 use crate::{
+    controls::choice::{ChoiceKind, ChoiceVisualState, render_choice_line},
     interaction_result::InteractionResult,
+    render_context::RenderContext,
     screens::{md_viewer::FileViewer, screens::Screen},
-    util::{
-        buttons::{checkbox, draw_buttons},
-        terms_focus::Focus,
-    },
+    util::{buttons::draw_buttons, terms_focus::Focus},
 };
 use chrono::{Local, TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent};
@@ -13,7 +12,6 @@ use iota_terms::{Doc, TermsType, get_newest_link, get_terms};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph},
 };
@@ -123,7 +121,19 @@ impl Screen for TermsUpdaterScreen {
         self
     }
 
-    fn render(&self, f: &mut Frame, size: Rect) {
+    fn render(&self, f: &mut Frame, size: Rect, context: &RenderContext<'_>) {
+        let checkbox = |label, selected, focused, enabled| {
+            render_choice_line(
+                label,
+                ChoiceKind::Checkbox,
+                ChoiceVisualState {
+                    selected,
+                    focused,
+                    enabled,
+                },
+                context.theme,
+            )
+        };
         let mut needed_height = 5;
 
         if size.height < 6 || size.width < 27 {
@@ -523,19 +533,19 @@ impl Screen for TermsUpdaterScreen {
         };
         if size.width < 60 || size.height < needed_height as u16 {
             let width_style = if size.width > 76 {
-                Style::default().fg(Color::Green)
+                context.theme.status.success
             } else if size.width >= 60 {
-                Style::default().fg(Color::Yellow)
+                context.theme.status.warning
             } else {
-                Style::default().fg(Color::Red)
+                context.theme.status.error
             };
 
             let height_style = if size.height > 20 {
-                Style::default().fg(Color::Green)
+                context.theme.status.success
             } else if size.height >= (header_lines as u16 + 10) {
-                Style::default().fg(Color::Yellow)
+                context.theme.status.warning
             } else {
-                Style::default().fg(Color::Red)
+                context.theme.status.error
             };
 
             let warning_text = Text::from(vec![
@@ -579,6 +589,7 @@ impl Screen for TermsUpdaterScreen {
             self.update_needed,
             downgrade_scenario,
             self.pp_needed || self.tos_needed,
+            context.theme,
         );
     }
 

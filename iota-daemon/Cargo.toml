@@ -8,6 +8,7 @@ iota-daemon-lib = { path = "../iota-daemon-lib" }
 iota-ipc = { path = "../iota-ipc" }
 iota-logger = { path = "../iota-logger" }
 iota-state = { path = "../iota-state" }
+iota-paths = { path = "../iota-paths" }
 iota-storage = { path = "../iota-storage" }
 omikron-connector = { path = "../omikron-connector" }
 web-server = { path = "../web-server" }

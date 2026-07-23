@@ -1,9 +1,8 @@
 use crate::omikron_connection::OmikronConnection;
 use dashmap::DashMap;
-use iota_state::APP_STATE;
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
-use std::sync::atomic::Ordering;
 use std::sync::LazyLock;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::time::Duration;
 
@@ -23,7 +22,9 @@ impl OmikronConnection {
             .with_id(id)
             .add_typed_default(
                 DataType::LastPing,
-                DataValue::Array(vec![DataValue::SignedNumber(*self.last_ping.lock().await as i128)]),
+                DataValue::Array(vec![DataValue::SignedNumber(
+                    *self.last_ping.lock().await as i128,
+                )]),
             );
 
         let _ = self.send_message(&ping_message).await;
@@ -37,7 +38,7 @@ impl OmikronConnection {
         if let Some((_, send_time)) = PING_TIMES.remove(&id) {
             let ping_ms = Instant::now().duration_since(send_time).as_millis() as i64;
             *self.last_ping.lock().await = ping_ms;
-            APP_STATE.lock().unwrap().push_ping_val(ping_ms as f64);
+            self.app.lock().unwrap().push_ping_val(ping_ms as f64);
         }
     }
 }

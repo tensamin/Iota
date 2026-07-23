@@ -5,7 +5,6 @@ use iota_state::ClientState;
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Style},
     widgets::{
         Block, Borders,
         canvas::{Canvas, Line},
@@ -15,6 +14,7 @@ use ratatui::{
 use crate::{
     elements::elements::{Element, InteractableElement, JoinableElement},
     interaction_result::InteractionResult,
+    render_context::RenderContext,
     ui::UI,
     util::borders::draw_block_joins,
 };
@@ -26,43 +26,30 @@ pub enum GRAPHS {
 }
 
 impl GRAPHS {
-    pub fn get_color(&self) -> Color {
+    pub fn get_color(&self, theme: &crate::theme::ResolvedTheme) -> ratatui::style::Color {
         match self {
-            GRAPHS::Ram => Color::Blue,
-            GRAPHS::Cpu => Color::Red,
-            GRAPHS::Ping => Color::Green,
+            GRAPHS::Ram => theme.graphs.ram,
+            GRAPHS::Cpu => theme.graphs.cpu,
+            GRAPHS::Ping => theme.graphs.ping,
         }
     }
 
     pub fn get_graph(&self, state: &ClientState) -> Vec<(f64, f64)> {
+        let state = match state.app.try_lock() {
+            Ok(state) => state,
+            Err(_) => return Vec::new(),
+        };
         match self {
-            GRAPHS::Ram => state
-                .app
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .with_width(28)
-                .ram
-                .clone(),
-            GRAPHS::Cpu => state
-                .app
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .with_width(28)
-                .cpu
-                .clone(),
-            GRAPHS::Ping => state
-                .app
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .with_width(28)
-                .ping
-                .clone(),
+            GRAPHS::Ram => state.with_width(28).ram.clone(),
+            GRAPHS::Cpu => state.with_width(28).cpu.clone(),
+            GRAPHS::Ping => state.with_width(28).ping.clone(),
         }
     }
 
     pub fn get_unit(&self) -> String {
         match self {
-            GRAPHS::Ram => "MB".to_string(),
+            // Memory is collected as a percentage of total RAM, not MiB.
+            GRAPHS::Ram => "%".to_string(),
             GRAPHS::Cpu => "%".to_string(),
             GRAPHS::Ping => "ms".to_string(),
         }
@@ -111,19 +98,24 @@ impl Element for GraphCard {
         self
     }
 
-    fn render(&self, f: &mut Frame, r: Rect) {
+    fn render(&self, f: &mut Frame, r: Rect, context: &RenderContext<'_>) {
         if self.open {
             let graph = self.graph_type.get_graph(&self.state);
             let unit = self.graph_type.get_unit();
             let min_x = graph.first().map(|(x, _)| *x).unwrap_or(0.0);
             let max_x = graph.last().map(|(x, _)| *x).unwrap_or(100.0);
+            let max_x = if max_x <= min_x { min_x + 1.0 } else { max_x };
             let min_y = graph
                 .iter()
                 .map(|(_, y)| *y)
                 .filter(|y| *y > 0.0)
                 .min_by(|a, b| a.total_cmp(b))
                 .unwrap_or(0.0);
-            let max_y = graph.iter().map(|(_, y)| *y).fold(-1.0, f64::max);
+            let max_y = graph.iter().map(|(_, y)| *y).fold(0.0, f64::max);
+            let y_upper = match self.graph_type {
+                GRAPHS::Cpu | GRAPHS::Ram => 100.0,
+                GRAPHS::Ping => (max_y * 1.2).max(10.0),
+            };
 
             let block = Block::default()
                 .title(format!(
@@ -136,15 +128,15 @@ impl Element for GraphCard {
                 ))
                 .borders(self.borders)
                 .border_style(if self.focused {
-                    Style::default().fg(Color::Yellow)
+                    context.theme.graphs.focused_border
                 } else {
-                    Style::default()
+                    context.theme.graphs.border
                 });
 
             let canvas = Canvas::default()
                 .block(block)
                 .x_bounds([min_x, max_x])
-                .y_bounds([0.0, 100.0])
+                .y_bounds([0.0, y_upper])
                 .paint(|ctx| {
                     for (x, y) in &graph {
                         ctx.draw(&Line {
@@ -152,7 +144,7 @@ impl Element for GraphCard {
                             y1: 0.0,
                             x2: *x,
                             y2: *y,
-                            color: self.graph_type.get_color(),
+                            color: self.graph_type.get_color(context.theme),
                         });
                     }
                 });
@@ -162,13 +154,23 @@ impl Element for GraphCard {
                 .title("")
                 .borders(self.borders)
                 .border_style(if self.focused {
-                    Style::default().fg(Color::Yellow)
+                    context.theme.graphs.focused_border
                 } else {
-                    Style::default()
+                    context.theme.graphs.border
                 });
             f.render_widget(block, r);
         }
-        draw_block_joins(f, r, self.borders, self.joins);
+        draw_block_joins(
+            f,
+            r,
+            self.borders,
+            self.joins,
+            if self.focused {
+                context.theme.borders.focused
+            } else {
+                context.theme.borders.normal
+            },
+        );
     }
 }
 

@@ -59,42 +59,52 @@ impl LanguagePack {
     }
 
     pub fn load_language(&mut self, language: &str) {
-        let path = format!("languages/{}/", language);
+        let files = [
+            "frontend.json",
+            "omikron.json",
+            "buttons.json",
+            "debug.json",
+            "general.json",
+        ];
 
-        let frontend_messages = file_util::load_file(&path, "frontend.json");
-        let frontend_messages = parse(&frontend_messages).unwrap();
-        for (key, value) in frontend_messages.entries() {
-            self.language
-                .insert(key.to_string(), value.as_str().unwrap().to_string());
+        // The daemon can initialize the logger before iota-core has created
+        // the generated language files. Create the built-in pack on demand.
+        if language == "en_INT"
+            && files
+                .iter()
+                .any(|file| !file_util::has_file(&format!("languages/{language}/"), file))
+        {
+            let _ = crate::language_creator::create_languages();
         }
 
-        let omikron_messages = file_util::load_file(&path, "omikron.json");
-        let omikron_messages = parse(&omikron_messages).unwrap();
-        for (key, value) in omikron_messages.entries() {
-            self.language
-                .insert(key.to_string(), value.as_str().unwrap().to_string());
-        }
+        let loaded = files
+            .iter()
+            .all(|file| self.load_file(&format!("languages/{language}/"), file));
 
-        let button_texts = file_util::load_file(&path, "buttons.json");
-        let button_texts = parse(&button_texts).unwrap();
-        for (key, value) in button_texts.entries() {
-            self.language
-                .insert(key.to_string(), value.as_str().unwrap().to_string());
+        // A process may have been interrupted while an older version was
+        // writing a language file. Regenerate the default pack once in that
+        // case, and still leave custom language packs non-fatal.
+        if !loaded && language == "en_INT" {
+            self.language.clear();
+            let _ = crate::language_creator::create_languages();
+            for file in files {
+                let _ = self.load_file(&format!("languages/{language}/"), file);
+            }
         }
+    }
 
-        let debug_messages = file_util::load_file(&path, "debug.json");
-        let debug_messages = parse(&debug_messages).unwrap();
-        for (key, value) in debug_messages.entries() {
-            self.language
-                .insert(key.to_string(), value.as_str().unwrap().to_string());
-        }
+    fn load_file(&mut self, path: &str, file: &str) -> bool {
+        let contents = file_util::load_file(path, file);
+        let Ok(messages) = parse(&contents) else {
+            return false;
+        };
 
-        let general_messages = file_util::load_file(&path, "general.json");
-        let general_messages = parse(&general_messages).unwrap();
-        for (key, value) in general_messages.entries() {
-            self.language
-                .insert(key.to_string(), value.as_str().unwrap().to_string());
+        for (key, value) in messages.entries() {
+            if let Some(value) = value.as_str() {
+                self.language.insert(key.to_string(), value.to_string());
+            }
         }
+        true
     }
     pub fn get_translation(&self, key: &str) -> String {
         match self.language.get(key) {
