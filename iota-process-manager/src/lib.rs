@@ -218,6 +218,8 @@ mod systemd {
 
     pub struct SystemdManager {
         executor: Arc<dyn CommandExecutor>,
+        service: &'static str,
+        socket: &'static str,
     }
     impl SystemdManager {
         pub async fn detect() -> Option<Self> {
@@ -225,16 +227,29 @@ mod systemd {
                 return None;
             }
             let executor: Arc<dyn CommandExecutor> = Arc::new(RealExecutor);
-            executor
+            let mut manager = executor
                 .output("systemctl", &["--version", &COMMON[0], &COMMON[1]])
                 .await
                 .ok()
                 .filter(|r| r.success)
-                .map(|_| Self { executor })
+                .map(|_| Self {
+                    executor,
+                    service: SERVICE,
+                    socket: SOCKET,
+                })?;
+            if manager.status("iota.service").await.is_ok() {
+                manager.service = "iota.service";
+                manager.socket = "iota.socket";
+            }
+            Some(manager)
         }
         #[cfg(test)]
         pub fn with_executor(executor: Arc<dyn CommandExecutor>) -> Self {
-            Self { executor }
+            Self {
+                executor,
+                service: SERVICE,
+                socket: SOCKET,
+            }
         }
         async fn run(&self, action: &[&str]) -> Result<(), ProcessManagerError> {
             let mut args = COMMON.to_vec();
@@ -358,19 +373,25 @@ mod systemd {
         async fn unit_status(&self, unit: &str) -> Result<UnitStatus, ProcessManagerError> {
             self.status(unit).await
         }
+        async fn iota_startup_status(&self) -> Result<DaemonStartupStatus, ProcessManagerError> {
+            Ok(DaemonStartupStatus::classify(
+                self.status(self.service).await?,
+                self.status(self.socket).await?,
+            ))
+        }
         async fn set_iota_startup_mode(
             &self,
             mode: StartupMode,
         ) -> Result<DaemonStartupStatus, ProcessManagerError> {
             match mode {
                 StartupMode::AlwaysOn => {
-                    self.run(&["disable", SOCKET]).await?;
-                    self.run(&["enable", "--now", SERVICE]).await?;
+                    self.run(&["disable", self.socket]).await?;
+                    self.run(&["enable", "--now", self.service]).await?;
                     self.verify(DetectedStartupMode::AlwaysOn).await
                 }
                 StartupMode::SocketActivated => {
-                    self.run(&["disable", "--now", SERVICE]).await?;
-                    self.run(&["enable", "--now", SOCKET]).await?;
+                    self.run(&["disable", "--now", self.service]).await?;
+                    self.run(&["enable", "--now", self.socket]).await?;
                     self.verify(DetectedStartupMode::SocketActivated).await
                 }
             }
@@ -378,9 +399,21 @@ mod systemd {
         async fn unit_action(&self, action: &[&str]) -> Result<(), ProcessManagerError> {
             self.run(action).await
         }
+        async fn process_action(
+            &self,
+            action: ProcessAction,
+        ) -> Result<DaemonStartupStatus, ProcessManagerError> {
+            let verb = match action {
+                ProcessAction::Start => "start",
+                ProcessAction::Stop => "stop",
+                ProcessAction::Restart => "restart",
+            };
+            self.run(&[verb, self.service]).await?;
+            self.iota_startup_status().await
+        }
         async fn disable_startup(&self) -> Result<DaemonStartupStatus, ProcessManagerError> {
-            self.run(&["disable", "--now", SERVICE]).await?;
-            self.run(&["disable", "--now", SOCKET]).await?;
+            self.run(&["disable", "--now", self.service]).await?;
+            self.run(&["disable", "--now", self.socket]).await?;
             self.verify(DetectedStartupMode::Disabled).await
         }
     }

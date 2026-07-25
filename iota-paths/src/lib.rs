@@ -25,6 +25,7 @@ pub enum IpcEndpoint {
 #[derive(Debug)]
 pub enum PathError {
     MissingPlatformDirectory(&'static str),
+    MissingRequiredOverride(&'static str),
     EmptyOverride(&'static str),
     RelativeOverride {
         variable: &'static str,
@@ -37,6 +38,7 @@ impl fmt::Display for PathError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingPlatformDirectory(name) => write!(f, "missing platform directory: {name}"),
+            Self::MissingRequiredOverride(name) => write!(f, "{name} must be set"),
             Self::EmptyOverride(name) => write!(f, "{name} must not be empty"),
             Self::RelativeOverride { variable, value } => {
                 write!(f, "{variable} must be absolute, got {}", value.display())
@@ -81,7 +83,11 @@ impl IotaPaths {
         let install_root = override_first(&["IOTA_INSTALL_ROOT"])?.unwrap_or(defaults.install_root);
         let config_file = override_first(&["IOTA_CONFIG_FILE"])?
             .unwrap_or_else(|| config_dir.join("config.yaml"));
-        let ipc_endpoint = resolve_ipc(scope, runtime_dir.as_deref(), defaults.ipc_endpoint)?;
+        let ipc_endpoint = resolve_ipc(scope, defaults.ipc_endpoint)?;
+        let runtime_dir = runtime_dir.or_else(|| match &ipc_endpoint {
+            IpcEndpoint::UnixSocket(path) => path.parent().map(Path::to_path_buf),
+            IpcEndpoint::WindowsPipe(_) => None,
+        });
         Ok(Self {
             scope,
             config_dir,
@@ -234,7 +240,7 @@ struct Defaults {
     log_dir: PathBuf,
     asset_dir: PathBuf,
     install_root: PathBuf,
-    ipc_endpoint: IpcEndpoint,
+    ipc_endpoint: Option<IpcEndpoint>,
 }
 impl Defaults {
     fn for_scope(scope: Scope) -> Result<Self, PathError> {
@@ -250,7 +256,7 @@ impl Defaults {
                         log_dir: "/var/log/iota".into(),
                         asset_dir: "/usr/local/share/iota/web".into(),
                         install_root: "/usr/local/libexec/iota".into(),
-                        ipc_endpoint: IpcEndpoint::UnixSocket("/run/iota/iota.sock".into()),
+                        ipc_endpoint: Some(IpcEndpoint::UnixSocket("/run/iota/iota.sock".into())),
                     })
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -271,18 +277,15 @@ fn user_defaults() -> Result<Defaults, PathError> {
     let state_base = xdg_or_home("XDG_STATE_HOME", &home, ".local/state")?;
     let cache_base = xdg_or_home("XDG_CACHE_HOME", &home, ".cache")?;
     let data_base = xdg_or_home("XDG_DATA_HOME", &home, ".local/share")?;
-    let runtime = absolute_env("XDG_RUNTIME_DIR")?
-        .ok_or(PathError::MissingPlatformDirectory("XDG_RUNTIME_DIR"))?
-        .join("iota");
     Ok(Defaults {
         config_dir: config_base.join("iota"),
         state_dir: state_base.join("iota"),
         cache_dir: cache_base.join("iota"),
-        runtime_dir: Some(runtime.clone()),
+        runtime_dir: None,
         log_dir: state_base.join("iota/logs"),
         asset_dir: data_base.join("iota/web"),
         install_root: data_base.join("iota/bin"),
-        ipc_endpoint: IpcEndpoint::UnixSocket(runtime.join("iota.sock")),
+        ipc_endpoint: None,
     })
 }
 #[cfg(windows)]
@@ -301,7 +304,9 @@ fn user_defaults() -> Result<Defaults, PathError> {
         log_dir: local.join("logs"),
         asset_dir: local.join("data"),
         install_root: local.join("bin"),
-        ipc_endpoint: IpcEndpoint::WindowsPipe(r"\\.\pipe\Tensamin.Iota.User".into()),
+        ipc_endpoint: Some(IpcEndpoint::WindowsPipe(
+            r"\\.\pipe\Tensamin.Iota.User".into(),
+        )),
     })
 }
 
@@ -332,20 +337,14 @@ fn override_first(names: &[&'static str]) -> Result<Option<PathBuf>, PathError> 
     }
     Ok(None)
 }
-fn resolve_ipc(
-    scope: Scope,
-    runtime: Option<&Path>,
-    default: IpcEndpoint,
-) -> Result<IpcEndpoint, PathError> {
+fn resolve_ipc(scope: Scope, default: Option<IpcEndpoint>) -> Result<IpcEndpoint, PathError> {
     #[cfg(unix)]
     {
         if let Some(path) = absolute_env("IOTA_SOCKET")? {
             return Ok(IpcEndpoint::UnixSocket(path));
         }
         if scope == Scope::User {
-            return runtime
-                .map(|dir| IpcEndpoint::UnixSocket(dir.join("iota.sock")))
-                .ok_or(PathError::MissingPlatformDirectory("XDG_RUNTIME_DIR"));
+            return Err(PathError::MissingRequiredOverride("IOTA_SOCKET"));
         }
     }
     #[cfg(windows)]
@@ -358,7 +357,7 @@ fn resolve_ipc(
             return Ok(IpcEndpoint::WindowsPipe(name));
         }
     }
-    Ok(default)
+    default.ok_or(PathError::UnsupportedScope)
 }
 fn create_directory(path: &Path, private: bool) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;

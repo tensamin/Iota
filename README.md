@@ -60,4 +60,5 @@ usermod -aG iota-operators USER
 ```
 
 The user must start a new login session before supplementary group membership
-is visible. `IOTA_SOCKET` remains authoritative for custom deployments.
+is visible. Unix per-user deployments must set `IOTA_SOCKET` to an absolute
+path; Iota does not derive its IPC socket from `XDG_RUNTIME_DIR`.
