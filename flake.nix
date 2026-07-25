@@ -183,7 +183,7 @@
 
             users.groups.iota = {};
 
-            systemd.sockets.iota-daemon = {
+            systemd.sockets.iota = {
               description = "${descriptionText} IPC socket";
               wantedBy = ["sockets.target"];
               socketConfig = {
@@ -198,10 +198,11 @@
               };
             };
 
-            systemd.services.iota-daemon = {
+            systemd.services.iota = {
               description = descriptionText;
-              after = ["network.target"];
-              requires = ["iota-daemon.socket"];
+              wantedBy = ["multi-user.target"];
+              after = ["network.target" "iota.socket"];
+              requires = ["iota.socket"];
 
               serviceConfig =
                 {
