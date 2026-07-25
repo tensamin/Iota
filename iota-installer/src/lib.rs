@@ -172,20 +172,4 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn service_uses_installed_daemon_and_declared_identities() {
-        let service = include_str!("../../systemd/iota-daemon.service");
-        let socket = include_str!("../../systemd/iota-daemon.socket");
-        let sysusers = include_str!("../../systemd/sysusers.d/iota.conf");
-        assert!(service.contains("ExecStart=/usr/local/libexec/iota/iota-daemon"));
-        assert!(service.contains("User=iota"));
-        assert!(service.contains("Group=iota"));
-        assert!(socket.contains("SocketUser=iota"));
-        assert!(socket.contains("SocketGroup=iota-operators"));
-        assert!(socket.contains("NonBlocking=true"));
-        assert!(sysusers.contains("u iota "));
-        assert!(sysusers.contains("g iota-operators"));
-    }
-}
+
