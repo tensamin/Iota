@@ -1,7 +1,7 @@
 use crate::elements::elements::{Element, InteractableElement, JoinableElement};
 use crate::util::borders::draw_block_joins;
 use crate::{interaction_result::InteractionResult, render_context::RenderContext};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use iota_state::{ClientState, UiLogEntry};
 use ratatui::{
     Frame,
@@ -10,7 +10,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
-use std::any::Any;
+use std::{
+    any::Any,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Copy)]
@@ -55,8 +58,11 @@ pub struct LogCard {
     focused: bool,
     selected: bool,
     scroll_offset: usize,
-    last_total_lines: usize,
-    last_visible_height: usize,
+    last_total_lines: AtomicUsize,
+    last_visible_height: AtomicUsize,
+    last_width: AtomicUsize,
+    filter: String,
+    filtering: bool,
     pub borders: Borders,
     pub joins: Borders,
 }
@@ -68,8 +74,11 @@ impl LogCard {
             focused: false,
             selected: false,
             scroll_offset: 0,
-            last_total_lines: 0,
-            last_visible_height: 10,
+            last_total_lines: AtomicUsize::new(0),
+            last_visible_height: AtomicUsize::new(1),
+            last_width: AtomicUsize::new(1),
+            filter: String::new(),
+            filtering: false,
             borders: Borders::ALL,
             joins: Borders::NONE,
         }
@@ -80,9 +89,15 @@ impl LogCard {
             Ok(state) => state,
             Err(_) => return Vec::new(),
         };
+        let needle = self.filter.to_ascii_lowercase();
         state
             .get_logs()
             .iter()
+            .filter(|entry| {
+                needle.is_empty()
+                    || entry.sender.to_ascii_lowercase().contains(&needle)
+                    || entry.message.to_ascii_lowercase().contains(&needle)
+            })
             .map(|e| UiLogEntry {
                 timestamp_ms: e.timestamp_ms,
                 sender: e.sender.clone(),
@@ -214,11 +229,13 @@ impl LogCard {
     }
 
     fn get_title_hints(&self) -> (bool, bool) {
-        if self.last_total_lines == 0 || self.last_total_lines <= self.last_visible_height {
+        let total_lines = self.last_total_lines.load(Ordering::Relaxed);
+        let visible_height = self.last_visible_height.load(Ordering::Relaxed);
+        if total_lines == 0 || total_lines <= visible_height {
             return (false, false);
         }
 
-        let max_offset = self.last_total_lines - self.last_visible_height;
+        let max_offset = total_lines - visible_height;
         let can_scroll_up = self.scroll_offset < max_offset;
         let can_scroll_down = self.scroll_offset > 0;
 
@@ -226,6 +243,12 @@ impl LogCard {
     }
 
     fn build_title(&self) -> String {
+        if self.filtering {
+            return format!("Logs filter: {}_", self.filter);
+        }
+        if !self.filter.is_empty() {
+            return format!("Logs [filter: {}]", self.filter);
+        }
         if !self.focused {
             return "Logs".to_string();
         }
@@ -250,7 +273,8 @@ impl LogCard {
     fn scroll_up(&mut self) {
         let max_offset = self
             .last_total_lines
-            .saturating_sub(self.last_visible_height);
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.last_visible_height.load(Ordering::Relaxed));
         self.scroll_offset = (self.scroll_offset + 1).min(max_offset);
     }
 
@@ -297,17 +321,14 @@ impl Element for LogCard {
     fn render(&self, f: &mut Frame, area: Rect, context: &RenderContext<'_>) {
         let entries = self.get_logs();
 
-        let block = Block::default()
-            .title(self.build_title())
-            .borders(self.borders)
-            .border_style(if self.focused {
-                context.theme.logs.focused_border
-            } else {
-                context.theme.logs.border
-            });
-
-        let inner_area = block.inner(area);
-        f.render_widget(block, area);
+        let inner_area = if matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) {
+            crate::controls::panel::render_panel(f, area, &self.build_title(), self.focused, context.theme)
+        } else {
+            let block = Block::default().title(self.build_title()).borders(self.borders).border_style(if self.focused { context.theme.logs.focused_border } else { context.theme.logs.border });
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            inner
+        };
 
         if inner_area.width == 0 || inner_area.height == 0 {
             draw_block_joins(
@@ -327,6 +348,11 @@ impl Element for LogCard {
         let all_lines = self.build_all_lines(entries, inner_area.width as usize);
         let total_lines = all_lines.len();
         let visible_height = inner_area.height as usize;
+        self.last_width
+            .store(inner_area.width as usize, Ordering::Relaxed);
+        self.last_total_lines.store(total_lines, Ordering::Relaxed);
+        self.last_visible_height
+            .store(visible_height, Ordering::Relaxed);
 
         let (start, end) = self.calculate_view_window(total_lines, visible_height);
         let visible_lines = &all_lines[start..end];
@@ -337,6 +363,7 @@ impl Element for LogCard {
                 let mut spans = Vec::new();
 
                 let (prefix, rest) = Self::split_line_prefix(line);
+                let prefix = if matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) { "" } else { prefix };
 
                 if !prefix.is_empty() {
                     spans.push(Span::styled(
@@ -377,7 +404,7 @@ impl Element for LogCard {
             f.render_widget(Paragraph::new(line.clone()), line_area);
         }
 
-        draw_block_joins(
+        if !matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) { draw_block_joins(
             f,
             area,
             self.borders,
@@ -387,7 +414,7 @@ impl Element for LogCard {
             } else {
                 context.theme.borders.normal
             },
-        );
+        ); }
     }
 }
 
@@ -435,14 +462,44 @@ impl InteractableElement for LogCard {
     }
 
     fn interact(&mut self, key: KeyEvent) -> InteractionResult {
+        if self.filtering {
+            match key.code {
+                KeyCode::Esc => {
+                    self.filtering = false;
+                    self.filter.clear();
+                }
+                KeyCode::Enter => self.filtering = false,
+                KeyCode::Backspace => {
+                    self.filter.pop();
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.filter.push(c);
+                }
+                _ => {}
+            }
+            self.scroll_offset = 0;
+            return InteractionResult::Handled;
+        }
         let entries = self.get_logs();
-        let estimated_width = 80usize;
-        let all_lines = self.build_all_lines(entries, estimated_width);
+        let width = self.last_width.load(Ordering::Relaxed).max(1);
+        let all_lines = self.build_all_lines(entries, width);
 
-        self.last_total_lines = all_lines.len();
-        let visible_height = self.last_visible_height.max(1);
+        self.last_total_lines
+            .store(all_lines.len(), Ordering::Relaxed);
+        let total_lines = all_lines.len();
+        let visible_height = self.last_visible_height.load(Ordering::Relaxed).max(1);
 
         match key.code {
+            KeyCode::Char('/') => {
+                self.filtering = true;
+                self.filter.clear();
+                self.scroll_offset = 0;
+                InteractionResult::Handled
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 self.selected = !self.selected;
                 InteractionResult::Handled
@@ -476,8 +533,8 @@ impl InteractableElement for LogCard {
                 InteractionResult::Handled
             }
             KeyCode::Home => {
-                if self.last_total_lines > visible_height {
-                    self.scroll_offset = self.last_total_lines - visible_height;
+                if total_lines > visible_height {
+                    self.scroll_offset = total_lines - visible_height;
                 }
                 InteractionResult::Handled
             }

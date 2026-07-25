@@ -24,6 +24,13 @@ pub struct BorderStyles {
     pub title: Style,
 }
 #[derive(Clone, Debug)]
+pub struct SurfaceStyles {
+    pub canvas: Style, pub toolbar: Style, pub panel: Style, pub panel_alternate: Style,
+    pub panel_focused: Style, pub panel_selected: Style, pub footer: Style, pub overlay: Style,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChromeMode { Bordered, Surfaces }
+#[derive(Clone, Debug)]
 pub struct ChoiceItemStyle {
     pub marker: Style,
     pub label: Style,
@@ -119,6 +126,9 @@ pub struct TextSemantics {
 #[derive(Clone, Debug)]
 pub struct ResolvedTheme {
     pub name: ThemeName,
+    pub unicode: bool,
+    pub surfaces: SurfaceStyles,
+    pub chrome: ChromeMode,
     pub text: TextStyles,
     pub status: StatusStyles,
     pub choices: ChoiceStyles,

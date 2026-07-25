@@ -1,4 +1,4 @@
-use crate::ui::UI;
+use crate::{screens::screens::UiEvent, ui::UI};
 use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyModifiers, poll, read};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,8 +27,9 @@ pub fn setup_input_handler(ui: Arc<UI>) -> JoinHandle<Result<(), String>> {
             tokio::select! {
                 event = rx.recv() => match event {
                     Some(Event::Key(key)) if key.kind == KeyEventKind::Press => handle_input(key, ui.clone()).await,
-                    Some(Event::Resize(_, _)) => ui.invalidate(),
-                    Some(Event::Paste(text)) => ui.handle_paste(text).await,
+                    Some(Event::Mouse(mouse)) => ui.clone().handle_event(UiEvent::Mouse(mouse)).await,
+                    Some(Event::Resize(width, height)) => ui.clone().handle_event(UiEvent::Resize(width, height)).await,
+                    Some(Event::Paste(text)) => ui.clone().handle_event(UiEvent::Paste(text)).await,
                     Some(_) => {},
                     None => break,
                 },
@@ -55,6 +56,6 @@ pub async fn handle_input(key: KeyEvent, ui: Arc<UI>) {
     {
         ui.request_shutdown();
     } else {
-        ui.handle_input(key).await;
+        ui.handle_event(UiEvent::Key(key)).await;
     }
 }

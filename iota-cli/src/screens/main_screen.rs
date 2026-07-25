@@ -1,4 +1,5 @@
 use crate::{
+    controls::button::{ActionButton, ButtonIntent, render_button},
     elements::{
         console_card::ConsoleCard,
         elements::{InteractableElement, JoinableElement},
@@ -8,19 +9,28 @@ use crate::{
     interaction_result::InteractionResult,
     ipc_client::{DaemonStatus, IpcConnectionState},
     render_context::RenderContext,
-    screens::screens::{NavDirection, Screen},
+    screens::{
+        overview::OverviewScreen,
+        screens::{AppAction, HitMap, KeyHint, NavDirection, Screen, UiEvent},
+    },
     ui::UI,
 };
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Margin, Rect},
-    widgets::{Block, Borders},
+    layout::{Constraint, Layout, Rect},
+    widgets::Borders,
 };
 use tokio::sync::watch;
 
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
+};
 
 pub struct MainScreen {
     elements: Vec<Box<dyn InteractableElement>>,
@@ -29,9 +39,38 @@ pub struct MainScreen {
     graphs_open: bool,
     connection_status_rx: watch::Receiver<IpcConnectionState>,
     daemon_status_rx: watch::Receiver<DaemonStatus>,
+    layout_width: AtomicU16,
 }
 
 impl MainScreen {
+    pub fn connection_status(&self) -> watch::Receiver<IpcConnectionState> {
+        self.connection_status_rx.clone()
+    }
+    pub fn daemon_status(&self) -> watch::Receiver<DaemonStatus> {
+        self.daemon_status_rx.clone()
+    }
+    fn status_summary(&self) -> String {
+        let connection = match self.connection_status_rx.borrow().clone() {
+            IpcConnectionState::Connected => "[OK] Connected".to_owned(),
+            IpcConnectionState::Connecting => "[..] Connecting".to_owned(),
+            IpcConnectionState::Reconnecting { .. } => "[WARN] Reconnecting".to_owned(),
+            IpcConnectionState::Failed { .. } | IpcConnectionState::Incompatible { .. } => {
+                "[FAIL] Failed".to_owned()
+            }
+            IpcConnectionState::Disconnected => "[WARN] Disconnected".to_owned(),
+        };
+        let daemon = self.daemon_status_rx.borrow().clone();
+        let version = if daemon.version.is_empty() {
+            String::new()
+        } else {
+            format!(" v{}", daemon.version)
+        };
+        let ready = daemon
+            .startup_phase
+            .map(|phase| format!(" {:?}", phase))
+            .unwrap_or_default();
+        format!("IOTA{version}    {connection}{ready}")
+    }
     pub async fn new(ui: Arc<UI>) -> Self {
         let mut elements: Vec<Box<dyn InteractableElement>> = Vec::new();
 
@@ -80,6 +119,7 @@ impl MainScreen {
             graphs_open,
             connection_status_rx,
             daemon_status_rx,
+            layout_width: AtomicU16::new(0),
         };
         screen.focus_current();
         screen
@@ -172,6 +212,11 @@ impl MainScreen {
         let mut seen: Vec<Option<usize>> = Vec::new();
         for (y, row) in self.nav_grid.iter().enumerate() {
             for (x, elem_opt) in row.iter().enumerate() {
+                if x == 1
+                    && (!self.graphs_open || self.layout_width.load(Ordering::Relaxed) < 70)
+                {
+                    continue;
+                }
                 if elem_opt.is_some() && !seen.contains(elem_opt) {
                     seen.push(*elem_opt);
                     positions.push((y, x));
@@ -209,7 +254,8 @@ impl Screen for MainScreen {
         self
     }
 
-    fn render(&self, f: &mut Frame, rect: Rect, context: &RenderContext<'_>) {
+    fn render(&self, f: &mut Frame, rect: Rect, context: &RenderContext<'_>, hits: &mut HitMap) {
+        self.layout_width.store(rect.width, Ordering::Relaxed);
         // A watch Ref blocks senders until it is dropped.  Rendering may do
         // terminal I/O, so retain only owned snapshots for the whole frame.
         let status = self.connection_status_rx.borrow().clone();
@@ -242,25 +288,15 @@ impl Screen for MainScreen {
         } else {
             format!(" v{}", daemon.version)
         };
-        let main_block = Block::default()
-            .title(format!(
-                "Iota{version} [{status_text}; {readiness}{health}]"
-            ))
-            .borders(Borders::ALL)
-            .border_style(context.theme.borders.normal)
-            .title_style(context.theme.borders.title);
-        f.render_widget(main_block, rect);
+        let _ = (status_text, readiness, health, version);
+        f.render_widget(
+            ratatui::widgets::Block::default().style(context.theme.surfaces.canvas),
+            rect,
+        );
+        let inner = rect;
 
-        let inner = rect.inner(Margin {
-            vertical: 1,
-            horizontal: 1,
-        });
-
-        let graphs_width = if self.graphs_open && inner.width >= 70 {
-            30
-        } else {
-            2
-        };
+        let metrics_visible = self.graphs_open && inner.width >= 70;
+        let graphs_width = if metrics_visible { 30 } else { 0 };
         let main_width = inner.width.saturating_sub(graphs_width);
 
         let horizontal_chunks = Layout::default()
@@ -273,9 +309,39 @@ impl Screen for MainScreen {
 
         let left_area = horizontal_chunks[0];
         let right_area = horizontal_chunks[1];
+        hits.register(left_area, AppAction::FocusLogs);
+        if metrics_visible {
+            hits.register(right_area, AppAction::FocusMetrics);
+        }
+
+        if inner.width >= 70 {
+            let metrics_button = Rect {
+                x: right_area.x,
+                y: right_area.y,
+                width: right_area.width,
+                height: 1,
+            };
+            render_button(
+                f,
+                metrics_button,
+                ActionButton {
+                    label: if self.graphs_open {
+                        "Hide metrics"
+                    } else {
+                        "Show metrics"
+                    },
+                    intent: ButtonIntent::Neutral,
+                    focused: false,
+                    enabled: true,
+                },
+                context.theme,
+            );
+            hits.register(metrics_button, AppAction::ToggleMetrics);
+        }
 
         let left_rows =
             Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).split(left_area);
+        hits.register(left_rows[1], AppAction::FocusConsole);
 
         if let Some(log) = self.elements.get(0) {
             log.as_element().render(f, left_rows[0], context);
@@ -291,7 +357,7 @@ impl Screen for MainScreen {
             .filter(|el| el.as_any().is::<GraphCard>())
             .collect();
 
-        if !graph_elements.is_empty() {
+        if metrics_visible && !graph_elements.is_empty() {
             let graph_chunks = Layout::vertical(
                 graph_elements
                     .iter()
@@ -306,7 +372,40 @@ impl Screen for MainScreen {
         }
     }
 
-    fn handle_input(&mut self, event: KeyEvent) -> InteractionResult {
+    fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
+        if let UiEvent::Paste(text) = &event {
+            if self.selected_coords == (2, 0) {
+                if let Some(console) = self
+                    .elements
+                    .get_mut(1)
+                    .and_then(|element| element.as_any_mut().downcast_mut::<ConsoleCard>())
+                {
+                    console.handle_paste(text);
+                    return InteractionResult::Handled;
+                }
+            }
+            return InteractionResult::Unhandled;
+        }
+        if let UiEvent::Resize(width, _) = &event {
+            self.layout_width.store(*width, Ordering::Relaxed);
+            if *width < 70 && self.selected_coords.1 == 1 {
+                self.unfocus_current(self.selected_coords.0, self.selected_coords.1);
+                self.selected_coords = (0, 0);
+                self.focus_current();
+            }
+            return InteractionResult::Handled;
+        }
+        let UiEvent::Key(event) = event else {
+            return InteractionResult::Unhandled;
+        };
+        // A focused console consumes text and cursor keys before dashboard
+        // shortcuts; commands such as `users` must remain typeable.
+        if self.selected_coords == (2, 0) && !matches!(event.code, KeyCode::Tab | KeyCode::BackTab)
+        {
+            if let Some(console) = self.elements.get_mut(1) {
+                return console.interact(event);
+            }
+        }
         match event.code {
             KeyCode::Tab => {
                 self.navigate_focus(true);
@@ -315,6 +414,27 @@ impl Screen for MainScreen {
             KeyCode::BackTab => {
                 self.navigate_focus(false);
                 return InteractionResult::Handled;
+            }
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                let conn_rx = self.connection_status_rx.clone();
+                let daemon_rx = self.daemon_status_rx.clone();
+                return InteractionResult::OpenScreen {
+                    screen: Box::new(OverviewScreen::new(conn_rx, daemon_rx)),
+                };
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                return InteractionResult::AppTask {
+                    task: Box::pin(async {
+                        UiEvent::App(crate::screens::screens::AppEvent::OpenUsers)
+                    }),
+                };
+            }
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                return InteractionResult::AppTask {
+                    task: Box::pin(async {
+                        UiEvent::App(crate::screens::screens::AppEvent::OpenMetrics)
+                    }),
+                };
             }
             KeyCode::Enter | KeyCode::Char(' ') if self.selected_coords.1 == 1 => {
                 self.graphs_open = !self.graphs_open;
@@ -346,5 +466,71 @@ impl Screen for MainScreen {
         }
 
         InteractionResult::Handled
+    }
+    fn handle_action(&mut self, action: AppAction) -> InteractionResult {
+        match action {
+            AppAction::ToggleMetrics => {
+                self.graphs_open = !self.graphs_open;
+                for element in &mut self.elements {
+                    if let Some(graph) = element.as_any_mut().downcast_mut::<GraphCard>() {
+                        graph.set_open(self.graphs_open);
+                    }
+                }
+                InteractionResult::Handled
+            }
+            AppAction::OpenOverview => {
+                self.handle_event(UiEvent::Key(KeyEvent::from(KeyCode::Char('o'))))
+            }
+            AppAction::OpenUsers => {
+                self.handle_event(UiEvent::Key(KeyEvent::from(KeyCode::Char('u'))))
+            }
+            AppAction::FocusLogs => {
+                self.unfocus_current(self.selected_coords.0, self.selected_coords.1);
+                self.selected_coords = (0, 0);
+                self.focus_current();
+                InteractionResult::Handled
+            }
+            AppAction::FocusConsole => {
+                self.unfocus_current(self.selected_coords.0, self.selected_coords.1);
+                self.selected_coords = (2, 0);
+                self.focus_current();
+                InteractionResult::Handled
+            }
+            AppAction::FocusMetrics => {
+                self.unfocus_current(self.selected_coords.0, self.selected_coords.1);
+                self.selected_coords = (0, 1);
+                self.focus_current();
+                InteractionResult::Handled
+            }
+            _ => InteractionResult::Unhandled,
+        }
+    }
+    fn app_title(&self) -> String {
+        self.status_summary()
+    }
+    fn key_hints(&self) -> Vec<KeyHint> {
+        if self.selected_coords == (2, 0) {
+            vec![
+                KeyHint { keys: "Enter", action: "Send" },
+                KeyHint { keys: "Up/Down", action: "History" },
+                KeyHint { keys: "Tab", action: "Complete" },
+                KeyHint { keys: "F6", action: "Header" },
+            ]
+        } else if self.selected_coords == (0, 0) {
+            vec![
+                KeyHint { keys: "J/K", action: "Scroll logs" },
+                KeyHint { keys: "Enter", action: "Lock scroll" },
+                KeyHint { keys: "/", action: "Filter" },
+                KeyHint { keys: "M", action: "Metrics screen" },
+                KeyHint { keys: "Tab", action: "Next panel" },
+                KeyHint { keys: "F6", action: "Header" },
+            ]
+        } else {
+            vec![
+                KeyHint { keys: "Enter", action: "Toggle metrics" },
+                KeyHint { keys: "Tab", action: "Next panel" },
+                KeyHint { keys: "F6", action: "Header" },
+            ]
+        }
     }
 }

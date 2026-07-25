@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use iota_daemon_lib::{CommandRouter, DaemonRuntime, DaemonServices};
+use iota_daemon_lib::log_buffer::LogBuffer;
 use iota_ipc::{LocalRequest, ResponseResult};
 use mtp::codec::CommunicationValue;
 use omikron_connector::{OmikronClient, OmikronError};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -43,7 +44,7 @@ async fn reconnect_uses_the_injected_client() {
         users: Default::default(),
         config: Default::default(),
     });
-    let router = CommandRouter::new(Arc::new(DaemonRuntime::new()), services);
+    let router = CommandRouter::new(Arc::new(DaemonRuntime::new()), services, Arc::new(Mutex::new(LogBuffer::new(100))));
     assert!(matches!(
         router.route(1, LocalRequest::ReconnectOmikron).await.result,
         ResponseResult::Ok(_)

@@ -3,11 +3,11 @@ use crate::{
     controls::choice::{ChoiceKind, ChoiceVisualState, render_choice_line},
     interaction_result::InteractionResult,
     render_context::RenderContext,
-    screens::{md_viewer::FileViewer, screens::Screen},
+    screens::{md_viewer::FileViewer, screens::{HitMap, Screen, UiEvent}},
     util::{buttons::draw_buttons, terms_focus::Focus},
 };
 use chrono::{Local, TimeZone, Utc};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyCode;
 use iota_terms::{Doc, TermsType, get_newest_link, get_terms};
 use ratatui::{
     Frame,
@@ -121,7 +121,7 @@ impl Screen for TermsUpdaterScreen {
         self
     }
 
-    fn render(&self, f: &mut Frame, size: Rect, context: &RenderContext<'_>) {
+    fn render(&self, f: &mut Frame, size: Rect, context: &RenderContext<'_>, _hits: &mut HitMap) {
         let checkbox = |label, selected, focused, enabled| {
             render_choice_line(
                 label,
@@ -593,7 +593,8 @@ impl Screen for TermsUpdaterScreen {
         );
     }
 
-    fn handle_input(&mut self, event: KeyEvent) -> InteractionResult {
+    fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
+        let UiEvent::Key(event) = event else { return InteractionResult::Unhandled; };
         let mut possible_states = Vec::new();
 
         if self.eula_needed {

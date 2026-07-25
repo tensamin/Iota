@@ -34,15 +34,15 @@ impl GRAPHS {
         }
     }
 
-    pub fn get_graph(&self, state: &ClientState) -> Vec<(f64, f64)> {
+    pub fn get_graph(&self, state: &ClientState, sample_width: usize) -> Vec<(f64, f64)> {
         let state = match state.app.try_lock() {
             Ok(state) => state,
             Err(_) => return Vec::new(),
         };
         match self {
-            GRAPHS::Ram => state.with_width(28).ram.clone(),
-            GRAPHS::Cpu => state.with_width(28).cpu.clone(),
-            GRAPHS::Ping => state.with_width(28).ping.clone(),
+            GRAPHS::Ram => state.with_width(sample_width.min(u16::MAX as usize) as u16).ram.clone(),
+            GRAPHS::Cpu => state.with_width(sample_width.min(u16::MAX as usize) as u16).cpu.clone(),
+            GRAPHS::Ping => state.with_width(sample_width.min(u16::MAX as usize) as u16).ping.clone(),
         }
     }
 
@@ -69,6 +69,7 @@ pub struct GraphCard {
     joins: Borders,
 
     open: bool,
+    sample_width: usize,
 }
 
 impl GraphCard {
@@ -82,11 +83,16 @@ impl GraphCard {
             borders: Borders::ALL,
             joins: Borders::NONE,
             open: true,
+            sample_width: 28,
         }
     }
 
     pub fn set_open(&mut self, open: bool) {
         self.open = open;
+    }
+
+    pub fn set_sample_width(&mut self, sample_width: usize) {
+        self.sample_width = sample_width.max(1);
     }
 }
 impl Element for GraphCard {
@@ -100,7 +106,24 @@ impl Element for GraphCard {
 
     fn render(&self, f: &mut Frame, r: Rect, context: &RenderContext<'_>) {
         if self.open {
-            let graph = self.graph_type.get_graph(&self.state);
+            let graph = self.graph_type.get_graph(&self.state, self.sample_width);
+            if graph.is_empty() {
+                let block = Block::default()
+                    .title(format!(" {} ", self.title))
+                    .borders(self.borders)
+                    .border_style(if self.focused {
+                        context.theme.graphs.focused_border
+                    } else {
+                        context.theme.graphs.border
+                    });
+                f.render_widget(
+                    ratatui::widgets::Paragraph::new("No metric samples yet.")
+                        .style(context.theme.text.muted)
+                        .block(block),
+                    r,
+                );
+                return;
+            }
             let unit = self.graph_type.get_unit();
             let min_x = graph.first().map(|(x, _)| *x).unwrap_or(0.0);
             let max_x = graph.last().map(|(x, _)| *x).unwrap_or(100.0);
@@ -117,16 +140,19 @@ impl Element for GraphCard {
                 GRAPHS::Ping => (max_y * 1.2).max(10.0),
             };
 
+            let surface = matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces);
+            let title = format!("{}: {}{}  {}min/{}max", self.title, graph.last().unwrap_or(&(0.0, 0.0)).1 as i64, unit, min_y as i64, max_y as i64);
+            let plot_area = if surface { crate::controls::panel::render_panel(f, r, &title, self.focused, context.theme) } else { r };
             let block = Block::default()
-                .title(format!(
+                .title(if surface { String::new() } else { format!(
                     "{}:─{}{}─{}min/{}max",
                     self.title,
                     graph.last().unwrap_or(&(0.0, 0.0)).1 as i64,
                     unit,
                     min_y as i64,
                     max_y as i64,
-                ))
-                .borders(self.borders)
+                ) })
+                .borders(if surface { Borders::NONE } else { self.borders })
                 .border_style(if self.focused {
                     context.theme.graphs.focused_border
                 } else {
@@ -148,7 +174,7 @@ impl Element for GraphCard {
                         });
                     }
                 });
-            f.render_widget(canvas, r);
+            f.render_widget(canvas, plot_area);
         } else {
             let block = Block::default()
                 .title("")
@@ -160,7 +186,7 @@ impl Element for GraphCard {
                 });
             f.render_widget(block, r);
         }
-        draw_block_joins(
+        if !matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) { draw_block_joins(
             f,
             r,
             self.borders,
@@ -170,7 +196,7 @@ impl Element for GraphCard {
             } else {
                 context.theme.borders.normal
             },
-        );
+        ); }
     }
 }
 

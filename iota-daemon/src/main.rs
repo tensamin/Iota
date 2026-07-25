@@ -1,11 +1,12 @@
 use iota_daemon_lib::{
     DaemonRuntime, DaemonServices, IpcServer, ShutdownReason, StartupPhase, log_broadcaster,
+    log_buffer::LogBuffer,
 };
 use iota_logger::{self as logger, log};
 use iota_storage::users::user_manager;
 use iota_storage::util::config_util::CONFIG;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 #[tokio::main(flavor = "multi_thread")]
@@ -41,7 +42,8 @@ async fn main() -> ExitCode {
     let runtime = Arc::new(DaemonRuntime::new());
     // --- IPC infrastructure ---
     let (log_tx, _) = broadcast::channel(512);
-    log_broadcaster::spawn(log_tx.clone());
+    let log_buffer = Arc::new(Mutex::new(LogBuffer::new(1024)));
+    log_broadcaster::spawn(log_tx.clone(), log_buffer.clone());
     let (state_tx, state_rx) = watch::channel(runtime.snapshot());
 
     runtime.set_startup_phase(StartupPhase::LoadingUsers);
@@ -101,6 +103,7 @@ async fn main() -> ExitCode {
         runtime.clone(),
         services,
         log_tx.clone(),
+        log_buffer.clone(),
         state_rx,
     )
     .await
@@ -128,6 +131,21 @@ async fn main() -> ExitCode {
         .await;
     log!("iota-daemon IPC server ready");
 
+    log!(
+        "iota-daemon paths (scope={:?}): config={} state={} storage={} identity={} cache={} log={} asset={} ipc={}",
+        paths.scope,
+        paths.config_file.display(),
+        paths.state_dir.display(),
+        paths.storage_dir.display(),
+        paths.identity_dir.display(),
+        paths.cache_dir.display(),
+        paths.log_dir.display(),
+        paths.asset_dir.display(),
+        match &paths.ipc_endpoint {
+            iota_paths::IpcEndpoint::UnixSocket(p) => p.display().to_string(),
+            iota_paths::IpcEndpoint::WindowsPipe(n) => n.clone(),
+        },
+    );
     runtime.set_startup_phase(StartupPhase::StartingServices);
 
     // --- System monitor ---

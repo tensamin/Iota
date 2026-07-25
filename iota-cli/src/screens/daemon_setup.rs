@@ -6,9 +6,9 @@ use crate::{
     },
     interaction_result::InteractionResult,
     render_context::RenderContext,
-    screens::screens::Screen,
+    screens::screens::{HitMap, Screen, UiEvent},
 };
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -29,7 +29,7 @@ impl Screen for DaemonStartingScreen {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
-    fn render(&self, frame: &mut Frame, area: Rect, context: &RenderContext<'_>) {
+    fn render(&self, frame: &mut Frame, area: Rect, context: &RenderContext<'_>, _hits: &mut HitMap) {
         let popup = crate::layout::fit::centered_rect(
             area,
             crate::layout::fit::RequiredSize {
@@ -51,7 +51,7 @@ impl Screen for DaemonStartingScreen {
             popup,
         );
     }
-    fn handle_input(&mut self, _: KeyEvent) -> InteractionResult {
+    fn handle_event(&mut self, _: UiEvent) -> InteractionResult {
         InteractionResult::Handled
     }
 }
@@ -191,7 +191,7 @@ impl Screen for DaemonSetupScreen {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
-    fn render(&self, frame: &mut Frame, area: Rect, context: &RenderContext<'_>) {
+    fn render(&self, frame: &mut Frame, area: Rect, context: &RenderContext<'_>, _hits: &mut HitMap) {
         let popup = crate::layout::fit::centered_rect(
             area,
             crate::layout::fit::RequiredSize {
@@ -266,7 +266,8 @@ impl Screen for DaemonSetupScreen {
             context.theme,
         );
     }
-    fn handle_input(&mut self, event: KeyEvent) -> InteractionResult {
+    fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
+        let UiEvent::Key(event) = event else { return InteractionResult::Unhandled; };
         match event.code {
             KeyCode::Esc => {
                 self.complete(DaemonSetupDecision::Exit);

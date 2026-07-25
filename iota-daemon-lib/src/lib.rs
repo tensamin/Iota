@@ -3,6 +3,7 @@ pub mod daemon_state;
 pub mod deployment;
 pub mod ipc_server;
 pub mod log_broadcaster;
+pub mod log_buffer;
 pub mod services;
 pub mod task_registry;
 

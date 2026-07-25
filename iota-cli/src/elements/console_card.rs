@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -35,6 +35,10 @@ pub struct ConsoleCard {
     last_swap: Arc<Mutex<Instant>>,
     pending_restore: Arc<Mutex<Option<String>>>,
     pending_confirmation: Option<String>,
+    history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: String,
+    message: Option<String>,
 }
 
 impl ConsoleCard {
@@ -51,6 +55,10 @@ impl ConsoleCard {
             last_swap: Arc::new(Mutex::new(Instant::now())),
             pending_restore: Arc::new(Mutex::new(None)),
             pending_confirmation: None,
+            history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            message: None,
         }
     }
 
@@ -151,6 +159,9 @@ impl ConsoleCard {
     }
 
     fn render_cursor_spans(&self, theme: &crate::theme::ResolvedTheme) -> Vec<Span<'static>> {
+        if let Some(message) = &self.message {
+            return vec![Span::styled(message.clone(), theme.console.error)];
+        }
         if let Some(command) = &self.pending_confirmation {
             return vec![Span::styled(
                 format!("Confirm `{command}`? [y/N]"),
@@ -163,11 +174,17 @@ impl ConsoleCard {
     fn is_destructive(command: &str) -> bool {
         matches!(
             command.trim_start_matches('/').trim(),
-            "restart" | "reload" | "stop" | "shutdown" | "regenerate keys"
+            "restart"
+                | "reload"
+                | "stop"
+                | "shutdown"
+                | "regenerate keys"
+                | "identity rotate"
         ) || command
             .trim_start_matches('/')
             .trim_start()
-            .starts_with("user remove ")
+            .split_once(" remove ")
+            .is_some_and(|(noun, _)| matches!(noun, "user" | "users"))
     }
 
     fn dispatch_command(&self, command: String) {
@@ -214,6 +231,69 @@ impl ConsoleCard {
         self.content.insert(idx, c);
         self.cursor_position += 1;
     }
+
+    pub fn handle_paste(&mut self, text: &str) {
+        let sanitized = text.replace(['\r', '\n'], " ");
+        let index = self.byte_index();
+        self.content.insert_str(index, &sanitized);
+        self.cursor_position += sanitized.chars().count();
+        self.message = None;
+    }
+
+    fn set_editor(&mut self, value: String) {
+        self.content = value;
+        self.cursor_position = self.content.chars().count();
+    }
+
+    fn history_previous(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let index = match self.history_index {
+            None => {
+                self.history_draft = self.content.clone();
+                self.history.len() - 1
+            }
+            Some(index) => index.saturating_sub(1),
+        };
+        self.history_index = Some(index);
+        self.set_editor(self.history[index].clone());
+        self.message = None;
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index + 1 < self.history.len() {
+            self.history_index = Some(index + 1);
+            self.set_editor(self.history[index + 1].clone());
+        } else {
+            self.history_index = None;
+            let draft = std::mem::take(&mut self.history_draft);
+            self.set_editor(draft);
+        }
+        self.message = None;
+    }
+
+    fn complete(&mut self) -> bool {
+        let completions = iota_ipc::text_commands::completions(&self.content);
+        if completions.len() == 1 {
+            let leading_slash = self.content.starts_with('/');
+            self.set_editor(format!(
+                "{}{}",
+                if leading_slash { "/" } else { "" },
+                completions[0]
+            ));
+            self.message = None;
+            true
+        } else if completions.len() > 1 {
+            self.message = Some(format!("Matches: {}", completions.join(", ")));
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Element for ConsoleCard {
@@ -226,6 +306,21 @@ impl Element for ConsoleCard {
     }
 
     fn render(&self, f: &mut Frame, r: Rect, context: &RenderContext<'_>) {
+        if matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) {
+            let inner = crate::controls::panel::render_panel(
+                f,
+                r,
+                &self.title,
+                self.focused,
+                context.theme,
+            );
+            f.render_widget(
+                Paragraph::new(Line::from(self.render_cursor_spans(context.theme)))
+                    .style(context.theme.console.text),
+                inner,
+            );
+            return;
+        }
         let block = Block::default()
             .borders(self.borders)
             .title(self.title.clone())
@@ -304,6 +399,7 @@ impl InteractableElement for ConsoleCard {
         if let Some(restored) = self.pending_restore.lock().unwrap().take() {
             self.content = restored;
             self.cursor_position = self.content.chars().count();
+            self.message = Some("Command failed; restored for retry.".into());
         }
 
         if let Some(command) = self.pending_confirmation.take() {
@@ -320,6 +416,22 @@ impl InteractableElement for ConsoleCard {
                 }
 
                 let command = self.content.clone();
+                if let Some(error) = iota_ipc::text_commands::validation_error(&command) {
+                    self.message = Some(error);
+                    return InteractionResult::Handled;
+                }
+                if command.trim_start_matches('/').trim() == "help" {
+                    self.message = Some(format!(
+                        "Commands: {}",
+                        iota_ipc::text_commands::COMMANDS.join(", ")
+                    ));
+                    return InteractionResult::Handled;
+                }
+                if self.history.last() != Some(&command) {
+                    self.history.push(command.clone());
+                }
+                self.history_index = None;
+                self.history_draft.clear();
                 self.content.clear();
                 self.cursor_position = 0;
                 if Self::is_destructive(&command) {
@@ -330,10 +442,12 @@ impl InteractableElement for ConsoleCard {
                 InteractionResult::Handled
             }
             KeyCode::Backspace => {
+                self.message = None;
                 self.delete_at_cursor();
                 InteractionResult::Handled
             }
             KeyCode::Delete => {
+                self.message = None;
                 let len = self.content.chars().count();
                 if self.cursor_position < len {
                     let start = self.byte_index();
@@ -363,14 +477,35 @@ impl InteractableElement for ConsoleCard {
                 self.cursor_position = self.content.chars().count();
                 InteractionResult::Handled
             }
-            KeyCode::Tab | KeyCode::BackTab => InteractionResult::Unhandled,
-            _ => {
-                if let Some(c) = key.code.as_char() {
-                    self.insert_at_cursor(c);
+            KeyCode::Up => {
+                self.history_previous();
+                InteractionResult::Handled
+            }
+            KeyCode::Down => {
+                self.history_next();
+                InteractionResult::Handled
+            }
+            KeyCode::Tab if !self.content.is_empty() => {
+                if self.complete() {
                     InteractionResult::Handled
                 } else {
-                    InteractionResult::Unhandled
+                    self.message = Some("No command completion.".into());
+                    InteractionResult::Handled
                 }
+            }
+            KeyCode::Tab | KeyCode::BackTab => InteractionResult::Unhandled,
+            _ => {
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    if let Some(c) = key.code.as_char() {
+                        self.insert_at_cursor(c);
+                        self.message = None;
+                        return InteractionResult::Handled;
+                    }
+                }
+                InteractionResult::Unhandled
             }
         }
     }

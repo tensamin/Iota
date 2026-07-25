@@ -1,14 +1,28 @@
 use crate::{
+    controls::header::render_header,
     input_handler::setup_input_handler,
     interaction_result::InteractionResult,
     ipc_client::IpcClient,
     render_context::RenderContext,
-    screens::screens::Screen,
+    screens::{
+        main_screen::MainScreen,
+        metrics::MetricsScreen,
+        overview::OverviewScreen,
+        screens::{AppAction, AppEvent, HitMap, Screen, UiEvent},
+        settings::SettingsScreen,
+        users::{UserEntry, UsersScreen},
+    },
     theme::{self, ResolvedTheme, ThemeName},
 };
-use crossterm::event::KeyEvent;
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, MouseEventKind,
+};
 use once_cell::sync::Lazy;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Layout},
+};
 use std::{
     io,
     io::Stdout,
@@ -18,7 +32,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Notify, RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -35,6 +49,10 @@ pub struct UI {
     theme: RwLock<Arc<ResolvedTheme>>,
     pub(crate) invalidation: Notify,
     failure: Arc<Mutex<Option<String>>>,
+    hits: Mutex<HitMap>,
+    app_event_tx: mpsc::UnboundedSender<UiEvent>,
+    app_event_rx: Mutex<Option<mpsc::UnboundedReceiver<UiEvent>>>,
+    header_focus: Mutex<Option<usize>>,
 }
 
 pub fn start_tui(ipc: Arc<IpcClient>) -> io::Result<TuiSession> {
@@ -55,6 +73,24 @@ pub fn start_bootstrap_tui_with_theme(theme: ResolvedTheme) -> io::Result<TuiSes
 
 fn start_session(ui: UI) -> io::Result<TuiSession> {
     let ui = Arc::new(ui);
+    let mut app_event_rx = ui
+        .app_event_rx
+        .lock()
+        .map_err(|_| io::Error::other("application event queue poisoned"))?
+        .take()
+        .ok_or_else(|| io::Error::other("application event queue already started"))?;
+    let app_ui = ui.clone();
+    let app_event_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = app_ui.cancellation.cancelled() => break,
+                event = app_event_rx.recv() => match event {
+                    Some(event) => app_ui.clone().handle_event(event).await,
+                    None => break,
+                },
+            }
+        }
+    });
     let uic = ui.clone();
     let renderer_task = tokio::spawn(async move {
         let cancellation = uic.cancellation_token();
@@ -62,7 +98,6 @@ fn start_session(ui: UI) -> io::Result<TuiSession> {
             tokio::select! {
                 _ = cancellation.cancelled() => break Ok(()),
                 _ = uic.invalidation.notified() => { if !uic.is_shutdown() { uic.render().await?; } },
-                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => { if !uic.is_shutdown() { uic.render().await?; } },
             }
         };
         if let Err(error) = &result {
@@ -101,6 +136,7 @@ fn start_session(ui: UI) -> io::Result<TuiSession> {
         ui,
         renderer_task,
         input_task,
+        app_event_task,
         signal_task,
         restored: AtomicBool::new(false),
         previous_hook,
@@ -111,6 +147,7 @@ pub struct TuiSession {
     ui: Arc<UI>,
     renderer_task: JoinHandle<io::Result<()>>,
     input_task: JoinHandle<Result<(), String>>,
+    app_event_task: JoinHandle<()>,
     signal_task: Option<JoinHandle<()>>,
     restored: AtomicBool,
     previous_hook: Arc<Mutex<Option<Box<dyn Fn(&PanicHookInfo<'_>) + Send + Sync + 'static>>>>,
@@ -129,6 +166,7 @@ impl TuiSession {
             tokio::time::timeout(std::time::Duration::from_secs(2), &mut self.renderer_task).await;
         let input =
             tokio::time::timeout(std::time::Duration::from_secs(2), &mut self.input_task).await;
+        self.app_event_task.abort();
         if renderer.is_err() {
             self.renderer_task.abort();
         }
@@ -154,6 +192,7 @@ impl TuiSession {
     }
     fn restore_terminal_once(&self) {
         if !self.restored.swap(true, Ordering::AcqRel) {
+            let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
             ratatui::restore();
         }
     }
@@ -168,6 +207,7 @@ impl Drop for TuiSession {
         self.ui.request_shutdown();
         self.renderer_task.abort();
         self.input_task.abort();
+        self.app_event_task.abort();
         if let Some(task) = self.signal_task.as_ref() {
             task.abort();
         }
@@ -182,6 +222,8 @@ impl UI {
         theme: ResolvedTheme,
     ) -> io::Result<Self> {
         let terminal = ratatui::try_init()?;
+        crossterm::execute!(io::stdout(), EnableMouseCapture)?;
+        let (app_event_tx, app_event_rx) = mpsc::unbounded_channel();
         Ok(Self {
             ipc: RwLock::new(ipc),
             shutdown_on_empty,
@@ -191,6 +233,10 @@ impl UI {
             theme: RwLock::new(Arc::new(theme)),
             invalidation: Notify::new(),
             failure: Arc::new(Mutex::new(None)),
+            hits: Mutex::new(HitMap::default()),
+            app_event_tx,
+            app_event_rx: Mutex::new(Some(app_event_rx)),
+            header_focus: Mutex::new(None),
         })
     }
 
@@ -228,10 +274,6 @@ impl UI {
     pub fn failure(&self) -> Option<String> {
         self.failure.lock().ok().and_then(|f| f.clone())
     }
-    pub async fn handle_paste(&self, _text: String) {
-        self.invalidate();
-    }
-
     /// Lets bootstrap operations race their work against Ctrl+C without
     /// blocking the input task or leaving the terminal in raw mode.
     pub async fn wait_for_shutdown(&self) {
@@ -259,10 +301,157 @@ impl UI {
         self.invalidate();
     }
     pub async fn handle_input(self: Arc<Self>, key_event: KeyEvent) {
+        self.handle_event(UiEvent::Key(key_event)).await;
+    }
+    pub async fn handle_event(self: Arc<Self>, event: UiEvent) {
+        if matches!(&event, UiEvent::App(AppEvent::OpenUsers)) {
+            self.open_users().await;
+            return;
+        }
+        if matches!(&event, UiEvent::App(AppEvent::OpenMetrics)) {
+            if let Some(screen) = MetricsScreen::new(self.clone()).await {
+                self.set_screen(Box::new(screen)).await;
+            }
+            return;
+        }
+        if let UiEvent::App(AppEvent::ApplyTheme { theme, persist }) = &event {
+            self.set_theme(theme::resolve(*theme)).await;
+            if *persist {
+                let mut config = theme::UiConfig::load().unwrap_or_default();
+                config.theme = *theme;
+                let result = config
+                    .save()
+                    .map_err(|error| format!("Could not save UI settings: {error}"));
+                let _ = self
+                    .app_event_tx
+                    .send(UiEvent::App(AppEvent::ThemeSaved(result)));
+            }
+            return;
+        }
+        if let UiEvent::App(AppEvent::SaveSettings { theme, color, unicode }) = &event {
+            self.set_theme(theme::resolve(*theme)).await;
+            let mut config = theme::UiConfig::load().unwrap_or_default();
+            config.theme = *theme;
+            config.color = *color;
+            config.unicode = *unicode;
+            let result = config
+                .save()
+                .map_err(|error| format!("Could not save UI settings: {error}"));
+            let _ = self.app_event_tx.send(UiEvent::App(AppEvent::ThemeSaved(result)));
+            return;
+        }
+        if matches!(&event, UiEvent::App(AppEvent::RegenerateKeysRequested)) {
+            let Some(ipc) = self.ipc().await else {
+                let _ = self
+                    .app_event_tx
+                    .send(UiEvent::App(AppEvent::KeysRegenerated(Err(
+                        "Not connected to daemon.".into(),
+                    ))));
+                return;
+            };
+            let sender = self.app_event_tx.clone();
+            tokio::spawn(async move {
+                let result = match ipc
+                    .send_request(iota_ipc::LocalRequest::RotateIotaIdentity)
+                    .await
+                {
+                    Ok(iota_ipc::ResponseResult::Ok(_)) => Ok(()),
+                    Ok(iota_ipc::ResponseResult::Error(error)) => {
+                        Err(format!("Cannot regenerate keys: {error}"))
+                    }
+                    Err(error) => Err(format!("Cannot regenerate keys: {error}")),
+                };
+                let _ = sender.send(UiEvent::App(AppEvent::KeysRegenerated(result)));
+            });
+            return;
+        }
+        if let UiEvent::Key(key) = &event {
+            let header_is_focused = self
+                .header_focus
+                .lock()
+                .map(|focus| focus.is_some())
+                .unwrap_or(false);
+            if key.code == KeyCode::F(6) {
+                if let Ok(mut focus) = self.header_focus.lock() {
+                    *focus = if focus.is_some() { None } else { Some(0) };
+                }
+                self.invalidate();
+                return;
+            }
+            if header_is_focused {
+                let mut action = None;
+                if let Ok(mut focus) = self.header_focus.lock() {
+                    let index = focus.unwrap_or(0);
+                    match key.code {
+                        KeyCode::Left | KeyCode::BackTab => *focus = Some((index + 3) % 4),
+                        KeyCode::Right | KeyCode::Tab => *focus = Some((index + 1) % 4),
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            action = Some([
+                                AppAction::OpenOverview,
+                                AppAction::OpenUsers,
+                                AppAction::OpenSettings,
+                                AppAction::Quit,
+                            ][index]);
+                            *focus = None;
+                        }
+                        KeyCode::Esc => *focus = None,
+                        _ => {}
+                    }
+                }
+                if let Some(action) = action {
+                    self.dispatch_action(action).await;
+                } else {
+                    self.invalidate();
+                }
+                return;
+            }
+        }
+        if let UiEvent::Mouse(mouse) = &event {
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) {
+                let action = self
+                    .hits
+                    .lock()
+                    .ok()
+                    .and_then(|hits| hits.action_at(mouse.column, mouse.row));
+                if action == Some(AppAction::FocusLogs) {
+                    self.dispatch_action(AppAction::FocusLogs).await;
+                    let key = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                        KeyCode::Up
+                    } else {
+                        KeyCode::Down
+                    };
+                    // Log scrolling is a local, handled interaction; route it
+                    // directly rather than recursively constructing another
+                    // async UI event future.
+                    if let Some(screen) = self.screen_stack.write().await.last_mut() {
+                        let _ = screen.handle_event(UiEvent::Key(KeyEvent::from(key)));
+                    }
+                    self.invalidate();
+                    return;
+                }
+            }
+            if matches!(
+                mouse.kind,
+                MouseEventKind::Down(crossterm::event::MouseButton::Left)
+            ) {
+                if let Some(action) = self
+                    .hits
+                    .lock()
+                    .ok()
+                    .and_then(|hits| hits.action_at(mouse.column, mouse.row))
+                {
+                    self.dispatch_action(action).await;
+                    return;
+                }
+            }
+        }
         let result = {
             let mut stack = self.screen_stack.write().await;
             if let Some(screen) = stack.last_mut() {
-                screen.handle_input(key_event)
+                screen.handle_event(event)
             } else {
                 return;
             }
@@ -278,6 +467,13 @@ impl UI {
                     _ = ui.cancellation.cancelled() => return,
                 }
             }
+            InteractionResult::AppTask { task } => {
+                let sender = self.app_event_tx.clone();
+                tokio::spawn(async move {
+                    let event = task.await;
+                    let _ = sender.send(event);
+                });
+            }
             InteractionResult::CloseScreen => {
                 let mut stack = self.screen_stack.write().await;
                 stack.pop();
@@ -292,6 +488,78 @@ impl UI {
         self.invalidate();
     }
 
+    async fn dispatch_action(self: &Arc<Self>, action: AppAction) {
+        match action {
+            AppAction::Quit => self.request_shutdown(),
+            AppAction::OpenMain => {
+                let mut stack = self.screen_stack.write().await;
+                if stack.len() > 1 {
+                    stack.truncate(1);
+                }
+                drop(stack);
+                self.invalidate();
+            }
+            AppAction::OpenOverview => {
+                let status = {
+                    let stack = self.screen_stack.read().await;
+                    stack
+                        .iter()
+                        .rev()
+                        .find_map(|s| s.as_any().downcast_ref::<MainScreen>())
+                        .map(|main| (main.connection_status(), main.daemon_status()))
+                };
+                if let Some((connection, daemon)) = status {
+                    self.set_screen(Box::new(OverviewScreen::new(connection, daemon)))
+                        .await;
+                }
+            }
+            AppAction::OpenUsers => self.open_users().await,
+            AppAction::OpenSettings => {
+                let current = self.theme_name().await;
+                self.set_screen(Box::new(SettingsScreen::new(current))).await;
+            }
+            AppAction::OpenMetrics => {
+                if let Some(screen) = MetricsScreen::new(self.clone()).await {
+                    self.set_screen(Box::new(screen)).await;
+                }
+            }
+            action => {
+                let result = {
+                    let mut stack = self.screen_stack.write().await;
+                    stack.last_mut().map(|screen| screen.handle_action(action))
+                };
+                if matches!(result, Some(InteractionResult::CloseScreen)) {
+                    let mut stack = self.screen_stack.write().await;
+                    stack.pop();
+                }
+                self.invalidate();
+            }
+        }
+    }
+    async fn open_users(self: &Arc<Self>) {
+        let Some(ipc) = self.ipc().await else { return };
+        self.set_screen(Box::new(UsersScreen::loading(ipc.clone())))
+            .await;
+        let sender = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = match ipc.send_request(iota_ipc::LocalRequest::ListUsers).await {
+                Ok(iota_ipc::ResponseResult::Ok(iota_ipc::ResponsePayload::Users(users))) => {
+                    Ok(users
+                        .into_iter()
+                        .map(|u| UserEntry {
+                            user_id: u.user_id,
+                            username: u.username,
+                        })
+                        .collect())
+                }
+                Ok(iota_ipc::ResponseResult::Error(error)) => Err(format!("Cannot load users: {error}")),
+                Ok(_) => Err("Daemon returned an unexpected response while loading users.".into()),
+                Err(error) => Err(format!("Cannot load users: {error}")),
+            };
+            let _ = sender.send(UiEvent::App(AppEvent::UsersLoaded(result)));
+        });
+    }
+
     pub async fn render(&self) -> io::Result<()> {
         let theme = self.theme.read().await.clone();
         let context = RenderContext {
@@ -304,9 +572,54 @@ impl UI {
                 .terminal
                 .lock()
                 .map_err(|_| io::Error::other("terminal mutex poisoned"))?;
+            let mut hits = HitMap::default();
             terminal.draw(|f| {
-                screen.render(f, f.area(), &context);
+                let rows = Layout::vertical([
+                    Constraint::Length(2),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
+                .split(f.area());
+                let header_title = self
+                    .screen_stack
+                    .try_read()
+                    .ok()
+                    .and_then(|stack| {
+                        stack
+                            .iter()
+                            .find_map(|item| item.as_any().downcast_ref::<MainScreen>())
+                            .map(|main| main.app_title())
+                    })
+                    .unwrap_or_else(|| screen.app_title());
+                let header_focus = self.header_focus.lock().ok().and_then(|focus| *focus);
+                render_header(
+                    f,
+                    rows[0],
+                    &header_title,
+                    context.theme,
+                    &mut hits,
+                    header_focus,
+                );
+                let hints = if header_focus.is_some() {
+                    " Left/Right: choose   Enter: activate   Esc/F6: screen".to_owned()
+                } else {
+                    screen
+                        .key_hints()
+                        .into_iter()
+                        .map(|hint| format!("{}: {}", hint.keys, hint.action))
+                        .collect::<Vec<_>>()
+                        .join("   ")
+                };
+                f.render_widget(
+                    ratatui::widgets::Paragraph::new(format!(" {hints}"))
+                        .style(context.theme.surfaces.footer.patch(context.theme.text.muted)),
+                    rows[2],
+                );
+                screen.render(f, rows[1], &context, &mut hits);
             })?;
+            if let Ok(mut current) = self.hits.lock() {
+                *current = hits;
+            }
         }
         Ok(())
     }

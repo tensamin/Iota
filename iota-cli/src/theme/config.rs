@@ -13,6 +13,19 @@ pub struct UiConfig {
     /// Whether opening the interactive UI should launch a locally installed daemon.
     #[serde(default)]
     pub daemon_start_policy: DaemonStartPolicy,
+    #[serde(default)]
+    pub color: TerminalPolicy,
+    #[serde(default)]
+    pub unicode: TerminalPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalPolicy {
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

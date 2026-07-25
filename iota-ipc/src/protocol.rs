@@ -49,6 +49,25 @@ pub enum LocalRequest {
     RestartDaemon,
     #[serde(skip)]
     StopDaemon,
+    GetConfig,
+    SetConfig {
+        key: String,
+        value: String,
+    },
+    ReloadConfig,
+    GetOmikronStatus,
+    ListComponents,
+    GetUser {
+        user_id: i64,
+    },
+    ImportUser {
+        username: String,
+    },
+    GetLogs {
+        limit: usize,
+    },
+    CheckUpdate,
+    ListCommunities,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -107,8 +126,100 @@ pub struct ResponseEnvelope {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ResponseResult {
-    Ok(String),
+    Ok(ResponsePayload),
     Error(IpcErrorCode),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum ResponsePayload {
+    Status(StatusResponse),
+    Tasks(Vec<TaskSummary>),
+    Users(Vec<UserSummary>),
+    UserCreated {
+        user_id: i64,
+        username: String,
+    },
+    UserRemoved {
+        user_id: i64,
+    },
+    Acknowledged {
+        message: String,
+    },
+    DaemonStatus(DaemonStatusResponse),
+    Config(ConfigResponse),
+    OmikronStatus(OmikronStatusResponse),
+    Components(Vec<ComponentStatusResponse>),
+    UserDetail(UserDetailResponse),
+    LogEntries(LogEntriesResponse),
+    UpdateStatus(UpdateStatusResponse),
+    Communities(Vec<CommunitySummary>),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ConfigResponse {
+    pub yaml: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OmikronStatusResponse {
+    pub connected: bool,
+    pub iota_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ComponentStatusResponse {
+    pub id: ComponentId,
+    pub status: HealthStatus,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UserDetailResponse {
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub created_at: i64,
+    pub trusted_apps: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LogEntriesResponse {
+    pub entries: Vec<LogEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UpdateStatusResponse {
+    pub available: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CommunitySummary {
+    pub name: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StatusResponse {
+    pub phase: String,
+    pub tasks: Vec<String>,
+    pub degraded_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TaskSummary {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UserSummary {
+    pub user_id: i64,
+    pub username: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DaemonStatusResponse {
+    pub formatted: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -126,6 +237,36 @@ pub enum IpcErrorCode {
     Cancelled,
     Unauthorized,
     InternalFailure,
+}
+
+impl std::fmt::Display for IpcErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidRequest => "the daemon rejected the request",
+            Self::NotFound => "the requested resource was not found",
+            Self::Conflict => "the request conflicts with current daemon state",
+            Self::StorageFailure => "the daemon could not access local storage",
+            Self::OmikronUnavailable => "Omikron is unavailable",
+            Self::UnsupportedVersion => "the client and daemon protocol versions are incompatible",
+            Self::NotReady => "the daemon is not ready yet",
+            Self::Disconnected => "the daemon connection was lost",
+            Self::Timeout => "the daemon did not respond in time",
+            Self::Cancelled => "the daemon cancelled the request",
+            Self::Unauthorized => "the daemon denied this operation",
+            Self::InternalFailure => "the daemon encountered an internal failure",
+        })
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::IpcErrorCode;
+
+    #[test]
+    fn error_codes_have_operator_facing_messages() {
+        assert_eq!(IpcErrorCode::NotReady.to_string(), "the daemon is not ready yet");
+        assert!(!IpcErrorCode::InternalFailure.to_string().contains("InternalFailure"));
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

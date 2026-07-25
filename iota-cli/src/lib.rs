@@ -8,9 +8,13 @@ pub mod screens {
     pub mod daemon_setup;
     pub mod main_screen;
     pub mod md_viewer;
+    pub mod metrics;
+    pub mod overview;
     pub mod screens;
+    pub mod settings;
     pub mod terms_checker;
     pub mod terms_updater;
+    pub mod users;
 }
 pub mod util {
     pub mod borders;

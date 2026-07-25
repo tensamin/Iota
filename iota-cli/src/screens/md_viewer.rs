@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use crossterm::event::{self, Event, KeyCode};
 use ratatui::{
     DefaultTerminal,
     prelude::*,
@@ -10,7 +10,7 @@ use std::{any::Any, time::Duration};
 use crate::{
     interaction_result::InteractionResult,
     render_context::RenderContext,
-    screens::screens::Screen,
+    screens::screens::{HitMap, Screen, UiEvent},
     theme::{ResolvedTheme, TextSemantics, ThemeName},
 };
 
@@ -29,11 +29,12 @@ impl Screen for FileViewer {
         self
     }
 
-    fn render(&self, f: &mut Frame, rect: Rect, context: &RenderContext<'_>) {
+    fn render(&self, f: &mut Frame, rect: Rect, context: &RenderContext<'_>, _hits: &mut HitMap) {
         self.draw(f, rect, context.theme);
     }
 
-    fn handle_input(&mut self, event: KeyEvent) -> InteractionResult {
+    fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
+        let UiEvent::Key(event) = event else { return InteractionResult::Unhandled; };
         match event.code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 return InteractionResult::CloseScreen;

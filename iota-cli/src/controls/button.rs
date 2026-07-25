@@ -3,7 +3,7 @@ use ratatui::{
     Frame,
     layout::{Alignment, Rect},
     text::Span,
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
 };
 use unicode_width::UnicodeWidthStr;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,9 +39,8 @@ pub fn render_button(
         }
     };
     frame.render_widget(
-        Paragraph::new(Span::styled(button.label, style))
-            .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(Span::styled(if button.focused { format!("› {}", button.label) } else { button.label.to_owned() }, style))
+            .alignment(Alignment::Center),
         area,
     );
 }

@@ -1,3 +1,4 @@
+use crate::log_buffer::LogBuffer;
 use crate::deployment::from_environment;
 use crate::{CommandRouter, DaemonRuntime, DaemonServices};
 use iota_ipc::{
@@ -8,7 +9,7 @@ use iota_logger::log;
 use std::io::Result;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{env, fs::File, os::fd::FromRawFd, os::unix::net::UnixListener as StdUnixListener};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -22,11 +23,25 @@ const CLIENT_CHANNEL_SIZE: usize = 256;
 const MAX_HANDSHAKE_RETRIES: u32 = 1;
 const CLIENT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Minimum metric subscription interval to prevent excessive update rates.
+const MIN_METRIC_INTERVAL_MS: u64 = 100;
+/// Maximum metric subscription interval.
+const MAX_METRIC_INTERVAL_MS: u64 = 60_000;
+/// Default metric interval if the client does not specify one.
+const DEFAULT_METRIC_INTERVAL_MS: u64 = 500;
+
+/// Per-client subscription state.
+struct ClientSubscription {
+    log_classes: Vec<String>,
+    metric_interval_ms: u64,
+}
+
 pub struct IpcServer {
     listener: UnixListener,
     runtime: Arc<DaemonRuntime>,
     services: Arc<DaemonServices>,
     log_tx: broadcast::Sender<DaemonMessage>,
+    log_buffer: Arc<Mutex<LogBuffer>>,
     state_rx: watch::Receiver<iota_ipc::StateSnapshot>,
     instance_id: String,
     _instance_lock: File,
@@ -38,6 +53,7 @@ impl IpcServer {
         runtime: Arc<DaemonRuntime>,
         services: Arc<DaemonServices>,
         log_tx: broadcast::Sender<DaemonMessage>,
+        log_buffer: Arc<Mutex<LogBuffer>>,
         state_rx: watch::Receiver<iota_ipc::StateSnapshot>,
     ) -> Result<Self> {
         let path = path.into();
@@ -90,6 +106,7 @@ impl IpcServer {
                     runtime,
                     services,
                     log_tx,
+                    log_buffer,
                     state_rx,
                     instance_id: Uuid::new_v4().to_string(),
                     _instance_lock: lock,
@@ -101,6 +118,7 @@ impl IpcServer {
             runtime,
             services,
             log_tx,
+            log_buffer,
             state_rx,
             instance_id: Uuid::new_v4().to_string(),
             _instance_lock: File::options().read(true).open("/dev/null")?,
@@ -114,11 +132,12 @@ impl IpcServer {
             let runtime = self.runtime.clone();
             let services = self.services.clone();
             let log_tx = self.log_tx.clone();
+            let log_buffer = self.log_buffer.clone();
             let state_rx = self.state_rx.clone();
             let instance_id = self.instance_id.clone();
             tokio::spawn(async move {
                 if let Err(error) =
-                    handle_client(stream, runtime, services, log_tx, state_rx, instance_id).await
+                    handle_client(stream, runtime, services, log_tx, log_buffer, state_rx, instance_id).await
                 {
                     eprintln!("IPC client error: {error}");
                 }
@@ -252,6 +271,7 @@ async fn handle_client(
     runtime: Arc<DaemonRuntime>,
     services: Arc<DaemonServices>,
     log_tx: broadcast::Sender<DaemonMessage>,
+    log_buffer: Arc<Mutex<LogBuffer>>,
     mut state_rx: watch::Receiver<iota_ipc::StateSnapshot>,
     instance_id: String,
 ) -> Result<()> {
@@ -337,12 +357,18 @@ async fn handle_client(
 
     // --- Writer task: merge directed responses + shared log events ---
     let mut log_rx = log_tx.subscribe();
+    let (sub_tx, mut sub_rx) = tokio::sync::watch::channel(ClientSubscription {
+        log_classes: Vec::new(),
+        metric_interval_ms: DEFAULT_METRIC_INTERVAL_MS,
+    });
     let writer_task = {
         let runtime = runtime.clone();
         let session_cancellation = session_cancellation.clone();
         tokio::spawn(async move {
             let mut directed_rx = directed_rx;
+            let mut last_metric_sent = tokio::time::Instant::now();
             loop {
+                let metric_interval = sub_rx.borrow().metric_interval_ms;
                 tokio::select! {
                     // Directed messages (responses to this client's requests)
                     msg = directed_rx.recv() => {
@@ -360,9 +386,35 @@ async fn handle_client(
                     // Shared log events
                     result = log_rx.recv() => {
                         match result {
+                            Ok(DaemonMessage::LogEntry(entry)) => {
+                                // Filter by subscribed log classes
+                                let log_classes = sub_rx.borrow().log_classes.clone();
+                                if log_classes.is_empty()
+                                    || log_classes.iter().any(|c| entry.sender == *c)
+                                {
+                                    if let Err(error) = write_client_message(&mut writer, &DaemonMessage::LogEntry(entry)).await {
+                                        eprintln!("IPC client writer stopped while sending log message: {error}");
+                                        session_cancellation.cancel();
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(DaemonMessage::MetricSample(sample)) => {
+                                // Rate-limit metric samples based on subscription interval
+                                let now = tokio::time::Instant::now();
+                                if now.duration_since(last_metric_sent) >= std::time::Duration::from_millis(metric_interval) {
+                                    last_metric_sent = now;
+                                    if let Err(error) = write_client_message(&mut writer, &DaemonMessage::MetricSample(sample)).await {
+                                        eprintln!("IPC client writer stopped while sending metric sample: {error}");
+                                        session_cancellation.cancel();
+                                        break;
+                                    }
+                                }
+                            }
                             Ok(message) => {
+                                // Forward other broadcast messages as-is
                                 if let Err(error) = write_client_message(&mut writer, &message).await {
-                                    eprintln!("IPC client writer stopped while sending log message: {error}");
+                                    eprintln!("IPC client writer stopped while sending broadcast message: {error}");
                                     session_cancellation.cancel();
                                     break;
                                 }
@@ -389,13 +441,14 @@ async fn handle_client(
                             break;
                         }
                     }
+                    _ = sub_rx.changed() => {}
                 }
             }
         })
     };
 
     // --- Reader loop ---
-    let router = CommandRouter::new(runtime.clone(), services);
+    let router = CommandRouter::new(runtime.clone(), services, log_buffer);
     loop {
         let message = tokio::select! {
             _ = session_cancellation.cancelled() => break,
@@ -442,7 +495,17 @@ async fn handle_client(
                     break;
                 }
             }
-            Ok(ClientMessage::Subscribe { .. }) => {
+            Ok(ClientMessage::Subscribe {
+                log_classes,
+                metric_interval_ms,
+            }) => {
+                let interval = metric_interval_ms
+                    .unwrap_or(DEFAULT_METRIC_INTERVAL_MS)
+                    .clamp(MIN_METRIC_INTERVAL_MS, MAX_METRIC_INTERVAL_MS);
+                let _ = sub_tx.send(ClientSubscription {
+                    log_classes,
+                    metric_interval_ms: interval,
+                });
                 let snapshot = DaemonMessage::StateUpdate(runtime.snapshot());
                 let _ = directed_tx.send(snapshot).await;
                 let _ = directed_tx.send(DaemonMessage::Subscribed).await;

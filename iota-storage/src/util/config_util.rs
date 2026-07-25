@@ -172,6 +172,57 @@ pub fn modify_config(f: impl FnOnce(&mut IotaConfig)) {
     CONFIG.store(Arc::new(cfg));
     save_config();
 }
+
+pub fn modify_config_value(key: &str, value: &str) -> Result<(), &'static str> {
+    match key {
+        "iota_id" => {
+            let parsed: u64 = value.parse().map_err(|_| "invalid iota_id")?;
+            modify_config(|cfg| cfg.iota_id = Some(parsed));
+            Ok(())
+        }
+        "port" => {
+            let parsed: u16 = value.parse().map_err(|_| "invalid port")?;
+            modify_config(|cfg| cfg.port = parsed);
+            Ok(())
+        }
+        "omikron_host" => {
+            let host = value.to_string();
+            modify_config(|cfg| cfg.omikron_host = Some(host));
+            Ok(())
+        }
+        "omikron_port" => {
+            let parsed: u16 = value.parse().map_err(|_| "invalid omikron_port")?;
+            modify_config(|cfg| cfg.omikron_port = Some(parsed));
+            Ok(())
+        }
+        "read_receipts_enabled" => {
+            let parsed: bool = value.parse().map_err(|_| "invalid boolean")?;
+            modify_config(|cfg| cfg.read_receipts_enabled = parsed);
+            Ok(())
+        }
+        "web.mode" => {
+            let mode = match value {
+                "disabled" => WebMode::Disabled,
+                "loopback" => WebMode::Loopback,
+                "network" => WebMode::Network,
+                _ => return Err("invalid web.mode; use disabled, loopback, or network"),
+            };
+            modify_config(|cfg| cfg.web.mode = mode);
+            Ok(())
+        }
+        "web.port" => {
+            let parsed: u16 = value.parse().map_err(|_| "invalid web.port")?;
+            modify_config(|cfg| cfg.web.port = parsed);
+            Ok(())
+        }
+        "web.bind" => {
+            let bind = value.to_string();
+            modify_config(|cfg| cfg.web.bind = bind);
+            Ok(())
+        }
+        _ => Err("unknown config key"),
+    }
+}
 static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn configure_config_path(path: PathBuf) {

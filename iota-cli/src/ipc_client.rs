@@ -1,6 +1,6 @@
 use iota_ipc::{
     ClientMessage, DaemonMessage, HelloAck, LocalRequest, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
-    RequestEnvelope, ResponseResult, read_msg, write_msg,
+    RequestEnvelope, ResponsePayload, ResponseResult, read_msg, write_msg,
 };
 use iota_state::{ClientState, UiLogEntry};
 use std::collections::HashMap;
@@ -443,6 +443,92 @@ impl IpcClient {
         });
     }
 
+    fn format_payload(payload: &ResponsePayload) -> String {
+        match payload {
+            ResponsePayload::Status(status) => {
+                let mut msg = format!("Phase: {}", status.phase);
+                if !status.tasks.is_empty() {
+                    msg.push_str(&format!(", Tasks: {}", status.tasks.join(", ")));
+                }
+                if let Some(reason) = &status.degraded_reason {
+                    msg.push_str(&format!(", Degraded: {reason}"));
+                }
+                msg
+            }
+            ResponsePayload::Tasks(tasks) => {
+                if tasks.is_empty() {
+                    "No active tasks.".into()
+                } else {
+                    tasks.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+                }
+            }
+            ResponsePayload::Users(users) => {
+                if users.is_empty() {
+                    "No users.".into()
+                } else {
+                    users.iter().map(|u| format!("{} ({})", u.username, u.user_id)).collect::<Vec<_>>().join("\n")
+                }
+            }
+            ResponsePayload::UserCreated { user_id, username } => {
+                format!("Created user {} ({})", username, user_id)
+            }
+            ResponsePayload::UserRemoved { user_id } => {
+                format!("Removed user {}", user_id)
+            }
+            ResponsePayload::Acknowledged { message } => message.clone(),
+            ResponsePayload::DaemonStatus(status) => status.formatted.clone(),
+            ResponsePayload::Config(config) => config.yaml.clone(),
+            ResponsePayload::OmikronStatus(status) => {
+                let mut msg = format!("Connected: {}", status.connected);
+                if let Some(id) = status.iota_id {
+                    msg.push_str(&format!("\nIota ID: {}", id));
+                }
+                msg
+            }
+            ResponsePayload::Components(components) => {
+                if components.is_empty() {
+                    "No component health data available.".into()
+                } else {
+                    components.iter().map(|c| {
+                        let status_str = match c.status {
+                            iota_ipc::HealthStatus::Healthy => "healthy",
+                            iota_ipc::HealthStatus::Degraded => "degraded",
+                            iota_ipc::HealthStatus::Failed => "failed",
+                        };
+                        format!("{:?}: {}", c.id, status_str)
+                    }).collect::<Vec<_>>().join("\n")
+                }
+            }
+            ResponsePayload::UserDetail(user) => {
+                let mut msg = format!("User: {} ({})", user.username, user.user_id);
+                if let Some(ref name) = user.display_name {
+                    msg.push_str(&format!("\nDisplay Name: {name}"));
+                }
+                msg.push_str(&format!("\nCreated At: {}", user.created_at));
+                if !user.trusted_apps.is_empty() {
+                    msg.push_str(&format!("\nTrusted Apps: {}", user.trusted_apps.join(", ")));
+                }
+                msg
+            }
+            ResponsePayload::LogEntries(logs) => {
+                logs.entries.iter().map(|e| {
+                    let level = if e.is_error { "ERR" } else { "INF" };
+                    format!("[{}] {level} {}: {}", e.timestamp_ms, e.sender, e.message)
+                }).collect::<Vec<_>>().join("\n")
+            }
+            ResponsePayload::UpdateStatus(status) => {
+                if status.available { "Update available.".into() } else { "Up to date.".into() }
+            }
+            ResponsePayload::Communities(communities) => {
+                if communities.is_empty() {
+                    "No communities.".into()
+                } else {
+                    communities.iter().map(|c| format!("{} ({})", c.title, c.name)).collect::<Vec<_>>().join("\n")
+                }
+            }
+        }
+    }
+
     fn format_error(code: &iota_ipc::IpcErrorCode) -> &'static str {
         match code {
             iota_ipc::IpcErrorCode::InvalidRequest => "The command is not valid.",
@@ -496,29 +582,9 @@ impl IpcClient {
     }
 
     /// Parse a legacy console command string into a typed request.
+    /// Delegates to the shared parser in iota-ipc.
     pub fn parse_console_command(line: &str) -> Option<LocalRequest> {
-        let parts: Vec<&str> = line.trim_start_matches('/').split_whitespace().collect();
-        match parts.as_slice() {
-            ["help"] => None,
-            ["tasks"] => Some(LocalRequest::ListTasks),
-            ["user", "add", username] => Some(LocalRequest::CreateUser {
-                username: username.to_string(),
-            }),
-            ["user", "remove", user_id_str] => {
-                let user_id = user_id_str.parse::<i64>().ok()?;
-                Some(LocalRequest::RemoveUser { user_id })
-            }
-            ["user", "list"] => Some(LocalRequest::ListUsers),
-            ["reconnect"] => Some(LocalRequest::ReconnectOmikron),
-            ["regenerate", "keys"] => Some(LocalRequest::RotateIotaIdentity),
-            ["reload"] | ["restart"] => Some(LocalRequest::RequestProcessExit {
-                intent: iota_ipc::ExitIntent::Restart,
-            }),
-            ["shutdown"] | ["stop"] => Some(LocalRequest::RequestProcessExit {
-                intent: iota_ipc::ExitIntent::Stop,
-            }),
-            _ => None,
-        }
+        iota_ipc::text_commands::parse(line)
     }
 
     /// Legacy command interface: parse text command, send as typed request.
@@ -559,7 +625,7 @@ impl IpcClient {
                 Ok(result) => {
                     let mut state = self.state.app.lock().await;
                     let message = match &result {
-                        ResponseResult::Ok(msg) => msg.clone(),
+                        ResponseResult::Ok(payload) => Self::format_payload(payload),
                         ResponseResult::Error(code) => Self::format_error(code).into(),
                     };
                     state.push_log(UiLogEntry {
@@ -595,8 +661,8 @@ impl IpcClient {
                     .unwrap_or_default()
                     .as_millis(),
                 sender: "Console".into(),
-                message: if trimmed == "help" {
-                    "Commands: status, tasks, ping, user add <name>, user remove <id>, user list, reconnect, regenerate keys, restart, stop"
+                message:                 if trimmed == "help" {
+                    "Commands: status, tasks, ping, user add <name>, user remove <id>, user list, users, reconnect, regenerate keys, restart, stop, config get, config reload, omikron status, components"
                         .into()
                 } else {
                     format!("Unknown command: {}", line)
@@ -695,7 +761,7 @@ impl IpcClient {
                 } else {
                     let mut state = self.state.app.lock().await;
                     let message = match &response.result {
-                        ResponseResult::Ok(msg) => msg.clone(),
+                        ResponseResult::Ok(payload) => Self::format_payload(payload),
                         ResponseResult::Error(code) => Self::format_error(code).into(),
                     };
                     state.push_log(UiLogEntry {

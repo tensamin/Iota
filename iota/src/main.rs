@@ -2,7 +2,7 @@ use iota_cli::{
     ipc_client::IpcClient, screens::main_screen::MainScreen, theme,
     ui::start_bootstrap_tui_with_theme,
 };
-use iota_ipc::{LocalRequest, ResponseResult};
+use iota_ipc::{LocalRequest, ResponsePayload, ResponseResult};
 use iota_process_manager::detect;
 use std::{path::Path, process::ExitCode, sync::Arc};
 
@@ -11,7 +11,7 @@ mod daemon_setup_flow;
 mod local_daemon;
 mod startup_error;
 
-use cli_args::{CliInvocation, Command};
+use cli_args::{CapabilityPolicy, CliInvocation, Command, OutputFormat};
 use startup_error::StartupError;
 
 #[tokio::main(flavor = "multi_thread")]
@@ -30,6 +30,13 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), StartupError> {
     let invocation =
         CliInvocation::parse(std::env::args().skip(1)).map_err(StartupError::InvalidCommand)?;
+    let CliInvocation {
+        theme_override,
+        output,
+        color,
+        unicode,
+        command,
+    } = invocation;
     let local_endpoint = match iota_paths::IotaPaths::resolve(iota_paths::Scope::User)
         .map_err(|error| StartupError::Other(format!("Cannot resolve user IPC path: {error}")))?
         .ipc_endpoint
@@ -57,9 +64,18 @@ async fn run() -> Result<(), StartupError> {
         system: system_endpoint,
     };
 
-    match invocation.command {
+    match command {
         Command::Help => {
             print_help();
+            Ok(())
+        }
+        Command::Version => {
+            println!("iota {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Command::Completions { shell } => print_completions(&shell),
+        Command::ManPage => {
+            print_man_page();
             Ok(())
         }
         Command::Install { bundle, operator } => {
@@ -72,7 +88,12 @@ async fn run() -> Result<(), StartupError> {
         command => {
             if matches!(
                 command,
-                Command::DaemonEnable { .. } | Command::DaemonDisableStartup
+                Command::DaemonEnable { .. }
+                    | Command::DaemonDisableStartup
+                    | Command::DaemonStartupStatus
+                    | Command::DaemonStart
+                    | Command::DaemonRestartService
+                    | Command::DaemonStopService
             ) {
                 return run_startup_command(command).await;
             }
@@ -87,9 +108,9 @@ async fn run() -> Result<(), StartupError> {
                     result = connect_available(&endpoints) => result?,
                     _ = tokio::signal::ctrl_c() => return Err(StartupError::Cancelled),
                 };
-                return run_command(ipc, command).await;
+                return run_command(ipc, command, output).await;
             }
-            run_dashboard(invocation.theme_override, endpoints).await
+            run_dashboard(theme_override, color, unicode, endpoints).await
         }
     }
 }
@@ -118,6 +139,42 @@ async fn run_startup_command(command: Command) -> Result<(), StartupError> {
             .disable_startup()
             .await
             .map_err(|e| StartupError::Other(e.to_string()))?,
+        Command::DaemonStartupStatus => {
+            let status = manager
+                .iota_startup_status()
+                .await
+                .map_err(|e| StartupError::Other(e.to_string()))?;
+            println!("service active: {}", status.service.active);
+            println!("service enabled: {}", status.service.enabled);
+            println!("socket active: {}", status.socket.active);
+            println!("socket enabled: {}", status.socket.enabled);
+            println!("detected mode: {:?}", status.detected);
+            return Ok(());
+        }
+        Command::DaemonStart => {
+            let status = manager
+                .process_action(iota_process_manager::ProcessAction::Start)
+                .await
+                .map_err(|e| StartupError::Other(e.to_string()))?;
+            println!("Daemon started. detected mode: {:?}", status.detected);
+            return Ok(());
+        }
+        Command::DaemonRestartService => {
+            let status = manager
+                .process_action(iota_process_manager::ProcessAction::Restart)
+                .await
+                .map_err(|e| StartupError::Other(e.to_string()))?;
+            println!("Daemon restarted. detected mode: {:?}", status.detected);
+            return Ok(());
+        }
+        Command::DaemonStopService => {
+            let status = manager
+                .process_action(iota_process_manager::ProcessAction::Stop)
+                .await
+                .map_err(|e| StartupError::Other(e.to_string()))?;
+            println!("Daemon stopped. detected mode: {:?}", status.detected);
+            return Ok(());
+        }
         _ => unreachable!(),
     };
     println!("deployment status: {:?}", status.detected);
@@ -149,6 +206,8 @@ async fn connect_available(
 
 async fn run_dashboard(
     theme_override: Option<theme::ThemeName>,
+    color_policy: CapabilityPolicy,
+    unicode_policy: CapabilityPolicy,
     endpoints: daemon_setup_flow::DaemonEndpoints,
 ) -> Result<(), StartupError> {
     use std::io::IsTerminal;
@@ -162,9 +221,55 @@ async fn run_dashboard(
             "TERM=dumb does not support the interactive dashboard".into(),
         ));
     }
-    let session = start_bootstrap_tui_with_theme(theme::resolve(theme::UiConfig::resolve_theme(
-        theme_override,
-    )))
+    let stored_terminal = theme::UiConfig::load().unwrap_or_default();
+    let color_policy = match color_policy {
+        CapabilityPolicy::Auto => match stored_terminal.color {
+            theme::TerminalPolicy::Auto => CapabilityPolicy::Auto,
+            theme::TerminalPolicy::Always => CapabilityPolicy::Always,
+            theme::TerminalPolicy::Never => CapabilityPolicy::Never,
+        },
+        policy => policy,
+    };
+    let unicode_policy = match unicode_policy {
+        CapabilityPolicy::Auto => match stored_terminal.unicode {
+            theme::TerminalPolicy::Auto => CapabilityPolicy::Auto,
+            theme::TerminalPolicy::Always => CapabilityPolicy::Always,
+            theme::TerminalPolicy::Never => CapabilityPolicy::Never,
+        },
+        policy => policy,
+    };
+    let color_enabled = match color_policy {
+        CapabilityPolicy::Always => true,
+        CapabilityPolicy::Never => false,
+        CapabilityPolicy::Auto => {
+            std::env::var_os("NO_COLOR").is_none()
+                && std::env::var("TERM").as_deref() != Ok("dumb")
+        }
+    };
+    let unicode_enabled = match unicode_policy {
+        CapabilityPolicy::Always => true,
+        CapabilityPolicy::Never => false,
+        CapabilityPolicy::Auto => std::env::var("LC_ALL")
+            .or_else(|_| std::env::var("LC_CTYPE"))
+            .or_else(|_| std::env::var("LANG"))
+            .map(|locale| {
+                let locale = locale.to_ascii_lowercase();
+                locale.contains("utf-8") || locale.contains("utf8")
+            })
+            .unwrap_or(false),
+    };
+    let truecolor_enabled = std::env::var("COLORTERM")
+        .map(|value| {
+            let value = value.to_ascii_lowercase();
+            value.contains("truecolor") || value.contains("24bit")
+        })
+        .unwrap_or(false);
+    let session = start_bootstrap_tui_with_theme(theme::resolve_with_terminal_profile(
+        theme::UiConfig::resolve_theme(theme_override),
+        color_enabled,
+        unicode_enabled,
+        truecolor_enabled,
+    ))
     .map_err(|error| StartupError::Terminal(error.to_string()))?;
     let ui = session.ui();
     let result = async {
@@ -258,32 +363,105 @@ fn writable_socket_path(path: &Path) -> Result<(), StartupError> {
 }
 
 fn print_help() {
-    println!(
-        "Iota operator console\n\nUsage:\n  iota [--theme <name>]    Open the dashboard\n  iota daemon install --bundle <release.zip> [--operator USER]\n  iota status              Print daemon readiness and tasks\n  iota tasks               Print active tasks\n  iota users list          List users\n  iota daemon restart --yes\n  iota daemon stop --yes\n\nRun the dashboard in an interactive terminal to review required terms."
-    );
+    println!("{}", CliInvocation::help_text());
 }
 
-async fn run_command(ipc: Arc<IpcClient>, command: Command) -> Result<(), StartupError> {
+fn print_completions(shell: &str) -> Result<(), StartupError> {
+    let command_paths = CliInvocation::command_paths();
+    let words = command_paths
+        .iter()
+        .flat_map(|command| command.split_whitespace())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(" ");
+    match shell {
+        "bash" => println!(
+            "_iota() {{ local words='{} --help --version --theme --output --color --unicode --yes --mode --bundle --operator'; COMPREPLY=( $(compgen -W \"$words\" -- \"${{COMP_WORDS[COMP_CWORD]}}\") ); }}\ncomplete -F _iota iota",
+            words
+        ),
+        "zsh" => println!(
+            "#compdef iota\n_arguments '1:command:({})' '*::argument:->args'",
+            words
+        ),
+        "fish" => {
+            for command in words.split_whitespace() {
+                println!("complete -c iota -f -a '{command}'");
+            }
+        }
+        _ => {
+            return Err(StartupError::InvalidCommand(
+                "completion shell must be bash, zsh, or fish".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn print_man_page() {
+    println!(".TH IOTA 1");
+    println!(".SH NAME\n iota \\- Iota operator console");
+    println!(".SH SYNOPSIS\n.B iota\n[global options] [command]");
+    println!(".SH COMMANDS");
+    for command in CliInvocation::command_paths() {
+        println!(".TP\n.B {command}");
+    }
+    println!(".SH GLOBAL OPTIONS");
+    println!(".TP\n.B --output text|json|yaml");
+    println!(".TP\n.B --color auto|always|never");
+    println!(".TP\n.B --unicode auto|always|never");
+}
+
+async fn run_command(
+    ipc: Arc<IpcClient>,
+    command: Command,
+    output: OutputFormat,
+) -> Result<(), StartupError> {
     let request = match command {
         Command::Status => LocalRequest::GetStatus,
         Command::Tasks => LocalRequest::ListTasks,
         Command::UsersList => LocalRequest::ListUsers,
+        Command::UsersShow { user_id } => LocalRequest::GetUser { user_id },
+        Command::UsersAdd { username } => LocalRequest::CreateUser { username },
+        Command::UsersRemove {
+            user_id,
+            confirmed: true,
+        } => LocalRequest::RemoveUser { user_id },
+        Command::UsersImport { username } => LocalRequest::ImportUser { username },
+        Command::OmikronReconnect => LocalRequest::ReconnectOmikron,
+        Command::IdentityRotate { confirmed: true } => LocalRequest::RotateIotaIdentity,
+        Command::RegenerateKeys { confirmed: true } => LocalRequest::RotateIotaIdentity,
         Command::DaemonRestart { confirmed: true } => LocalRequest::RequestProcessExit {
             intent: iota_ipc::ExitIntent::Restart,
         },
         Command::DaemonStop { confirmed: true } => LocalRequest::RequestProcessExit {
             intent: iota_ipc::ExitIntent::Stop,
         },
-        Command::DaemonStopProcess => LocalRequest::RequestProcessExit {
-            intent: iota_ipc::ExitIntent::Stop,
-        },
         Command::DaemonDaemonStatus => LocalRequest::GetDaemonStatus,
-        Command::DaemonRestart { confirmed: false } | Command::DaemonStop { confirmed: false } => {
+        Command::OmikronStatus => LocalRequest::GetOmikronStatus,
+        Command::ConfigGet => LocalRequest::GetConfig,
+        Command::ConfigSet { key, value } => LocalRequest::SetConfig { key, value },
+        Command::ConfigReload => LocalRequest::ReloadConfig,
+        Command::Components => LocalRequest::ListComponents,
+        Command::Logs { limit } => LocalRequest::GetLogs { limit },
+        Command::UpdateCheck => LocalRequest::CheckUpdate,
+        Command::CommunityList => LocalRequest::ListCommunities,
+        Command::UsersRemove {
+            confirmed: false, ..
+        }
+        | Command::IdentityRotate { confirmed: false }
+        | Command::RegenerateKeys { confirmed: false }
+        | Command::DaemonRestart { confirmed: false }
+        | Command::DaemonStop { confirmed: false } => {
             return Err(StartupError::InvalidCommand(
                 "Refusing destructive command without --yes.".into(),
             ));
         }
-        _ => {
+        Command::Dashboard | Command::Help | Command::Version | Command::Completions { .. }
+        | Command::ManPage | Command::Install { .. }
+        | Command::DaemonEnable { .. } | Command::DaemonDisableStartup
+        | Command::DaemonStartupStatus | Command::DaemonStart
+        | Command::DaemonRestartService | Command::DaemonStopService => {
             return Err(StartupError::InvalidCommand(
                 "Command cannot be run headlessly.".into(),
             ));
@@ -294,12 +472,139 @@ async fn run_command(ipc: Arc<IpcClient>, command: Command) -> Result<(), Startu
         .await
         .map_err(|e| StartupError::Other(e.to_string()))?
     {
-        ResponseResult::Ok(message) => {
-            println!("{message}");
+        ResponseResult::Ok(payload) => {
+            if !matches!(output, OutputFormat::Text) {
+                return render_structured(&payload, output);
+            }
+            match payload {
+                ResponsePayload::Status(status) => {
+                    print!("Phase: {}", status.phase);
+                    if !status.tasks.is_empty() {
+                        print!(", Tasks: {}", status.tasks.join(", "));
+                    }
+                    if let Some(reason) = status.degraded_reason {
+                        print!(", Degraded: {}", reason);
+                    }
+                    println!();
+                }
+                ResponsePayload::Tasks(tasks) => {
+                    if tasks.is_empty() {
+                        println!("No active tasks.");
+                    } else {
+                        for task in &tasks {
+                            println!("{}", task.name);
+                        }
+                    }
+                }
+                ResponsePayload::Users(users) => {
+                    if users.is_empty() {
+                        println!("No users.");
+                    } else {
+                        for user in &users {
+                            println!("{} ({})", user.username, user.user_id);
+                        }
+                    }
+                }
+                ResponsePayload::UserCreated { user_id, username } => {
+                    println!("Created user {} ({})", username, user_id);
+                }
+                ResponsePayload::UserRemoved { user_id } => {
+                    println!("Removed user {}", user_id);
+                }
+                ResponsePayload::Acknowledged { message } => {
+                    println!("{}", message);
+                }
+                ResponsePayload::DaemonStatus(status) => {
+                    println!("{}", status.formatted);
+                }
+                ResponsePayload::Config(config) => {
+                    println!("{}", config.yaml);
+                }
+                ResponsePayload::OmikronStatus(status) => {
+                    println!("Connected: {}", status.connected);
+                    if let Some(id) = status.iota_id {
+                        println!("Iota ID: {}", id);
+                    }
+                }
+                ResponsePayload::Components(components) => {
+                    if components.is_empty() {
+                        println!("No component health data available.");
+                    } else {
+                        for comp in &components {
+                            let status_str = match comp.status {
+                                iota_ipc::HealthStatus::Healthy => "healthy",
+                                iota_ipc::HealthStatus::Degraded => "degraded",
+                                iota_ipc::HealthStatus::Failed => "failed",
+                            };
+                            let suffix = comp
+                                .message
+                                .as_deref()
+                                .map(|m| format!(" ({m})"))
+                                .unwrap_or_default();
+                            println!("{:?}: {}{}", comp.id, status_str, suffix);
+                        }
+                    }
+                }
+                ResponsePayload::UserDetail(user) => {
+                    println!("User: {} ({})", user.username, user.user_id);
+                    if let Some(ref name) = user.display_name {
+                        println!("Display Name: {name}");
+                    }
+                    println!("Created At: {}", user.created_at);
+                    if !user.trusted_apps.is_empty() {
+                        println!("Trusted Apps: {}", user.trusted_apps.join(", "));
+                    }
+                }
+                ResponsePayload::LogEntries(logs) => {
+                    for entry in &logs.entries {
+                        let ts = entry.timestamp_ms;
+                        let level = if entry.is_error { "ERR" } else { "INF" };
+                        println!("[{ts}] {level} {}: {}", entry.sender, entry.message);
+                    }
+                }
+                ResponsePayload::UpdateStatus(status) => {
+                    if status.available {
+                        println!("Update available.");
+                    } else {
+                        println!("Up to date.");
+                    }
+                }
+                ResponsePayload::Communities(communities) => {
+                    if communities.is_empty() {
+                        println!("No communities.");
+                    } else {
+                        for c in &communities {
+                            println!("{} ({})", c.title, c.name);
+                        }
+                    }
+                }
+            }
             Ok(())
         }
         ResponseResult::Error(code) => Err(StartupError::Other(format!(
-            "Daemon request failed: {code:?}"
+            "Daemon request failed: {code}"
         ))),
     }
+}
+
+/// The IPC payload is the versioned, tagged schema used by headless clients.
+/// Text remains an operator-oriented presentation; JSON and YAML must never
+/// require consumers to parse it.
+fn render_structured(payload: &ResponsePayload, output: OutputFormat) -> Result<(), StartupError> {
+    match output {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(payload).map_err(|error| StartupError::Other(format!(
+                "Cannot encode JSON output: {error}"
+            )))?
+        ),
+        OutputFormat::Yaml => print!(
+            "{}",
+            serde_yaml::to_string(payload).map_err(|error| StartupError::Other(format!(
+                "Cannot encode YAML output: {error}"
+            )))?
+        ),
+        OutputFormat::Text => unreachable!(),
+    }
+    Ok(())
 }
