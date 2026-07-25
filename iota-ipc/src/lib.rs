@@ -3,12 +3,12 @@ pub mod text_commands;
 pub mod transport;
 
 pub use protocol::{
-    ClientMessage, ComponentHealth, ComponentId, ComponentStatusResponse, ConfigResponse,
-    ConnectionStatus, DaemonMessage, DaemonStatusResponse, DeploymentMode, ExitIntent,
-    HealthStatus, HelloAck, IpcErrorCode, LifecycleEvent, LifecyclePhase, LocalRequest, LogEntry,
-    LogEntriesResponse, MetricSample, OmikronStatusResponse, RequestEnvelope, ResponseEnvelope,
-    ResponsePayload, ResponseResult, StartupPhase, StateSnapshot, StatusResponse, SupervisorKind,
-    TaskSummary, UpdateStatusResponse, UserDetailResponse, UserSummary, CommunitySummary,
+    ClientMessage, CommunitySummary, ComponentHealth, ComponentId, ComponentStatusResponse,
+    ConfigResponse, ConnectionStatus, DaemonMessage, DaemonStatusResponse, DeploymentMode,
+    ExitIntent, HealthStatus, HelloAck, IpcErrorCode, LifecycleEvent, LifecyclePhase, LocalRequest,
+    LogEntriesResponse, LogEntry, MetricSample, OmikronStatusResponse, RequestEnvelope,
+    ResponseEnvelope, ResponsePayload, ResponseResult, StartupPhase, StateSnapshot, StatusResponse,
+    SupervisorKind, TaskSummary, UpdateStatusResponse, UserDetailResponse, UserSummary,
 };
 pub use transport::{read_msg, write_msg};
 

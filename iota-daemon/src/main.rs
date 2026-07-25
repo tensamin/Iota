@@ -22,6 +22,61 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Bind a deliberately dormant IPC daemon before terms are accepted.  This
+    // makes socket activation and `iota terms accept --system` usable, while
+    // the router exposes status only and the inactive service cannot connect.
+    if !iota_terms::consent::load(&paths.state_dir).has_all_required() {
+        let socket = match &paths.ipc_endpoint {
+            iota_paths::IpcEndpoint::UnixSocket(path) => path.clone(),
+            iota_paths::IpcEndpoint::WindowsPipe(_) => {
+                eprintln!("Windows named-pipe daemon transport is not implemented yet");
+                return ExitCode::FAILURE;
+            }
+        };
+        let runtime = Arc::new(DaemonRuntime::new());
+        let (log_tx, _) = broadcast::channel(64);
+        let log_buffer = Arc::new(Mutex::new(LogBuffer::new(64)));
+        let (_, state_rx) = watch::channel(runtime.snapshot());
+        let server = match IpcServer::bind(
+            socket,
+            runtime.clone(),
+            DaemonServices::inactive(),
+            log_tx,
+            log_buffer,
+            state_rx,
+        )
+        .await
+        {
+            Ok(server) => server,
+            Err(error) => {
+                eprintln!("Cannot bind dormant daemon IPC socket: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+        eprintln!(
+            "Iota daemon is awaiting terms acceptance. Run `iota terms accept{}` in an interactive terminal.",
+            if paths.scope == iota_paths::Scope::System {
+                " --system"
+            } else {
+                ""
+            }
+        );
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if iota_terms::consent::load(&paths.state_dir).has_all_required() {
+                        // systemd restarts this daemon; a locally-launched daemon can
+                        // simply be started again after accepting the documents.
+                        return ExitCode::from(75);
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => return ExitCode::SUCCESS,
+            }
+        }
+    }
     if let Err(error) = paths.migrate_legacy_layout() {
         eprintln!("Cannot migrate legacy Iota layout: {error}");
         return ExitCode::FAILURE;

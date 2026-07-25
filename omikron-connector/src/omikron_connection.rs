@@ -889,6 +889,7 @@ impl OmikronConnection {
         dispatch!(CreateApp, handle_create_app);
         dispatch!(DeleteApp, handle_delete_app);
         dispatch!(ClientConnected, handle_client_connected);
+        dispatch!(ClientStateAck, handle_client_state_ack);
         dispatch!(MessageState, handle_message_state);
         dispatch!(MessageSend, handle_message_send);
         dispatch!(MessageEdit, handle_message_edit);
@@ -1163,6 +1164,12 @@ impl OmikronConnection {
     async fn handle_client_connected(self: Arc<Self>, cv: &CommunicationValue) {
         let _ = self
             .send_message(&message_handlers::handle_client_connected(cv))
+            .await;
+    }
+
+    async fn handle_client_state_ack(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_client_state_ack(cv))
             .await;
     }
 

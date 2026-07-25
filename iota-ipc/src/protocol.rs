@@ -136,16 +136,9 @@ pub enum ResponsePayload {
     Status(StatusResponse),
     Tasks(Vec<TaskSummary>),
     Users(Vec<UserSummary>),
-    UserCreated {
-        user_id: i64,
-        username: String,
-    },
-    UserRemoved {
-        user_id: i64,
-    },
-    Acknowledged {
-        message: String,
-    },
+    UserCreated { user_id: i64, username: String },
+    UserRemoved { user_id: i64 },
+    Acknowledged { message: String },
     DaemonStatus(DaemonStatusResponse),
     Config(ConfigResponse),
     OmikronStatus(OmikronStatusResponse),
@@ -264,8 +257,15 @@ mod error_tests {
 
     #[test]
     fn error_codes_have_operator_facing_messages() {
-        assert_eq!(IpcErrorCode::NotReady.to_string(), "the daemon is not ready yet");
-        assert!(!IpcErrorCode::InternalFailure.to_string().contains("InternalFailure"));
+        assert_eq!(
+            IpcErrorCode::NotReady.to_string(),
+            "the daemon is not ready yet"
+        );
+        assert!(
+            !IpcErrorCode::InternalFailure
+                .to_string()
+                .contains("InternalFailure")
+        );
     }
 }
 

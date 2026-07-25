@@ -28,6 +28,27 @@ theme: surface
 
 An invalid `ui.yaml` value is reported and Iota falls back to ANSI so the TUI can still start.
 
+## Accepting terms without the TUI
+
+Iota services do not start until the required agreements have been accepted for
+the deployment. Use the terminal flow to read each current document and type
+the document-specific acceptance phrase:
+
+```text
+iota terms accept
+```
+
+For a system-managed daemon, accept its deployment-scoped terms as an account
+that can write the system Iota state directory (normally via `sudo`):
+
+```text
+sudo iota terms accept --system
+```
+
+`iota terms status` reports the stored state, and `iota terms show eula`,
+`iota terms show tos`, or `iota terms show privacy` displays an individual
+document without accepting it.
+
 # Linux daemon installation
 
 The system-managed daemon runs as the dedicated `iota` account and listens on

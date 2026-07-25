@@ -212,9 +212,7 @@ impl MainScreen {
         let mut seen: Vec<Option<usize>> = Vec::new();
         for (y, row) in self.nav_grid.iter().enumerate() {
             for (x, elem_opt) in row.iter().enumerate() {
-                if x == 1
-                    && (!self.graphs_open || self.layout_width.load(Ordering::Relaxed) < 70)
-                {
+                if x == 1 && (!self.graphs_open || self.layout_width.load(Ordering::Relaxed) < 70) {
                     continue;
                 }
                 if elem_opt.is_some() && !seen.contains(elem_opt) {
@@ -511,25 +509,64 @@ impl Screen for MainScreen {
     fn key_hints(&self) -> Vec<KeyHint> {
         if self.selected_coords == (2, 0) {
             vec![
-                KeyHint { keys: "Enter", action: "Send" },
-                KeyHint { keys: "Up/Down", action: "History" },
-                KeyHint { keys: "Tab", action: "Complete" },
-                KeyHint { keys: "F6", action: "Header" },
+                KeyHint {
+                    keys: "Enter",
+                    action: "Send",
+                },
+                KeyHint {
+                    keys: "Up/Down",
+                    action: "History",
+                },
+                KeyHint {
+                    keys: "Tab",
+                    action: "Complete",
+                },
+                KeyHint {
+                    keys: "F6",
+                    action: "Header",
+                },
             ]
         } else if self.selected_coords == (0, 0) {
             vec![
-                KeyHint { keys: "J/K", action: "Scroll logs" },
-                KeyHint { keys: "Enter", action: "Lock scroll" },
-                KeyHint { keys: "/", action: "Filter" },
-                KeyHint { keys: "M", action: "Metrics screen" },
-                KeyHint { keys: "Tab", action: "Next panel" },
-                KeyHint { keys: "F6", action: "Header" },
+                KeyHint {
+                    keys: "J/K",
+                    action: "Scroll logs",
+                },
+                KeyHint {
+                    keys: "Enter",
+                    action: "Lock scroll",
+                },
+                KeyHint {
+                    keys: "/",
+                    action: "Filter",
+                },
+                KeyHint {
+                    keys: "M",
+                    action: "Metrics screen",
+                },
+                KeyHint {
+                    keys: "Tab",
+                    action: "Next panel",
+                },
+                KeyHint {
+                    keys: "F6",
+                    action: "Header",
+                },
             ]
         } else {
             vec![
-                KeyHint { keys: "Enter", action: "Toggle metrics" },
-                KeyHint { keys: "Tab", action: "Next panel" },
-                KeyHint { keys: "F6", action: "Header" },
+                KeyHint {
+                    keys: "Enter",
+                    action: "Toggle metrics",
+                },
+                KeyHint {
+                    keys: "Tab",
+                    action: "Next panel",
+                },
+                KeyHint {
+                    keys: "F6",
+                    action: "Header",
+                },
             ]
         }
     }

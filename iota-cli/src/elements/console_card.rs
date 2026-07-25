@@ -174,12 +174,7 @@ impl ConsoleCard {
     fn is_destructive(command: &str) -> bool {
         matches!(
             command.trim_start_matches('/').trim(),
-            "restart"
-                | "reload"
-                | "stop"
-                | "shutdown"
-                | "regenerate keys"
-                | "identity rotate"
+            "restart" | "reload" | "stop" | "shutdown" | "regenerate keys" | "identity rotate"
         ) || command
             .trim_start_matches('/')
             .trim_start()

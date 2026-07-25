@@ -1,5 +1,6 @@
 use crate::storage_error::StorageError;
 use crate::util::db;
+use crate::util::sync::{self, EntityType, Operation};
 use iota_logger::log;
 use rusqlite::params;
 
@@ -46,6 +47,7 @@ impl MessageState {
 #[derive(Debug, Clone)]
 pub struct StoredMessage {
     pub id: i64,
+    pub external_user: i64,
     pub message_time: i64,
     pub content: String,
     pub edited: bool,
@@ -150,7 +152,8 @@ fn update_message_content(
             .unwrap()
             .as_millis() as i64;
 
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             r#"
             INSERT INTO message_edits (message_id, content_before, content_after, edited_at, edited_by)
             VALUES (?1, ?2, ?3, ?4, ?5)
@@ -158,7 +161,7 @@ fn update_message_content(
             params![msg_id, old_content, new_content, now, editor_id],
         )?;
 
-        conn.execute(
+        tx.execute(
             r#"
             UPDATE messages
             SET content = ?1, edited_count = edited_count + 1
@@ -166,6 +169,14 @@ fn update_message_content(
             "#,
             params![new_content, msg_id],
         )?;
+        sync::record_event(
+            &tx,
+            storage_owner,
+            EntityType::Message,
+            msg_id,
+            Operation::Upsert,
+        )?;
+        tx.commit()?;
 
         Ok(())
     })
@@ -187,15 +198,24 @@ pub fn hard_delete_message(
             |row| row.get(0),
         )?;
 
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "DELETE FROM message_edits WHERE message_id = ?1",
             params![msg_id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM reactions WHERE message_id = ?1",
             params![msg_id],
         )?;
-        conn.execute("DELETE FROM messages WHERE id = ?1", params![msg_id])?;
+        tx.execute("DELETE FROM messages WHERE id = ?1", params![msg_id])?;
+        sync::record_event(
+            &tx,
+            storage_owner,
+            EntityType::Message,
+            msg_id,
+            Operation::Delete,
+        )?;
+        tx.commit()?;
         Ok(())
     })
 }
@@ -261,7 +281,8 @@ pub fn flag_deleted_by_external(
     message_time: i64,
 ) -> Result<(), StorageError> {
     db::with_db(|conn| {
-        let affected = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let affected = tx.execute(
             r#"
             UPDATE messages
             SET deleted_by_external = 1
@@ -272,6 +293,15 @@ pub fn flag_deleted_by_external(
         if affected == 0 {
             return Err(StorageError::Other("Message not found".into()));
         }
+        let msg_id: i64 = tx.query_row("SELECT id FROM messages WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3 ORDER BY id DESC LIMIT 1", params![storage_owner, external_user, message_time], |r| r.get(0))?;
+        sync::record_event(
+            &tx,
+            storage_owner,
+            EntityType::Message,
+            msg_id,
+            Operation::Delete,
+        )?;
+        tx.commit()?;
         Ok(())
     })
 }
@@ -297,10 +327,19 @@ pub fn delete_edit_history(
             |row| row.get(0),
         )?;
 
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "DELETE FROM message_edits WHERE message_id = ?1",
             params![msg_id],
         )?;
+        sync::record_event(
+            &tx,
+            storage_owner,
+            EntityType::Message,
+            msg_id,
+            Operation::Upsert,
+        )?;
+        tx.commit()?;
         Ok(())
     })
 }
@@ -328,13 +367,22 @@ pub fn add_reaction(
             .unwrap()
             .as_millis() as i64;
 
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             r#"
             INSERT OR IGNORE INTO reactions (message_id, user_id, reaction, created_at)
             VALUES (?1, ?2, ?3, ?4)
             "#,
             params![msg_id, user_id, reaction, now],
         )?;
+        sync::record_event(
+            &tx,
+            storage_owner,
+            EntityType::Message,
+            msg_id,
+            Operation::Upsert,
+        )?;
+        tx.commit()?;
         Ok(())
     })
 }
@@ -357,10 +405,19 @@ pub fn remove_reaction(
             |row| row.get(0),
         )?;
 
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "DELETE FROM reactions WHERE message_id = ?1 AND user_id = ?2 AND reaction = ?3",
             params![msg_id, user_id, reaction],
         )?;
+        sync::record_event(
+            &tx,
+            storage_owner,
+            EntityType::Message,
+            msg_id,
+            Operation::Upsert,
+        )?;
+        tx.commit()?;
         Ok(())
     })
 }
@@ -383,7 +440,8 @@ pub fn add_message(
     };
 
     if let Err(e) = db::with_db(|conn| {
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             r#"
             INSERT INTO messages (
                 storage_owner, external_user, message_time, content,
@@ -405,6 +463,15 @@ pub fn add_message(
                 reply_to,
             ],
         )?;
+        let msg_id = tx.last_insert_rowid();
+        sync::record_event(
+            &tx,
+            storage_owner,
+            EntityType::Message,
+            msg_id,
+            Operation::Upsert,
+        )?;
+        tx.commit()?;
         Ok(())
     }) {
         log!("Failed to insert message into sqlite: {}", e);
@@ -447,7 +514,8 @@ pub fn change_message_state(
             .as_str()
             .to_string();
 
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             r#"
             UPDATE messages
             SET message_state = ?1
@@ -459,6 +527,13 @@ pub fn change_message_state(
             "#,
             params![upgraded, storage_owner, external_user, timestamp],
         )?;
+        let msg_id: i64 = tx.query_row(
+            "SELECT id FROM messages WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3 ORDER BY id DESC LIMIT 1",
+            params![storage_owner, external_user, timestamp],
+            |row| row.get(0),
+        )?;
+        sync::record_event(&tx, storage_owner, EntityType::Message, msg_id, Operation::Upsert)?;
+        tx.commit()?;
         Ok(())
     })
     .map_err(|e: StorageError| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
@@ -532,6 +607,7 @@ pub fn get_messages(
             |row| {
                 Ok(StoredMessage {
                     id: row.get(0)?,
+                    external_user,
                     message_time: row.get(1)?,
                     content: row.get(2)?,
                     sent_by_self: row.get::<_, i64>(3)? != 0,
@@ -566,6 +642,69 @@ pub fn get_messages(
             Vec::new()
         }
     }
+}
+
+pub fn get_messages_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<StoredMessage> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let wanted: std::collections::HashSet<i64> = ids.iter().copied().collect();
+    // A journal id uniquely identifies a row. Load all messages for this owner and retain only
+    // those ids; this keeps reaction hydration identical to normal message loading.
+    match db::with_db(|conn| {
+        let mut stmt = conn.prepare("SELECT id, message_time, content, sent_by_self, message_state, height, reply_to, edited_count, external_user FROM messages WHERE storage_owner = ?1 AND deleted_by_external = 0")?;
+        let rows = stmt.query_map([storage_owner], |row| {
+            let external_user: i64 = row.get(8)?;
+            Ok(StoredMessage {
+                id: row.get(0)?,
+                external_user,
+                message_time: row.get(1)?,
+                content: row.get(2)?,
+                sent_by_self: row.get::<_, i64>(3)? != 0,
+                message_state: row.get(4)?,
+                height: row.get(5).unwrap_or(0),
+                reply_to: row.get(6).ok().flatten(),
+                edited: row.get::<_, i64>(7).unwrap_or(0) > 0,
+                reactions: Vec::new(),
+            })
+        })?;
+        let mut messages = Vec::new();
+        for row in rows {
+            let message = row?;
+            if wanted.contains(&message.id) {
+                messages.push(message);
+            }
+        }
+        let reaction_map = load_reactions(conn, &messages.iter().map(|m| m.id).collect::<Vec<_>>());
+        for message in &mut messages {
+            message.reactions = reaction_map.get(&message.id).cloned().unwrap_or_default();
+        }
+        Ok(messages)
+    }) {
+        Ok(messages) => messages,
+        Err(e) => {
+            log!("Failed to query messages by id: {}", e);
+            Vec::new()
+        }
+    }
+}
+
+pub fn get_all_messages(storage_owner: i64) -> Vec<StoredMessage> {
+    let ids = match db::with_db(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM messages WHERE storage_owner = ?1 AND deleted_by_external = 0",
+        )?;
+        Ok(stmt
+            .query_map([storage_owner], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }) {
+        Ok(ids) => ids,
+        Err(e) => {
+            log!("Failed to query all messages: {}", e);
+            return Vec::new();
+        }
+    };
+    get_messages_by_ids(storage_owner, &ids)
 }
 
 #[cfg(test)]

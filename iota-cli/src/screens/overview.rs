@@ -53,17 +53,11 @@ impl OverviewScreen {
 
         let mut lines = Vec::new();
 
-        lines.push(Line::from(Span::styled(
-            "Connection",
-            theme.text.heading,
-        )));
+        lines.push(Line::from(Span::styled("Connection", theme.text.heading)));
         lines.push(Line::from(format!("  State: {}", connection_label(&conn))));
         lines.push(Line::from(""));
 
-        lines.push(Line::from(Span::styled(
-            "Daemon",
-            theme.text.heading,
-        )));
+        lines.push(Line::from(Span::styled("Daemon", theme.text.heading)));
         lines.push(Line::from(format!(
             "  Version: {}",
             version_or_unknown(&daemon.version)
@@ -113,10 +107,7 @@ impl OverviewScreen {
 
         if !daemon.components.is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "Components",
-                theme.text.heading,
-            )));
+            lines.push(Line::from(Span::styled("Components", theme.text.heading)));
             for (id, health) in &daemon.components {
                 let status_str = match health.status {
                     iota_ipc::HealthStatus::Healthy => "[OK] healthy",
@@ -187,7 +178,13 @@ impl Screen for OverviewScreen {
             .borders(Borders::ALL)
             .border_style(context.theme.borders.normal)
             .title_style(context.theme.borders.title);
-        let inner = if matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) { crate::controls::panel::render_panel(f, rect, "Overview", false, context.theme) } else { let inner = block.inner(rect); f.render_widget(block, rect); inner };
+        let inner = if matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) {
+            crate::controls::panel::render_panel(f, rect, "Overview", false, context.theme)
+        } else {
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            inner
+        };
         let rows = ratatui::layout::Layout::vertical([
             ratatui::layout::Constraint::Min(1),
             ratatui::layout::Constraint::Length(1),
@@ -273,10 +270,22 @@ impl Screen for OverviewScreen {
     }
     fn key_hints(&self) -> Vec<KeyHint> {
         vec![
-            KeyHint { keys: "Up/Down", action: "Scroll" },
-            KeyHint { keys: "PgUp/PgDn", action: "Page" },
-            KeyHint { keys: "Esc/B", action: "Back" },
-            KeyHint { keys: "F6", action: "Header" },
+            KeyHint {
+                keys: "Up/Down",
+                action: "Scroll",
+            },
+            KeyHint {
+                keys: "PgUp/PgDn",
+                action: "Page",
+            },
+            KeyHint {
+                keys: "Esc/B",
+                action: "Back",
+            },
+            KeyHint {
+                keys: "F6",
+                action: "Header",
+            },
         ]
     }
 }

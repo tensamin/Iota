@@ -34,7 +34,9 @@ impl Screen for FileViewer {
     }
 
     fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
-        let UiEvent::Key(event) = event else { return InteractionResult::Unhandled; };
+        let UiEvent::Key(event) = event else {
+            return InteractionResult::Unhandled;
+        };
         match event.code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 return InteractionResult::CloseScreen;

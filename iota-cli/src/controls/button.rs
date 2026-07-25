@@ -39,8 +39,15 @@ pub fn render_button(
         }
     };
     frame.render_widget(
-        Paragraph::new(Span::styled(if button.focused { format!("› {}", button.label) } else { button.label.to_owned() }, style))
-            .alignment(Alignment::Center),
+        Paragraph::new(Span::styled(
+            if button.focused {
+                format!("› {}", button.label)
+            } else {
+                button.label.to_owned()
+            },
+            style,
+        ))
+        .alignment(Alignment::Center),
         area,
     );
 }

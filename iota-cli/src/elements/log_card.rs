@@ -322,9 +322,22 @@ impl Element for LogCard {
         let entries = self.get_logs();
 
         let inner_area = if matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) {
-            crate::controls::panel::render_panel(f, area, &self.build_title(), self.focused, context.theme)
+            crate::controls::panel::render_panel(
+                f,
+                area,
+                &self.build_title(),
+                self.focused,
+                context.theme,
+            )
         } else {
-            let block = Block::default().title(self.build_title()).borders(self.borders).border_style(if self.focused { context.theme.logs.focused_border } else { context.theme.logs.border });
+            let block = Block::default()
+                .title(self.build_title())
+                .borders(self.borders)
+                .border_style(if self.focused {
+                    context.theme.logs.focused_border
+                } else {
+                    context.theme.logs.border
+                });
             let inner = block.inner(area);
             f.render_widget(block, area);
             inner
@@ -363,7 +376,11 @@ impl Element for LogCard {
                 let mut spans = Vec::new();
 
                 let (prefix, rest) = Self::split_line_prefix(line);
-                let prefix = if matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) { "" } else { prefix };
+                let prefix = if matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) {
+                    ""
+                } else {
+                    prefix
+                };
 
                 if !prefix.is_empty() {
                     spans.push(Span::styled(
@@ -404,17 +421,19 @@ impl Element for LogCard {
             f.render_widget(Paragraph::new(line.clone()), line_area);
         }
 
-        if !matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) { draw_block_joins(
-            f,
-            area,
-            self.borders,
-            self.joins,
-            if self.focused {
-                context.theme.borders.focused
-            } else {
-                context.theme.borders.normal
-            },
-        ); }
+        if !matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) {
+            draw_block_joins(
+                f,
+                area,
+                self.borders,
+                self.joins,
+                if self.focused {
+                    context.theme.borders.focused
+                } else {
+                    context.theme.borders.normal
+                },
+            );
+        }
     }
 }
 

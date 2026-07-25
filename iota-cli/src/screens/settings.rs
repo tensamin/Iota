@@ -49,8 +49,12 @@ impl SettingsScreen {
             selected,
             saved: current,
             message: "Left/Right previews. Enter saves.".into(),
-            color: UiConfig::load().map(|config| config.color).unwrap_or_default(),
-            unicode: UiConfig::load().map(|config| config.unicode).unwrap_or_default(),
+            color: UiConfig::load()
+                .map(|config| config.color)
+                .unwrap_or_default(),
+            unicode: UiConfig::load()
+                .map(|config| config.unicode)
+                .unwrap_or_default(),
             focus: Focus::Theme,
             dialog: None,
             pending: false,
@@ -64,14 +68,16 @@ impl SettingsScreen {
     fn apply(&self, persist: bool) -> InteractionResult {
         let theme = self.selected_theme();
         InteractionResult::AppTask {
-            task: Box::pin(async move {
-                UiEvent::App(AppEvent::ApplyTheme { theme, persist })
-            }),
+            task: Box::pin(async move { UiEvent::App(AppEvent::ApplyTheme { theme, persist }) }),
         }
     }
 
     fn next_policy(policy: TerminalPolicy) -> TerminalPolicy {
-        match policy { TerminalPolicy::Auto => TerminalPolicy::Always, TerminalPolicy::Always => TerminalPolicy::Never, TerminalPolicy::Never => TerminalPolicy::Auto }
+        match policy {
+            TerminalPolicy::Auto => TerminalPolicy::Always,
+            TerminalPolicy::Always => TerminalPolicy::Never,
+            TerminalPolicy::Never => TerminalPolicy::Auto,
+        }
     }
 
     fn next_focus(&mut self) {
@@ -100,9 +106,7 @@ impl SettingsScreen {
                     self.pending = true;
                     self.message = "Regenerating keys…".into();
                     return InteractionResult::AppTask {
-                        task: Box::pin(async {
-                            UiEvent::App(AppEvent::RegenerateKeysRequested)
-                        }),
+                        task: Box::pin(async { UiEvent::App(AppEvent::RegenerateKeysRequested) }),
                     };
                 }
             }
@@ -113,7 +117,15 @@ impl SettingsScreen {
                 let theme = self.selected_theme();
                 let color = self.color;
                 let unicode = self.unicode;
-                InteractionResult::AppTask { task: Box::pin(async move { UiEvent::App(AppEvent::SaveSettings { theme, color, unicode }) }) }
+                InteractionResult::AppTask {
+                    task: Box::pin(async move {
+                        UiEvent::App(AppEvent::SaveSettings {
+                            theme,
+                            color,
+                            unicode,
+                        })
+                    }),
+                }
             }
             Focus::RegenerateKeys => {
                 self.dialog = Some(Dialog::ConfirmRegenerateKeys);
@@ -146,8 +158,7 @@ impl Screen for SettingsScreen {
             .border_style(context.theme.borders.focused);
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let rows =
-            Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
+        let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
         frame.render_widget(
             Paragraph::new(format!(
                 "Theme: < {} >{}\nColor: {:?} (C)   Unicode: {:?} (U)",
@@ -156,7 +167,9 @@ impl Screen for SettingsScreen {
                     "  [saved]"
                 } else {
                     "  [preview]"
-                }, self.color, self.unicode
+                },
+                self.color,
+                self.unicode
             ))
             .style(context.theme.text.heading),
             rows[0],
@@ -331,8 +344,14 @@ impl Screen for SettingsScreen {
                 self.prev_focus();
                 InteractionResult::Handled
             }
-            KeyCode::Char('c') | KeyCode::Char('C') => { self.color = Self::next_policy(self.color); InteractionResult::Handled }
-            KeyCode::Char('u') | KeyCode::Char('U') => { self.unicode = Self::next_policy(self.unicode); InteractionResult::Handled }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.color = Self::next_policy(self.color);
+                InteractionResult::Handled
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                self.unicode = Self::next_policy(self.unicode);
+                InteractionResult::Handled
+            }
             KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => {
                 InteractionResult::CloseScreen
             }
@@ -378,8 +397,14 @@ impl Screen for SettingsScreen {
                     keys: "Enter",
                     action: "Save/Activate",
                 },
-                KeyHint { keys: "Tab", action: "Move focus" },
-                KeyHint { keys: "C/U", action: "Color/Unicode" },
+                KeyHint {
+                    keys: "Tab",
+                    action: "Move focus",
+                },
+                KeyHint {
+                    keys: "C/U",
+                    action: "Color/Unicode",
+                },
                 KeyHint {
                     keys: "Esc/B",
                     action: "Back",

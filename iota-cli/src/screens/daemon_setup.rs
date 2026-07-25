@@ -29,7 +29,13 @@ impl Screen for DaemonStartingScreen {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
-    fn render(&self, frame: &mut Frame, area: Rect, context: &RenderContext<'_>, _hits: &mut HitMap) {
+    fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        context: &RenderContext<'_>,
+        _hits: &mut HitMap,
+    ) {
         let popup = crate::layout::fit::centered_rect(
             area,
             crate::layout::fit::RequiredSize {
@@ -191,7 +197,13 @@ impl Screen for DaemonSetupScreen {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
-    fn render(&self, frame: &mut Frame, area: Rect, context: &RenderContext<'_>, _hits: &mut HitMap) {
+    fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        context: &RenderContext<'_>,
+        _hits: &mut HitMap,
+    ) {
         let popup = crate::layout::fit::centered_rect(
             area,
             crate::layout::fit::RequiredSize {
@@ -267,7 +279,9 @@ impl Screen for DaemonSetupScreen {
         );
     }
     fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
-        let UiEvent::Key(event) = event else { return InteractionResult::Unhandled; };
+        let UiEvent::Key(event) = event else {
+            return InteractionResult::Unhandled;
+        };
         match event.code {
             KeyCode::Esc => {
                 self.complete(DaemonSetupDecision::Exit);

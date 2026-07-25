@@ -6,10 +6,7 @@ use tokio::sync::broadcast;
 
 /* The daemon adapts logger output to the wire protocol so the logger stays
  * independent from both the socket implementation and TUI state. */
-pub fn spawn(
-    message_tx: broadcast::Sender<DaemonMessage>,
-    buffer: Arc<Mutex<LogBuffer>>,
-) {
+pub fn spawn(message_tx: broadcast::Sender<DaemonMessage>, buffer: Arc<Mutex<LogBuffer>>) {
     let Some(mut logs) = subscribe() else {
         return;
     };

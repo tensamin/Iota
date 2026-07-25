@@ -459,14 +459,22 @@ impl IpcClient {
                 if tasks.is_empty() {
                     "No active tasks.".into()
                 } else {
-                    tasks.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+                    tasks
+                        .iter()
+                        .map(|t| t.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 }
             }
             ResponsePayload::Users(users) => {
                 if users.is_empty() {
                     "No users.".into()
                 } else {
-                    users.iter().map(|u| format!("{} ({})", u.username, u.user_id)).collect::<Vec<_>>().join("\n")
+                    users
+                        .iter()
+                        .map(|u| format!("{} ({})", u.username, u.user_id))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 }
             }
             ResponsePayload::UserCreated { user_id, username } => {
@@ -489,14 +497,18 @@ impl IpcClient {
                 if components.is_empty() {
                     "No component health data available.".into()
                 } else {
-                    components.iter().map(|c| {
-                        let status_str = match c.status {
-                            iota_ipc::HealthStatus::Healthy => "healthy",
-                            iota_ipc::HealthStatus::Degraded => "degraded",
-                            iota_ipc::HealthStatus::Failed => "failed",
-                        };
-                        format!("{:?}: {}", c.id, status_str)
-                    }).collect::<Vec<_>>().join("\n")
+                    components
+                        .iter()
+                        .map(|c| {
+                            let status_str = match c.status {
+                                iota_ipc::HealthStatus::Healthy => "healthy",
+                                iota_ipc::HealthStatus::Degraded => "degraded",
+                                iota_ipc::HealthStatus::Failed => "failed",
+                            };
+                            format!("{:?}: {}", c.id, status_str)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 }
             }
             ResponsePayload::UserDetail(user) => {
@@ -510,20 +522,31 @@ impl IpcClient {
                 }
                 msg
             }
-            ResponsePayload::LogEntries(logs) => {
-                logs.entries.iter().map(|e| {
+            ResponsePayload::LogEntries(logs) => logs
+                .entries
+                .iter()
+                .map(|e| {
                     let level = if e.is_error { "ERR" } else { "INF" };
                     format!("[{}] {level} {}: {}", e.timestamp_ms, e.sender, e.message)
-                }).collect::<Vec<_>>().join("\n")
-            }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
             ResponsePayload::UpdateStatus(status) => {
-                if status.available { "Update available.".into() } else { "Up to date.".into() }
+                if status.available {
+                    "Update available.".into()
+                } else {
+                    "Up to date.".into()
+                }
             }
             ResponsePayload::Communities(communities) => {
                 if communities.is_empty() {
                     "No communities.".into()
                 } else {
-                    communities.iter().map(|c| format!("{} ({})", c.title, c.name)).collect::<Vec<_>>().join("\n")
+                    communities
+                        .iter()
+                        .map(|c| format!("{} ({})", c.title, c.name))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 }
             }
         }

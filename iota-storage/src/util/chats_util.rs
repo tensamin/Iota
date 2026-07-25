@@ -1,10 +1,12 @@
 use crate::users::contact::Contact;
 use crate::util::db;
+use crate::util::sync::{self, EntityType, Operation};
 use rusqlite::params;
 
 pub fn mod_user(storage_owner: i64, contact: &Contact) {
     if let Err(e) = db::with_db(|conn| {
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             r#"
             INSERT INTO contacts (storage_owner, user_id, user_name, last_message_at)
             VALUES (?1, ?2, ?3, ?4)
@@ -19,10 +21,29 @@ pub fn mod_user(storage_owner: i64, contact: &Contact) {
                 contact.last_message_at,
             ],
         )?;
+        sync::record_event(
+            &tx,
+            storage_owner,
+            EntityType::Contact,
+            contact.user_id,
+            Operation::Upsert,
+        )?;
+        tx.commit()?;
         Ok(())
     }) {
         eprintln!("Failed to mod_user: {}", e);
     }
+}
+
+pub fn get_users_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<Contact> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let wanted: std::collections::HashSet<i64> = ids.iter().copied().collect();
+    get_users(storage_owner)
+        .into_iter()
+        .filter(|contact| wanted.contains(&contact.user_id))
+        .collect()
 }
 
 pub fn get_user(storage_owner: i64, user_id: i64) -> Option<Contact> {

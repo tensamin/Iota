@@ -3,7 +3,10 @@ use crate::{
     controls::choice::{ChoiceKind, ChoiceVisualState, render_choice_line},
     interaction_result::InteractionResult,
     render_context::RenderContext,
-    screens::{md_viewer::FileViewer, screens::{HitMap, Screen, UiEvent}},
+    screens::{
+        md_viewer::FileViewer,
+        screens::{HitMap, Screen, UiEvent},
+    },
     util::{buttons::draw_buttons, terms_focus::Focus},
 };
 use chrono::{Local, TimeZone, Utc};
@@ -594,7 +597,9 @@ impl Screen for TermsUpdaterScreen {
     }
 
     fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
-        let UiEvent::Key(event) = event else { return InteractionResult::Unhandled; };
+        let UiEvent::Key(event) = event else {
+            return InteractionResult::Unhandled;
+        };
         let mut possible_states = Vec::new();
 
         if self.eula_needed {

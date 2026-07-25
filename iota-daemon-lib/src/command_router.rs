@@ -1,8 +1,8 @@
-use crate::{DaemonRuntime, DaemonServices};
 use crate::log_buffer::LogBuffer;
+use crate::{DaemonRuntime, DaemonServices};
 use iota_ipc::{
-    ComponentStatusResponse, CommunitySummary, ConfigResponse, ExitIntent, IpcErrorCode,
-    LogEntriesResponse, LocalRequest, OmikronStatusResponse, ResponseEnvelope, ResponsePayload,
+    CommunitySummary, ComponentStatusResponse, ConfigResponse, ExitIntent, IpcErrorCode,
+    LocalRequest, LogEntriesResponse, OmikronStatusResponse, ResponseEnvelope, ResponsePayload,
     ResponseResult, StatusResponse, TaskSummary, UpdateStatusResponse, UserDetailResponse,
     UserSummary,
 };
@@ -23,8 +23,16 @@ pub struct CommandRouter {
 }
 
 impl CommandRouter {
-    pub fn new(runtime: Arc<DaemonRuntime>, services: Arc<DaemonServices>, log_buffer: Arc<Mutex<LogBuffer>>) -> Self {
-        Self { runtime, services, log_buffer }
+    pub fn new(
+        runtime: Arc<DaemonRuntime>,
+        services: Arc<DaemonServices>,
+        log_buffer: Arc<Mutex<LogBuffer>>,
+    ) -> Self {
+        Self {
+            runtime,
+            services,
+            log_buffer,
+        }
     }
 
     pub async fn route(&self, request_id: u64, request: LocalRequest) -> ResponseEnvelope {
@@ -34,6 +42,14 @@ impl CommandRouter {
     }
 
     async fn execute(&self, request: LocalRequest) -> ResponseResult {
+        if !self.services.active
+            && !matches!(
+                request,
+                LocalRequest::GetStatus | LocalRequest::GetDaemonStatus
+            )
+        {
+            return ResponseResult::Error(IpcErrorCode::Unauthorized);
+        }
         let needs_omikron = matches!(
             request,
             LocalRequest::CreateUser { .. }
@@ -96,12 +112,10 @@ impl CommandRouter {
                 )
                 .await
                 {
-                    (Some(user), _) => {
-                        ResponseResult::Ok(ResponsePayload::UserCreated {
-                            user_id: user.user_id,
-                            username: user.username,
-                        })
-                    }
+                    (Some(user), _) => ResponseResult::Ok(ResponsePayload::UserCreated {
+                        user_id: user.user_id,
+                        username: user.username,
+                    }),
                     _ => ResponseResult::Error(IpcErrorCode::StorageFailure),
                 }
             }
@@ -154,13 +168,11 @@ impl CommandRouter {
                     message: "process exit accepted".into(),
                 })
             }
-            LocalRequest::GetDaemonStatus => {
-                ResponseResult::Ok(ResponsePayload::DaemonStatus(
-                    iota_ipc::DaemonStatusResponse {
-                        formatted: format!("{:?}", self.runtime.snapshot()),
-                    },
-                ))
-            }
+            LocalRequest::GetDaemonStatus => ResponseResult::Ok(ResponsePayload::DaemonStatus(
+                iota_ipc::DaemonStatusResponse {
+                    formatted: format!("{:?}", self.runtime.snapshot()),
+                },
+            )),
             LocalRequest::RestartDaemon => {
                 self.runtime.shutdown(ShutdownReason::Restart);
                 ResponseResult::Ok(ResponsePayload::Acknowledged {
@@ -195,12 +207,10 @@ impl CommandRouter {
             LocalRequest::GetOmikronStatus => {
                 let connected = self.services.omikron.is_connected().await;
                 let iota_id = config_util::CONFIG.load().iota_id;
-                ResponseResult::Ok(ResponsePayload::OmikronStatus(
-                    OmikronStatusResponse {
-                        connected,
-                        iota_id,
-                    },
-                ))
+                ResponseResult::Ok(ResponsePayload::OmikronStatus(OmikronStatusResponse {
+                    connected,
+                    iota_id,
+                }))
             }
             LocalRequest::ListComponents => {
                 let snapshot = self.runtime.snapshot();
@@ -215,20 +225,16 @@ impl CommandRouter {
                     .collect();
                 ResponseResult::Ok(ResponsePayload::Components(components))
             }
-            LocalRequest::GetUser { user_id } => {
-                match user_manager::get_user(user_id) {
-                    Some(user) => ResponseResult::Ok(ResponsePayload::UserDetail(
-                        UserDetailResponse {
-                            user_id: user.user_id,
-                            username: user.username,
-                            display_name: user.display_name,
-                            created_at: user.created_at,
-                            trusted_apps: user.trusted_apps.keys().cloned().collect(),
-                        },
-                    )),
-                    None => ResponseResult::Error(IpcErrorCode::NotFound),
-                }
-            }
+            LocalRequest::GetUser { user_id } => match user_manager::get_user(user_id) {
+                Some(user) => ResponseResult::Ok(ResponsePayload::UserDetail(UserDetailResponse {
+                    user_id: user.user_id,
+                    username: user.username,
+                    display_name: user.display_name,
+                    created_at: user.created_at,
+                    trusted_apps: user.trusted_apps.keys().cloned().collect(),
+                })),
+                None => ResponseResult::Error(IpcErrorCode::NotFound),
+            },
             LocalRequest::ImportUser { username } => {
                 match user_manager::load_from_tu(&username).await {
                     Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
@@ -245,17 +251,22 @@ impl CommandRouter {
                 };
                 ResponseResult::Ok(ResponsePayload::LogEntries(LogEntriesResponse { entries }))
             }
-            LocalRequest::CheckUpdate => {
-                match iota_updater::check_update().await {
-                    Ok(available) => ResponseResult::Ok(ResponsePayload::UpdateStatus(
-                        UpdateStatusResponse { available },
-                    )),
-                    Err(_e) => ResponseResult::Error(IpcErrorCode::InternalFailure),
+            LocalRequest::CheckUpdate => match iota_updater::check_update().await {
+                Ok(available) => {
+                    ResponseResult::Ok(ResponsePayload::UpdateStatus(UpdateStatusResponse {
+                        available,
+                    }))
                 }
-            }
+                Err(_e) => ResponseResult::Error(IpcErrorCode::InternalFailure),
+            },
             LocalRequest::ListCommunities => {
-                let iota_id = config_util::CONFIG.load().iota_id.map(|id| id as i64).unwrap_or(0);
-                let stored = iota_storage::util::communities_util::CommunitiesUtil::get_communities(iota_id);
+                let iota_id = config_util::CONFIG
+                    .load()
+                    .iota_id
+                    .map(|id| id as i64)
+                    .unwrap_or(0);
+                let stored =
+                    iota_storage::util::communities_util::CommunitiesUtil::get_communities(iota_id);
                 let summaries: Vec<CommunitySummary> = stored
                     .into_iter()
                     .map(|c| CommunitySummary {

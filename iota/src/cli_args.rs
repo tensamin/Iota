@@ -1,5 +1,6 @@
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use iota_cli::theme::ThemeName;
+use iota_terms::TermsType;
 
 #[derive(Debug)]
 pub struct CliInvocation {
@@ -25,61 +26,220 @@ pub enum OutputFormat {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliTheme { Monospace, Binary, Ansi, Surface }
+enum CliTheme {
+    Monospace,
+    Binary,
+    Ansi,
+    Surface,
+}
 impl From<CliTheme> for ThemeName {
     fn from(value: CliTheme) -> Self {
-        match value { CliTheme::Monospace => Self::Monospace, CliTheme::Binary => Self::Binary, CliTheme::Ansi => Self::Ansi, CliTheme::Surface => Self::Surface }
+        match value {
+            CliTheme::Monospace => Self::Monospace,
+            CliTheme::Binary => Self::Binary,
+            CliTheme::Ansi => Self::Ansi,
+            CliTheme::Surface => Self::Surface,
+        }
     }
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "iota", version, about = "Iota operator console", arg_required_else_help = false)]
+#[command(
+    name = "iota",
+    version,
+    about = "Iota operator console",
+    arg_required_else_help = false
+)]
 struct Cli {
-    #[arg(long, global = true, value_enum)] theme: Option<CliTheme>,
-    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)] output: OutputFormat,
-    #[arg(long, global = true, value_enum, default_value_t = CapabilityPolicy::Auto)] color: CapabilityPolicy,
-    #[arg(long, global = true, value_enum, default_value_t = CapabilityPolicy::Auto)] unicode: CapabilityPolicy,
-    #[arg(long, global = true)] no_color: bool,
-    #[command(subcommand)] command: Option<CliCommand>,
+    #[arg(long, global = true, value_enum)]
+    theme: Option<CliTheme>,
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
+    output: OutputFormat,
+    #[arg(long, global = true, value_enum, default_value_t = CapabilityPolicy::Auto)]
+    color: CapabilityPolicy,
+    #[arg(long, global = true, value_enum, default_value_t = CapabilityPolicy::Auto)]
+    unicode: CapabilityPolicy,
+    #[arg(long, global = true)]
+    no_color: bool,
+    #[command(subcommand)]
+    command: Option<CliCommand>,
 }
 
 #[derive(Subcommand, Debug)]
 enum CliCommand {
-    Status, Tasks,
-    Users(UsersArgs), Omikron(OmikronArgs), Identity(IdentityArgs), Daemon(DaemonArgs), Config(ConfigArgs),
-    RegenerateKeys { #[arg(long)] yes: bool },
+    Status,
+    Tasks,
+    Users(UsersArgs),
+    Omikron(OmikronArgs),
+    Identity(IdentityArgs),
+    Daemon(DaemonArgs),
+    Config(ConfigArgs),
+    Terms(TermsArgs),
+    RegenerateKeys {
+        #[arg(long)]
+        yes: bool,
+    },
     Components,
-    Logs { #[arg(long, default_value_t = 100)] limit: usize },
+    Logs {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     Update(UpdateArgs),
     Community(CommunityArgs),
-    Completions { shell: String },
+    Completions {
+        shell: String,
+    },
     Man,
 }
-#[derive(Args, Debug)] struct UsersArgs { #[command(subcommand)] action: UsersAction }
-#[derive(Subcommand, Debug)] enum UsersAction { List, Show { user_id: i64 }, Add { username: String }, Remove { user_id: i64, #[arg(long)] yes: bool }, Import { username: String } }
-#[derive(Args, Debug)] struct OmikronArgs { #[command(subcommand)] action: OmikronAction }
-#[derive(Subcommand, Debug)] enum OmikronAction { Reconnect, Status }
-#[derive(Args, Debug)] struct IdentityArgs { #[command(subcommand)] action: IdentityAction }
-#[derive(Subcommand, Debug)] enum IdentityAction { Rotate { #[arg(long)] yes: bool } }
-#[derive(Args, Debug)] struct ConfigArgs { #[command(subcommand)] action: ConfigAction }
-#[derive(Subcommand, Debug)] enum ConfigAction { Get, Set { key: String, value: String }, Reload }
-#[derive(Args, Debug)] struct DaemonArgs { #[command(subcommand)] action: DaemonAction }
-#[derive(Subcommand, Debug)] enum DaemonAction {
-    Restart { #[arg(long)] yes: bool }, Stop { #[arg(long)] yes: bool },
-    Enable { #[arg(long, value_parser = ["socket", "always-on"])] mode: String }, DisableStartup, Status, StartupStatus, Start, RestartService, StopService,
-    Install { #[arg(long)] bundle: String, #[arg(long)] operator: Option<String> },
+#[derive(Args, Debug)]
+struct UsersArgs {
+    #[command(subcommand)]
+    action: UsersAction,
 }
-#[derive(Args, Debug)] struct UpdateArgs { #[command(subcommand)] action: UpdateAction }
-#[derive(Subcommand, Debug)] enum UpdateAction { Check }
-#[derive(Args, Debug)] struct CommunityArgs { #[command(subcommand)] action: CommunityAction }
-#[derive(Subcommand, Debug)] enum CommunityAction { List }
+#[derive(Subcommand, Debug)]
+enum UsersAction {
+    List,
+    Show {
+        user_id: i64,
+    },
+    Add {
+        username: String,
+    },
+    Remove {
+        user_id: i64,
+        #[arg(long)]
+        yes: bool,
+    },
+    Import {
+        username: String,
+    },
+}
+#[derive(Args, Debug)]
+struct OmikronArgs {
+    #[command(subcommand)]
+    action: OmikronAction,
+}
+#[derive(Subcommand, Debug)]
+enum OmikronAction {
+    Reconnect,
+    Status,
+}
+#[derive(Args, Debug)]
+struct IdentityArgs {
+    #[command(subcommand)]
+    action: IdentityAction,
+}
+#[derive(Subcommand, Debug)]
+enum IdentityAction {
+    Rotate {
+        #[arg(long)]
+        yes: bool,
+    },
+}
+#[derive(Args, Debug)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    action: ConfigAction,
+}
+#[derive(Subcommand, Debug)]
+enum ConfigAction {
+    Get,
+    Set { key: String, value: String },
+    Reload,
+}
+#[derive(Args, Debug)]
+struct DaemonArgs {
+    #[command(subcommand)]
+    action: DaemonAction,
+}
+#[derive(Subcommand, Debug)]
+enum DaemonAction {
+    Restart {
+        #[arg(long)]
+        yes: bool,
+    },
+    Stop {
+        #[arg(long)]
+        yes: bool,
+    },
+    Enable {
+        #[arg(long, value_parser = ["socket", "always-on"])]
+        mode: String,
+    },
+    DisableStartup,
+    Status,
+    StartupStatus,
+    Start,
+    RestartService,
+    StopService,
+    Install {
+        #[arg(long)]
+        bundle: String,
+        #[arg(long)]
+        operator: Option<String>,
+    },
+}
+#[derive(Args, Debug)]
+struct UpdateArgs {
+    #[command(subcommand)]
+    action: UpdateAction,
+}
+#[derive(Subcommand, Debug)]
+enum UpdateAction {
+    Check,
+}
+#[derive(Args, Debug)]
+struct CommunityArgs {
+    #[command(subcommand)]
+    action: CommunityAction,
+}
+#[derive(Subcommand, Debug)]
+enum CommunityAction {
+    List,
+}
+#[derive(Args, Debug)]
+struct TermsArgs {
+    #[command(subcommand)]
+    action: TermsAction,
+}
+#[derive(Subcommand, Debug)]
+enum TermsAction {
+    Status {
+        #[arg(long)]
+        system: bool,
+    },
+    Show {
+        document: TermsDocument,
+    },
+    Accept {
+        #[arg(long)]
+        system: bool,
+    },
+}
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TermsDocument {
+    Eula,
+    Tos,
+    Privacy,
+}
+impl From<TermsDocument> for TermsType {
+    fn from(value: TermsDocument) -> Self {
+        match value {
+            TermsDocument::Eula => TermsType::EULA,
+            TermsDocument::Tos => TermsType::TOS,
+            TermsDocument::Privacy => TermsType::PP,
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Dashboard,
     Help,
     Version,
-    Completions { shell: String },
+    Completions {
+        shell: String,
+    },
     ManPage,
     Install {
         bundle: String,
@@ -88,7 +248,9 @@ pub enum Command {
     Status,
     Tasks,
     UsersList,
-    UsersShow { user_id: i64 },
+    UsersShow {
+        user_id: i64,
+    },
     UsersAdd {
         username: String,
     },
@@ -96,7 +258,9 @@ pub enum Command {
         user_id: i64,
         confirmed: bool,
     },
-    UsersImport { username: String },
+    UsersImport {
+        username: String,
+    },
     OmikronReconnect,
     IdentityRotate {
         confirmed: bool,
@@ -117,16 +281,30 @@ pub enum Command {
     DaemonRestartService,
     DaemonStopService,
     ConfigGet,
-    ConfigSet { key: String, value: String },
+    ConfigSet {
+        key: String,
+        value: String,
+    },
     ConfigReload,
     OmikronStatus,
     RegenerateKeys {
         confirmed: bool,
     },
     Components,
-    Logs { limit: usize },
+    Logs {
+        limit: usize,
+    },
     UpdateCheck,
     CommunityList,
+    TermsStatus {
+        system: bool,
+    },
+    TermsShow {
+        document: TermsType,
+    },
+    TermsAccept {
+        system: bool,
+    },
 }
 impl CliInvocation {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
@@ -134,13 +312,14 @@ impl CliInvocation {
         if args.as_slice() == ["help"] {
             return Ok(Self::special(Command::Help));
         }
-        let parsed = Cli::try_parse_from(std::iter::once("iota".to_owned()).chain(args)).map_err(|error| {
-            match error.kind() {
-                ErrorKind::DisplayHelp => return "__help__".to_owned(),
-                ErrorKind::DisplayVersion => return "__version__".to_owned(),
-                _ => error.to_string(),
-            }
-        });
+        let parsed =
+            Cli::try_parse_from(std::iter::once("iota".to_owned()).chain(args)).map_err(|error| {
+                match error.kind() {
+                    ErrorKind::DisplayHelp => return "__help__".to_owned(),
+                    ErrorKind::DisplayVersion => return "__version__".to_owned(),
+                    _ => error.to_string(),
+                }
+            });
         let parsed = match parsed {
             Ok(parsed) => parsed,
             Err(marker) if marker == "__help__" => return Ok(Self::special(Command::Help)),
@@ -154,33 +333,77 @@ impl CliInvocation {
             Some(CliCommand::Components) => Command::Components,
             Some(CliCommand::Completions { shell }) => Command::Completions { shell },
             Some(CliCommand::Man) => Command::ManPage,
-            Some(CliCommand::Users(users)) => match users.action { UsersAction::List => Command::UsersList, UsersAction::Show { user_id } => Command::UsersShow { user_id }, UsersAction::Add { username } => Command::UsersAdd { username }, UsersAction::Remove { user_id, yes } => Command::UsersRemove { user_id, confirmed: yes }, UsersAction::Import { username } => Command::UsersImport { username } },
-            Some(CliCommand::Omikron(omikron)) => match omikron.action { OmikronAction::Reconnect => Command::OmikronReconnect, OmikronAction::Status => Command::OmikronStatus },
-            Some(CliCommand::Identity(identity)) => match identity.action { IdentityAction::Rotate { yes } => Command::IdentityRotate { confirmed: yes } },
-            Some(CliCommand::Config(config)) => match config.action { ConfigAction::Get => Command::ConfigGet, ConfigAction::Set { key, value } => Command::ConfigSet { key, value }, ConfigAction::Reload => Command::ConfigReload },
+            Some(CliCommand::Users(users)) => match users.action {
+                UsersAction::List => Command::UsersList,
+                UsersAction::Show { user_id } => Command::UsersShow { user_id },
+                UsersAction::Add { username } => Command::UsersAdd { username },
+                UsersAction::Remove { user_id, yes } => Command::UsersRemove {
+                    user_id,
+                    confirmed: yes,
+                },
+                UsersAction::Import { username } => Command::UsersImport { username },
+            },
+            Some(CliCommand::Omikron(omikron)) => match omikron.action {
+                OmikronAction::Reconnect => Command::OmikronReconnect,
+                OmikronAction::Status => Command::OmikronStatus,
+            },
+            Some(CliCommand::Identity(identity)) => match identity.action {
+                IdentityAction::Rotate { yes } => Command::IdentityRotate { confirmed: yes },
+            },
+            Some(CliCommand::Config(config)) => match config.action {
+                ConfigAction::Get => Command::ConfigGet,
+                ConfigAction::Set { key, value } => Command::ConfigSet { key, value },
+                ConfigAction::Reload => Command::ConfigReload,
+            },
             Some(CliCommand::RegenerateKeys { yes }) => Command::RegenerateKeys { confirmed: yes },
             Some(CliCommand::Logs { limit }) => Command::Logs { limit },
-            Some(CliCommand::Update(update)) => match update.action { UpdateAction::Check => Command::UpdateCheck },
-            Some(CliCommand::Community(community)) => match community.action { CommunityAction::List => Command::CommunityList },
+            Some(CliCommand::Update(update)) => match update.action {
+                UpdateAction::Check => Command::UpdateCheck,
+            },
+            Some(CliCommand::Community(community)) => match community.action {
+                CommunityAction::List => Command::CommunityList,
+            },
+            Some(CliCommand::Terms(terms)) => match terms.action {
+                TermsAction::Status { system } => Command::TermsStatus { system },
+                TermsAction::Show { document } => Command::TermsShow {
+                    document: document.into(),
+                },
+                TermsAction::Accept { system } => Command::TermsAccept { system },
+            },
             Some(CliCommand::Daemon(daemon)) => match daemon.action {
-                DaemonAction::Restart { yes } => Command::DaemonRestart { confirmed: yes }, DaemonAction::Stop { yes } => Command::DaemonStop { confirmed: yes },
-                DaemonAction::Enable { mode } => Command::DaemonEnable { mode }, DaemonAction::DisableStartup => Command::DaemonDisableStartup,
-                DaemonAction::Status => Command::DaemonDaemonStatus, DaemonAction::StartupStatus => Command::DaemonStartupStatus,
-                DaemonAction::Start => Command::DaemonStart, DaemonAction::RestartService => Command::DaemonRestartService, DaemonAction::StopService => Command::DaemonStopService,
+                DaemonAction::Restart { yes } => Command::DaemonRestart { confirmed: yes },
+                DaemonAction::Stop { yes } => Command::DaemonStop { confirmed: yes },
+                DaemonAction::Enable { mode } => Command::DaemonEnable { mode },
+                DaemonAction::DisableStartup => Command::DaemonDisableStartup,
+                DaemonAction::Status => Command::DaemonDaemonStatus,
+                DaemonAction::StartupStatus => Command::DaemonStartupStatus,
+                DaemonAction::Start => Command::DaemonStart,
+                DaemonAction::RestartService => Command::DaemonRestartService,
+                DaemonAction::StopService => Command::DaemonStopService,
                 DaemonAction::Install { bundle, operator } => Command::Install { bundle, operator },
             },
         };
         Ok(Self {
             theme_override: parsed.theme.map(Into::into),
             output: parsed.output,
-            color: if parsed.no_color { CapabilityPolicy::Never } else { parsed.color },
+            color: if parsed.no_color {
+                CapabilityPolicy::Never
+            } else {
+                parsed.color
+            },
             unicode: parsed.unicode,
             command,
         })
     }
 
     fn special(command: Command) -> Self {
-        Self { theme_override: None, output: OutputFormat::Text, color: CapabilityPolicy::Auto, unicode: CapabilityPolicy::Auto, command }
+        Self {
+            theme_override: None,
+            output: OutputFormat::Text,
+            color: CapabilityPolicy::Auto,
+            unicode: CapabilityPolicy::Auto,
+            command,
+        }
     }
 
     pub fn help_text() -> String {
@@ -237,12 +460,9 @@ mod tests {
 
     #[test]
     fn parses_terminal_capability_overrides() {
-        let invocation = CliInvocation::parse([
-            "--color=never".into(),
-            "--unicode".into(),
-            "always".into(),
-        ])
-        .unwrap();
+        let invocation =
+            CliInvocation::parse(["--color=never".into(), "--unicode".into(), "always".into()])
+                .unwrap();
         assert_eq!(invocation.color, CapabilityPolicy::Never);
         assert_eq!(invocation.unicode, CapabilityPolicy::Always);
         assert_eq!(invocation.command, Command::Dashboard);

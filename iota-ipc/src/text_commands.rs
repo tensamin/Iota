@@ -37,7 +37,9 @@ pub fn validation_error(line: &str) -> Option<String> {
     if normalized == "help" || parse(normalized).is_some() {
         None
     } else {
-        Some(format!("Unknown command `{normalized}`. Use /help or Tab completion."))
+        Some(format!(
+            "Unknown command `{normalized}`. Use /help or Tab completion."
+        ))
     }
 }
 
@@ -121,10 +123,7 @@ mod tests {
 
     #[test]
     fn accepts_the_headless_cli_user_vocabulary() {
-        assert!(matches!(
-            parse("users list"),
-            Some(LocalRequest::ListUsers)
-        ));
+        assert!(matches!(parse("users list"), Some(LocalRequest::ListUsers)));
         assert!(matches!(
             parse("users add alice"),
             Some(LocalRequest::CreateUser { .. })
@@ -203,10 +202,7 @@ mod tests {
 
     #[test]
     fn parses_config_get() {
-        assert!(matches!(
-            parse("config get"),
-            Some(LocalRequest::GetConfig)
-        ));
+        assert!(matches!(parse("config get"), Some(LocalRequest::GetConfig)));
     }
 
     #[test]
@@ -319,6 +315,10 @@ mod tests {
     fn validation_distinguishes_help_and_unknown_commands() {
         assert_eq!(validation_error("/help"), None);
         assert!(validation_error("status").is_none());
-        assert!(validation_error("statuz").unwrap().contains("Unknown command"));
+        assert!(
+            validation_error("statuz")
+                .unwrap()
+                .contains("Unknown command")
+        );
     }
 }

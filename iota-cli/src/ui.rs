@@ -328,7 +328,12 @@ impl UI {
             }
             return;
         }
-        if let UiEvent::App(AppEvent::SaveSettings { theme, color, unicode }) = &event {
+        if let UiEvent::App(AppEvent::SaveSettings {
+            theme,
+            color,
+            unicode,
+        }) = &event
+        {
             self.set_theme(theme::resolve(*theme)).await;
             let mut config = theme::UiConfig::load().unwrap_or_default();
             config.theme = *theme;
@@ -337,7 +342,9 @@ impl UI {
             let result = config
                 .save()
                 .map_err(|error| format!("Could not save UI settings: {error}"));
-            let _ = self.app_event_tx.send(UiEvent::App(AppEvent::ThemeSaved(result)));
+            let _ = self
+                .app_event_tx
+                .send(UiEvent::App(AppEvent::ThemeSaved(result)));
             return;
         }
         if matches!(&event, UiEvent::App(AppEvent::RegenerateKeysRequested)) {
@@ -386,12 +393,14 @@ impl UI {
                         KeyCode::Left | KeyCode::BackTab => *focus = Some((index + 3) % 4),
                         KeyCode::Right | KeyCode::Tab => *focus = Some((index + 1) % 4),
                         KeyCode::Enter | KeyCode::Char(' ') => {
-                            action = Some([
-                                AppAction::OpenOverview,
-                                AppAction::OpenUsers,
-                                AppAction::OpenSettings,
-                                AppAction::Quit,
-                            ][index]);
+                            action = Some(
+                                [
+                                    AppAction::OpenOverview,
+                                    AppAction::OpenUsers,
+                                    AppAction::OpenSettings,
+                                    AppAction::Quit,
+                                ][index],
+                            );
                             *focus = None;
                         }
                         KeyCode::Esc => *focus = None,
@@ -516,7 +525,8 @@ impl UI {
             AppAction::OpenUsers => self.open_users().await,
             AppAction::OpenSettings => {
                 let current = self.theme_name().await;
-                self.set_screen(Box::new(SettingsScreen::new(current))).await;
+                self.set_screen(Box::new(SettingsScreen::new(current)))
+                    .await;
             }
             AppAction::OpenMetrics => {
                 if let Some(screen) = MetricsScreen::new(self.clone()).await {
@@ -552,7 +562,9 @@ impl UI {
                         })
                         .collect())
                 }
-                Ok(iota_ipc::ResponseResult::Error(error)) => Err(format!("Cannot load users: {error}")),
+                Ok(iota_ipc::ResponseResult::Error(error)) => {
+                    Err(format!("Cannot load users: {error}"))
+                }
                 Ok(_) => Err("Daemon returned an unexpected response while loading users.".into()),
                 Err(error) => Err(format!("Cannot load users: {error}")),
             };
@@ -611,8 +623,13 @@ impl UI {
                         .join("   ")
                 };
                 f.render_widget(
-                    ratatui::widgets::Paragraph::new(format!(" {hints}"))
-                        .style(context.theme.surfaces.footer.patch(context.theme.text.muted)),
+                    ratatui::widgets::Paragraph::new(format!(" {hints}")).style(
+                        context
+                            .theme
+                            .surfaces
+                            .footer
+                            .patch(context.theme.text.muted),
+                    ),
                     rows[2],
                 );
                 screen.render(f, rows[1], &context, &mut hits);

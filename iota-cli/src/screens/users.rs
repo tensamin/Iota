@@ -89,7 +89,12 @@ impl UsersScreen {
         let title = if self.filter.is_empty() {
             format!("Users ({})", self.users.len())
         } else {
-            format!("Users ({}/{}) filter: {}", visible_indices.len(), self.users.len(), self.filter)
+            format!(
+                "Users ({}/{}) filter: {}",
+                visible_indices.len(),
+                self.users.len(),
+                self.filter
+            )
         };
         let inner = if matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) {
             crate::controls::panel::render_panel(
@@ -124,14 +129,18 @@ impl UsersScreen {
         }
 
         let mut lines = Vec::new();
-        self.viewport_height.store(inner.height as usize, Ordering::Relaxed);
+        self.viewport_height
+            .store(inner.height as usize, Ordering::Relaxed);
         let labels: Vec<(usize, String)> = visible_indices
             .iter()
             .skip(self.scroll_offset)
             .take(inner.height as usize)
             .map(|user_index| {
                 let user = &self.users[*user_index];
-                (*user_index, format!("{:>6}  {}", user.user_id, user.username))
+                (
+                    *user_index,
+                    format!("{:>6}  {}", user.user_id, user.username),
+                )
             })
             .collect();
         for (user_index, label) in &labels {
@@ -291,7 +300,10 @@ impl UsersScreen {
 
     fn keep_focused_user_visible(&mut self) {
         let indices = self.filtered_indices();
-        let Some(position) = indices.iter().position(|index| *index == self.focused_index) else {
+        let Some(position) = indices
+            .iter()
+            .position(|index| *index == self.focused_index)
+        else {
             self.scroll_offset = 0;
             return;
         };

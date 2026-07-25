@@ -40,9 +40,18 @@ impl GRAPHS {
             Err(_) => return Vec::new(),
         };
         match self {
-            GRAPHS::Ram => state.with_width(sample_width.min(u16::MAX as usize) as u16).ram.clone(),
-            GRAPHS::Cpu => state.with_width(sample_width.min(u16::MAX as usize) as u16).cpu.clone(),
-            GRAPHS::Ping => state.with_width(sample_width.min(u16::MAX as usize) as u16).ping.clone(),
+            GRAPHS::Ram => state
+                .with_width(sample_width.min(u16::MAX as usize) as u16)
+                .ram
+                .clone(),
+            GRAPHS::Cpu => state
+                .with_width(sample_width.min(u16::MAX as usize) as u16)
+                .cpu
+                .clone(),
+            GRAPHS::Ping => state
+                .with_width(sample_width.min(u16::MAX as usize) as u16)
+                .ping
+                .clone(),
         }
     }
 
@@ -141,17 +150,32 @@ impl Element for GraphCard {
             };
 
             let surface = matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces);
-            let title = format!("{}: {}{}  {}min/{}max", self.title, graph.last().unwrap_or(&(0.0, 0.0)).1 as i64, unit, min_y as i64, max_y as i64);
-            let plot_area = if surface { crate::controls::panel::render_panel(f, r, &title, self.focused, context.theme) } else { r };
+            let title = format!(
+                "{}: {}{}  {}min/{}max",
+                self.title,
+                graph.last().unwrap_or(&(0.0, 0.0)).1 as i64,
+                unit,
+                min_y as i64,
+                max_y as i64
+            );
+            let plot_area = if surface {
+                crate::controls::panel::render_panel(f, r, &title, self.focused, context.theme)
+            } else {
+                r
+            };
             let block = Block::default()
-                .title(if surface { String::new() } else { format!(
-                    "{}:─{}{}─{}min/{}max",
-                    self.title,
-                    graph.last().unwrap_or(&(0.0, 0.0)).1 as i64,
-                    unit,
-                    min_y as i64,
-                    max_y as i64,
-                ) })
+                .title(if surface {
+                    String::new()
+                } else {
+                    format!(
+                        "{}:─{}{}─{}min/{}max",
+                        self.title,
+                        graph.last().unwrap_or(&(0.0, 0.0)).1 as i64,
+                        unit,
+                        min_y as i64,
+                        max_y as i64,
+                    )
+                })
                 .borders(if surface { Borders::NONE } else { self.borders })
                 .border_style(if self.focused {
                     context.theme.graphs.focused_border
@@ -186,17 +210,19 @@ impl Element for GraphCard {
                 });
             f.render_widget(block, r);
         }
-        if !matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) { draw_block_joins(
-            f,
-            r,
-            self.borders,
-            self.joins,
-            if self.focused {
-                context.theme.borders.focused
-            } else {
-                context.theme.borders.normal
-            },
-        ); }
+        if !matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) {
+            draw_block_joins(
+                f,
+                r,
+                self.borders,
+                self.joins,
+                if self.focused {
+                    context.theme.borders.focused
+                } else {
+                    context.theme.borders.normal
+                },
+            );
+        }
     }
 }
 

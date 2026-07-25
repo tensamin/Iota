@@ -10,6 +10,7 @@ mod cli_args;
 mod daemon_setup_flow;
 mod local_daemon;
 mod startup_error;
+mod terms;
 
 use cli_args::{CapabilityPolicy, CliInvocation, Command, OutputFormat};
 use startup_error::StartupError;
@@ -78,6 +79,9 @@ async fn run() -> Result<(), StartupError> {
             print_man_page();
             Ok(())
         }
+        Command::TermsStatus { system } => terms::run(terms::TermsCommand::Status { system }).await,
+        Command::TermsShow { document } => terms::run(terms::TermsCommand::Show { document }).await,
+        Command::TermsAccept { system } => terms::run(terms::TermsCommand::Accept { system }).await,
         Command::Install { bundle, operator } => {
             iota_installer::install_linux_bundle_with_operator(
                 Path::new(&bundle),
@@ -98,11 +102,13 @@ async fn run() -> Result<(), StartupError> {
                 return run_startup_command(command).await;
             }
             if !matches!(command, Command::Dashboard) {
-                match iota_core::consent_state::non_interactive_consent() {
-                    iota_core::consent_state::NonInteractiveConsent::Accepted => {}
-                    iota_core::consent_state::NonInteractiveConsent::RequiresInteractiveAcceptance => {
-                        return Err(StartupError::Consent("Run `iota` in an interactive terminal to review and accept the required terms.".into()));
-                    }
+                let state_dir = iota_paths::IotaPaths::resolve(iota_paths::Scope::User)
+                    .map_err(|error| {
+                        StartupError::Other(format!("Cannot resolve consent storage: {error}"))
+                    })?
+                    .state_dir;
+                if !iota_terms::consent::load(&state_dir).has_all_required() {
+                    return Err(StartupError::Consent("Run `iota terms accept` in an interactive terminal to review and accept the required terms.".into()));
                 }
                 let ipc = tokio::select! {
                     result = connect_available(&endpoints) => result?,
@@ -242,8 +248,7 @@ async fn run_dashboard(
         CapabilityPolicy::Always => true,
         CapabilityPolicy::Never => false,
         CapabilityPolicy::Auto => {
-            std::env::var_os("NO_COLOR").is_none()
-                && std::env::var("TERM").as_deref() != Ok("dumb")
+            std::env::var_os("NO_COLOR").is_none() && std::env::var("TERM").as_deref() != Ok("dumb")
         }
     };
     let unicode_enabled = match unicode_policy {
@@ -278,6 +283,7 @@ async fn run_dashboard(
         if consent != (true, true) {
             return Err(StartupError::Consent("Cannot continue until the required terms are accepted.".into()));
         }
+        persist_dashboard_consent().await?;
         let initial = tokio::select! {
             result = connect_available(&endpoints) => result,
             _ = ui.wait_for_shutdown() => Err(StartupError::Cancelled),
@@ -326,6 +332,20 @@ async fn run_dashboard(
         (Ok(()), Some(error)) => Err(StartupError::Terminal(error)),
         (Ok(()), None) => Ok(()),
     }
+}
+
+async fn persist_dashboard_consent() -> Result<(), StartupError> {
+    let docs = iota_terms::get_current_docs().await.ok_or_else(|| {
+        StartupError::Consent("Could not verify the current agreements after acceptance.".into())
+    })?;
+    let paths = iota_paths::IotaPaths::resolve(iota_paths::Scope::User)
+        .map_err(|error| StartupError::Other(format!("Cannot resolve consent storage: {error}")))?;
+    let mut record = iota_terms::consent::load(&paths.state_dir);
+    for document in [&docs.0, &docs.1, &docs.2] {
+        record.accept(document);
+    }
+    iota_terms::consent::save(&paths.state_dir, &record)
+        .map_err(|error| StartupError::Consent(format!("Could not save consent: {error}")))
 }
 
 fn map_process_manager_error(error: iota_process_manager::ProcessManagerError) -> StartupError {
@@ -457,11 +477,21 @@ async fn run_command(
                 "Refusing destructive command without --yes.".into(),
             ));
         }
-        Command::Dashboard | Command::Help | Command::Version | Command::Completions { .. }
-        | Command::ManPage | Command::Install { .. }
-        | Command::DaemonEnable { .. } | Command::DaemonDisableStartup
-        | Command::DaemonStartupStatus | Command::DaemonStart
-        | Command::DaemonRestartService | Command::DaemonStopService => {
+        Command::Dashboard
+        | Command::Help
+        | Command::Version
+        | Command::Completions { .. }
+        | Command::ManPage
+        | Command::Install { .. }
+        | Command::TermsStatus { .. }
+        | Command::TermsShow { .. }
+        | Command::TermsAccept { .. }
+        | Command::DaemonEnable { .. }
+        | Command::DaemonDisableStartup
+        | Command::DaemonStartupStatus
+        | Command::DaemonStart
+        | Command::DaemonRestartService
+        | Command::DaemonStopService => {
             return Err(StartupError::InvalidCommand(
                 "Command cannot be run headlessly.".into(),
             ));

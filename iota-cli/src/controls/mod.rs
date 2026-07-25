@@ -1,8 +1,8 @@
 pub mod action;
 pub mod button;
 pub mod checkbox_group;
-pub mod header;
 pub mod choice;
+pub mod header;
 pub mod navigation;
 pub mod panel;
 pub mod radio_group;

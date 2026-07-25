@@ -1,3 +1,4 @@
+use crossterm::event::{KeyCode, KeyEvent};
 use iota_cli::{
     interaction_result::InteractionResult,
     render_context::RenderContext,
@@ -8,7 +9,6 @@ use iota_cli::{
     theme::{ThemeName, resolve},
 };
 use ratatui::{Terminal, backend::TestBackend};
-use crossterm::event::{KeyCode, KeyEvent};
 
 fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
     terminal

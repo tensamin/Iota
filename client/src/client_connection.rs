@@ -250,6 +250,12 @@ impl ClientConnection {
             return;
         }
 
+        if cv.is_type(CommunicationType::ClientStateAck) {
+            self.send_message(&message_handlers::handle_client_state_ack(&cv))
+                .await;
+            return;
+        }
+
         // ************************************************ //
         // Direct messages                                  //
         // ************************************************ //

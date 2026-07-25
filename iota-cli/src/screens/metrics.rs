@@ -63,7 +63,13 @@ impl Screen for MetricsScreen {
         self
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect, context: &RenderContext<'_>, hits: &mut HitMap) {
+    fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        context: &RenderContext<'_>,
+        hits: &mut HitMap,
+    ) {
         let block = Block::default()
             .title(" Metrics ")
             .borders(Borders::ALL)
@@ -80,8 +86,7 @@ impl Screen for MetricsScreen {
         frame.render_widget(
             Paragraph::new(format!(
                 "Range: {} ({} samples)   Left/Right to change",
-                RANGES[self.range_index].1,
-                RANGES[self.range_index].0
+                RANGES[self.range_index].1, RANGES[self.range_index].0
             ))
             .style(context.theme.text.heading),
             rows[0],

@@ -220,6 +220,37 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    if current_version < 6 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS sync_heads (
+                user_id INTEGER PRIMARY KEY,
+                version INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sync_events (
+                user_id INTEGER NOT NULL,
+                version INTEGER NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                operation TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_events_user_version
+                ON sync_events (user_id, version);
+            CREATE TABLE IF NOT EXISTS client_sync_state (
+                user_id INTEGER NOT NULL,
+                session_id INTEGER NOT NULL,
+                acknowledged_version INTEGER NOT NULL,
+                cache_schema_version INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, session_id)
+            );
+            PRAGMA user_version = 6;
+            "#,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -289,13 +320,32 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
             assert!(statement.exists([column])?);
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_version_five_once_and_is_idempotent() -> Result<(), StorageError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA user_version = 5;")?;
+        run_migrations_on_connection(&conn)?;
+        run_migrations_on_connection(&conn)?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 6);
+        for table in ["sync_heads", "sync_events", "client_sync_state"] {
+            let exists: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )?;
+            assert_eq!(exists, 1);
+        }
         Ok(())
     }
 }

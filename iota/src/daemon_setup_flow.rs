@@ -65,19 +65,23 @@ pub async fn run(
     endpoints: &DaemonEndpoints,
     caps: Capabilities,
 ) -> Result<ConnectionContext, StartupError> {
-    // Try connecting to an already-running daemon before starting a new one.
+    // The initial dashboard probe may have raced a daemon that was still
+    // accepting connections. Re-check both endpoints before offering setup:
+    // a system-managed daemon normally listens on a different socket from a
+    // locally launched one.
     if let Ok(ipc) = IpcClient::connect(&endpoints.local).await {
         return Ok(ConnectionContext { ipc });
     }
+    if endpoints.system != endpoints.local {
+        if let Ok(ipc) = IpcClient::connect(&endpoints.system).await {
+            return Ok(ConnectionContext { ipc });
+        }
+    }
     let options = caps.options();
     if !options.iter().any(|o| o.enabled) {
-        let _ = show(
-            ui,
-            options,
-            "Daemon cannot be started. Correct the reported problem, then Retry, or Exit.",
-        )
-        .await?;
-        return Err(StartupError::Cancelled);
+        return Err(StartupError::Other(
+            "No running daemon could be reached, and no daemon launch method is available.".into(),
+        ));
     }
     if UiConfig::load()
         .map(|c| c.daemon_start_policy == iota_cli::theme::DaemonStartPolicy::WithUi)

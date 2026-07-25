@@ -1,7 +1,7 @@
 use super::{
-    BorderStyles, ButtonStyles, ChoiceItemStyle, ChoiceStyles, ConsoleStyles, CursorPresentation,
-    ChromeMode, GraphStyles, LogStyles, MarkdownStyles, MarkerSet, ResolvedTheme, StatusStyles, SurfaceStyles, TextStyles,
-    ThemeName,
+    BorderStyles, ButtonStyles, ChoiceItemStyle, ChoiceStyles, ChromeMode, ConsoleStyles,
+    CursorPresentation, GraphStyles, LogStyles, MarkdownStyles, MarkerSet, ResolvedTheme,
+    StatusStyles, SurfaceStyles, TextStyles, ThemeName,
 };
 use ratatui::style::{Color, Modifier, Style};
 
@@ -46,7 +46,16 @@ fn base(
     ResolvedTheme {
         name,
         unicode: true,
-        surfaces: SurfaceStyles { canvas: Style::default(), toolbar: Style::default(), panel: Style::default(), panel_alternate: Style::default(), panel_focused: focused, panel_selected: selected, footer: Style::default(), overlay: Style::default() },
+        surfaces: SurfaceStyles {
+            canvas: Style::default(),
+            toolbar: Style::default(),
+            panel: Style::default(),
+            panel_alternate: Style::default(),
+            panel_focused: focused,
+            panel_selected: selected,
+            footer: Style::default(),
+            overlay: Style::default(),
+        },
         chrome: ChromeMode::Bordered,
         text: TextStyles {
             normal,
@@ -300,11 +309,14 @@ pub fn resolve(name: ThemeName) -> ResolvedTheme {
                 CursorPresentation::StyledCell(plain.fg(Color::Black).bg(Color::Yellow));
             theme.chrome = ChromeMode::Surfaces;
             theme.surfaces = SurfaceStyles {
-                canvas: plain.bg(Color::Black), toolbar: plain.fg(Color::White).bg(Color::DarkGray),
+                canvas: plain.bg(Color::Black),
+                toolbar: plain.fg(Color::White).bg(Color::DarkGray),
                 panel: plain.fg(Color::White).bg(Color::Rgb(30, 35, 45)),
                 panel_alternate: plain.fg(Color::White).bg(Color::Rgb(45, 52, 66)),
                 panel_focused: plain.fg(Color::White).bg(Color::Rgb(48, 58, 78)),
-                panel_selected: selected, footer: plain.fg(Color::DarkGray).bg(Color::Black), overlay: plain.fg(Color::White).bg(Color::Rgb(45, 52, 66)),
+                panel_selected: selected,
+                footer: plain.fg(Color::DarkGray).bg(Color::Black),
+                overlay: plain.fg(Color::White).bg(Color::Rgb(45, 52, 66)),
             };
             theme
         }

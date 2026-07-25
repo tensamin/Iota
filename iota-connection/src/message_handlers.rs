@@ -109,6 +109,10 @@ fn stored_message_value(
 ) -> DataValue {
     let mut fields = vec![
         (
+            DataType::MessageId,
+            DataValue::SignedNumber(message.id as i128),
+        ),
+        (
             DataType::SendTime,
             DataValue::SignedNumber(message.message_time as i128),
         ),
@@ -261,56 +265,160 @@ pub fn handle_delete_app(cv: &CommunicationValue) -> CommunicationValue {
         .with_receiver(sender_id as u64)
 }
 
-pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
-    let user_id = cv.get_data(DataType::UserId).as_number().unwrap_or(0) as i64;
-
-    let contacts = chats_util::get_users(user_id);
-    let mut contacts_array = Vec::new();
-
-    for (i, contact) in contacts.iter().enumerate() {
-        let mut contact_container = Vec::new();
-        contact_container.push((
-            DataType::UserId,
-            DataValue::SignedNumber(contact.user_id as i128),
-        ));
-        contact_container.push((
-            DataType::LastMessageAt,
-            DataValue::SignedNumber(contact.last_message_at.unwrap_or(0) as i128),
-        ));
-
-        if let Some(ref name) = contact.user_name {
-            contact_container.push((DataType::Username, DataValue::Str(name.clone())));
-        }
-
-        let amount = if i < 10 { 20 } else { 1 };
-        let messages = chat_files::get_messages(user_id, contact.user_id, 0, amount);
-
-        let mut msg_array = Vec::new();
-        for m in &messages {
-            msg_array.push(stored_message_value(m, user_id, contact.user_id));
-
-            if msg_array.len() == 1 {
-                let sender_id = if m.sent_by_self {
-                    user_id
-                } else {
-                    contact.user_id
-                };
-                let mut last_msg = Vec::new();
-                last_msg.push((DataType::Content, DataValue::Str(m.content.clone())));
-                last_msg.push((
-                    DataType::SenderId,
-                    DataValue::SignedNumber(sender_id as i128),
-                ));
-                contact_container.push((DataType::LastMessage, typed_container(last_msg)));
-            }
-        }
-        contact_container.push((DataType::Messages, DataValue::Array(msg_array)));
-        contacts_array.push(typed_container(contact_container));
+fn contact_value(contact: &iota_storage::users::contact::Contact) -> DataValue {
+    let mut fields = vec![(
+        DataType::UserId,
+        DataValue::SignedNumber(contact.user_id as i128),
+    )];
+    if let Some(name) = &contact.user_name {
+        fields.push((DataType::Username, DataValue::Str(name.clone())));
     }
+    if let Some(last_message_at) = contact.last_message_at {
+        fields.push((
+            DataType::LastMessageAt,
+            DataValue::SignedNumber(last_message_at as i128),
+        ));
+    }
+    typed_container(fields)
+}
 
-    CommunicationValue::new(CommunicationType::ClientConnected)
+fn sync_error(cv: &CommunicationValue) -> CommunicationValue {
+    error_response(cv, CommunicationType::ErrorInvalidData).add_typed_default(
+        DataType::SessionId,
+        cv.get_data(DataType::SessionId).clone(),
+    )
+}
+
+/// The sender is authenticated by MTP; a UserId embedded by a client is never trusted here.
+pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
+    use iota_storage::util::sync::{self, CACHE_SCHEMA_VERSION};
+    let user_id = match i64::try_from(cv.get_sender()) {
+        Ok(id) if id > 0 => id,
+        _ => return sync_error(cv),
+    };
+    let session_id = match data_i64(cv, DataType::SessionId) {
+        Some(id) if id > 0 => id,
+        _ => return sync_error(cv),
+    };
+    let reported_version = match data_i64(cv, DataType::VersionNumber) {
+        Some(version) if version >= 0 => version,
+        _ => return sync_error(cv),
+    };
+    let cache_valid = cv.get_data(DataType::CacheValid).as_bool().unwrap_or(false);
+    let schema = data_i64(cv, DataType::CacheSchemaVersion).unwrap_or(0);
+    let head = match sync::head(user_id) {
+        Ok(version) => version,
+        Err(_) => return sync_error(cv),
+    };
+    let known_session = sync::has_session(user_id, session_id).unwrap_or(false);
+    let full = !cache_valid
+        || reported_version == 0
+        || !known_session
+        || reported_version > head
+        || schema != CACHE_SCHEMA_VERSION;
+    let (contacts, messages, deleted_messages, deleted_contacts, mode) = if full {
+        (
+            chats_util::get_users(user_id),
+            chat_files::get_all_messages(user_id),
+            Vec::new(),
+            Vec::new(),
+            "full",
+        )
+    } else {
+        match sync::delta(user_id, reported_version, head) {
+            Ok(delta) => (
+                chats_util::get_users_by_ids(user_id, &delta.contact_upserts),
+                chat_files::get_messages_by_ids(user_id, &delta.message_upserts),
+                delta.deleted_message_ids,
+                delta.deleted_contact_ids,
+                "delta",
+            ),
+            Err(_) => (
+                chats_util::get_users(user_id),
+                chat_files::get_all_messages(user_id),
+                Vec::new(),
+                Vec::new(),
+                "full",
+            ),
+        }
+    };
+    let all_contact_ids = chats_util::get_users(user_id)
+        .into_iter()
+        .map(|contact| DataValue::SignedNumber(contact.user_id as i128))
+        .collect();
+    let message_values = messages
+        .iter()
+        .map(|message| stored_message_value(message, user_id, message.external_user))
+        .collect();
+    CommunicationValue::new(CommunicationType::ClientStateSync)
         .with_id(cv.get_id())
-        .add_typed_default(DataType::Contacts, DataValue::Array(contacts_array))
+        .with_receiver(cv.get_sender())
+        .add_typed_default(
+            DataType::SessionId,
+            DataValue::SignedNumber(session_id as i128),
+        )
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::SignedNumber(head as i128),
+        )
+        .add_typed_default(
+            DataType::CacheSchemaVersion,
+            DataValue::SignedNumber(CACHE_SCHEMA_VERSION as i128),
+        )
+        .add_typed_default(DataType::SyncMode, DataValue::Str(mode.into()))
+        .add_typed_default(
+            DataType::Contacts,
+            DataValue::Array(contacts.iter().map(contact_value).collect()),
+        )
+        .add_typed_default(DataType::Messages, DataValue::Array(message_values))
+        .add_typed_default(
+            DataType::DeletedMessageIds,
+            DataValue::Array(
+                deleted_messages
+                    .into_iter()
+                    .map(|id| DataValue::SignedNumber(id as i128))
+                    .collect(),
+            ),
+        )
+        .add_typed_default(
+            DataType::DeletedContactIds,
+            DataValue::Array(
+                deleted_contacts
+                    .into_iter()
+                    .map(|id| DataValue::SignedNumber(id as i128))
+                    .collect(),
+            ),
+        )
+        .add_typed_default(DataType::UserIds, DataValue::Array(all_contact_ids))
+        .add_typed_default(DataType::Calls, DataValue::Array(Vec::new()))
+}
+
+pub fn handle_client_state_ack(cv: &CommunicationValue) -> CommunicationValue {
+    use iota_storage::util::sync::{self, CACHE_SCHEMA_VERSION};
+    let user_id = match i64::try_from(cv.get_sender()) {
+        Ok(id) if id > 0 => id,
+        _ => return sync_error(cv),
+    };
+    let session_id = match data_i64(cv, DataType::SessionId) {
+        Some(id) if id > 0 => id,
+        _ => return sync_error(cv),
+    };
+    let version = match data_i64(cv, DataType::VersionNumber) {
+        Some(version) if version >= 0 => version,
+        _ => return sync_error(cv),
+    };
+    if sync::acknowledge(user_id, session_id, version, CACHE_SCHEMA_VERSION).is_err() {
+        return sync_error(cv);
+    }
+    success_response(cv)
+        .add_typed_default(
+            DataType::SessionId,
+            DataValue::SignedNumber(session_id as i128),
+        )
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::SignedNumber(version as i128),
+        )
 }
 
 pub fn handle_message_state(cv: &CommunicationValue) {

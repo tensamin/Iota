@@ -10,6 +10,7 @@ iota-installer = { path = "../iota-installer" }
 iota-core = { path = "../iota-core" }
 iota-process-manager = { path = "../iota-process-manager" }
 iota-paths = { path = "../iota-paths" }
+iota-terms = { path = "../iota-terms" }
 tokio = { version = "1.50.0", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde_json = "1"

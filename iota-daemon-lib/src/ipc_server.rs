@@ -1,5 +1,5 @@
-use crate::log_buffer::LogBuffer;
 use crate::deployment::from_environment;
+use crate::log_buffer::LogBuffer;
 use crate::{CommandRouter, DaemonRuntime, DaemonServices};
 use iota_ipc::{
     ClientMessage, DaemonMessage, HelloAck, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, read_msg,
@@ -136,8 +136,16 @@ impl IpcServer {
             let state_rx = self.state_rx.clone();
             let instance_id = self.instance_id.clone();
             tokio::spawn(async move {
-                if let Err(error) =
-                    handle_client(stream, runtime, services, log_tx, log_buffer, state_rx, instance_id).await
+                if let Err(error) = handle_client(
+                    stream,
+                    runtime,
+                    services,
+                    log_tx,
+                    log_buffer,
+                    state_rx,
+                    instance_id,
+                )
+                .await
                 {
                     eprintln!("IPC client error: {error}");
                 }
