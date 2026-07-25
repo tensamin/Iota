@@ -42,13 +42,11 @@
         commonNativeBuildInputs = with pkgs; [cmake perl pkg-config];
       in {
         packages = {
-          default = self'.packages.iota-daemon;
-
-          iota-daemon = pkgs.rustPlatform.buildRustPackage {
-            pname = "iota-daemon";
+          default = pkgs.rustPlatform.buildRustPackage {
+            pname = "iota";
             version = "0.1.0";
             src = ./.;
-            cargoBuildFlags = ["-p" "iota-daemon"];
+            cargoBuildFlags = ["-p" "iota" "-p" "iota-daemon"];
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -56,6 +54,12 @@
             nativeBuildInputs = commonNativeBuildInputs;
             buildInputs = commonBuildInputs;
             dontUseCmakeConfigure = true;
+            passthru.dataDir = "/var/lib/iota";
+          };
+
+          iota-daemon = self'.packages.default.overrideAttrs (old: {
+            pname = "iota-daemon";
+            cargoBuildFlags = ["-p" "iota-daemon"];
             postInstall = ''
               for f in $out/bin/*; do
                 if [ "$(basename "$f")" != "iota-daemon" ]; then
@@ -63,33 +67,22 @@
                 fi
               done
             '';
-            passthru.dataDir = "/var/lib/iota";
-          };
+          });
 
-          iota-ui = pkgs.rustPlatform.buildRustPackage {
+          iota-ui = self'.packages.default.overrideAttrs (old: {
             pname = "iota-ui";
-            version = "0.1.0";
-            src = ./.;
             cargoBuildFlags = ["-p" "iota"];
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-              allowBuiltinFetchGit = true;
-            };
-            nativeBuildInputs = commonNativeBuildInputs;
-            buildInputs = commonBuildInputs;
-            dontUseCmakeConfigure = true;
             postInstall = ''
               for f in $out/bin/*; do
                 if [ "$(basename "$f")" != "iota" ]; then
                   rm "$f"
                 fi
               done
-              # Rename to avoid confusion
               if [ -f "$out/bin/iota" ]; then
                 mv "$out/bin/iota" "$out/bin/iota-ui"
               fi
             '';
-          };
+          });
         };
 
         devShells.default = pkgs.mkShell {
@@ -106,7 +99,7 @@
           ...
         }: let
           cfg = config.services.iota;
-          defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.iota-daemon or (throw "iota: no pre-built package for system ${pkgs.stdenv.hostPlatform.system}");
+          defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default or (throw "iota: no pre-built package for system ${pkgs.stdenv.hostPlatform.system}");
 
           configFormat = pkgs.formats.yaml {};
           configFile =
