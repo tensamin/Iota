@@ -7,7 +7,13 @@ use rand_core::{OsRng, RngCore};
 use rusqlite::params;
 
 pub fn add_user(user: UserProfile) {
-    if let Err(e) = db::with_db(|conn| {
+    if let Err(e) = try_add_user(user) {
+        eprintln!("Failed to add_user: {}", e);
+    }
+}
+
+pub fn try_add_user(user: UserProfile) -> Result<(), crate::storage_error::StorageError> {
+    db::with_db(|conn| {
         conn.execute(
             r#"
             INSERT INTO users (user_id, username, public_key, private_key_hash, reset_token, created_at, display_name)
@@ -40,9 +46,7 @@ pub fn add_user(user: UserProfile) {
             )?;
         }
         Ok(())
-    }) {
-        eprintln!("Failed to add_user: {}", e);
-    }
+    })
 }
 
 pub fn update_user(user: UserProfile) {

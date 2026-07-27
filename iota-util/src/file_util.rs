@@ -105,41 +105,28 @@ pub fn load_file_vec(path: &str, name: &str) -> Result<Vec<u8>, std::io::Error> 
 }
 
 pub fn save_file(path: &str, name: &str, value: &str) {
-    let Ok(file_path) = storage_file(path, name) else {
-        eprintln!("[IMPORTANT] Refusing unsafe storage path");
-        return;
-    };
-    let Some(dir) = file_path.parent() else {
-        return;
-    };
-
-    if !dir.exists() {
-        if let Err(e) = fs::create_dir_all(&dir) {
-            println!("[IMPORTANT] Couldn't create directories: {}", e);
-            return;
-        }
+    if let Err(error) = try_save_file(path, name, value) {
+        eprintln!("[IMPORTANT] Couldn't save file: {error}");
     }
+}
+
+pub fn try_save_file(path: &str, name: &str, value: &str) -> io::Result<()> {
+    let file_path = storage_file(path, name)?;
+    let dir = file_path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file has no parent"))?;
+
+    fs::create_dir_all(dir)?;
 
     // Write to a temp file first, then atomically rename to prevent partial writes.
     let tmp_name = format!(".{}.tmp", name);
     let tmp_path = dir.join(&tmp_name);
-    if let Err(e) = fs::write(&tmp_path, value) {
-        println!(
-            "[IMPORTANT] Couldn't write temp file {}: {}",
-            tmp_path.display(),
-            e
-        );
-        return;
-    }
-    if let Err(e) = fs::rename(&tmp_path, &file_path) {
-        println!(
-            "[IMPORTANT] Couldn't rename {} to {}: {}",
-            tmp_path.display(),
-            file_path.display(),
-            e
-        );
+    fs::write(&tmp_path, value)?;
+    if let Err(error) = fs::rename(&tmp_path, &file_path) {
         let _ = fs::remove_file(&tmp_path);
+        return Err(error);
     }
+    Ok(())
 }
 
 pub fn get_children(path: &str) -> Vec<String> {

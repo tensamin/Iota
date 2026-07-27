@@ -171,5 +171,3 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
         bail!("{program} failed; run the installer as root")
     }
 }
-
-

@@ -140,19 +140,75 @@ async fn main() -> ExitCode {
             );
             connection
         }
-        Err(omikron_connector::OmikronStartupError::Authentication) => {
+        Err(omikron_connector::OmikronStartupError::Authentication { connection }) => {
             runtime.set_component_failed(
                 iota_ipc::ComponentId::Omikron,
-                "Omikron authentication failed".into(),
+                "Omikron authentication failed; regenerate the Iota identity to register again"
+                    .into(),
             );
-            return ExitCode::FAILURE;
+            // Keep IPC alive: identity rotation is the supported recovery
+            // action and must remain available after authentication fails.
+            connection
         }
         Err(omikron_connector::OmikronStartupError::Construction(error)) => {
             eprintln!("Cannot construct Omikron connection: {error}");
             return ExitCode::FAILURE;
         }
     };
+    let omikron_health = omikron.clone();
     let services = DaemonServices::new(omikron);
+    let health_runtime = runtime.clone();
+    runtime
+        .tasks
+        .spawn_tracked("omikron-health", async move {
+            let mut states = omikron_health.connection_state();
+            loop {
+                let state = *states.borrow();
+                match state {
+                    omikron_connector::omikron_connection::ConnectionState::Connected {
+                        ..
+                    } => {
+                        let ping_ms = *omikron_health.last_ping.lock().await;
+                        let message = if ping_ms >= 0 {
+                            format!("connected (RTT: {ping_ms} ms)")
+                        } else {
+                            "connected (waiting for RTT sample)".into()
+                        };
+                        health_runtime
+                            .set_component_healthy(iota_ipc::ComponentId::Omikron, Some(message));
+                    }
+                    omikron_connector::omikron_connection::ConnectionState::Connecting => {
+                        health_runtime.set_component_degraded(
+                            iota_ipc::ComponentId::Omikron,
+                            "connecting to Omikron".into(),
+                        );
+                    }
+                    omikron_connector::omikron_connection::ConnectionState::Disconnected => {
+                        let message = omikron_health
+                            .get_auth_failure()
+                            .await
+                            .unwrap_or_else(|| "disconnected; retrying".into());
+                        if omikron_health.has_auth_failure().await {
+                            health_runtime
+                                .set_component_failed(iota_ipc::ComponentId::Omikron, message);
+                        } else {
+                            health_runtime
+                                .set_component_degraded(iota_ipc::ComponentId::Omikron, message);
+                        }
+                    }
+                }
+                tokio::select! {
+                    changed = states.changed() => if changed.is_err() { break },
+                    // RTT is updated by MTP's heartbeat independently of a
+                    // connection-state transition, so periodically refresh
+                    // the component detail while connected.
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                    _ = health_runtime.cancellation.cancelled() => break,
+                }
+            }
+            Ok(())
+        })
+        .await;
     let ipc_server = match IpcServer::bind(
         socket.clone(),
         runtime.clone(),

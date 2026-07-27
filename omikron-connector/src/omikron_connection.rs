@@ -13,7 +13,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -219,6 +219,11 @@ impl OmikronConnection {
     async fn set_state(&self, new_state: ConnectionState) {
         *self.state.write().await = new_state;
         let _ = self.state_watch_tx.send(new_state);
+    }
+
+    /// Subscribe to connection transitions for daemon health reporting.
+    pub fn connection_state(&self) -> watch::Receiver<ConnectionState> {
+        self.state_watch_tx.subscribe()
     }
 
     // -------------------------------------------------------------------------
@@ -1880,10 +1885,11 @@ impl OmikronConnection {
                     let reason = response_cv
                         .get_data(DataType::Message)
                         .as_str()
+                        .or_else(|| response_cv.get_data(DataType::ErrorType).as_str())
                         .unwrap_or("connection error")
                         .to_string();
                     Err(format!(
-                        "Request failed due to disconnect (msg_id={}, reason={})",
+                        "Request rejected (msg_id={}, reason={})",
                         msg_id, reason
                     ))
                 } else {
@@ -1955,6 +1961,75 @@ impl OmikronConnection {
         self.stop().await;
         self.connect().await;
     }
+
+    /// Create a new local keyring and register it as a new Iota identity.
+    /// The existing keyring is retained as a timestamped backup so a failed
+    /// recovery does not silently destroy the user's previous identity.
+    pub async fn rotate_identity(self: &Arc<Self>) -> Result<(), OmikronError> {
+        log!("Iota identity rotation requested");
+        self.stop().await;
+
+        let path = identity_path();
+        if path.exists() {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let backup = path.with_extension(format!("mk.backup-{stamp}"));
+            std::fs::rename(path, &backup).map_err(|error| {
+                OmikronError::Internal(format!(
+                    "could not back up identity {}: {error}",
+                    path.display()
+                ))
+            })?;
+            log!("Existing Iota identity backed up to {}", backup.display());
+        }
+
+        let keyring = crypto_helper::generate_keyring();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                OmikronError::Internal(format!(
+                    "could not create identity directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        mtp::files::save_keyring_raw(&keyring, path).map_err(|error| {
+            OmikronError::Internal(format!(
+                "could not save new identity {}: {error}",
+                path.display()
+            ))
+        })?;
+        modify_config(|config| {
+            config.iota_id = None;
+            config.keyring = None;
+            config.public_key = None;
+            config.private_key = None;
+        });
+        log!("New Iota identity generated; registration started");
+
+        self.clear_auth_failure().await;
+        self.connect().await;
+        match self.await_connection(Some(CONNECTION_TIMEOUT)).await {
+            Ok(()) => {
+                let id = CONFIG.load().iota_id;
+                log!(
+                    "New Iota identity registered{}",
+                    id.map(|v| format!(" (Iota-ID: {v})")).unwrap_or_default()
+                );
+                Ok(())
+            }
+            Err(timeout) => {
+                if let Some(reason) = self.get_auth_failure().await {
+                    log!("Iota identity registration failed: {}", reason);
+                    Err(OmikronError::Authentication(reason))
+                } else {
+                    log!("Iota identity registration did not complete: {}", timeout);
+                    Err(OmikronError::Timeout(timeout))
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1975,7 +2050,7 @@ pub async fn connect_initial(
     match conn.await_connection(Some(CONNECTION_TIMEOUT)).await {
         Ok(()) => Ok(conn),
         Err(_) if conn.has_auth_failure().await => {
-            Err(crate::client::OmikronStartupError::Authentication)
+            Err(crate::client::OmikronStartupError::Authentication { connection: conn })
         }
         Err(_) => {
             Err(crate::client::OmikronStartupError::InitialConnectionTimeout { connection: conn })
@@ -2027,6 +2102,8 @@ impl OmikronClient for OmikronConnection {
             .map_err(|error| {
                 if error.contains("timed out") {
                     OmikronError::Timeout(error)
+                } else if error.starts_with("Request rejected") {
+                    OmikronError::Internal(error)
                 } else {
                     OmikronError::Disconnected(error)
                 }
@@ -2055,6 +2132,29 @@ impl OmikronClient for OmikronConnection {
         });
         Self::reconnect(&this).await;
         Ok(())
+    }
+
+    async fn rotate_identity(&self) -> Result<(), OmikronError> {
+        let this = Arc::new(Self {
+            state: self.state.clone(),
+            state_watch_tx: self.state_watch_tx.clone(),
+            sender: self.sender.clone(),
+            connection_loop_handle: self.connection_loop_handle.clone(),
+            last_ping: self.last_ping.clone(),
+            heartbeat_handle: self.heartbeat_handle.clone(),
+            connection_id: self.connection_id,
+            shutdown_tx: self.shutdown_tx.clone(),
+            reconnect_on_close: self.reconnect_on_close.clone(),
+            auth_failure: self.auth_failure.clone(),
+            app_challenges: self.app_challenges.clone(),
+            app_sessions: self.app_sessions.clone(),
+            missed_pongs: self.missed_pongs.clone(),
+            handler_semaphore: self.handler_semaphore.clone(),
+            cancellation: self.cancellation.clone(),
+            active_tasks: self.active_tasks.clone(),
+            app: self.app.clone(),
+        });
+        Self::rotate_identity(&this).await
     }
 
     async fn is_connected(&self) -> bool {

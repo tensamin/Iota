@@ -27,7 +27,9 @@ pub enum OmikronStartupError {
     InitialConnectionTimeout {
         connection: std::sync::Arc<crate::omikron_connection::OmikronConnection>,
     },
-    Authentication,
+    Authentication {
+        connection: std::sync::Arc<crate::omikron_connection::OmikronConnection>,
+    },
 }
 
 #[async_trait]
@@ -39,5 +41,9 @@ pub trait OmikronClient: Send + Sync {
         timeout: Duration,
     ) -> Result<CommunicationValue, OmikronError>;
     async fn reconnect(&self) -> Result<(), OmikronError>;
+    /// Replace the local Iota identity and wait for the new identity to
+    /// register/authenticate. This is deliberately available while offline:
+    /// it is the recovery operation for an authentication failure.
+    async fn rotate_identity(&self) -> Result<(), OmikronError>;
     async fn is_connected(&self) -> bool;
 }

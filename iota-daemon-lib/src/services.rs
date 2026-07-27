@@ -61,6 +61,11 @@ impl OmikronClient for InactiveOmikron {
             "terms have not been accepted".into(),
         ))
     }
+    async fn rotate_identity(&self) -> Result<(), OmikronError> {
+        Err(OmikronError::Disconnected(
+            "terms have not been accepted".into(),
+        ))
+    }
     async fn is_connected(&self) -> bool {
         false
     }

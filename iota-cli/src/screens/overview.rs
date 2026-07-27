@@ -55,6 +55,17 @@ impl OverviewScreen {
 
         lines.push(Line::from(Span::styled("Connection", theme.text.heading)));
         lines.push(Line::from(format!("  State: {}", connection_label(&conn))));
+        let omikron = daemon.components.get(&iota_ipc::ComponentId::Omikron);
+        let omikron_label = match omikron.map(|health| health.status) {
+            Some(iota_ipc::HealthStatus::Healthy) => "[OK] Connected",
+            Some(iota_ipc::HealthStatus::Degraded) => "[WARN] Connecting or unavailable",
+            Some(iota_ipc::HealthStatus::Failed) => "[FAIL] Authentication failed",
+            None => "Unknown",
+        };
+        lines.push(Line::from(format!("  Omikron: {omikron_label}")));
+        if let Some(message) = omikron.and_then(|health| health.message.as_deref()) {
+            lines.push(Line::from(format!("  Omikron detail: {message}")));
+        }
         lines.push(Line::from(""));
 
         lines.push(Line::from(Span::styled("Daemon", theme.text.heading)));

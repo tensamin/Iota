@@ -98,19 +98,19 @@ pub fn startup_with_log_dir(log_dir: Option<std::path::PathBuf>) {
                 format!("{} ", msg.prefix)
             };
 
-            let line1 = format!(
-                "{} {}{}",
+            let line = format!(
+                "{} {} {}{}",
                 fixed_box(&msg.timestamp_ms.to_string(), 13),
+                timestamp,
                 prefix,
                 resolved_message
             );
-            let line2 = format!("    {}", timestamp);
 
             if let Some(file) = file.as_mut() {
-                let _ = writeln!(file, "{}\n{}", line1, line2);
+                let _ = writeln!(file, "{}", line);
             }
 
-            let _ = writeln!(std::io::stderr(), "{}\n{}", line1, line2);
+            let _ = writeln!(std::io::stderr(), "{}", line);
 
             let entry = UiLogEntry {
                 timestamp_ms: msg.timestamp_ms,
@@ -329,8 +329,11 @@ pub fn format_cv(cv: &CommunicationValue) -> String {
         parts.push(format!("> {}", receiver));
     }
 
-    let comm_type = cv.get_type().to_string();
-    parts.push(format!("{}", comm_type));
+    let comm_type = cv
+        .get_comm_type_enum()
+        .map(|kind| kind.to_string())
+        .unwrap_or_else(|| cv.get_type().to_string());
+    parts.push(format!("{} (id={})", comm_type, cv.get_id()));
 
     let data = cv.data();
 

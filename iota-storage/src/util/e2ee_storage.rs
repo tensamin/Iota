@@ -239,5 +239,3 @@ fn pending_forward_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pending
         created_at: row.get(8)?,
     })
 }
-
-

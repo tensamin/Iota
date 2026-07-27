@@ -594,7 +594,7 @@ impl IpcClient {
             return Err(error);
         }
 
-        match tokio::time::timeout(Duration::from_secs(30), response_rx).await {
+        match tokio::time::timeout(Duration::from_secs(45), response_rx).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Ok(ResponseResult::Error(iota_ipc::IpcErrorCode::Disconnected)),
             Err(_) => {

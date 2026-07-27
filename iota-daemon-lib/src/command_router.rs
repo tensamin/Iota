@@ -8,7 +8,7 @@ use iota_ipc::{
 };
 use iota_logger::{log, log_command};
 use iota_storage::users::user_manager;
-use iota_storage::util::config_util::{self, modify_config};
+use iota_storage::util::config_util::{self};
 use mtp::codec::{CommunicationType, CommunicationValue};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -52,10 +52,7 @@ impl CommandRouter {
         }
         let needs_omikron = matches!(
             request,
-            LocalRequest::CreateUser { .. }
-                | LocalRequest::RemoveUser { .. }
-                | LocalRequest::ReconnectOmikron
-                | LocalRequest::RotateIotaIdentity
+            LocalRequest::CreateUser { .. } | LocalRequest::RemoveUser { .. }
         );
         if needs_omikron && !self.services.omikron.is_connected().await {
             return ResponseResult::Error(
@@ -112,11 +109,33 @@ impl CommandRouter {
                 )
                 .await
                 {
-                    (Some(user), _) => ResponseResult::Ok(ResponsePayload::UserCreated {
+                    Ok(user) => ResponseResult::Ok(ResponsePayload::UserCreated {
                         user_id: user.user_id,
                         username: user.username,
                     }),
-                    _ => ResponseResult::Error(IpcErrorCode::StorageFailure),
+                    Err(error) => {
+                        log!("User creation failed: {error:?}");
+                        match error {
+                            omikron_connector::user_ops::CreateUserError::InvalidUsername => {
+                                ResponseResult::Error(IpcErrorCode::InvalidRequest)
+                            }
+                            omikron_connector::user_ops::CreateUserError::Transport(
+                                omikron_connector::OmikronError::Timeout(_),
+                            ) => ResponseResult::Error(IpcErrorCode::Timeout),
+                            omikron_connector::user_ops::CreateUserError::Transport(_) => {
+                                ResponseResult::Error(IpcErrorCode::OmikronUnavailable)
+                            }
+                            omikron_connector::user_ops::CreateUserError::RemoteRejected => {
+                                ResponseResult::Error(IpcErrorCode::Conflict)
+                            }
+                            omikron_connector::user_ops::CreateUserError::LocalPersistence(_) => {
+                                ResponseResult::Error(IpcErrorCode::StorageFailure)
+                            }
+                            omikron_connector::user_ops::CreateUserError::InvalidResponse => {
+                                ResponseResult::Error(IpcErrorCode::InternalFailure)
+                            }
+                        }
+                    }
                 }
             }
             LocalRequest::RemoveUser { user_id } => {
@@ -139,16 +158,14 @@ impl CommandRouter {
                 Err(_) => ResponseResult::Error(IpcErrorCode::OmikronUnavailable),
             },
             LocalRequest::RotateIotaIdentity => {
-                modify_config(|config| {
-                    config.public_key = None;
-                    config.private_key = None;
-                    config.iota_id = None;
-                });
-                match self.services.omikron.reconnect().await {
+                match self.services.omikron.rotate_identity().await {
                     Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
-                        message: "Key pair regenerated and Omikron reconnection requested".into(),
+                        message: "New identity registered with Omikron".into(),
                     }),
-                    Err(_) => ResponseResult::Error(IpcErrorCode::OmikronUnavailable),
+                    Err(error) => {
+                        log!("Iota identity rotation failed: {}", error);
+                        ResponseResult::Error(IpcErrorCode::OmikronUnavailable)
+                    }
                 }
             }
             LocalRequest::RequestProcessExit { intent } => {
