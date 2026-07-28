@@ -25,7 +25,6 @@ pub struct ClientConnection {
     sender: Arc<RwLock<Option<Arc<Sender>>>>,
     receiver: Receiver,
     connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    pub ping: Arc<RwLock<i64>>,
     pub connection_id: Uuid,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     pub waiting_tasks:
@@ -38,7 +37,6 @@ impl ClientConnection {
         sender: Arc<RwLock<Option<Arc<Sender>>>>,
         receiver: Receiver,
         connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-        ping: Arc<RwLock<i64>>,
         connection_id: Uuid,
         shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
         waiting_tasks: DashMap<
@@ -51,7 +49,6 @@ impl ClientConnection {
             sender,
             receiver,
             connection_loop_handle,
-            ping,
             connection_id,
             shutdown_tx,
             waiting_tasks,
@@ -96,33 +93,10 @@ impl ClientConnection {
     // -------------------------------------------------------------------------
     // Message Handling
     // -------------------------------------------------------------------------
-    async fn handle_ping(self: Arc<Self>, cv: CommunicationValue) {
-        // Update our ping if provided
-        if let DataValue::SignedNumber(last_ping) = cv.get_data(DataType::LastPing) {
-            let current = now_millis_i64();
-            let mut ping_guard = self.ping.write().await;
-            *ping_guard = current - *last_ping as i64;
-        }
-
-        // Send pong response
-        let response = CommunicationValue::new(CommunicationType::Pong)
-            .with_id(cv.get_id())
-            .add_typed_default(DataType::PingIota, DataValue::SignedNumber(0));
-
-        self.send_message(&response).await;
-    }
-
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
-        if !cv.is_type(CommunicationType::Ping) && !cv.is_type(CommunicationType::Pong) {
-            log_cv_in!(&cv);
-        }
+        log_cv_in!(&cv);
 
         let _msg_id = cv.get_id();
-
-        if cv.is_type(CommunicationType::Ping) {
-            self.handle_ping(cv).await;
-            return;
-        }
 
         if cv.is_type(CommunicationType::Challenge) {
             self.handle_challenge(&cv).await;
@@ -566,9 +540,7 @@ impl ClientConnection {
             let sender_clone = Arc::clone(sender);
             drop(sender_guard);
 
-            if !cv.is_type(CommunicationType::Ping) && !cv.is_type(CommunicationType::Pong) {
-                log_cv_out!(&cv);
-            }
+            log_cv_out!(&cv);
 
             if let Err(e) = sender_clone.send(cv).await {
                 return Err(e.to_string());

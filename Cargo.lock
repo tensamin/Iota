@@ -1266,13 +1266,13 @@ dependencies = [
 
 [[package]]
 name = "displaydoc"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ac70aa55017e108007fbaf5aa0f54b021c98f92ff8af59d42eda9da96e3dd4f"
+checksum = "c6232dd377dcc64799954cbd3a9bb882e9cdc1308ccd87b1c098f1fb2eaf82a8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -1987,7 +1987,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -2956,7 +2956,7 @@ dependencies = [
 [[package]]
 name = "mtp"
 version = "0.2.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#bcf8aee3716f1690f1284748ac1ff3cd22799fb0"
+source = "git+https://git.methanium.net/Methanium/mtp.git#590810ce59709efccd81ca04401c855be314b9c0"
 dependencies = [
  "mtp-client",
  "mtp-codec",
@@ -2972,7 +2972,7 @@ dependencies = [
 [[package]]
 name = "mtp-client"
 version = "0.2.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#bcf8aee3716f1690f1284748ac1ff3cd22799fb0"
+source = "git+https://git.methanium.net/Methanium/mtp.git#590810ce59709efccd81ca04401c855be314b9c0"
 dependencies = [
  "mtp-codec",
  "mtp-common",
@@ -2985,7 +2985,7 @@ dependencies = [
 [[package]]
 name = "mtp-codec"
 version = "0.2.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#bcf8aee3716f1690f1284748ac1ff3cd22799fb0"
+source = "git+https://git.methanium.net/Methanium/mtp.git#590810ce59709efccd81ca04401c855be314b9c0"
 dependencies = [
  "base64",
  "byteorder",
@@ -2998,7 +2998,7 @@ dependencies = [
 [[package]]
 name = "mtp-common"
 version = "0.2.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#bcf8aee3716f1690f1284748ac1ff3cd22799fb0"
+source = "git+https://git.methanium.net/Methanium/mtp.git#590810ce59709efccd81ca04401c855be314b9c0"
 dependencies = [
  "quinn",
  "rustls",
@@ -3009,7 +3009,7 @@ dependencies = [
 [[package]]
 name = "mtp-crypto"
 version = "0.2.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#bcf8aee3716f1690f1284748ac1ff3cd22799fb0"
+source = "git+https://git.methanium.net/Methanium/mtp.git#590810ce59709efccd81ca04401c855be314b9c0"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -3031,7 +3031,7 @@ dependencies = [
 [[package]]
 name = "mtp-files"
 version = "0.2.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#bcf8aee3716f1690f1284748ac1ff3cd22799fb0"
+source = "git+https://git.methanium.net/Methanium/mtp.git#590810ce59709efccd81ca04401c855be314b9c0"
 dependencies = [
  "mtp-crypto",
  "rand 0.10.2",
@@ -3042,7 +3042,7 @@ dependencies = [
 [[package]]
 name = "mtp-host"
 version = "0.2.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#bcf8aee3716f1690f1284748ac1ff3cd22799fb0"
+source = "git+https://git.methanium.net/Methanium/mtp.git#590810ce59709efccd81ca04401c855be314b9c0"
 dependencies = [
  "mtp-codec",
  "mtp-common",
@@ -3057,7 +3057,7 @@ dependencies = [
 [[package]]
 name = "mtp-transport"
 version = "0.2.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#bcf8aee3716f1690f1284748ac1ff3cd22799fb0"
+source = "git+https://git.methanium.net/Methanium/mtp.git#590810ce59709efccd81ca04401c855be314b9c0"
 dependencies = [
  "async-trait",
  "mtp-codec",
@@ -3075,7 +3075,7 @@ dependencies = [
 [[package]]
 name = "mtp-type-map"
 version = "0.2.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#bcf8aee3716f1690f1284748ac1ff3cd22799fb0"
+source = "git+https://git.methanium.net/Methanium/mtp.git#590810ce59709efccd81ca04401c855be314b9c0"
 dependencies = [
  "serde",
  "serde_yaml",
@@ -3084,7 +3084,7 @@ dependencies = [
 [[package]]
 name = "mtp-webserver"
 version = "0.2.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git#bcf8aee3716f1690f1284748ac1ff3cd22799fb0"
+source = "git+https://git.methanium.net/Methanium/mtp.git#590810ce59709efccd81ca04401c855be314b9c0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3810,7 +3810,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -3851,7 +3851,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -4835,7 +4835,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

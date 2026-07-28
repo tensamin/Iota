@@ -11,7 +11,6 @@ use iota_storage::users::user_manager;
 use iota_storage::util::config_util::{self};
 use mtp::codec::{CommunicationType, CommunicationValue};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use crate::daemon_state::{ShutdownReason, StartupPhase};
 
@@ -293,24 +292,6 @@ impl CommandRouter {
                     .collect();
                 ResponseResult::Ok(ResponsePayload::Communities(summaries))
             }
-        }
-    }
-
-    pub async fn ping(&self, seconds: u64) -> Result<String, String> {
-        let response = self
-            .services
-            .omikron
-            .await_response(
-                &CommunicationValue::new(CommunicationType::Ping),
-                Duration::from_secs(seconds),
-            )
-            .await;
-        match response {
-            Ok(value) => {
-                log!("{}", iota_logger::format_cv(&value));
-                Ok("Ping response received".into())
-            }
-            Err(error) => Err(format!("Ping error: {error:?}")),
         }
     }
 }

@@ -11,7 +11,6 @@ use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::{Keyring, PublicKeyBundle};
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, Semaphore, oneshot, watch};
@@ -110,10 +109,10 @@ const OMIKRON_PUBLIC_KEY_PATH: &str = "omikron.mpkb";
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 const TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const TASK_MAX_AGE: Duration = Duration::from_secs(60);
-const MAX_MISSED_PONGS: u32 = 3;
+const MAX_MISSED_PINGS: usize = 3;
 const MAX_CONCURRENT_HANDLERS: usize = 20;
 
 // ============================================================================
@@ -168,14 +167,13 @@ pub struct OmikronConnection {
     sender: Arc<RwLock<Option<Arc<Sender>>>>,
     connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub last_ping: Arc<Mutex<i64>>,
-    heartbeat_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    maintenance_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub connection_id: Uuid,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     reconnect_on_close: Arc<RwLock<bool>>,
     auth_failure: Arc<RwLock<Option<String>>>,
     pub app_challenges: Arc<DashMap<u64, String>>,
     pub app_sessions: Arc<DashMap<u64, (i64, String)>>,
-    pub(crate) missed_pongs: Arc<AtomicU32>,
     handler_semaphore: Arc<Semaphore>,
     cancellation: CancellationToken,
     pub(crate) active_tasks: Arc<DashSet<String>>,
@@ -201,14 +199,13 @@ impl OmikronConnection {
             sender: Arc::new(RwLock::new(None)),
             connection_loop_handle: Arc::new(Mutex::new(None)),
             last_ping: Arc::new(Mutex::new(-1)),
-            heartbeat_handle: Arc::new(Mutex::new(None)),
+            maintenance_handle: Arc::new(Mutex::new(None)),
             connection_id: Uuid::new_v4(),
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             reconnect_on_close: Arc::new(RwLock::new(true)),
             auth_failure: Arc::new(RwLock::new(None)),
             app_challenges: Arc::new(DashMap::new()),
             app_sessions: Arc::new(DashMap::new()),
-            missed_pongs: Arc::new(AtomicU32::new(0)),
             handler_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS)),
             cancellation,
             active_tasks,
@@ -267,7 +264,7 @@ impl OmikronConnection {
             handle.abort();
         }
 
-        if let Some(handle) = self.heartbeat_handle.lock().await.take() {
+        if let Some(handle) = self.maintenance_handle.lock().await.take() {
             handle.abort();
         }
 
@@ -363,7 +360,9 @@ impl OmikronConnection {
                 persistent_stream_max_retries: 5,
                 persistent_stream_retry_backoff: Duration::from_secs(5),
                 max_frames_per_stream: None,
-            });
+            })
+            .with_ping_interval(MAINTENANCE_INTERVAL)
+            .with_max_missed_pings(MAX_MISSED_PINGS);
 
         let connection = match Client::auth_connect_or_register(
             client_config,
@@ -402,18 +401,18 @@ impl OmikronConnection {
         // Start read loop
         let connection = Arc::new(connection);
         let read_self = self.clone();
+        let read_connection = connection.clone();
         let read_handle = tokio::spawn(async move {
-            read_self.read_loop(connection).await;
+            read_self.read_loop(read_connection).await;
         });
 
         log_t!("omikron_authenticated");
 
-        // Start heartbeat
-        let heartbeat_self = self.clone();
-        let heartbeat_handle = tokio::spawn(async move {
-            heartbeat_self.heartbeat_loop().await;
+        let maintenance_self = self.clone();
+        let maintenance_handle = tokio::spawn(async move {
+            maintenance_self.maintenance_loop(connection).await;
         });
-        *self.heartbeat_handle.lock().await = Some(heartbeat_handle);
+        *self.maintenance_handle.lock().await = Some(maintenance_handle);
 
         {
             self.active_tasks.insert("Omikron Listener".to_string());
@@ -427,7 +426,7 @@ impl OmikronConnection {
             self.active_tasks.remove("Omikron Listener");
         }
 
-        if let Some(handle) = self.heartbeat_handle.lock().await.take() {
+        if let Some(handle) = self.maintenance_handle.lock().await.take() {
             handle.abort();
         }
 
@@ -589,7 +588,7 @@ impl OmikronConnection {
     }
 
     // -------------------------------------------------------------------------
-    // Read Loop & Heartbeat
+    // Read Loop & Maintenance
     // -------------------------------------------------------------------------
 
     async fn read_loop(self: Arc<Self>, connection: Arc<MTPConnection>) {
@@ -603,11 +602,6 @@ impl OmikronConnection {
                             continue;
                         }
                     }
-                    if cv.is_type(CommunicationType::Pong) {
-                        self.handle_pong(&cv).await;
-                        continue;
-                    }
-
                     let permit = self.handler_semaphore.clone().acquire_owned().await;
                     let self_clone = self.clone();
                     tokio::spawn(async move {
@@ -635,9 +629,9 @@ impl OmikronConnection {
         }
     }
 
-    async fn heartbeat_loop(self: Arc<Self>) {
+    async fn maintenance_loop(self: Arc<Self>, connection: Arc<MTPConnection>) {
         loop {
-            sleep(HEARTBEAT_INTERVAL).await;
+            sleep(MAINTENANCE_INTERVAL).await;
 
             if !self.state.read().await.is_connected() {
                 break;
@@ -651,19 +645,13 @@ impl OmikronConnection {
                 break;
             }
 
-            if self.missed_pongs.load(Ordering::Relaxed) > MAX_MISSED_PONGS {
-                log!(
-                    "Connection appears dead ({} consecutive missed pongs), closing sender",
-                    self.missed_pongs.load(Ordering::Relaxed)
-                );
-                if let Some(sender) = self.sender.read().await.as_ref() {
-                    sender.close().await;
-                }
-                break;
+            if let Some(ping) = connection.get_ping() {
+                let ping_ms = ping.as_millis() as i64;
+                *self.last_ping.lock().await = ping_ms;
+                self.app.lock().unwrap().push_ping_val(ping_ms as f64);
             }
 
             self.flush_pending_chat_secret_forwards().await;
-            self.send_ping().await;
         }
     }
 
@@ -854,9 +842,7 @@ impl OmikronConnection {
     // -------------------------------------------------------------------------
 
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
-        if !cv.is_type(CommunicationType::Ping) && !cv.is_type(CommunicationType::Pong) {
-            log_cv_in!(&cv);
-        }
+        log_cv_in!(&cv);
 
         let msg_id = cv.get_id();
 
@@ -864,11 +850,6 @@ impl OmikronConnection {
             if (task.task)(cv.clone()) {
                 return;
             }
-        }
-
-        if cv.is_type(CommunicationType::Pong) {
-            self.handle_pong(&cv).await;
-            return;
         }
 
         self.clone().handle_message_impl(cv).await;
@@ -1804,9 +1785,7 @@ impl OmikronConnection {
             let sender_clone = Arc::clone(sender);
             drop(sender_guard);
 
-            if !cv.is_type(CommunicationType::Ping) && !cv.is_type(CommunicationType::Pong) {
-                log_cv_out!(&cv);
-            }
+            log_cv_out!(&cv);
 
             if let Err(e) = sender_clone.send(cv).await {
                 self.fail_all_waiting_tasks(format!(
@@ -2117,14 +2096,13 @@ impl OmikronClient for OmikronConnection {
             sender: self.sender.clone(),
             connection_loop_handle: self.connection_loop_handle.clone(),
             last_ping: self.last_ping.clone(),
-            heartbeat_handle: self.heartbeat_handle.clone(),
+            maintenance_handle: self.maintenance_handle.clone(),
             connection_id: self.connection_id,
             shutdown_tx: self.shutdown_tx.clone(),
             reconnect_on_close: self.reconnect_on_close.clone(),
             auth_failure: self.auth_failure.clone(),
             app_challenges: self.app_challenges.clone(),
             app_sessions: self.app_sessions.clone(),
-            missed_pongs: self.missed_pongs.clone(),
             handler_semaphore: self.handler_semaphore.clone(),
             cancellation: self.cancellation.clone(),
             active_tasks: self.active_tasks.clone(),
@@ -2141,14 +2119,13 @@ impl OmikronClient for OmikronConnection {
             sender: self.sender.clone(),
             connection_loop_handle: self.connection_loop_handle.clone(),
             last_ping: self.last_ping.clone(),
-            heartbeat_handle: self.heartbeat_handle.clone(),
+            maintenance_handle: self.maintenance_handle.clone(),
             connection_id: self.connection_id,
             shutdown_tx: self.shutdown_tx.clone(),
             reconnect_on_close: self.reconnect_on_close.clone(),
             auth_failure: self.auth_failure.clone(),
             app_challenges: self.app_challenges.clone(),
             app_sessions: self.app_sessions.clone(),
-            missed_pongs: self.missed_pongs.clone(),
             handler_semaphore: self.handler_semaphore.clone(),
             cancellation: self.cancellation.clone(),
             active_tasks: self.active_tasks.clone(),

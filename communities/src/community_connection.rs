@@ -30,7 +30,6 @@ pub struct CommunityConnection {
     challenged: Arc<RwLock<bool>>,
     challenge: Arc<RwLock<String>>,
     auth: Arc<RwLock<Option<AuthUser>>>,
-    pub ping: Arc<RwLock<i64>>,
 }
 impl CommunityConnection {
     pub fn new(
@@ -47,7 +46,6 @@ impl CommunityConnection {
             challenged: Arc::new(RwLock::new(false)),
             challenge: Arc::new(RwLock::new(String::new())),
             auth: Arc::new(RwLock::new(None)),
-            ping: Arc::new(RwLock::new(-1)),
         })
     }
     pub async fn send_message(&self, message: &CommunicationValue) {
@@ -81,11 +79,6 @@ impl CommunityConnection {
         }
 
         if !self.is_identified().await {
-            return;
-        }
-
-        if cv.is_type(CommunicationType::Ping) {
-            self.handle_ping(cv).await;
             return;
         }
 
@@ -381,16 +374,4 @@ impl CommunityConnection {
         }
     }
 
-    async fn handle_ping(&self, cv: CommunicationValue) {
-        if let Some(last_ping) = cv.get_data(DataType::LastPing) {
-            if let Ok(ping_val) = last_ping.to_string().parse::<i64>() {
-                let mut ping_guard = self.ping.write().await;
-                *ping_guard = ping_val;
-            }
-        }
-
-        let response = CommunicationValue::new(CommunicationType::Pong).with_id(cv.get_id());
-
-        self.send_message(&response).await;
-    }
 }
