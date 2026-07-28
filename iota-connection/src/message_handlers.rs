@@ -265,7 +265,11 @@ pub fn handle_delete_app(cv: &CommunicationValue) -> CommunicationValue {
         .with_receiver(sender_id as u64)
 }
 
-fn contact_value(contact: &iota_storage::users::contact::Contact) -> DataValue {
+fn contact_value(
+    contact: &iota_storage::users::contact::Contact,
+    messages: &[chat_files::StoredMessage],
+    storage_owner: i64,
+) -> DataValue {
     let mut fields = vec![(
         DataType::UserId,
         DataValue::SignedNumber(contact.user_id as i128),
@@ -279,6 +283,16 @@ fn contact_value(contact: &iota_storage::users::contact::Contact) -> DataValue {
             DataValue::SignedNumber(last_message_at as i128),
         ));
     }
+    fields.push((
+        DataType::Messages,
+        DataValue::Array(
+            messages
+                .iter()
+                .filter(|message| message.external_user == contact.user_id)
+                .map(|message| stored_message_value(message, storage_owner, contact.user_id))
+                .collect(),
+        ),
+    ));
     typed_container(fields)
 }
 
@@ -368,7 +382,12 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
         .add_typed_default(DataType::SyncMode, DataValue::Str(mode.into()))
         .add_typed_default(
             DataType::Contacts,
-            DataValue::Array(contacts.iter().map(contact_value).collect()),
+            DataValue::Array(
+                contacts
+                    .iter()
+                    .map(|contact| contact_value(contact, &messages, user_id))
+                    .collect(),
+            ),
         )
         .add_typed_default(DataType::Messages, DataValue::Array(message_values))
         .add_typed_default(

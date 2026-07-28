@@ -6,7 +6,7 @@ use iota_storage::util::config_util::{CONFIG, modify_config};
 use iota_storage::util::e2ee_storage::{self, PendingChatSecretForward, StoredChatSecret};
 use iota_util::crypto_helper::{self, keyring_from_base64};
 use iota_util::crypto_util::{self};
-use mtp::client::{Client, ClientConfig, Policy, Receiver, SendMode, Sender};
+use mtp::client::{Client, ClientConfig, MTPConnection, Policy, SendMode, Sender};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::{Keyring, PublicKeyBundle};
 use std::env;
@@ -394,16 +394,16 @@ impl OmikronConnection {
             log!("Registered with Iota-ID: {}", connection.client_id);
         }
 
-        let sender_arc = Arc::new(connection.sender);
+        let sender_arc = Arc::new(connection.sender.clone());
         *self.sender.write().await = Some(sender_arc.clone());
         self.set_state(ConnectionState::Connected { identified: true })
             .await;
 
         // Start read loop
-        let mut receiver = connection.receiver;
+        let connection = Arc::new(connection);
         let read_self = self.clone();
         let read_handle = tokio::spawn(async move {
-            read_self.read_loop(&mut receiver).await;
+            read_self.read_loop(connection).await;
         });
 
         log_t!("omikron_authenticated");
@@ -592,9 +592,9 @@ impl OmikronConnection {
     // Read Loop & Heartbeat
     // -------------------------------------------------------------------------
 
-    async fn read_loop(self: Arc<Self>, receiver: &mut Receiver) {
+    async fn read_loop(self: Arc<Self>, connection: Arc<MTPConnection>) {
         loop {
-            let result = receiver.receive().await;
+            let result = connection.receive().await;
             match result {
                 Ok(cv) => {
                     let msg_id = cv.get_id();
@@ -624,7 +624,7 @@ impl OmikronConnection {
                     break;
                 }
             }
-            if !receiver.is_open() {
+            if !connection.receiver.is_open() {
                 self.fail_all_waiting_tasks(format!(
                     "Connection closed (connection_id={}, receiver_open=false)",
                     self.connection_id
