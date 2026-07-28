@@ -3,7 +3,7 @@ mod model;
 mod name;
 mod presets;
 
-pub use config::{DaemonStartPolicy, TerminalPolicy, UiConfig};
+pub use config::{CliOutputFormat, DaemonStartPolicy, TerminalPolicy, UiConfig};
 pub use model::*;
 pub use name::ThemeName;
 

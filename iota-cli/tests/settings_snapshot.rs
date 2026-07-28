@@ -44,7 +44,9 @@ async fn settings_preview_and_save_emit_typed_application_events() {
         UiEvent::App(AppEvent::SaveSettings {
             theme: ThemeName::Surface,
             color: _,
-            unicode: _
+            unicode: _,
+            cli_output: _,
+            cli_require_confirmation: _
         })
     ));
 }

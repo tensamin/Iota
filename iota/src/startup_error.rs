@@ -28,6 +28,52 @@ impl StartupError {
             _ => 1,
         }
     }
+
+    pub fn suggestion(&self) -> Option<&'static str> {
+        match self {
+            Self::DaemonExecutableMissing(_) => {
+                Some("Install the daemon with `iota daemon install` or ensure it is in your PATH.")
+            }
+            Self::LocalSocketNotWritable(_, _) => {
+                Some("Check permissions on the parent directory or run as your user (not root).")
+            }
+            Self::SystemManagerUnavailable => {
+                Some("Install systemd or another supported process manager.")
+            }
+            Self::SystemPermissionDenied(_) => {
+                Some("Run with appropriate privileges or use a user-level daemon instead.")
+            }
+            Self::SocketPermissionDenied(_) => {
+                Some(
+                    "Check file permissions on the socket or ensure the daemon is running as your user.",
+                )
+            }
+            Self::IpcTimedOut(_) => {
+                Some(
+                    "The daemon may be starting up. Wait a moment and try again, or check daemon logs.",
+                )
+            }
+            Self::ProtocolMismatch { .. } => {
+                Some("Update your CLI or daemon to match versions.")
+            }
+            Self::DaemonExited { .. } => {
+                Some("Restart the daemon with `iota daemon restart`.")
+            }
+            Self::IpcBindUnavailable(_) => {
+                Some("Another instance may be running. Stop it first or use a different socket path.")
+            }
+            Self::Terminal(_) => {
+                Some("Use a terminal that supports interactive mode, or run commands headlessly.")
+            }
+            Self::Consent(_) => {
+                Some("Run `iota terms accept` in an interactive terminal to review and accept terms.")
+            }
+            Self::InvalidCommand(_) => {
+                Some("Run `iota --help` to see available commands.")
+            }
+            _ => None,
+        }
+    }
 }
 impl fmt::Display for StartupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -75,6 +121,18 @@ pub fn exit_code(error: &StartupError) -> ExitCode {
     ExitCode::from(error.exit_code())
 }
 
+pub fn print_error(error: &StartupError) {
+    let color = crate::cli_color::ColorConfig::new();
+    eprintln!("{} {}", crate::cli_color::error(&color, "error:"), error);
+    if let Some(suggestion) = error.suggestion() {
+        eprintln!(
+            "  {} {}",
+            crate::cli_color::info(&color, "hint:"),
+            suggestion
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +146,11 @@ mod tests {
         let error = StartupError::SystemPermissionDenied("run as an administrator".into());
         assert!(error.to_string().contains("authorization"));
         assert!(error.to_string().contains("administrator"));
+    }
+    #[test]
+    fn most_errors_have_suggestions() {
+        assert!(StartupError::DaemonExecutableMissing(PathBuf::from("iota-daemon")).suggestion().is_some());
+        assert!(StartupError::IpcTimedOut(PathBuf::from("/tmp/iota.sock")).suggestion().is_some());
+        assert!(StartupError::Cancelled.suggestion().is_none());
     }
 }

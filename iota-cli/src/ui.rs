@@ -1,8 +1,10 @@
 use crate::{
     controls::header::render_header,
+    help_overlay::HelpOverlay,
     input_handler::setup_input_handler,
     interaction_result::InteractionResult,
-    ipc_client::IpcClient,
+    ipc_client::{DaemonStatus, IpcClient, IpcConnectionState},
+    notification::{Notification, render_notification_area},
     render_context::RenderContext,
     screens::{
         main_screen::MainScreen,
@@ -21,7 +23,7 @@ use once_cell::sync::Lazy;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
 };
 use std::{
     io,
@@ -53,6 +55,7 @@ pub struct UI {
     app_event_tx: mpsc::UnboundedSender<UiEvent>,
     app_event_rx: Mutex<Option<mpsc::UnboundedReceiver<UiEvent>>>,
     header_focus: Mutex<Option<usize>>,
+    notifications: Arc<Mutex<Vec<Notification>>>,
 }
 
 pub fn start_tui(ipc: Arc<IpcClient>) -> io::Result<TuiSession> {
@@ -237,6 +240,7 @@ impl UI {
             app_event_tx,
             app_event_rx: Mutex::new(Some(app_event_rx)),
             header_focus: Mutex::new(None),
+            notifications: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -282,6 +286,27 @@ impl UI {
 
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    pub async fn push_notification(&self, notification: Notification) {
+        if let Ok(mut notifications) = self.notifications.lock() {
+            notifications.push(notification);
+            self.invalidate();
+        }
+    }
+
+    pub async fn clear_expired_notifications(&self) {
+        if let Ok(mut notifications) = self.notifications.lock() {
+            let before = notifications.len();
+            notifications.retain(|n| !n.is_expired());
+            if notifications.len() != before {
+                self.invalidate();
+            }
+        }
+    }
+
+    pub async fn notifications(&self) -> Vec<Notification> {
+        self.notifications.lock().map(|n| n.clone()).unwrap_or_default()
     }
 
     pub async fn set_screen(&self, screen: Box<dyn Screen>) {
@@ -332,6 +357,8 @@ impl UI {
             theme,
             color,
             unicode,
+            cli_output,
+            cli_require_confirmation,
         }) = &event
         {
             self.set_theme(theme::resolve(*theme)).await;
@@ -339,6 +366,8 @@ impl UI {
             config.theme = *theme;
             config.color = *color;
             config.unicode = *unicode;
+            config.cli_output = *cli_output;
+            config.cli_require_confirmation = *cli_require_confirmation;
             let result = config
                 .save()
                 .map_err(|error| format!("Could not save UI settings: {error}"));
@@ -383,6 +412,18 @@ impl UI {
                     *focus = if focus.is_some() { None } else { Some(0) };
                 }
                 self.invalidate();
+                return;
+            }
+            if key.code == KeyCode::Char('?') {
+                let has_help_overlay = self
+                    .screen_stack
+                    .read()
+                    .await
+                    .iter()
+                    .any(|s| s.as_any().downcast_ref::<HelpOverlay>().is_some());
+                if !has_help_overlay {
+                    self.set_screen(Box::new(HelpOverlay::new())).await;
+                }
                 return;
             }
             if header_is_focused {
@@ -551,35 +592,61 @@ impl UI {
         self.set_screen(Box::new(UsersScreen::loading(ipc.clone())))
             .await;
         let sender = self.app_event_tx.clone();
+        let ui = self.clone();
         tokio::spawn(async move {
-            let result = match ipc.send_request(iota_ipc::LocalRequest::ListUsers).await {
-                Ok(iota_ipc::ResponseResult::Ok(iota_ipc::ResponsePayload::Users(users))) => {
-                    Ok(users
-                        .into_iter()
-                        .map(|u| UserEntry {
-                            user_id: u.user_id,
-                            username: u.username,
-                        })
-                        .collect())
+            let load = async {
+                match ipc.send_request(iota_ipc::LocalRequest::ListUsers).await {
+                    Ok(iota_ipc::ResponseResult::Ok(iota_ipc::ResponsePayload::Users(users))) => {
+                        Ok(users
+                            .into_iter()
+                            .map(|u| UserEntry {
+                                user_id: u.user_id,
+                                username: u.username,
+                            })
+                            .collect())
+                    }
+                    Ok(iota_ipc::ResponseResult::Error(error)) => {
+                        Err(format!("Cannot load users: {error}"))
+                    }
+                    Ok(_) => Err("Daemon returned an unexpected response while loading users.".into()),
+                    Err(error) => Err(format!("Cannot load users: {error}")),
                 }
-                Ok(iota_ipc::ResponseResult::Error(error)) => {
-                    Err(format!("Cannot load users: {error}"))
+            };
+            tokio::pin!(load);
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let result = loop {
+                tokio::select! {
+                    result = &mut load => break result,
+                    _ = ticker.tick() => {
+                        ui.invalidate();
+                    }
                 }
-                Ok(_) => Err("Daemon returned an unexpected response while loading users.".into()),
-                Err(error) => Err(format!("Cannot load users: {error}")),
             };
             let _ = sender.send(UiEvent::App(AppEvent::UsersLoaded(result)));
         });
     }
 
     pub async fn render(&self) -> io::Result<()> {
+        self.clear_expired_notifications().await;
         let theme = self.theme.read().await.clone();
         let context = RenderContext {
             theme: theme.as_ref(),
         };
         // The renderer is the only task that takes the terminal lock.  Screen
         // mutations use the stack lock briefly before invalidating a frame.
-        if let Some(screen) = self.screen_stack.read().await.last() {
+        let stack_guard = self.screen_stack.read().await;
+        let (connection, daemon) = stack_guard
+            .iter()
+            .find_map(|item| item.as_any().downcast_ref::<MainScreen>())
+            .map(|main| {
+                (
+                    main.connection_status().borrow().clone(),
+                    main.daemon_status().borrow().clone(),
+                )
+            })
+            .unwrap_or_else(|| (IpcConnectionState::Disconnected, DaemonStatus::default()));
+        if let Some(screen) = stack_guard.last() {
             let mut terminal = self
                 .terminal
                 .lock()
@@ -592,22 +659,12 @@ impl UI {
                     Constraint::Length(1),
                 ])
                 .split(f.area());
-                let header_title = self
-                    .screen_stack
-                    .try_read()
-                    .ok()
-                    .and_then(|stack| {
-                        stack
-                            .iter()
-                            .find_map(|item| item.as_any().downcast_ref::<MainScreen>())
-                            .map(|main| main.app_title())
-                    })
-                    .unwrap_or_else(|| screen.app_title());
                 let header_focus = self.header_focus.lock().ok().and_then(|focus| *focus);
                 render_header(
                     f,
                     rows[0],
-                    &header_title,
+                    &connection,
+                    &daemon,
                     context.theme,
                     &mut hits,
                     header_focus,
@@ -615,12 +672,15 @@ impl UI {
                 let hints = if header_focus.is_some() {
                     " Left/Right: choose   Enter: activate   Esc/F6: screen".to_owned()
                 } else {
-                    screen
+                    let mut screen_hints: Vec<String> = screen
                         .key_hints()
                         .into_iter()
                         .map(|hint| format!("{}: {}", hint.keys, hint.action))
-                        .collect::<Vec<_>>()
-                        .join("   ")
+                        .collect();
+                    if !screen_hints.iter().any(|h| h.contains("?")) {
+                        screen_hints.push("?: Help".to_owned());
+                    }
+                    screen_hints.join("   ")
                 };
                 f.render_widget(
                     ratatui::widgets::Paragraph::new(format!(" {hints}")).style(
@@ -633,6 +693,18 @@ impl UI {
                     rows[2],
                 );
                 screen.render(f, rows[1], &context, &mut hits);
+
+                if let Ok(notifications) = self.notifications.try_lock() {
+                    if !notifications.is_empty() {
+                        let notification_area = Rect {
+                            x: rows[1].x + rows[1].width.saturating_sub(40),
+                            y: rows[1].y,
+                            width: 40.min(rows[1].width),
+                            height: 3.min(rows[1].height),
+                        };
+                        render_notification_area(f, notification_area, &notifications, context.theme);
+                    }
+                }
             })?;
             if let Ok(mut current) = self.hits.lock() {
                 *current = hits;

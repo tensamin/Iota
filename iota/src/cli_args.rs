@@ -1,5 +1,5 @@
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
-use iota_cli::theme::ThemeName;
+use iota_cli::theme::{CliOutputFormat, ThemeName, UiConfig};
 use iota_terms::TermsType;
 
 #[derive(Debug)]
@@ -23,6 +23,7 @@ pub enum OutputFormat {
     Text,
     Json,
     Yaml,
+    Table,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -39,6 +40,17 @@ impl From<CliTheme> for ThemeName {
             CliTheme::Binary => Self::Binary,
             CliTheme::Ansi => Self::Ansi,
             CliTheme::Surface => Self::Surface,
+        }
+    }
+}
+
+impl From<CliOutputFormat> for OutputFormat {
+    fn from(value: CliOutputFormat) -> Self {
+        match value {
+            CliOutputFormat::Text => OutputFormat::Text,
+            CliOutputFormat::Json => OutputFormat::Json,
+            CliOutputFormat::Yaml => OutputFormat::Yaml,
+            CliOutputFormat::Table => OutputFormat::Table,
         }
     }
 }
@@ -312,6 +324,11 @@ impl CliInvocation {
         if args.as_slice() == ["help"] {
             return Ok(Self::special(Command::Help));
         }
+
+        let config = UiConfig::load_or_default();
+        let config_output: OutputFormat = config.cli_output.into();
+        let require_confirmation = config.resolve_cli_require_confirmation();
+
         let parsed =
             Cli::try_parse_from(std::iter::once("iota".to_owned()).chain(args)).map_err(|error| {
                 match error.kind() {
@@ -326,6 +343,20 @@ impl CliInvocation {
             Err(marker) if marker == "__version__" => return Ok(Self::special(Command::Version)),
             Err(error) => return Err(error),
         };
+
+        let output = if parsed.output == OutputFormat::Text {
+            config_output
+        } else {
+            parsed.output
+        };
+
+        let resolve_confirmed = |yes_flag: bool| -> bool {
+            if yes_flag {
+                return true;
+            }
+            !require_confirmation
+        };
+
         let command = match parsed.command {
             None => Command::Dashboard,
             Some(CliCommand::Status) => Command::Status,
@@ -339,7 +370,7 @@ impl CliInvocation {
                 UsersAction::Add { username } => Command::UsersAdd { username },
                 UsersAction::Remove { user_id, yes } => Command::UsersRemove {
                     user_id,
-                    confirmed: yes,
+                    confirmed: resolve_confirmed(yes),
                 },
                 UsersAction::Import { username } => Command::UsersImport { username },
             },
@@ -348,14 +379,18 @@ impl CliInvocation {
                 OmikronAction::Status => Command::OmikronStatus,
             },
             Some(CliCommand::Identity(identity)) => match identity.action {
-                IdentityAction::Rotate { yes } => Command::IdentityRotate { confirmed: yes },
+                IdentityAction::Rotate { yes } => Command::IdentityRotate {
+                    confirmed: resolve_confirmed(yes),
+                },
             },
             Some(CliCommand::Config(config)) => match config.action {
                 ConfigAction::Get => Command::ConfigGet,
                 ConfigAction::Set { key, value } => Command::ConfigSet { key, value },
                 ConfigAction::Reload => Command::ConfigReload,
             },
-            Some(CliCommand::RegenerateKeys { yes }) => Command::RegenerateKeys { confirmed: yes },
+            Some(CliCommand::RegenerateKeys { yes }) => Command::RegenerateKeys {
+                confirmed: resolve_confirmed(yes),
+            },
             Some(CliCommand::Logs { limit }) => Command::Logs { limit },
             Some(CliCommand::Update(update)) => match update.action {
                 UpdateAction::Check => Command::UpdateCheck,
@@ -371,8 +406,12 @@ impl CliInvocation {
                 TermsAction::Accept { system } => Command::TermsAccept { system },
             },
             Some(CliCommand::Daemon(daemon)) => match daemon.action {
-                DaemonAction::Restart { yes } => Command::DaemonRestart { confirmed: yes },
-                DaemonAction::Stop { yes } => Command::DaemonStop { confirmed: yes },
+                DaemonAction::Restart { yes } => Command::DaemonRestart {
+                    confirmed: resolve_confirmed(yes),
+                },
+                DaemonAction::Stop { yes } => Command::DaemonStop {
+                    confirmed: resolve_confirmed(yes),
+                },
                 DaemonAction::Enable { mode } => Command::DaemonEnable { mode },
                 DaemonAction::DisableStartup => Command::DaemonDisableStartup,
                 DaemonAction::Status => Command::DaemonDaemonStatus,
@@ -385,7 +424,7 @@ impl CliInvocation {
         };
         Ok(Self {
             theme_override: parsed.theme.map(Into::into),
-            output: parsed.output,
+            output,
             color: if parsed.no_color {
                 CapabilityPolicy::Never
             } else {
@@ -519,7 +558,12 @@ mod tests {
     #[test]
     fn parses_unconfirmed_destructive_commands_explicitly() {
         let invocation = CliInvocation::parse(["daemon".into(), "stop".into()]).unwrap();
-        assert_eq!(invocation.command, Command::DaemonStop { confirmed: false });
+        assert_eq!(
+            invocation.command,
+            Command::DaemonStop {
+                confirmed: true
+            }
+        );
     }
 
     #[test]
@@ -560,7 +604,7 @@ mod tests {
             invocation.command,
             Command::UsersRemove {
                 user_id: 42,
-                confirmed: false,
+                confirmed: true,
             }
         );
     }
@@ -590,7 +634,7 @@ mod tests {
         let invocation = CliInvocation::parse(["identity".into(), "rotate".into()]).unwrap();
         assert_eq!(
             invocation.command,
-            Command::IdentityRotate { confirmed: false }
+            Command::IdentityRotate { confirmed: true }
         );
         let invocation =
             CliInvocation::parse(["identity".into(), "rotate".into(), "--yes".into()]).unwrap();

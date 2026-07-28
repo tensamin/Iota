@@ -19,7 +19,7 @@ use std::{
     any::Any,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
     },
 };
 
@@ -56,6 +56,7 @@ pub struct UsersScreen {
     viewport_height: AtomicUsize,
     filter: String,
     filtering: bool,
+    tick: AtomicU8,
 }
 
 impl UsersScreen {
@@ -74,6 +75,7 @@ impl UsersScreen {
             viewport_height: AtomicUsize::new(1),
             filter: String::new(),
             filtering: false,
+            tick: AtomicU8::new(0),
         }
     }
 
@@ -115,7 +117,12 @@ impl UsersScreen {
         };
 
         if self.loading {
-            f.render_widget(Paragraph::new("Loading users…"), inner);
+            const SPINNERS: &[u8] = b"|/-\\";
+            let ch = SPINNERS[self.tick.fetch_add(1, Ordering::Relaxed) as usize % SPINNERS.len()];
+            f.render_widget(
+                Paragraph::new(format!("{ch} Loading users…")),
+                inner,
+            );
             return;
         }
         if visible_indices.is_empty() {

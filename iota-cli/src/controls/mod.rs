@@ -2,6 +2,7 @@ pub mod action;
 pub mod button;
 pub mod checkbox_group;
 pub mod choice;
+pub mod dialog;
 pub mod header;
 pub mod navigation;
 pub mod panel;

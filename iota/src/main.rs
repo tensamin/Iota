@@ -7,12 +7,14 @@ use iota_process_manager::detect;
 use std::{path::Path, process::ExitCode, sync::Arc};
 
 mod cli_args;
+mod cli_color;
 mod daemon_setup_flow;
 mod local_daemon;
 mod startup_error;
 mod terms;
 
 use cli_args::{CapabilityPolicy, CliInvocation, Command, OutputFormat};
+use cli_color::ColorConfig;
 use startup_error::StartupError;
 
 #[tokio::main(flavor = "multi_thread")]
@@ -21,7 +23,7 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             if !matches!(error, StartupError::Cancelled) {
-                eprintln!("{error}");
+                startup_error::print_error(&error);
             }
             startup_error::exit_code(&error)
         }
@@ -383,7 +385,93 @@ fn writable_socket_path(path: &Path) -> Result<(), StartupError> {
 }
 
 fn print_help() {
-    println!("{}", CliInvocation::help_text());
+    let color = cli_color::ColorConfig::new();
+    println!(
+        "{}",
+        cli_color::heading(&color, "Iota Operator Console")
+    );
+    println!();
+    println!("Usage: iota [OPTIONS] [COMMAND]");
+    println!();
+    println!(
+        "{}",
+        cli_color::info(&color, "Commands:")
+    );
+    println!("  (no command)           Launch the interactive dashboard");
+    println!("  status                 Show daemon status");
+    println!("  tasks                  List active tasks");
+    println!("  users list             List all users");
+    println!("  users show <ID>        Show user details");
+    println!("  users add <NAME>       Create a new user");
+    println!("  users remove <ID>      Remove a user (requires --yes)");
+    println!("  omikron status         Show Omikron connection status");
+    println!("  omikron reconnect      Reconnect to Omikron");
+    println!("  identity rotate        Rotate identity keys (requires --yes)");
+    println!("  config get             Show current configuration");
+    println!("  config set <KEY> <VAL> Set a configuration value");
+    println!("  config reload          Reload configuration");
+    println!("  components             Show component health");
+    println!("  logs [--limit N]       Show recent log entries");
+    println!("  update check           Check for updates");
+    println!("  community list         List communities");
+    println!("  terms status           Show terms acceptance status");
+    println!("  terms show <DOC>       Show a terms document");
+    println!("  terms accept           Accept required terms");
+    println!("  daemon restart         Restart the daemon (requires --yes)");
+    println!("  daemon stop            Stop the daemon (requires --yes)");
+    println!("  daemon enable          Enable daemon at startup");
+    println!("  daemon disable-startup Disable daemon at startup");
+    println!("  daemon startup-status  Show startup configuration");
+    println!("  daemon start           Start the daemon");
+    println!("  daemon restart-service Restart the daemon service");
+    println!("  daemon stop-service    Stop the daemon service");
+    println!("  daemon install         Install from a bundle");
+    println!("  help                   Show this help message");
+    println!("  completions <SHELL>    Generate shell completions");
+    println!("  man                    Show the man page");
+    println!();
+    println!(
+        "{}",
+        cli_color::info(&color, "Options:")
+    );
+    println!("  --theme <THEME>        Theme: monospace, binary, ansi, surface");
+    println!("  --output <FORMAT>      Output format: text, json, yaml, table");
+    println!("  --color <WHEN>         Color: auto, always, never");
+    println!("  --unicode <WHEN>       Unicode: auto, always, never");
+    println!("  --no-color             Disable colored output");
+    println!("  --yes, -y              Confirm destructive operations");
+    println!("  -h, --help             Show help");
+    println!("  -V, --version          Show version");
+    println!();
+    println!(
+        "{}",
+        cli_color::info(&color, "Examples:")
+    );
+    println!("  iota                        Launch the interactive dashboard");
+    println!("  iota status                 Show daemon status");
+    println!("  iota users list --output=json   List users in JSON format");
+    println!("  iota users add alice       Create a user named 'alice'");
+    println!("  iota users remove 42 --yes Remove user 42");
+    println!("  iota config get --output=yaml   Show config in YAML format");
+    println!("  iota logs --limit 50       Show last 50 log entries");
+    println!("  iota completions bash      Generate bash completions");
+    println!();
+    println!(
+        "{}",
+        cli_color::info(&color, "Exit Codes:")
+    );
+    println!("  0    Success");
+    println!("  1    General error");
+    println!("  2    Invalid command or arguments");
+    println!("  130  Interrupted (Ctrl+C)");
+    println!();
+    println!(
+        "{}",
+        cli_color::muted(&color, "Environment Variables:")
+    );
+    println!("  NO_COLOR      Disable colored output when set");
+    println!("  TERM          Terminal type (dumb disables colors)");
+    println!("  IOTA_THEME    Default theme override");
 }
 
 fn print_completions(shell: &str) -> Result<(), StartupError> {
@@ -422,14 +510,47 @@ fn print_man_page() {
     println!(".TH IOTA 1");
     println!(".SH NAME\n iota \\- Iota operator console");
     println!(".SH SYNOPSIS\n.B iota\n[global options] [command]");
+    println!(".SH DESCRIPTION");
+    println!("Iota is the operator console for managing Iota daemon instances.");
+    println!("It provides both an interactive dashboard and headless CLI commands.");
     println!(".SH COMMANDS");
     for command in CliInvocation::command_paths() {
         println!(".TP\n.B {command}");
     }
     println!(".SH GLOBAL OPTIONS");
-    println!(".TP\n.B --output text|json|yaml");
+    println!(".TP\n.B --output text|json|yaml|table");
+    println!("Set the output format for headless commands.");
     println!(".TP\n.B --color auto|always|never");
+    println!("Control colored output.");
     println!(".TP\n.B --unicode auto|always|never");
+    println!("Control Unicode character rendering.");
+    println!(".TP\n.B --yes, -y");
+    println!("Confirm destructive operations without prompting.");
+    println!(".SH EXIT CODES");
+    println!(".TP\n.B 0");
+    println!("Success");
+    println!(".TP\n.B 1");
+    println!("General error");
+    println!(".TP\n.B 2");
+    println!("Invalid command or arguments");
+    println!(".TP\n.B 130");
+    println!("Interrupted (Ctrl+C)");
+    println!(".SH EXAMPLES");
+    println!(".TP\n.B iota");
+    println!("Launch the interactive dashboard");
+    println!(".TP\n.B iota status");
+    println!("Show daemon status");
+    println!(".TP\n.B iota users list --output=json");
+    println!("List users in JSON format");
+    println!(".TP\n.B iota users add alice");
+    println!("Create a user named 'alice'");
+    println!(".SH ENVIRONMENT");
+    println!(".TP\n.B NO_COLOR");
+    println!("Disable colored output when set");
+    println!(".TP\n.B TERM");
+    println!("Terminal type (dumb disables colors)");
+    println!(".TP\n.B IOTA_THEME");
+    println!("Default theme override");
 }
 
 async fn run_command(
@@ -437,6 +558,7 @@ async fn run_command(
     command: Command,
     output: OutputFormat,
 ) -> Result<(), StartupError> {
+    let color = ColorConfig::new();
     let request = match command {
         Command::Status => LocalRequest::GetStatus,
         Command::Tasks => LocalRequest::ListTasks,
@@ -508,18 +630,31 @@ async fn run_command(
             }
             match payload {
                 ResponsePayload::Status(status) => {
-                    print!("Phase: {}", status.phase);
+                    let phase_color = if status.degraded_reason.is_some() {
+                        cli_color::WARNING
+                    } else {
+                        cli_color::SUCCESS
+                    };
+                    print!(
+                        "{} {}",
+                        cli_color::info(&color, "Phase:"),
+                        color.colorize(&status.phase, phase_color)
+                    );
                     if !status.tasks.is_empty() {
-                        print!(", Tasks: {}", status.tasks.join(", "));
+                        print!(
+                            ", {} {}",
+                            cli_color::info(&color, "Tasks:"),
+                            status.tasks.join(", ")
+                        );
                     }
                     if let Some(reason) = status.degraded_reason {
-                        print!(", Degraded: {}", reason);
+                        print!(", {}: {}", cli_color::warning(&color, "Degraded"), reason);
                     }
                     println!();
                 }
                 ResponsePayload::Tasks(tasks) => {
                     if tasks.is_empty() {
-                        println!("No active tasks.");
+                        println!("{}", cli_color::muted(&color, "No active tasks."));
                     } else {
                         for task in &tasks {
                             println!("{}", task.name);
@@ -528,18 +663,31 @@ async fn run_command(
                 }
                 ResponsePayload::Users(users) => {
                     if users.is_empty() {
-                        println!("No users.");
+                        println!("{}", cli_color::muted(&color, "No users."));
                     } else {
                         for user in &users {
-                            println!("{} ({})", user.username, user.user_id);
+                            println!(
+                                "{} ({})",
+                                cli_color::heading(&color, &user.username),
+                                user.user_id
+                            );
                         }
                     }
                 }
                 ResponsePayload::UserCreated { user_id, username } => {
-                    println!("Created user {} ({})", username, user_id);
+                    println!(
+                        "{} {} ({})",
+                        cli_color::success(&color, "Created user"),
+                        cli_color::heading(&color, &username),
+                        user_id
+                    );
                 }
                 ResponsePayload::UserRemoved { user_id } => {
-                    println!("Removed user {}", user_id);
+                    println!(
+                        "{} {}",
+                        cli_color::warning(&color, "Removed user"),
+                        user_id
+                    );
                 }
                 ResponsePayload::Acknowledged { message } => {
                     println!("{}", message);
@@ -551,32 +699,57 @@ async fn run_command(
                     println!("{}", config.yaml);
                 }
                 ResponsePayload::OmikronStatus(status) => {
-                    println!("Connected: {}", status.connected);
+                    println!(
+                        "{}: {}",
+                        cli_color::info(&color, "Connected"),
+                        status.connected
+                    );
                     if let Some(id) = status.iota_id {
-                        println!("Iota ID: {}", id);
+                        println!(
+                            "{}: {}",
+                            cli_color::info(&color, "Iota ID"),
+                            id
+                        );
                     }
                 }
                 ResponsePayload::Components(components) => {
                     if components.is_empty() {
-                        println!("No component health data available.");
+                        println!(
+                            "{}",
+                            cli_color::muted(&color, "No component health data available.")
+                        );
                     } else {
                         for comp in &components {
-                            let status_str = match comp.status {
-                                iota_ipc::HealthStatus::Healthy => "healthy",
-                                iota_ipc::HealthStatus::Degraded => "degraded",
-                                iota_ipc::HealthStatus::Failed => "failed",
+                            let (status_str, style) = match comp.status {
+                                iota_ipc::HealthStatus::Healthy => {
+                                    ("healthy", cli_color::SUCCESS)
+                                }
+                                iota_ipc::HealthStatus::Degraded => {
+                                    ("degraded", cli_color::WARNING)
+                                }
+                                iota_ipc::HealthStatus::Failed => ("failed", cli_color::ERROR),
                             };
                             let suffix = comp
                                 .message
                                 .as_deref()
                                 .map(|m| format!(" ({m})"))
                                 .unwrap_or_default();
-                            println!("{:?}: {}{}", comp.id, status_str, suffix);
+                            println!(
+                                "{:?}: {}{}",
+                                comp.id,
+                                color.colorize(status_str, style),
+                                suffix
+                            );
                         }
                     }
                 }
                 ResponsePayload::UserDetail(user) => {
-                    println!("User: {} ({})", user.username, user.user_id);
+                    println!(
+                        "{}: {} ({})",
+                        cli_color::info(&color, "User"),
+                        cli_color::heading(&color, &user.username),
+                        user.user_id
+                    );
                     if let Some(ref name) = user.display_name {
                         println!("Display Name: {name}");
                     }
@@ -588,23 +761,42 @@ async fn run_command(
                 ResponsePayload::LogEntries(logs) => {
                     for entry in &logs.entries {
                         let ts = entry.timestamp_ms;
-                        let level = if entry.is_error { "ERR" } else { "INF" };
-                        println!("[{ts}] {level} {}: {}", entry.sender, entry.message);
+                        let (level, style) = if entry.is_error {
+                            ("ERR", cli_color::ERROR)
+                        } else {
+                            ("INF", cli_color::INFO)
+                        };
+                        println!(
+                            "[{ts}] {} {}: {}",
+                            color.colorize(level, style),
+                            entry.sender,
+                            entry.message
+                        );
                     }
                 }
                 ResponsePayload::UpdateStatus(status) => {
                     if status.available {
-                        println!("Update available.");
+                        println!(
+                            "{}",
+                            cli_color::success(&color, "Update available.")
+                        );
                     } else {
-                        println!("Up to date.");
+                        println!(
+                            "{}",
+                            cli_color::info(&color, "Up to date.")
+                        );
                     }
                 }
                 ResponsePayload::Communities(communities) => {
                     if communities.is_empty() {
-                        println!("No communities.");
+                        println!("{}", cli_color::muted(&color, "No communities."));
                     } else {
                         for c in &communities {
-                            println!("{} ({})", c.title, c.name);
+                            println!(
+                                "{} ({})",
+                                cli_color::heading(&color, &c.title),
+                                c.name
+                            );
                         }
                     }
                 }
@@ -634,7 +826,130 @@ fn render_structured(payload: &ResponsePayload, output: OutputFormat) -> Result<
                 "Cannot encode YAML output: {error}"
             )))?
         ),
+        OutputFormat::Table => render_table(payload),
         OutputFormat::Text => unreachable!(),
     }
     Ok(())
+}
+
+fn render_table(payload: &ResponsePayload) {
+    match payload {
+        ResponsePayload::Users(users) => {
+            if users.is_empty() {
+                println!("No users.");
+                return;
+            }
+            println!("{:<8} {}", "ID", "USERNAME");
+            println!("{:<8} {}", "--------", "--------");
+            for user in users {
+                println!("{:<8} {}", user.user_id, user.username);
+            }
+        }
+        ResponsePayload::Tasks(tasks) => {
+            if tasks.is_empty() {
+                println!("No active tasks.");
+                return;
+            }
+            println!("{}", "NAME");
+            println!("{}", "--------");
+            for task in tasks {
+                println!("{}", task.name);
+            }
+        }
+        ResponsePayload::Components(components) => {
+            if components.is_empty() {
+                println!("No component health data available.");
+                return;
+            }
+            println!("{:<20} {:<10} {}", "COMPONENT", "STATUS", "MESSAGE");
+            println!("{:<20} {:<10} {}", "--------", "--------", "--------");
+            for comp in components {
+                let status_str = match comp.status {
+                    iota_ipc::HealthStatus::Healthy => "healthy",
+                    iota_ipc::HealthStatus::Degraded => "degraded",
+                    iota_ipc::HealthStatus::Failed => "failed",
+                };
+                let message = comp.message.as_deref().unwrap_or("-");
+                println!("{:<20} {:<10} {}", format!("{:?}", comp.id), status_str, message);
+            }
+        }
+        ResponsePayload::Communities(communities) => {
+            if communities.is_empty() {
+                println!("No communities.");
+                return;
+            }
+            println!("{:<20} {}", "NAME", "TITLE");
+            println!("{:<20} {}", "--------", "--------");
+            for c in communities {
+                println!("{:<20} {}", c.name, c.title);
+            }
+        }
+        ResponsePayload::LogEntries(logs) => {
+            if logs.entries.is_empty() {
+                println!("No log entries.");
+                return;
+            }
+            println!("{:<20} {:<6} {:<12} {}", "TIMESTAMP", "LEVEL", "SENDER", "MESSAGE");
+            println!("{:<20} {:<6} {:<12} {}", "--------", "--------", "--------", "--------");
+            for entry in &logs.entries {
+                let level = if entry.is_error { "ERR" } else { "INF" };
+                println!(
+                    "{:<20} {:<6} {:<12} {}",
+                    entry.timestamp_ms, level, entry.sender, entry.message
+                );
+            }
+        }
+        ResponsePayload::Status(status) => {
+            println!("{:<15} {}", "Field", "Value");
+            println!("{:<15} {}", "--------", "--------");
+            println!("{:<15} {}", "Phase", status.phase);
+            if !status.tasks.is_empty() {
+                println!("{:<15} {}", "Tasks", status.tasks.join(", "));
+            }
+            if let Some(reason) = &status.degraded_reason {
+                println!("{:<15} {}", "Degraded", reason);
+            }
+        }
+        ResponsePayload::DaemonStatus(status) => {
+            println!("{}", status.formatted);
+        }
+        ResponsePayload::Config(config) => {
+            println!("{}", config.yaml);
+        }
+        ResponsePayload::OmikronStatus(status) => {
+            println!("{:<15} {}", "Field", "Value");
+            println!("{:<15} {}", "--------", "--------");
+            println!("{:<15} {}", "Connected", status.connected);
+            if let Some(id) = &status.iota_id {
+                println!("{:<15} {}", "Iota ID", id);
+            }
+        }
+        ResponsePayload::UpdateStatus(status) => {
+            println!("{:<15} {}", "Field", "Value");
+            println!("{:<15} {}", "--------", "--------");
+            println!("{:<15} {}", "Available", status.available);
+        }
+        ResponsePayload::UserCreated { user_id, username } => {
+            println!("Created user {} ({})", username, user_id);
+        }
+        ResponsePayload::UserRemoved { user_id } => {
+            println!("Removed user {}", user_id);
+        }
+        ResponsePayload::Acknowledged { message } => {
+            println!("{}", message);
+        }
+        ResponsePayload::UserDetail(user) => {
+            println!("{:<15} {}", "Field", "Value");
+            println!("{:<15} {}", "--------", "--------");
+            println!("{:<15} {}", "Username", user.username);
+            println!("{:<15} {}", "User ID", user.user_id);
+            if let Some(ref name) = user.display_name {
+                println!("{:<15} {}", "Display Name", name);
+            }
+            println!("{:<15} {}", "Created At", user.created_at);
+            if !user.trusted_apps.is_empty() {
+                println!("{:<15} {}", "Trusted Apps", user.trusted_apps.join(", "));
+            }
+        }
+    }
 }

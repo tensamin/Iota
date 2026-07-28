@@ -49,28 +49,6 @@ impl MainScreen {
     pub fn daemon_status(&self) -> watch::Receiver<DaemonStatus> {
         self.daemon_status_rx.clone()
     }
-    fn status_summary(&self) -> String {
-        let connection = match self.connection_status_rx.borrow().clone() {
-            IpcConnectionState::Connected => "[OK] Connected".to_owned(),
-            IpcConnectionState::Connecting => "[..] Connecting".to_owned(),
-            IpcConnectionState::Reconnecting { .. } => "[WARN] Reconnecting".to_owned(),
-            IpcConnectionState::Failed { .. } | IpcConnectionState::Incompatible { .. } => {
-                "[FAIL] Failed".to_owned()
-            }
-            IpcConnectionState::Disconnected => "[WARN] Disconnected".to_owned(),
-        };
-        let daemon = self.daemon_status_rx.borrow().clone();
-        let version = if daemon.version.is_empty() {
-            String::new()
-        } else {
-            format!(" v{}", daemon.version)
-        };
-        let ready = daemon
-            .startup_phase
-            .map(|phase| format!(" {:?}", phase))
-            .unwrap_or_default();
-        format!("IOTA{version}    {connection}{ready}")
-    }
     pub async fn new(ui: Arc<UI>) -> Self {
         let mut elements: Vec<Box<dyn InteractableElement>> = Vec::new();
 
@@ -254,39 +232,6 @@ impl Screen for MainScreen {
 
     fn render(&self, f: &mut Frame, rect: Rect, context: &RenderContext<'_>, hits: &mut HitMap) {
         self.layout_width.store(rect.width, Ordering::Relaxed);
-        // A watch Ref blocks senders until it is dropped.  Rendering may do
-        // terminal I/O, so retain only owned snapshots for the whole frame.
-        let status = self.connection_status_rx.borrow().clone();
-        let daemon = self.daemon_status_rx.borrow().clone();
-        let status_text = match status {
-            IpcConnectionState::Connected => "Connected".to_string(),
-            IpcConnectionState::Connecting => "Connecting...".to_string(),
-            IpcConnectionState::Reconnecting { attempt } => {
-                format!("Reconnecting (attempt {})...", attempt)
-            }
-            IpcConnectionState::Incompatible { message } => {
-                format!("Incompatible protocol: {}", message)
-            }
-            IpcConnectionState::Failed { message } => {
-                format!("Connection failed: {}", message)
-            }
-            IpcConnectionState::Disconnected => "Disconnected".to_string(),
-        };
-        let readiness = daemon
-            .startup_phase
-            .map(|phase| format!("{:?}", phase))
-            .unwrap_or_else(|| "Waiting for status".into());
-        let health = daemon
-            .degraded_reason
-            .as_deref()
-            .map(|reason| format!(" — {reason}"))
-            .unwrap_or_default();
-        let version = if daemon.version.is_empty() {
-            String::new()
-        } else {
-            format!(" v{}", daemon.version)
-        };
-        let _ = (status_text, readiness, health, version);
         f.render_widget(
             ratatui::widgets::Block::default().style(context.theme.surfaces.canvas),
             rect,
@@ -502,9 +447,6 @@ impl Screen for MainScreen {
             }
             _ => InteractionResult::Unhandled,
         }
-    }
-    fn app_title(&self) -> String {
-        self.status_summary()
     }
     fn key_hints(&self) -> Vec<KeyHint> {
         if self.selected_coords == (2, 0) {

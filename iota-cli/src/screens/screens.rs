@@ -30,6 +30,8 @@ pub enum AppEvent {
         theme: crate::theme::ThemeName,
         color: crate::theme::TerminalPolicy,
         unicode: crate::theme::TerminalPolicy,
+        cli_output: crate::theme::CliOutputFormat,
+        cli_require_confirmation: bool,
     },
     ThemeSaved(Result<(), String>),
     UsersLoaded(Result<Vec<crate::screens::users::UserEntry>, String>),
@@ -117,9 +119,6 @@ pub trait Screen: Send + Sync + Any {
     fn handle_event(&mut self, event: UiEvent) -> InteractionResult;
     fn handle_action(&mut self, _action: AppAction) -> InteractionResult {
         InteractionResult::Unhandled
-    }
-    fn app_title(&self) -> String {
-        "IOTA".to_owned()
     }
     fn key_hints(&self) -> Vec<KeyHint> {
         vec![

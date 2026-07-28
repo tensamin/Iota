@@ -13,12 +13,14 @@ use crate::{
     interaction_result::InteractionResult,
     render_context::RenderContext,
     screens::screens::{AppAction, AppEvent, HitMap, KeyHint, Screen, UiEvent},
-    theme::{TerminalPolicy, ThemeName, UiConfig},
+    theme::{CliOutputFormat, TerminalPolicy, ThemeName, UiConfig},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Theme,
+    CliOutput,
+    CliConfirm,
     RegenerateKeys,
     Back,
 }
@@ -34,6 +36,8 @@ pub struct SettingsScreen {
     message: String,
     color: TerminalPolicy,
     unicode: TerminalPolicy,
+    cli_output: CliOutputFormat,
+    cli_require_confirmation: bool,
     focus: Focus,
     dialog: Option<Dialog>,
     pending: bool,
@@ -45,16 +49,15 @@ impl SettingsScreen {
             .iter()
             .position(|theme| *theme == current)
             .unwrap_or(0);
+        let config = UiConfig::load_or_default();
         Self {
             selected,
             saved: current,
             message: "Left/Right previews. Enter saves.".into(),
-            color: UiConfig::load()
-                .map(|config| config.color)
-                .unwrap_or_default(),
-            unicode: UiConfig::load()
-                .map(|config| config.unicode)
-                .unwrap_or_default(),
+            color: config.color,
+            unicode: config.unicode,
+            cli_output: config.cli_output,
+            cli_require_confirmation: config.cli_require_confirmation,
             focus: Focus::Theme,
             dialog: None,
             pending: false,
@@ -82,7 +85,9 @@ impl SettingsScreen {
 
     fn next_focus(&mut self) {
         self.focus = match self.focus {
-            Focus::Theme => Focus::RegenerateKeys,
+            Focus::Theme => Focus::CliOutput,
+            Focus::CliOutput => Focus::CliConfirm,
+            Focus::CliConfirm => Focus::RegenerateKeys,
             Focus::RegenerateKeys => Focus::Back,
             Focus::Back => Focus::Theme,
         };
@@ -92,7 +97,9 @@ impl SettingsScreen {
         self.focus = match self.focus {
             Focus::Theme => Focus::Back,
             Focus::Back => Focus::RegenerateKeys,
-            Focus::RegenerateKeys => Focus::Theme,
+            Focus::RegenerateKeys => Focus::CliConfirm,
+            Focus::CliConfirm => Focus::CliOutput,
+            Focus::CliOutput => Focus::Theme,
         };
     }
 
@@ -114,24 +121,44 @@ impl SettingsScreen {
         match self.focus {
             Focus::Theme => {
                 self.message = "Saving theme…".into();
-                let theme = self.selected_theme();
-                let color = self.color;
-                let unicode = self.unicode;
-                InteractionResult::AppTask {
-                    task: Box::pin(async move {
-                        UiEvent::App(AppEvent::SaveSettings {
-                            theme,
-                            color,
-                            unicode,
-                        })
-                    }),
-                }
+            }
+            Focus::CliOutput => {
+                self.message = "Output format updated.".into();
+                return InteractionResult::Handled;
+            }
+            Focus::CliConfirm => {
+                self.cli_require_confirmation = !self.cli_require_confirmation;
+                self.message = format!(
+                    "Confirm: {}",
+                    if self.cli_require_confirmation {
+                        "On"
+                    } else {
+                        "Off"
+                    },
+                );
+                return InteractionResult::Handled;
             }
             Focus::RegenerateKeys => {
                 self.dialog = Some(Dialog::ConfirmRegenerateKeys);
-                InteractionResult::Handled
+                return InteractionResult::Handled;
             }
-            Focus::Back => InteractionResult::CloseScreen,
+            Focus::Back => return InteractionResult::CloseScreen,
+        }
+        let theme = self.selected_theme();
+        let color = self.color;
+        let unicode = self.unicode;
+        let cli_output = self.cli_output;
+        let cli_require_confirmation = self.cli_require_confirmation;
+        InteractionResult::AppTask {
+            task: Box::pin(async move {
+                UiEvent::App(AppEvent::SaveSettings {
+                    theme,
+                    color,
+                    unicode,
+                    cli_output,
+                    cli_require_confirmation,
+                })
+            }),
         }
     }
 }
@@ -152,13 +179,16 @@ impl Screen for SettingsScreen {
         context: &RenderContext<'_>,
         hits: &mut HitMap,
     ) {
-        let block = Block::default()
+        let header_block = Block::default()
             .title(" Settings ")
             .borders(Borders::ALL)
             .border_style(context.theme.borders.focused);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
+        let inner = header_block.inner(area);
+        frame.render_widget(header_block, area);
+
+        let sections = Layout::vertical([Constraint::Length(2), Constraint::Min(1)])
+            .split(inner);
+
         frame.render_widget(
             Paragraph::new(format!(
                 "Theme: < {} >{}\nColor: {:?} (C)   Unicode: {:?} (U)",
@@ -169,18 +199,28 @@ impl Screen for SettingsScreen {
                     "  [preview]"
                 },
                 self.color,
-                self.unicode
+                self.unicode,
             ))
             .style(context.theme.text.heading),
-            rows[0],
+            sections[0],
+        );
+
+        let cli_line = format!(
+            "CLI output: {:?} (L)   Confirm: {} (K)",
+            self.cli_output,
+            if self.cli_require_confirmation {
+                "required"
+            } else {
+                "disabled"
+            },
         );
 
         let bottom_rows =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(rows[1]);
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(sections[1]);
 
         let lines = vec![
             Line::from(Span::styled(&self.message, context.theme.text.normal)),
-            Line::from(""),
+            Line::from(Span::styled(&cli_line, context.theme.text.normal)),
             Line::from("Preview"),
             Line::from("[OK] Healthy"),
             Line::from("[WARN] Degraded"),
@@ -352,6 +392,23 @@ impl Screen for SettingsScreen {
                 self.unicode = Self::next_policy(self.unicode);
                 InteractionResult::Handled
             }
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                self.cli_output = self.cli_output.next();
+                self.message = format!("CLI output: {:?}", self.cli_output);
+                InteractionResult::Handled
+            }
+            KeyCode::Char('k') | KeyCode::Char('K') => {
+                self.cli_require_confirmation = !self.cli_require_confirmation;
+                self.message = format!(
+                    "CLI confirm: {}",
+                    if self.cli_require_confirmation {
+                        "On"
+                    } else {
+                        "Off"
+                    },
+                );
+                InteractionResult::Handled
+            }
             KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => {
                 InteractionResult::CloseScreen
             }
@@ -404,6 +461,10 @@ impl Screen for SettingsScreen {
                 KeyHint {
                     keys: "C/U",
                     action: "Color/Unicode",
+                },
+                KeyHint {
+                    keys: "L/K",
+                    action: "CLI Out/Confirm",
                 },
                 KeyHint {
                     keys: "Esc/B",

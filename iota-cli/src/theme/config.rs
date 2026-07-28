@@ -17,6 +17,55 @@ pub struct UiConfig {
     pub color: TerminalPolicy,
     #[serde(default)]
     pub unicode: TerminalPolicy,
+    /// Default CLI output format for headless commands.
+    #[serde(default)]
+    pub cli_output: CliOutputFormat,
+    /// Whether destructive CLI operations require --yes by default.
+    #[serde(default = "default_false")]
+    pub cli_require_confirmation: bool,
+}
+
+fn default_false() -> bool {
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CliOutputFormat {
+    #[default]
+    Text,
+    Json,
+    Yaml,
+    Table,
+}
+
+impl CliOutputFormat {
+    pub fn all() -> &'static [CliOutputFormat] {
+        &[
+            CliOutputFormat::Text,
+            CliOutputFormat::Json,
+            CliOutputFormat::Yaml,
+            CliOutputFormat::Table,
+        ]
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            CliOutputFormat::Text => "text",
+            CliOutputFormat::Json => "json",
+            CliOutputFormat::Yaml => "yaml",
+            CliOutputFormat::Table => "table",
+        }
+    }
+
+    pub fn next(&self) -> Self {
+        match self {
+            CliOutputFormat::Text => CliOutputFormat::Json,
+            CliOutputFormat::Json => CliOutputFormat::Yaml,
+            CliOutputFormat::Yaml => CliOutputFormat::Table,
+            CliOutputFormat::Table => CliOutputFormat::Text,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -26,6 +75,16 @@ pub enum TerminalPolicy {
     Auto,
     Always,
     Never,
+}
+
+impl TerminalPolicy {
+    pub fn next(&self) -> Self {
+        match self {
+            TerminalPolicy::Auto => TerminalPolicy::Always,
+            TerminalPolicy::Always => TerminalPolicy::Never,
+            TerminalPolicy::Never => TerminalPolicy::Auto,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -62,8 +121,21 @@ impl UiConfig {
     pub fn path() -> PathBuf {
         iota_paths::config_dir().join("ui.yaml")
     }
+
+    fn fallback_path() -> Option<PathBuf> {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|d| d.join(".config").join("iota").join("ui.yaml"))
+    }
+
     pub fn load() -> Result<Self, io::Error> {
-        Self::load_from(&Self::path())
+        let path = match (|| std::panic::catch_unwind(|| Self::path()))() {
+            Ok(path) => path,
+            Err(_) => Self::fallback_path().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "could not determine config path")
+            })?,
+        };
+        Self::load_from(&path)
     }
 
     fn load_from(path: &Path) -> Result<Self, io::Error> {
@@ -80,6 +152,12 @@ impl UiConfig {
         }
         let yaml = serde_yaml::to_string(self).map_err(io::Error::other)?;
         fs::write(path, yaml)
+    }
+
+    /// Load from config path, or return defaults if the config path can't be resolved.
+    /// This avoids panics when `IOTA_SOCKET` is not set (e.g. in unit tests).
+    pub fn load_or_default() -> Self {
+        Self::load().unwrap_or_default()
     }
 
     pub fn resolve_theme(override_theme: Option<ThemeName>) -> ThemeName {
@@ -116,6 +194,33 @@ impl UiConfig {
                 ThemeName::Ansi
             }
         }
+    }
+
+    /// Resolve the default CLI output format from config file and environment.
+    /// Priority: IOTA_OUTPUT env var > config file > "text" default.
+    pub fn resolve_cli_output(&self) -> CliOutputFormat {
+        if let Ok(value) = std::env::var("IOTA_OUTPUT") {
+            match value.to_ascii_lowercase().as_str() {
+                "json" => return CliOutputFormat::Json,
+                "yaml" | "yml" => return CliOutputFormat::Yaml,
+                "table" => return CliOutputFormat::Table,
+                _ => {}
+            }
+        }
+        self.cli_output
+    }
+
+    /// Resolve the default --yes behavior from config file and environment.
+    /// Priority: IOTA_YES env var > config file > false default.
+    pub fn resolve_cli_require_confirmation(&self) -> bool {
+        if let Ok(value) = std::env::var("IOTA_YES") {
+            match value.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "y" => return false,
+                "0" | "false" | "no" | "n" => return true,
+                _ => {}
+            }
+        }
+        self.cli_require_confirmation
     }
 }
 
@@ -172,5 +277,38 @@ mod tests {
             UiConfig::resolve_theme_from(None, None, &path),
             ThemeName::Ansi
         );
+    }
+
+    #[test]
+    fn cli_output_defaults_to_text() {
+        let config = UiConfig::default();
+        assert_eq!(config.resolve_cli_output(), CliOutputFormat::Text);
+    }
+
+    #[test]
+    fn cli_output_cycles_through_variants() {
+        assert_eq!(CliOutputFormat::Text.next(), CliOutputFormat::Json);
+        assert_eq!(CliOutputFormat::Json.next(), CliOutputFormat::Yaml);
+        assert_eq!(CliOutputFormat::Yaml.next(), CliOutputFormat::Table);
+        assert_eq!(CliOutputFormat::Table.next(), CliOutputFormat::Text);
+    }
+
+    #[test]
+    fn require_confirmation_defaults_to_false() {
+        let config = UiConfig::default();
+        assert!(!config.resolve_cli_require_confirmation());
+    }
+
+    #[test]
+    fn cli_output_serializes_roundtrip() {
+        let config = UiConfig {
+            cli_output: CliOutputFormat::Table,
+            cli_require_confirmation: true,
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let loaded: UiConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(loaded.cli_output, CliOutputFormat::Table);
+        assert!(loaded.cli_require_confirmation);
     }
 }
