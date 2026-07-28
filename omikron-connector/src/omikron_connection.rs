@@ -112,7 +112,6 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 const TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const TASK_MAX_AGE: Duration = Duration::from_secs(60);
-const MAX_MISSED_PINGS: usize = 3;
 const MAX_CONCURRENT_HANDLERS: usize = 20;
 
 // ============================================================================
@@ -353,7 +352,7 @@ impl OmikronConnection {
                 accept_stream_timeout: Duration::from_millis(10_000),
                 read_timeout: Duration::from_millis(30_000),
                 keep_alive_interval: Some(Duration::from_secs(6)),
-                max_idle_timeout: Some(Duration::from_secs(30)),
+                max_idle_timeout: None,
                 force_close_delay: Duration::from_millis(300),
                 receiver_queue_capacity: 1000,
                 max_concurrent_stream_tasks: 10,
@@ -362,7 +361,7 @@ impl OmikronConnection {
                 max_frames_per_stream: None,
             })
             .with_ping_interval(MAINTENANCE_INTERVAL)
-            .with_max_missed_pings(MAX_MISSED_PINGS);
+            .with_max_missed_pings(0);
 
         let connection = match Client::auth_connect_or_register(
             client_config,
