@@ -14,7 +14,7 @@ pnet = "0.35.0"
 ratatui = "0.30.0"
 reqwest = "0.13.2"
 tokio = { version = "1.50.0", features = ["full"] }
-sysinfo = "0.38.3"
+sysinfo = "0.39.0"
 uuid = { version = "*", features = ["v4"] }
 walkdir = "2.5.0"
 zip = "6.0.0"
