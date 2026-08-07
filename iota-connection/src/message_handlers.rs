@@ -296,6 +296,45 @@ fn contact_value(
     typed_container(fields)
 }
 
+fn current_contact_ids(user_id: i64) -> DataValue {
+    contact_ids_value(
+        chats_util::get_users(user_id)
+            .into_iter()
+            .map(|contact| contact.user_id),
+    )
+}
+
+fn contact_ids_value(ids: impl IntoIterator<Item = i64>) -> DataValue {
+    let mut contact_ids = ids.into_iter().collect::<Vec<_>>();
+    contact_ids.sort_unstable();
+    contact_ids.dedup();
+
+    DataValue::Array(
+        contact_ids
+            .into_iter()
+            .map(|user_id| DataValue::SignedNumber(user_id as i128))
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::contact_ids_value;
+    use mtp::codec::DataValue;
+
+    #[test]
+    fn contact_snapshot_is_sorted_and_deduplicated() {
+        assert_eq!(
+            contact_ids_value([9, 3, 9, 4, 3]),
+            DataValue::Array(vec![
+                DataValue::SignedNumber(3),
+                DataValue::SignedNumber(4),
+                DataValue::SignedNumber(9),
+            ])
+        );
+    }
+}
+
 fn sync_error(cv: &CommunicationValue) -> CommunicationValue {
     error_response(cv, CommunicationType::ErrorInvalidData).add_typed_default(
         DataType::SessionId,
@@ -356,10 +395,6 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
             ),
         }
     };
-    let all_contact_ids = chats_util::get_users(user_id)
-        .into_iter()
-        .map(|contact| DataValue::SignedNumber(contact.user_id as i128))
-        .collect();
     let message_values = messages
         .iter()
         .map(|message| stored_message_value(message, user_id, message.external_user))
@@ -408,7 +443,7 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
                     .collect(),
             ),
         )
-        .add_typed_default(DataType::UserIds, DataValue::Array(all_contact_ids))
+        .add_typed_default(DataType::UserIds, current_contact_ids(user_id))
         .add_typed_default(DataType::Calls, DataValue::Array(Vec::new()))
 }
 
@@ -511,6 +546,10 @@ pub fn handle_get_chats(cv: &CommunicationValue) -> CommunicationValue {
 
 pub fn handle_add_conversation(cv: &CommunicationValue) -> CommunicationValue {
     let user_id = cv.get_sender();
+    let session_id = match data_i64(cv, DataType::SessionId) {
+        Some(id) if id > 0 => id,
+        _ => return sync_error(cv),
+    };
     let other_id = match cv.get_data(DataType::ChatPartnerId).as_number() {
         Some(n) => n as i64,
         None => cv
@@ -532,6 +571,11 @@ pub fn handle_add_conversation(cv: &CommunicationValue) -> CommunicationValue {
     CommunicationValue::new(CommunicationType::AddConversation)
         .with_id(cv.get_id())
         .with_receiver(user_id)
+        .add_typed_default(
+            DataType::SessionId,
+            DataValue::SignedNumber(session_id as i128),
+        )
+        .add_typed_default(DataType::UserIds, current_contact_ids(user_id as i64))
 }
 
 pub fn handle_add_community(cv: &CommunicationValue) -> CommunicationValue {
