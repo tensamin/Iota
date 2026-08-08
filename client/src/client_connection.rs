@@ -407,6 +407,12 @@ impl ClientConnection {
             return;
         }
 
+        if cv.is_type(CommunicationType::MessageGet) {
+            self.send_message(&message_handlers::handle_message_get(&cv))
+                .await;
+            return;
+        }
+
         if cv.is_type(CommunicationType::GetChats) {
             self.send_message(&message_handlers::handle_get_chats(&cv))
                 .await;

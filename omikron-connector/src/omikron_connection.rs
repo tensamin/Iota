@@ -884,6 +884,7 @@ impl OmikronConnection {
         dispatch!(MessageReactionLive, handle_message_reaction_live);
         dispatch!(MessageDeleteLive, handle_message_delete_live);
         dispatch!(MessageOtherIota, handle_message_other_iota);
+        dispatch!(MessageGet, handle_message_get);
         dispatch!(MessagesGet, handle_messages_get);
         dispatch!(GetChats, handle_get_chats);
         dispatch!(AddConversation, handle_add_conversation);
@@ -1447,6 +1448,24 @@ impl OmikronConnection {
         let height = cv.get_data(DataType::Height).as_number().unwrap_or(0) as i64;
         let reply_to = cv.get_data(DataType::ReplyId).as_number().map(|n| n as i64);
 
+        if let Some(reply_to) = reply_to {
+            match chat_files::get_message(sender_id as i64, reply_to, Some(receiver_id)) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let _ = self
+                        .send_message(&error_response(cv, CommunicationType::ErrorNotFound))
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = self
+                        .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
+                        .await;
+                    return;
+                }
+            }
+        }
+
         let is_local = iota_storage::users::user_manager::get_user(receiver_id).is_some();
 
         if is_local {
@@ -1698,6 +1717,12 @@ impl OmikronConnection {
     async fn handle_messages_get(self: Arc<Self>, cv: &CommunicationValue) {
         let _ = self
             .send_message(&message_handlers::handle_messages_get(cv))
+            .await;
+    }
+
+    async fn handle_message_get(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_message_get(cv))
             .await;
     }
 

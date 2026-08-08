@@ -102,11 +102,11 @@ pub fn handle_message_delete(cv: &CommunicationValue) -> CommunicationValue {
     }
 }
 
-fn stored_message_value(
+fn stored_message_fields(
     message: &chat_files::StoredMessage,
     storage_owner: i64,
     partner_id: i64,
-) -> DataValue {
+) -> Vec<(DataType, DataValue)> {
     let mut fields = vec![
         (
             DataType::MessageId,
@@ -162,7 +162,15 @@ fn stored_message_value(
             .collect();
         fields.push((DataType::Reactions, DataValue::Array(reactions)));
     }
-    typed_container(fields)
+    fields
+}
+
+fn stored_message_value(
+    message: &chat_files::StoredMessage,
+    storage_owner: i64,
+    partner_id: i64,
+) -> DataValue {
+    typed_container(stored_message_fields(message, storage_owner, partner_id))
 }
 
 pub fn handle_get_chat_secret(cv: &CommunicationValue) -> CommunicationValue {
@@ -518,6 +526,28 @@ pub fn handle_messages_get(cv: &CommunicationValue) -> CommunicationValue {
         .with_id(cv.get_id())
         .with_receiver(my_id)
         .add_typed_default(DataType::Messages, DataValue::Array(msg_array))
+}
+
+pub fn handle_message_get(cv: &CommunicationValue) -> CommunicationValue {
+    let Some(send_time) = data_i64(cv, DataType::SendTime) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let partner_id = data_i64(cv, DataType::ChatPartnerId);
+    let owner = cv.get_sender() as i64;
+
+    let message = match chat_files::get_message(owner, send_time, partner_id) {
+        Ok(Some(message)) => message,
+        Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
+        Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+    };
+
+    let mut response = CommunicationValue::new(CommunicationType::MessageGet)
+        .with_id(cv.get_id())
+        .with_receiver(cv.get_sender());
+    for (data_type, value) in stored_message_fields(&message, owner, message.external_user) {
+        response = response.add_typed_default(data_type, value);
+    }
+    response
 }
 
 pub fn handle_get_chats(cv: &CommunicationValue) -> CommunicationValue {

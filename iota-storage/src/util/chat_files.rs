@@ -644,6 +644,62 @@ pub fn get_messages(
     }
 }
 
+pub fn get_message(
+    storage_owner: i64,
+    message_time: i64,
+    external_user: Option<i64>,
+) -> Result<Option<StoredMessage>, StorageError> {
+    db::with_db(|conn| {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, message_time, content, sent_by_self, message_state, height,
+                   reply_to, edited_count, external_user
+            FROM messages
+            WHERE storage_owner = ?1
+              AND message_time = ?2
+              AND deleted_by_external = 0
+              AND (?3 IS NULL OR external_user = ?3)
+            ORDER BY id DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![storage_owner, message_time, external_user], |row| {
+            Ok(StoredMessage {
+                id: row.get(0)?,
+                message_time: row.get(1)?,
+                content: row.get(2)?,
+                sent_by_self: row.get::<_, i64>(3)? != 0,
+                message_state: row.get(4)?,
+                height: row.get(5).unwrap_or(0),
+                reply_to: row.get(6).ok().flatten(),
+                edited: row.get::<_, i64>(7).unwrap_or(0) > 0,
+                external_user: row.get(8)?,
+                reactions: Vec::new(),
+            })
+        })?;
+
+        let messages: Vec<StoredMessage> = rows.collect::<Result<_, _>>()?;
+        if messages.is_empty() {
+            return Ok(None);
+        }
+        if external_user.is_none()
+            && messages
+                .iter()
+                .map(|message| message.external_user)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1
+        {
+            return Ok(None);
+        }
+
+        let mut message = messages.into_iter().next().expect("checked non-empty");
+        let reaction_map = load_reactions(conn, &[message.id]);
+        message.reactions = reaction_map.get(&message.id).cloned().unwrap_or_default();
+        Ok(Some(message))
+    })
+}
+
 pub fn get_messages_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<StoredMessage> {
     if ids.is_empty() {
         return Vec::new();
