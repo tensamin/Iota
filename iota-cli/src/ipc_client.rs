@@ -483,6 +483,9 @@ impl IpcClient {
             ResponsePayload::UserRemoved { user_id } => {
                 format!("Removed user {}", user_id)
             }
+            ResponsePayload::UserDataPurged { user_id } => {
+                format!("Purged hosted data for {}", user_id)
+            }
             ResponsePayload::Acknowledged { message } => message.clone(),
             ResponsePayload::DaemonStatus(status) => status.formatted.clone(),
             ResponsePayload::Config(config) => config.yaml.clone(),

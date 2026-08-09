@@ -602,6 +602,9 @@ impl UI {
                             .map(|u| UserEntry {
                                 user_id: u.user_id,
                                 username: u.username,
+                                state: u.state,
+                                data_present: u.data_present,
+                                credential_present: u.credential_present,
                             })
                             .collect())
                     }

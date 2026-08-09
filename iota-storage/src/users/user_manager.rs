@@ -1,10 +1,26 @@
 use crate::users::user_profile::UserProfile;
 use crate::util::db;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use iota_util::crypto_helper::{self, hex_hash, keyring_from_base64, public_key_bundle_to_base64};
-use iota_util::file_util::{load_file, save_file};
-use rand_core::{OsRng, RngCore};
+use iota_util::file_util::{delete_user_directory, load_file, remove_user_credential, save_file};
 use rusqlite::params;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalUserState {
+    Managed,
+    Released,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserResidency {
+    pub user_id: i64,
+    pub username: String,
+    pub state: LocalUserState,
+    pub data_present: bool,
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+}
 
 pub fn add_user(user: UserProfile) {
     if let Err(e) = try_add_user(user) {
@@ -45,6 +61,12 @@ pub fn try_add_user(user: UserProfile) -> Result<(), crate::storage_error::Stora
                 params![user.user_id, app_id, app_secret],
             )?;
         }
+        conn.execute(
+            r#"INSERT INTO user_residency (user_id, username, lifecycle_state, data_state, updated_at)
+               VALUES (?1, ?2, 'managed', COALESCE((SELECT data_state FROM user_residency WHERE user_id = ?1), 'present'), ?3)
+               ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, lifecycle_state = 'managed', updated_at = excluded.updated_at"#,
+            params![user.user_id, user.username, now_millis()],
+        )?;
         Ok(())
     })
 }
@@ -205,42 +227,92 @@ pub fn remove_user(user_id: i64) {
     }
 }
 
+/// Remove only local management authority. Hosted content is intentionally
+/// retained and is indexed as released for a later purge operation.
+pub fn release_user(user_id: i64) -> Result<(), crate::storage_error::StorageError> {
+    let username = get_user(user_id).map(|user| user.username).ok_or_else(|| {
+        crate::storage_error::StorageError::Other("managed user was not found".into())
+    })?;
+    db::with_db(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM trusted_apps WHERE user_id = ?1", params![user_id])?;
+        tx.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
+        tx.execute(
+            r#"INSERT INTO user_residency (user_id, username, lifecycle_state, data_state, updated_at)
+               VALUES (?1, ?2, 'released', COALESCE((SELECT data_state FROM user_residency WHERE user_id = ?1), 'present'), ?3)
+               ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, lifecycle_state = 'released', updated_at = excluded.updated_at"#,
+            params![user_id, username, now_millis()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })?;
+    remove_user_credential(user_id).map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))
+}
+
+/// Authoritative hosted-data erasure used by local purge and future Omega
+/// erasure delivery. Management metadata and credentials are left intact.
+pub fn purge_user_data(user_id: i64) -> Result<(), crate::storage_error::StorageError> {
+    db::with_db(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM message_edits WHERE message_id IN (SELECT id FROM messages WHERE storage_owner = ?1)", params![user_id])?;
+        tx.execute("DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE storage_owner = ?1)", params![user_id])?;
+        tx.execute("DELETE FROM messages WHERE storage_owner = ?1", params![user_id])?;
+        tx.execute("DELETE FROM contacts WHERE storage_owner = ?1", params![user_id])?;
+        tx.execute("DELETE FROM communities WHERE storage_owner = ?1", params![user_id])?;
+        tx.execute("DELETE FROM settings WHERE user_id = ?1", params![user_id])?;
+        tx.execute("DELETE FROM sync_events WHERE user_id = ?1", params![user_id])?;
+        tx.execute("DELETE FROM sync_heads WHERE user_id = ?1", params![user_id])?;
+        tx.execute("DELETE FROM client_sync_state WHERE user_id = ?1", params![user_id])?;
+        tx.execute("DELETE FROM trusted_apps WHERE user_id = ?1", params![user_id])?;
+        tx.execute(
+            "UPDATE user_residency SET data_state = 'empty', updated_at = ?2 WHERE user_id = ?1",
+            params![user_id, now_millis()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })?;
+    crate::util::e2ee_storage::purge_user(user_id)
+        .map_err(crate::storage_error::StorageError::Other)?;
+    delete_user_directory(user_id).map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))
+}
+
+/// Complete local erasure is idempotent and is the target for a durable
+/// Omega-hosted erasure request after account deletion.
+pub fn erase_user_locally(user_id: i64) -> Result<(), crate::storage_error::StorageError> {
+    purge_user_data(user_id)?;
+    db::with_db(|conn| {
+        conn.execute("DELETE FROM trusted_apps WHERE user_id = ?1", params![user_id])?;
+        conn.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
+        conn.execute("DELETE FROM user_residency WHERE user_id = ?1", params![user_id])?;
+        Ok(())
+    })?;
+    remove_user_credential(user_id).map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))
+}
+
+pub fn get_residency() -> Vec<UserResidency> {
+    db::with_db(|conn| {
+        let mut stmt = conn.prepare("SELECT user_id, username, lifecycle_state, data_state FROM user_residency ORDER BY username")?;
+        let rows = stmt.query_map([], |row| {
+            let lifecycle: String = row.get(2)?;
+            Ok(UserResidency {
+                user_id: row.get(0)?, username: row.get(1)?,
+                state: if lifecycle == "managed" { LocalUserState::Managed } else { LocalUserState::Released },
+                data_present: row.get::<_, String>(3)? == "present",
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }).unwrap_or_default()
+}
+
 pub fn clear() {
     if let Err(e) = db::with_db(|conn| {
-        conn.execute_batch("DELETE FROM trusted_apps; DELETE FROM users;")?;
+        conn.execute_batch("DELETE FROM trusted_apps; DELETE FROM users; DELETE FROM user_residency;")?;
         Ok(())
     }) {
         eprintln!("Failed to clear users: {}", e);
     }
 }
 
-#[allow(dead_code)]
-pub async fn load_from_tu(username: &str) -> Result<(), ()> {
-    let file_content = load_file("", &format!("{}.tu", username));
-    let segments = file_content.split("::").collect::<Vec<&str>>();
-    let (uuid_str, _omega_host) = segments[0].split_once('@').unwrap_or((segments[0], ""));
-    let uuid = uuid_str.parse::<i64>().unwrap_or(0);
-    let b64_private_key = segments[1];
-
-    let keyring = keyring_from_base64(b64_private_key).unwrap();
-    let pub_key_bundle = keyring.public_key_bundle();
-    let keyring_b64 = crypto_helper::keyring_to_base64(&keyring);
-
-    let mut bytes = [0u8; 192];
-    OsRng.fill_bytes(&mut bytes);
-    let reset_token = STANDARD.encode(&bytes);
-
-    let user_profile = UserProfile::new(
-        uuid,
-        username.to_string(),
-        Some(username.to_string()),
-        public_key_bundle_to_base64(&pub_key_bundle),
-        hex_hash(&keyring_b64),
-        reset_token,
-    );
-    add_user(user_profile);
-    Ok(())
-}
 
 pub fn save_users() {
     // No-op: users are auto-saved via SQLite.

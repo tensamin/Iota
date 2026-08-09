@@ -1,6 +1,7 @@
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use iota_cli::theme::{CliOutputFormat, ThemeName, UiConfig};
 use iota_terms::TermsType;
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub struct CliInvocation {
@@ -115,15 +116,33 @@ enum UsersAction {
         user_id: i64,
     },
     Add {
-        username: String,
+        username: Option<String>,
+        #[arg(long, value_name = "PATH")]
+        tu: Option<PathBuf>,
     },
-    Remove {
+    Release {
         user_id: i64,
         #[arg(long)]
         yes: bool,
     },
-    Import {
-        username: String,
+    Data {
+        #[command(subcommand)]
+        action: UserDataAction,
+    },
+    CompleteDelete {
+        user_id: i64,
+        #[arg(long, value_name = "PATH")]
+        tu: Option<PathBuf>,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+#[derive(Subcommand, Debug)]
+enum UserDataAction {
+    Purge {
+        user_id: i64,
+        #[arg(long)]
+        yes: bool,
     },
 }
 #[derive(Args, Debug)]
@@ -264,14 +283,21 @@ pub enum Command {
         user_id: i64,
     },
     UsersAdd {
-        username: String,
+        username: Option<String>,
+        tu: Option<PathBuf>,
     },
-    UsersRemove {
+    UsersRelease {
         user_id: i64,
         confirmed: bool,
     },
-    UsersImport {
-        username: String,
+    UsersPurgeData {
+        user_id: i64,
+        confirmed: bool,
+    },
+    UsersCompleteDelete {
+        user_id: i64,
+        tu: Option<PathBuf>,
+        confirmed: bool,
     },
     OmikronReconnect,
     IdentityRotate {
@@ -367,12 +393,29 @@ impl CliInvocation {
             Some(CliCommand::Users(users)) => match users.action {
                 UsersAction::List => Command::UsersList,
                 UsersAction::Show { user_id } => Command::UsersShow { user_id },
-                UsersAction::Add { username } => Command::UsersAdd { username },
-                UsersAction::Remove { user_id, yes } => Command::UsersRemove {
+                UsersAction::Add { username, tu } => {
+                    if username.is_some() == tu.is_some() {
+                        return Err(
+                            "users add requires exactly one of <username> or --tu <PATH>".into(),
+                        );
+                    }
+                    Command::UsersAdd { username, tu }
+                }
+                UsersAction::Release { user_id, yes } => Command::UsersRelease {
                     user_id,
                     confirmed: resolve_confirmed(yes),
                 },
-                UsersAction::Import { username } => Command::UsersImport { username },
+                UsersAction::Data {
+                    action: UserDataAction::Purge { user_id, yes },
+                } => Command::UsersPurgeData {
+                    user_id,
+                    confirmed: resolve_confirmed(yes),
+                },
+                UsersAction::CompleteDelete { user_id, tu, yes } => Command::UsersCompleteDelete {
+                    user_id,
+                    tu,
+                    confirmed: resolve_confirmed(yes),
+                },
             },
             Some(CliCommand::Omikron(omikron)) => match omikron.action {
                 OmikronAction::Reconnect => Command::OmikronReconnect,
@@ -445,6 +488,7 @@ impl CliInvocation {
         }
     }
 
+    #[allow(unused)]
     pub fn help_text() -> String {
         Cli::command().render_long_help().to_string()
     }
@@ -528,7 +572,7 @@ mod tests {
     #[test]
     fn command_schema_drives_help_and_completion_paths() {
         let paths = CliInvocation::command_paths();
-        assert!(paths.contains(&"users remove".to_owned()));
+        assert!(paths.contains(&"users release".to_owned()));
         assert!(paths.contains(&"daemon install".to_owned()));
         let help = CliInvocation::help_text();
         assert!(help.contains("users"));
@@ -558,12 +602,7 @@ mod tests {
     #[test]
     fn parses_unconfirmed_destructive_commands_explicitly() {
         let invocation = CliInvocation::parse(["daemon".into(), "stop".into()]).unwrap();
-        assert_eq!(
-            invocation.command,
-            Command::DaemonStop {
-                confirmed: true
-            }
-        );
+        assert_eq!(invocation.command, Command::DaemonStop { confirmed: true });
     }
 
     #[test]
@@ -573,7 +612,8 @@ mod tests {
         assert_eq!(
             invocation.command,
             Command::UsersAdd {
-                username: "alice".into()
+                username: Some("alice".into()),
+                tu: None,
             }
         );
     }
@@ -597,26 +637,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_users_remove_without_confirmation() {
-        let invocation =
-            CliInvocation::parse(["users".into(), "remove".into(), "42".into()]).unwrap();
-        assert_eq!(
-            invocation.command,
-            Command::UsersRemove {
-                user_id: 42,
-                confirmed: true,
-            }
-        );
+    fn rejects_ambiguous_users_remove() {
+        let error =
+            CliInvocation::parse(["users".into(), "remove".into(), "42".into()]).unwrap_err();
+        assert!(error.contains("remove"));
     }
 
     #[test]
-    fn parses_users_remove_with_confirmation() {
-        let invocation =
-            CliInvocation::parse(["users".into(), "remove".into(), "42".into(), "--yes".into()])
-                .unwrap();
+    fn parses_users_release_with_confirmation() {
+        let invocation = CliInvocation::parse([
+            "users".into(),
+            "release".into(),
+            "42".into(),
+            "--yes".into(),
+        ])
+        .unwrap();
         assert_eq!(
             invocation.command,
-            Command::UsersRemove {
+            Command::UsersRelease {
                 user_id: 42,
                 confirmed: true,
             }

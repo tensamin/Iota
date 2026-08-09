@@ -27,6 +27,9 @@ use std::{
 pub struct UserEntry {
     pub user_id: i64,
     pub username: String,
+    pub state: iota_ipc::LocalUserState,
+    pub data_present: bool,
+    pub credential_present: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -146,7 +149,9 @@ impl UsersScreen {
                 let user = &self.users[*user_index];
                 (
                     *user_index,
-                    format!("{:>6}  {}", user.user_id, user.username),
+                    format!("{:>6}  {}  {}{}", user.user_id, user.username,
+                        match user.state { iota_ipc::LocalUserState::Managed => "managed", iota_ipc::LocalUserState::Released => "released" },
+                        if user.data_present { "" } else { ", data purged" }),
                 )
             })
             .collect();
@@ -211,7 +216,7 @@ impl UsersScreen {
             f,
             buttons_area[2],
             ActionButton {
-                label: "Remove",
+                label: "Release",
                 intent: ButtonIntent::Destructive,
                 focused: self.focus == Focus::RemoveButton,
                 enabled: !self.loading && !self.pending && !self.users.is_empty(),
@@ -235,7 +240,7 @@ impl UsersScreen {
                     return InteractionResult::AppTask {
                         task: Box::pin(async move {
                             let result = match ipc.send_request(iota_ipc::LocalRequest::CreateUser { username: name }).await {
-                            Ok(iota_ipc::ResponseResult::Ok(iota_ipc::ResponsePayload::UserCreated { user_id, username })) => Ok(UserEntry { user_id, username }),
+                            Ok(iota_ipc::ResponseResult::Ok(iota_ipc::ResponsePayload::UserCreated { user_id, username })) => Ok(UserEntry { user_id, username, state: iota_ipc::LocalUserState::Managed, data_present: true, credential_present: true }),
                             Ok(iota_ipc::ResponseResult::Error(error)) => Err(format!("Cannot create user: {error}")),
                             Ok(_) => Err("Daemon returned an unexpected response while creating the user.".into()),
                             Err(error) => Err(format!("Cannot create user: {error}")),
@@ -249,14 +254,14 @@ impl UsersScreen {
                     let ipc = self.ipc.clone();
                     let id = user.user_id;
                     self.pending = true;
-                    self.message = Some(format!("Removing {}…", user.username));
+                    self.message = Some(format!("Releasing {}…", user.username));
                     return InteractionResult::AppTask {
                         task: Box::pin(async move {
-                            let result = match ipc.send_request(iota_ipc::LocalRequest::RemoveUser { user_id: id }).await {
-                            Ok(iota_ipc::ResponseResult::Ok(iota_ipc::ResponsePayload::UserRemoved { .. })) => Ok(()),
-                            Ok(iota_ipc::ResponseResult::Error(error)) => Err(format!("Cannot remove user: {error}")),
-                            Ok(_) => Err("Daemon returned an unexpected response while removing the user.".into()),
-                            Err(error) => Err(format!("Cannot remove user: {error}")),
+                            let result = match ipc.send_request(iota_ipc::LocalRequest::ReleaseUser { user_id: id }).await {
+                            Ok(iota_ipc::ResponseResult::Ok(iota_ipc::ResponsePayload::Acknowledged { .. })) => Ok(()),
+                            Ok(iota_ipc::ResponseResult::Error(error)) => Err(format!("Cannot release user: {error}")),
+                            Ok(_) => Err("Daemon returned an unexpected response while releasing the user.".into()),
+                            Err(error) => Err(format!("Cannot release user: {error}")),
                         };
                             UiEvent::App(AppEvent::UserRemoved {
                                 user_id: id,
@@ -528,10 +533,11 @@ impl Screen for UsersScreen {
                 match result {
                     Ok(()) => {
                         self.pending_dialog = None;
-                        self.users.retain(|user| user.user_id != user_id);
-                        self.focused_index =
-                            self.focused_index.min(self.users.len().saturating_sub(1));
-                        self.message = Some(format!("Removed user {user_id}."));
+                        if let Some(user) = self.users.iter_mut().find(|user| user.user_id == user_id) {
+                            user.state = iota_ipc::LocalUserState::Released;
+                            user.credential_present = false;
+                        }
+                        self.message = Some(format!("Released user {user_id}; hosted data retained."));
                     }
                     Err(error) => {
                         self.dialog = self.pending_dialog.take();

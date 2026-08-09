@@ -251,6 +251,21 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    if current_version < 7 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS user_residency (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT NOT NULL,
+                lifecycle_state TEXT NOT NULL CHECK (lifecycle_state IN ('managed', 'released')),
+                data_state TEXT NOT NULL CHECK (data_state IN ('present', 'empty')),
+                updated_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 7;
+            "#,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -320,7 +335,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -337,8 +352,8 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 6);
-        for table in ["sync_heads", "sync_events", "client_sync_state"] {
+        assert_eq!(version, 7);
+        for table in ["sync_heads", "sync_events", "client_sync_state", "user_residency"] {
             let exists: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
                 [table],

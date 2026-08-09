@@ -33,11 +33,70 @@ fn delete_dir_recursive(directory: &Path) -> bool {
 }
 
 #[allow(dead_code)]
-pub fn delete_user_directory(user_id: i64) {
+pub fn delete_user_directory(user_id: i64) -> io::Result<()> {
     let user_dir = Path::new(&get_directory())
         .join("users")
         .join(user_id.to_string());
-    let _ = delete_dir_recursive(&user_dir);
+    if !user_dir.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(user_dir)
+}
+
+pub fn credential_path(user_id: i64) -> PathBuf {
+    storage_directory().join("credentials").join(format!("{user_id}.tu"))
+}
+
+pub fn read_user_credential(user_id: i64) -> io::Result<Option<String>> {
+    let path = credential_path(user_id);
+    match fs::read_to_string(path) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Resolve a credential by immutable account id. A valid legacy
+/// `<username>.tu` is migrated atomically the first time it is encountered.
+pub fn read_user_credential_with_legacy(user_id: i64, username: &str) -> io::Result<Option<String>> {
+    if let Some(credential) = read_user_credential(user_id)? {
+        return Ok(Some(credential));
+    }
+    let legacy = storage_file("", format!("{username}.tu"))?;
+    let credential = match fs::read_to_string(&legacy) {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let parsed = crate::tu::TuCredential::parse(&credential)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if parsed.user_id != user_id {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "legacy credential user id mismatch"));
+    }
+    write_user_credential(user_id, &parsed.to_canonical_string())?;
+    fs::remove_file(legacy)?;
+    Ok(Some(parsed.to_canonical_string()))
+}
+
+pub fn write_user_credential(user_id: i64, credential: &str) -> io::Result<()> {
+    let path = credential_path(user_id);
+    let parent = path.parent().expect("credential path has parent");
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".{user_id}.tu.tmp"));
+    fs::write(&temporary, credential)?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn remove_user_credential(user_id: i64) -> io::Result<()> {
+    match fs::remove_file(credential_path(user_id)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn load_file_buf(path: &str, name: &str) -> io::Result<BufReader<File>> {

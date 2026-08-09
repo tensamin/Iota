@@ -403,7 +403,9 @@ fn print_help() {
     println!("  users list             List all users");
     println!("  users show <ID>        Show user details");
     println!("  users add <NAME>       Create a new user");
-    println!("  users remove <ID>      Remove a user (requires --yes)");
+    println!("  users add --tu <PATH>  Add an existing account credential");
+    println!("  users data purge <ID>  Purge hosted data (requires --yes)");
+    println!("  users release <ID>     Release this Iota (requires --yes)");
     println!("  omikron status         Show Omikron connection status");
     println!("  omikron reconnect      Reconnect to Omikron");
     println!("  identity rotate        Rotate identity keys (requires --yes)");
@@ -451,7 +453,7 @@ fn print_help() {
     println!("  iota status                 Show daemon status");
     println!("  iota users list --output=json   List users in JSON format");
     println!("  iota users add alice       Create a user named 'alice'");
-    println!("  iota users remove 42 --yes Remove user 42");
+    println!("  iota users data purge 42 --yes  Purge hosted data");
     println!("  iota config get --output=yaml   Show config in YAML format");
     println!("  iota logs --limit 50       Show last 50 log entries");
     println!("  iota completions bash      Generate bash completions");
@@ -564,12 +566,40 @@ async fn run_command(
         Command::Tasks => LocalRequest::ListTasks,
         Command::UsersList => LocalRequest::ListUsers,
         Command::UsersShow { user_id } => LocalRequest::GetUser { user_id },
-        Command::UsersAdd { username } => LocalRequest::CreateUser { username },
-        Command::UsersRemove {
+        Command::UsersAdd { username: Some(username), tu: None } => LocalRequest::CreateUser { username },
+        Command::UsersAdd { username: None, tu: Some(path) } => {
+            let contents = std::fs::read_to_string(&path)
+                .map_err(|error| StartupError::InvalidCommand(format!("Cannot read {}: {error}", path.display())))?;
+            iota_util::tu::TuCredential::parse(&contents)
+                .map_err(|error| StartupError::InvalidCommand(format!("Invalid credential {}: {error}", path.display())))?;
+            LocalRequest::AttachUserFromTu { credential: iota_ipc::SecretString(contents) }
+        }
+        Command::UsersAdd { .. } => {
+            return Err(StartupError::InvalidCommand(
+                "users add requires exactly one of <username> or --tu <PATH>".into(),
+            ));
+        }
+        Command::UsersRelease {
             user_id,
             confirmed: true,
-        } => LocalRequest::RemoveUser { user_id },
-        Command::UsersImport { username } => LocalRequest::ImportUser { username },
+        } => LocalRequest::ReleaseUser { user_id },
+        Command::UsersPurgeData { user_id, confirmed: true } => LocalRequest::PurgeUserData { user_id },
+        Command::UsersCompleteDelete { user_id, tu, confirmed: true } => {
+            let credential = match tu {
+                Some(path) => {
+                    let contents = std::fs::read_to_string(&path)
+                        .map_err(|error| StartupError::InvalidCommand(format!("Cannot read {}: {error}", path.display())))?;
+                    let parsed = iota_util::tu::TuCredential::parse(&contents)
+                        .map_err(|error| StartupError::InvalidCommand(format!("Invalid credential {}: {error}", path.display())))?;
+                    if parsed.user_id != user_id {
+                        return Err(StartupError::InvalidCommand("credential user ID does not match complete-delete target".into()));
+                    }
+                    Some(iota_ipc::SecretString(contents))
+                }
+                None => None,
+            };
+            LocalRequest::CompleteDeleteUser { user_id, credential }
+        }
         Command::OmikronReconnect => LocalRequest::ReconnectOmikron,
         Command::IdentityRotate { confirmed: true } => LocalRequest::RotateIotaIdentity,
         Command::RegenerateKeys { confirmed: true } => LocalRequest::RotateIotaIdentity,
@@ -588,9 +618,11 @@ async fn run_command(
         Command::Logs { limit } => LocalRequest::GetLogs { limit },
         Command::UpdateCheck => LocalRequest::CheckUpdate,
         Command::CommunityList => LocalRequest::ListCommunities,
-        Command::UsersRemove {
+        Command::UsersRelease {
             confirmed: false, ..
         }
+        | Command::UsersPurgeData { confirmed: false, .. }
+        | Command::UsersCompleteDelete { confirmed: false, .. }
         | Command::IdentityRotate { confirmed: false }
         | Command::RegenerateKeys { confirmed: false }
         | Command::DaemonRestart { confirmed: false }
@@ -688,6 +720,9 @@ async fn run_command(
                         cli_color::warning(&color, "Removed user"),
                         user_id
                     );
+                }
+                ResponsePayload::UserDataPurged { user_id } => {
+                    println!("{} hosted data for {}. Account remains managed by this Iota.", cli_color::success(&color, "Purged"), user_id);
                 }
                 ResponsePayload::Acknowledged { message } => {
                     println!("{}", message);
@@ -934,6 +969,9 @@ fn render_table(payload: &ResponsePayload) {
         }
         ResponsePayload::UserRemoved { user_id } => {
             println!("Removed user {}", user_id);
+        }
+        ResponsePayload::UserDataPurged { user_id } => {
+            println!("Purged hosted data for {}", user_id);
         }
         ResponsePayload::Acknowledged { message } => {
             println!("{}", message);

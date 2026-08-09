@@ -156,6 +156,7 @@ async fn main() -> ExitCode {
         }
     };
     let omikron_health = omikron.clone();
+    let omikron_reconcile = omikron.clone();
     let services = DaemonServices::new(omikron);
     let health_runtime = runtime.clone();
     runtime
@@ -204,6 +205,22 @@ async fn main() -> ExitCode {
                     // the component detail while connected.
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {},
                     _ = health_runtime.cancellation.cancelled() => break,
+                }
+            }
+            Ok(())
+        })
+        .await;
+    runtime
+        .tasks
+        .spawn_tracked("user-lifecycle-reconciliation", async move {
+            let mut states = omikron_reconcile.connection_state();
+            loop {
+                if matches!(*states.borrow(), omikron_connector::omikron_connection::ConnectionState::Connected { .. }) {
+                    omikron_connector::user_ops::reconcile_managed_users(omikron_reconcile.as_ref()).await;
+                }
+                tokio::select! {
+                    changed = states.changed() => if changed.is_err() { break },
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {},
                 }
             }
             Ok(())

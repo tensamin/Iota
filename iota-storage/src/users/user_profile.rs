@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose};
-use iota_util::file_util::{has_file, load_file, used_dir_space};
+use iota_util::file_util::{read_user_credential_with_legacy, used_dir_space};
 use json::{JsonValue, object};
 use rand::Rng;
 use rand::rngs::OsRng;
@@ -55,9 +55,11 @@ impl UserProfile {
         if let Some(d) = &self.display_name {
             obj["display_name"] = d.clone().into();
         }
-        if has_file("", &format!("{}.tu", self.username.clone())) {
-            obj["tu"] = load_file("", &format!("{}.tu", self.username.clone())).into();
-        }
+        // Frontend consumers must never receive private credential material.
+        obj["has_tu"] = read_user_credential_with_legacy(self.user_id, &self.username)
+            .map(|credential| credential.is_some())
+            .unwrap_or(false)
+            .into();
         obj
     }
 

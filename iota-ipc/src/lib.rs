@@ -8,7 +8,7 @@ pub use protocol::{
     ExitIntent, HealthStatus, HelloAck, IpcErrorCode, LifecycleEvent, LifecyclePhase, LocalRequest,
     LogEntriesResponse, LogEntry, MetricSample, OmikronStatusResponse, RequestEnvelope,
     ResponseEnvelope, ResponsePayload, ResponseResult, StartupPhase, StateSnapshot, StatusResponse,
-    SupervisorKind, TaskSummary, UpdateStatusResponse, UserDetailResponse, UserSummary,
+    SecretString, SupervisorKind, TaskSummary, UpdateStatusResponse, UserDetailResponse, UserSummary, LocalUserState,
 };
 pub use transport::{read_msg, write_msg};
 

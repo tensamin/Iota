@@ -1,5 +1,17 @@
 use serde::{Deserialize, Serialize};
 
+/// IPC credentials are supplied by the interactive CLI, never a daemon-side
+/// path lookup.  Debug is deliberately redacted because command routing logs
+/// the request value.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct SecretString(pub String);
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Client → Daemon
 // ---------------------------------------------------------------------------
@@ -36,6 +48,21 @@ pub enum LocalRequest {
     CreateUser {
         username: String,
     },
+    AttachUserFromTu {
+        credential: SecretString,
+    },
+    PurgeUserData {
+        user_id: i64,
+    },
+    ReleaseUser {
+        user_id: i64,
+    },
+    CompleteDeleteUser {
+        user_id: i64,
+        credential: Option<SecretString>,
+    },
+    /// Retained only to return an actionable deprecation error to old IPC
+    /// clients. It must never select lifecycle semantics implicitly.
     RemoveUser {
         user_id: i64,
     },
@@ -137,7 +164,9 @@ pub enum ResponsePayload {
     Tasks(Vec<TaskSummary>),
     Users(Vec<UserSummary>),
     UserCreated { user_id: i64, username: String },
+    /// Retained only for wire compatibility. New lifecycle code never emits it.
     UserRemoved { user_id: i64 },
+    UserDataPurged { user_id: i64 },
     Acknowledged { message: String },
     DaemonStatus(DaemonStatusResponse),
     Config(ConfigResponse),
@@ -174,6 +203,9 @@ pub struct UserDetailResponse {
     pub display_name: Option<String>,
     pub created_at: i64,
     pub trusted_apps: Vec<String>,
+    pub state: LocalUserState,
+    pub data_present: bool,
+    pub credential_present: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -208,6 +240,16 @@ pub struct TaskSummary {
 pub struct UserSummary {
     pub user_id: i64,
     pub username: String,
+    pub state: LocalUserState,
+    pub data_present: bool,
+    pub credential_present: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalUserState {
+    Managed,
+    Released,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

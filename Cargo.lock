@@ -2250,6 +2250,7 @@ dependencies = [
  "iota-paths",
  "iota-process-manager",
  "iota-terms",
+ "iota-util",
  "serde_json",
  "serde_yaml",
  "tokio",

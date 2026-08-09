@@ -2,9 +2,12 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use iota_logger::{PrintType, log, log_cv, log_t};
 use iota_storage::users::user_manager::try_add_user;
 use iota_storage::users::user_profile::UserProfile;
+use iota_storage::util::config_util::CONFIG;
 use iota_util::crypto_helper::{self, hex_hash, public_key_bundle_to_base64};
-use iota_util::file_util::try_save_file;
+use iota_util::file_util::write_user_credential;
+use iota_util::tu::TuCredential;
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+use mtp::crypto::{Ed25519Signer, MlDsaSigner, SignatureScheme};
 use rand_core::{OsRng, RngCore};
 use std::time::Duration;
 
@@ -18,6 +21,133 @@ pub enum CreateUserError {
     InvalidResponse,
     RemoteRejected,
     LocalPersistence(String),
+}
+
+#[derive(Debug)]
+pub enum LifecycleUserError {
+    InvalidCredential(String),
+    OmegaHostMismatch,
+    RemoteRejected,
+    Transport(crate::OmikronError),
+    LocalPersistence(String),
+}
+
+impl From<crate::OmikronError> for LifecycleUserError {
+    fn from(value: crate::OmikronError) -> Self { Self::Transport(value) }
+}
+
+fn lifecycle_payload(domain: &[u8], user_id: i64, iota_id: i64, nonce: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(domain.len() + 24);
+    payload.extend_from_slice(domain);
+    payload.extend_from_slice(&user_id.to_be_bytes());
+    payload.extend_from_slice(&iota_id.to_be_bytes());
+    payload.extend_from_slice(&nonce.to_be_bytes());
+    payload
+}
+
+fn configured_iota_id() -> Result<i64, LifecycleUserError> {
+    CONFIG.load().iota_id
+        .and_then(|id| i64::try_from(id).ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(|| LifecycleUserError::InvalidCredential("Iota identity is not registered".into()))
+}
+
+fn sign_lifecycle_payload(credential: &TuCredential, payload: &[u8]) -> Result<(Vec<u8>, Vec<u8>), LifecycleUserError> {
+    let classical = Ed25519Signer::new(&credential.keyring.sig_cl_secret_key)
+        .map_err(|error| LifecycleUserError::InvalidCredential(error.to_string()))?
+        .sign(payload)
+        .map_err(|error| LifecycleUserError::InvalidCredential(error.to_string()))?;
+    let pq = MlDsaSigner::new(&credential.keyring.sig_pq_secret_key, &credential.keyring.sig_pq_public_key)
+        .map_err(|error| LifecycleUserError::InvalidCredential(error.to_string()))?
+        .sign(payload)
+        .map_err(|error| LifecycleUserError::InvalidCredential(error.to_string()))?;
+    Ok((classical, pq))
+}
+
+async fn inspect_credential_account(
+    connection: &dyn OmikronClient,
+    credential: &TuCredential,
+) -> Result<(String, String), LifecycleUserError> {
+    if credential.omega_host != omega_discovery::omega_host() {
+        return Err(LifecycleUserError::OmegaHostMismatch);
+    }
+    let request = CommunicationValue::new(CommunicationType::GetUserData)
+        .add_typed_default(DataType::UserId, DataValue::SignedNumber(credential.user_id.into()));
+    let response = connection.await_response(&request, Duration::from_secs(20)).await?;
+    if !response.is_type(CommunicationType::GetUserData) {
+        return Err(LifecycleUserError::RemoteRejected);
+    }
+    let username = response.get_data(DataType::Username).as_str().map(str::to_owned)
+        .ok_or(LifecycleUserError::RemoteRejected)?;
+    let public_key = response.get_data(DataType::PublicKey).as_str().map(str::to_owned)
+        .ok_or(LifecycleUserError::RemoteRejected)?;
+    if public_key != public_key_bundle_to_base64(&credential.public_key_bundle()) {
+        return Err(LifecycleUserError::RemoteRejected);
+    }
+    Ok((username, public_key))
+}
+
+async fn credential_proof(
+    connection: &dyn OmikronClient,
+    credential: &TuCredential,
+    begin: CommunicationType,
+    challenge: CommunicationType,
+    complete: CommunicationType,
+    domain: &[u8],
+) -> Result<(), LifecycleUserError> {
+    let iota_id = configured_iota_id()?;
+    let begin_request = CommunicationValue::new(begin)
+        .add_typed_default(DataType::UserId, DataValue::SignedNumber(credential.user_id.into()));
+    let challenge_response = connection.await_response(&begin_request, Duration::from_secs(20)).await?;
+    if !challenge_response.is_type(challenge) {
+        return Err(LifecycleUserError::RemoteRejected);
+    }
+    let nonce = challenge_response.get_data(DataType::ServerNonce).as_signed_number()
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(LifecycleUserError::RemoteRejected)?;
+    let (signature, pq_signature) = sign_lifecycle_payload(credential, &lifecycle_payload(domain, credential.user_id, iota_id, nonce))?;
+    let complete_request = CommunicationValue::new(complete)
+        .add_typed_default(DataType::UserId, DataValue::SignedNumber(credential.user_id.into()))
+        .add_typed_default(DataType::ServerNonce, DataValue::SignedNumber(nonce.into()))
+        .add_typed_default(DataType::Signature, DataValue::Bytes(signature))
+        .add_typed_default(DataType::PqSignature, DataValue::Bytes(pq_signature));
+    let response = connection.await_response(&complete_request, Duration::from_secs(20)).await?;
+    if response.is_type(CommunicationType::Success) { Ok(()) } else { Err(LifecycleUserError::RemoteRejected) }
+}
+
+/// Attach or migrate an existing account. Local state is written only after
+/// Omega has accepted the credential proof and changed its assignment.
+pub async fn attach_user_from_tu(connection: &dyn OmikronClient, contents: &str) -> Result<UserProfile, LifecycleUserError> {
+    let credential = TuCredential::parse(contents).map_err(|error| LifecycleUserError::InvalidCredential(error.to_string()))?;
+    let (username, public_key) = inspect_credential_account(connection, &credential).await?;
+    credential_proof(connection, &credential, CommunicationType::AttachUserBegin, CommunicationType::AttachUserChallenge, CommunicationType::AttachUserComplete, b"tensamin:user-attach:v1\0").await?;
+    let profile = UserProfile::new(credential.user_id, username, None, public_key, hex_hash(contents), String::new());
+    write_user_credential(profile.user_id, &credential.to_canonical_string())
+        .map_err(|error| LifecycleUserError::LocalPersistence(error.to_string()))?;
+    try_add_user(profile.clone()).map_err(|error| LifecycleUserError::LocalPersistence(error.to_string()))?;
+    Ok(profile)
+}
+
+pub async fn complete_delete_user_with_tu(connection: &dyn OmikronClient, contents: &str, expected_user_id: i64) -> Result<(), LifecycleUserError> {
+    let credential = TuCredential::parse(contents).map_err(|error| LifecycleUserError::InvalidCredential(error.to_string()))?;
+    if credential.user_id != expected_user_id { return Err(LifecycleUserError::InvalidCredential("credential user ID does not match deletion target".into())); }
+    inspect_credential_account(connection, &credential).await?;
+    credential_proof(connection, &credential, CommunicationType::DeleteUserCredentialBegin, CommunicationType::DeleteUserCredentialChallenge, CommunicationType::DeleteUserCredentialComplete, b"tensamin:user-delete:v1\0").await
+}
+
+/// Repair local management state after a release or migration committed in
+/// Omega but local cleanup was interrupted. Hosted data is retained.
+pub async fn reconcile_managed_users(connection: &dyn OmikronClient) {
+    let Ok(local_iota_id) = configured_iota_id() else { return; };
+    for user in iota_storage::users::user_manager::get_users() {
+        let request = CommunicationValue::new(CommunicationType::GetUserData)
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user.user_id.into()));
+        let Ok(response) = connection.await_response(&request, Duration::from_secs(10)).await else { continue; };
+        let remote_iota_id = response.get_data(DataType::IotaId).as_signed_number().and_then(|value| i64::try_from(value).ok());
+        if remote_iota_id != Some(local_iota_id) {
+            let _ = iota_storage::users::user_manager::release_user(user.user_id);
+        }
+    }
 }
 
 fn valid_username(username: &str) -> bool {
@@ -136,15 +266,9 @@ pub async fn create_user(
         }
     }
     log!("Created User");
-    try_save_file(
-        "",
-        &format!("{}.tu", username),
-        &format!(
-            "{}@{}::{}",
-            user_id,
-            omega_discovery::omega_host(),
-            keyring_b64
-        ),
+    write_user_credential(
+        user_id,
+        &format!("{}@{}::{}", user_id, omega_discovery::omega_host(), keyring_b64),
     )
     .map_err(|error| CreateUserError::LocalPersistence(error.to_string()))?;
 

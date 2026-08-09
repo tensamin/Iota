@@ -188,6 +188,23 @@ pub fn delete_pending_chat_secret_forward(
     })
 }
 
+/// Erase every E2EE record owned by, or queued for, a user.  The operation is
+/// intentionally idempotent so it can be retried after an interrupted remote
+/// erasure request.
+pub fn purge_user(user_id: i64) -> Result<(), StorageError> {
+    let user_id = user_id.to_string();
+    db::with_conn(&E2EE_DB, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM chat_secrets WHERE user_id = ?1", params![user_id])?;
+        tx.execute(
+            "DELETE FROM pending_chat_secret_forwards WHERE recipient_user_id = ?1 OR sender_user_id = ?1",
+            params![user_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+}
+
 pub fn get_chat_secret(query: ChatSecretQuery) -> Result<Option<StoredChatSecret>, StorageError> {
     if query.user_id.is_empty() || query.chat_id.is_empty() {
         return Ok(None);

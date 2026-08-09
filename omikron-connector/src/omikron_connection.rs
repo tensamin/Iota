@@ -896,11 +896,40 @@ impl OmikronConnection {
         dispatch!(SettingsSave, handle_settings_save);
         dispatch!(SettingsLoad, handle_settings_load);
         dispatch!(SettingsList, handle_settings_list);
+        dispatch!(EraseHostedUserData, handle_erase_hosted_user_data);
     }
 
     // -------------------------------------------------------------------------
     // Message Handlers
     // -------------------------------------------------------------------------
+
+    /// Omega-authorized account cleanup. The storage operation is idempotent;
+    /// acknowledgement is therefore safe to retry after a reconnect.
+    async fn handle_erase_hosted_user_data(self: Arc<Self>, cv: &CommunicationValue) {
+        let Some(user_id) = cv
+            .get_data(DataType::UserId)
+            .as_signed_number()
+            .and_then(|id| i64::try_from(id).ok())
+            .filter(|id| *id > 0)
+        else {
+            let _ = self
+                .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
+                .await;
+            return;
+        };
+
+        if iota_storage::users::user_manager::erase_user_locally(user_id).is_err() {
+            let _ = self
+                .send_message(&error_response(cv, CommunicationType::ErrorInternal))
+                .await;
+            return;
+        }
+
+        let acknowledgement = CommunicationValue::new(CommunicationType::EraseHostedUserDataAck)
+            .with_id(cv.get_id())
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
+        let _ = self.send_message(&acknowledgement).await;
+    }
 
     async fn handle_set_chat_secret(self: Arc<Self>, cv: &CommunicationValue) {
         let sender_id = cv.get_sender().to_string();
