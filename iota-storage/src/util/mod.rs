@@ -4,5 +4,7 @@ pub mod communities_util;
 pub mod config_util;
 pub mod db;
 pub mod e2ee_storage;
+pub mod relay_queue;
+pub mod relay_replay;
 pub mod settings;
 pub mod sync;

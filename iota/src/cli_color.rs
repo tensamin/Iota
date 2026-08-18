@@ -13,10 +13,8 @@ impl Default for ColorConfig {
 
 impl ColorConfig {
     pub fn new() -> Self {
-        let enabled = env::var("NO_COLOR").is_err()
-            && env::var("TERM")
-                .map(|t| t != "dumb")
-                .unwrap_or(true);
+        let enabled =
+            env::var("NO_COLOR").is_err() && env::var("TERM").map(|t| t != "dumb").unwrap_or(true);
         Self { enabled }
     }
 

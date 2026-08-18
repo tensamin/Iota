@@ -4,7 +4,11 @@ use iota_storage::util::chats_util::{self, get_user, mod_user};
 use iota_storage::util::communities_util::CommunitiesUtil;
 use iota_storage::util::e2ee_storage::{self, ChatSecretQuery};
 use iota_storage::util::settings;
-use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+use mtp::codec::{
+    CommunicationType, CommunicationValue, DataType, DataValue, TypeMap, VerifiedRelayContent,
+};
+
+use crate::relay::VerifiedRelayContext;
 
 pub struct MessageMutation {
     pub sender_id: i64,
@@ -31,6 +35,170 @@ pub fn message_mutation(cv: &CommunicationValue) -> Result<MessageMutation, Comm
 
 pub fn success_response(cv: &CommunicationValue) -> CommunicationValue {
     error_response(cv, CommunicationType::Success)
+}
+
+fn relay_field<'a>(
+    payload: &'a DataValue,
+    data_type: DataType,
+    type_map: &TypeMap,
+) -> Option<&'a DataValue> {
+    payload.get_field(data_type.try_to_id(type_map)?)
+}
+
+fn relay_string<'a>(
+    payload: &'a DataValue,
+    data_type: DataType,
+    type_map: &TypeMap,
+) -> Option<&'a str> {
+    relay_field(payload, data_type, type_map)?.as_str()
+}
+
+fn relay_number(payload: &DataValue, data_type: DataType, type_map: &TypeMap) -> Option<i128> {
+    relay_field(payload, data_type, type_map)?.as_number()
+}
+
+fn relay_identity(
+    payload: &DataValue,
+    data_type: DataType,
+    type_map: &TypeMap,
+) -> Result<Option<u64>, String> {
+    let Some(value) = relay_field(payload, data_type, type_map) else {
+        return Ok(None);
+    };
+    if let Some(number) = value.as_number() {
+        return u64::try_from(number)
+            .map(Some)
+            .map_err(|_| format!("Relay {data_type:?} is outside the user ID range"));
+    }
+    if let Some(text) = value.as_str() {
+        return text
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| format!("Relay {data_type:?} is not a user ID"));
+    }
+    Err(format!("Relay {data_type:?} has an invalid user ID value"))
+}
+
+fn validate_relay_identity(
+    context: &VerifiedRelayContext,
+    payload: &DataValue,
+) -> Result<(), String> {
+    if relay_identity(payload, DataType::SenderId, &context.type_map)?
+        .is_some_and(|sender_id| sender_id != context.signer_id)
+    {
+        return Err("Relay SenderId does not match the authenticated signer".into());
+    }
+    if relay_identity(payload, DataType::ReceiverId, &context.type_map)?
+        .is_some_and(|receiver_id| receiver_id != context.final_recipient_id)
+    {
+        return Err("Relay ReceiverId does not match the authenticated recipient".into());
+    }
+    Ok(())
+}
+
+/*
+ * Apply only operations whose actor and recipient can be taken from verified
+ * Relay metadata. The raw Relay frame never enters these handlers, so outer
+ * routing fields cannot become application identity.
+ */
+pub fn apply_verified_relay_content(
+    context: &VerifiedRelayContext,
+    content: &VerifiedRelayContent,
+) -> Result<(), String> {
+    validate_relay_identity(context, &content.content)?;
+    let sender_id = i64::try_from(context.signer_id)
+        .map_err(|_| "Relay signer ID exceeds the local storage range".to_string())?;
+    let recipient_id = i64::try_from(context.final_recipient_id)
+        .map_err(|_| "Relay recipient ID exceeds the local storage range".to_string())?;
+    let created_at = i64::try_from(context.created_at)
+        .map_err(|_| "Relay creation time exceeds the local storage range".to_string())?;
+
+    match content.message_type.as_str() {
+        "MessageSend" => {
+            let message = relay_string(&content.content, DataType::Content, &context.type_map)
+                .ok_or_else(|| "Relay MessageSend is missing Content".to_string())?;
+            let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
+                .and_then(|value| i64::try_from(value).ok())
+                .unwrap_or(created_at);
+            let height = relay_number(&content.content, DataType::Height, &context.type_map)
+                .and_then(|value| i64::try_from(value).ok())
+                .unwrap_or_default();
+            let reply_to = relay_number(&content.content, DataType::ReplyId, &context.type_map)
+                .and_then(|value| i64::try_from(value).ok());
+            chat_files::add_message(
+                u128::try_from(send_time)
+                    .map_err(|_| "Relay MessageSend has a negative SendTime".to_string())?,
+                false,
+                recipient_id,
+                sender_id,
+                message,
+                height,
+                reply_to,
+            );
+            Ok(())
+        }
+        "MessageEdit" => {
+            let message = relay_string(&content.content, DataType::Content, &context.type_map)
+                .ok_or_else(|| "Relay MessageEdit is missing Content".to_string())?;
+            let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
+                .and_then(|value| i64::try_from(value).ok())
+                .ok_or_else(|| "Relay MessageEdit is missing SendTime".to_string())?;
+            chat_files::apply_remote_edit(recipient_id, sender_id, send_time, sender_id, message)
+                .map_err(|error| error.to_string())
+        }
+        "MessageReactionAdd" | "MessageReactionRemove" => {
+            let reaction = relay_string(&content.content, DataType::Reaction, &context.type_map)
+                .filter(|value| !value.is_empty() && value.len() <= 64)
+                .ok_or_else(|| "Relay reaction is invalid".to_string())?;
+            let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
+                .and_then(|value| i64::try_from(value).ok())
+                .ok_or_else(|| "Relay reaction is missing SendTime".to_string())?;
+            let result = if content.message_type == "MessageReactionAdd" {
+                chat_files::add_reaction(recipient_id, sender_id, send_time, sender_id, reaction)
+            } else {
+                chat_files::remove_reaction(recipient_id, sender_id, send_time, sender_id, reaction)
+            };
+            result.map_err(|error| error.to_string())
+        }
+        "MessageDeleteLive" => {
+            let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
+                .and_then(|value| i64::try_from(value).ok())
+                .ok_or_else(|| "Relay MessageDeleteLive is missing SendTime".to_string())?;
+            chat_files::apply_remote_delete(recipient_id, sender_id, send_time, sender_id)
+                .map_err(|error| error.to_string())
+        }
+        "SetChatSecret" => {
+            let frame = CommunicationValue::new(CommunicationType::SetChatSecret)
+                .with_payload(content.content.clone());
+            let recipients = chat_secret_recipients(&frame)
+                .ok_or_else(|| "Relay SetChatSecret has no recipients".to_string())?;
+            let recipient = recipients
+                .into_iter()
+                .find(|value| value.user_id == context.final_recipient_id.to_string())
+                .ok_or_else(|| "Relay SetChatSecret recipient mismatch".to_string())?;
+            let chat_id = data_string(&frame, DataType::ChatId)
+                .ok_or_else(|| "Relay SetChatSecret is missing ChatId".to_string())?;
+            let secret_id = data_string(&frame, DataType::SecretId)
+                .ok_or_else(|| "Relay SetChatSecret is missing SecretId".to_string())?;
+            let version = data_i64(&frame, DataType::VersionNumber)
+                .ok_or_else(|| "Relay SetChatSecret is missing VersionNumber".to_string())?;
+            let wrapping_scheme = data_string(&frame, DataType::WrappingScheme)
+                .ok_or_else(|| "Relay SetChatSecret is missing WrappingScheme".to_string())?;
+            e2ee_storage::put_chat_secret(e2ee_storage::StoredChatSecret {
+                user_id: context.final_recipient_id.to_string(),
+                chat_id,
+                secret_id,
+                version,
+                encrypted_secret: recipient.encrypted_secret,
+                kem_ciphertext: recipient.kem_ciphertext,
+                wrapping_scheme,
+                created_at,
+                updated_at: now_millis_i64(),
+            })
+            .map_err(|error| error.to_string())
+        }
+        _ => Ok(()),
+    }
 }
 
 pub fn handle_message_edit(cv: &CommunicationValue) -> CommunicationValue {
@@ -346,7 +514,9 @@ mod presence_tests {
 fn sync_error(cv: &CommunicationValue) -> CommunicationValue {
     error_response(cv, CommunicationType::ErrorInvalidData).add_typed_default(
         DataType::SessionId,
-        cv.get_data(DataType::SessionId).clone(),
+        cv.get_data(DataType::SessionId)
+            .cloned()
+            .unwrap_or(DataValue::Null),
     )
 }
 

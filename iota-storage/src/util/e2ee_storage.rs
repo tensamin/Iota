@@ -24,19 +24,6 @@ pub struct ChatSecretQuery {
     pub secret_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingChatSecretForward {
-    pub recipient_user_id: String,
-    pub chat_id: String,
-    pub sender_user_id: String,
-    pub secret_id: String,
-    pub version: i64,
-    pub encrypted_secret: Vec<u8>,
-    pub kem_ciphertext: Vec<u8>,
-    pub wrapping_scheme: String,
-    pub created_at: i64,
-}
-
 static E2EE_DB: LazyLock<Arc<Mutex<rusqlite::Connection>>> = LazyLock::new(|| {
     db::create_shared_connection(
         "e2ee",
@@ -63,21 +50,6 @@ static E2EE_DB: LazyLock<Arc<Mutex<rusqlite::Connection>>> = LazyLock::new(|| {
         CREATE INDEX IF NOT EXISTS idx_chat_secrets_owner
             ON chat_secrets (user_id, chat_id, secret_id);
 
-        CREATE TABLE IF NOT EXISTS pending_chat_secret_forwards (
-            recipient_user_id TEXT NOT NULL,
-            chat_id TEXT NOT NULL,
-            sender_user_id TEXT NOT NULL,
-            secret_id TEXT NOT NULL,
-            version INTEGER NOT NULL,
-            encrypted_secret BLOB NOT NULL,
-            kem_ciphertext BLOB NOT NULL,
-            wrapping_scheme TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (recipient_user_id, chat_id, secret_id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_pending_chat_secret_forwards_recipient
-            ON pending_chat_secret_forwards (recipient_user_id, created_at);
     "#,
     )
     .expect("Failed to create or initialize E2EE DB")
@@ -115,89 +87,15 @@ pub fn put_chat_secret(record: StoredChatSecret) -> Result<(), StorageError> {
     })
 }
 
-pub fn put_pending_chat_secret_forward(
-    record: PendingChatSecretForward,
-) -> Result<(), StorageError> {
-    db::with_conn(&E2EE_DB, |conn| {
-        conn.execute(
-            r#"
-            INSERT INTO pending_chat_secret_forwards (
-                recipient_user_id, chat_id, sender_user_id, secret_id, version,
-                encrypted_secret, kem_ciphertext, wrapping_scheme, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            ON CONFLICT(recipient_user_id, chat_id, secret_id) DO UPDATE SET
-                sender_user_id = excluded.sender_user_id,
-                version = excluded.version,
-                encrypted_secret = excluded.encrypted_secret,
-                kem_ciphertext = excluded.kem_ciphertext,
-                wrapping_scheme = excluded.wrapping_scheme,
-                created_at = excluded.created_at
-            "#,
-            params![
-                record.recipient_user_id,
-                record.chat_id,
-                record.sender_user_id,
-                record.secret_id,
-                record.version,
-                record.encrypted_secret,
-                record.kem_ciphertext,
-                record.wrapping_scheme,
-                record.created_at,
-            ],
-        )?;
-        Ok(())
-    })
-}
-
-pub fn get_pending_chat_secret_forwards(
-    limit: i64,
-) -> Result<Vec<PendingChatSecretForward>, StorageError> {
-    db::with_conn(&E2EE_DB, |conn| {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT recipient_user_id, chat_id, sender_user_id, secret_id, version,
-                   encrypted_secret, kem_ciphertext, wrapping_scheme, created_at
-            FROM pending_chat_secret_forwards
-            ORDER BY created_at ASC
-            LIMIT ?1
-            "#,
-        )?;
-        let rows = stmt.query_map(params![limit.clamp(1, 500)], pending_forward_from_row)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    })
-}
-
-pub fn delete_pending_chat_secret_forward(
-    recipient_user_id: &str,
-    chat_id: &str,
-    secret_id: &str,
-) -> Result<(), StorageError> {
-    db::with_conn(&E2EE_DB, |conn| {
-        conn.execute(
-            r#"
-            DELETE FROM pending_chat_secret_forwards
-            WHERE recipient_user_id = ?1 AND chat_id = ?2 AND secret_id = ?3
-            "#,
-            params![recipient_user_id, chat_id, secret_id],
-        )?;
-        Ok(())
-    })
-}
-
-/// Erase every E2EE record owned by, or queued for, a user.  The operation is
+/// Erase every E2EE record owned by a user. The operation is
 /// intentionally idempotent so it can be retried after an interrupted remote
 /// erasure request.
 pub fn purge_user(user_id: i64) -> Result<(), StorageError> {
     let user_id = user_id.to_string();
     db::with_conn(&E2EE_DB, |conn| {
         let tx = conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM chat_secrets WHERE user_id = ?1", params![user_id])?;
         tx.execute(
-            "DELETE FROM pending_chat_secret_forwards WHERE recipient_user_id = ?1 OR sender_user_id = ?1",
+            "DELETE FROM chat_secrets WHERE user_id = ?1",
             params![user_id],
         )?;
         tx.commit()?;
@@ -240,19 +138,5 @@ fn chat_secret_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChatS
         wrapping_scheme: row.get(6)?,
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
-    })
-}
-
-fn pending_forward_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingChatSecretForward> {
-    Ok(PendingChatSecretForward {
-        recipient_user_id: row.get(0)?,
-        chat_id: row.get(1)?,
-        sender_user_id: row.get(2)?,
-        secret_id: row.get(3)?,
-        version: row.get(4)?,
-        encrypted_secret: row.get(5)?,
-        kem_ciphertext: row.get(6)?,
-        wrapping_scheme: row.get(7)?,
-        created_at: row.get(8)?,
     })
 }

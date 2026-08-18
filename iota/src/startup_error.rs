@@ -43,34 +43,24 @@ impl StartupError {
             Self::SystemPermissionDenied(_) => {
                 Some("Run with appropriate privileges or use a user-level daemon instead.")
             }
-            Self::SocketPermissionDenied(_) => {
-                Some(
-                    "Check file permissions on the socket or ensure the daemon is running as your user.",
-                )
-            }
-            Self::IpcTimedOut(_) => {
-                Some(
-                    "The daemon may be starting up. Wait a moment and try again, or check daemon logs.",
-                )
-            }
-            Self::ProtocolMismatch { .. } => {
-                Some("Update your CLI or daemon to match versions.")
-            }
-            Self::DaemonExited { .. } => {
-                Some("Restart the daemon with `iota daemon restart`.")
-            }
-            Self::IpcBindUnavailable(_) => {
-                Some("Another instance may be running. Stop it first or use a different socket path.")
-            }
+            Self::SocketPermissionDenied(_) => Some(
+                "Check file permissions on the socket or ensure the daemon is running as your user.",
+            ),
+            Self::IpcTimedOut(_) => Some(
+                "The daemon may be starting up. Wait a moment and try again, or check daemon logs.",
+            ),
+            Self::ProtocolMismatch { .. } => Some("Update your CLI or daemon to match versions."),
+            Self::DaemonExited { .. } => Some("Restart the daemon with `iota daemon restart`."),
+            Self::IpcBindUnavailable(_) => Some(
+                "Another instance may be running. Stop it first or use a different socket path.",
+            ),
             Self::Terminal(_) => {
                 Some("Use a terminal that supports interactive mode, or run commands headlessly.")
             }
-            Self::Consent(_) => {
-                Some("Run `iota terms accept` in an interactive terminal to review and accept terms.")
-            }
-            Self::InvalidCommand(_) => {
-                Some("Run `iota --help` to see available commands.")
-            }
+            Self::Consent(_) => Some(
+                "Run `iota terms accept` in an interactive terminal to review and accept terms.",
+            ),
+            Self::InvalidCommand(_) => Some("Run `iota --help` to see available commands."),
             _ => None,
         }
     }
@@ -149,8 +139,16 @@ mod tests {
     }
     #[test]
     fn most_errors_have_suggestions() {
-        assert!(StartupError::DaemonExecutableMissing(PathBuf::from("iota-daemon")).suggestion().is_some());
-        assert!(StartupError::IpcTimedOut(PathBuf::from("/tmp/iota.sock")).suggestion().is_some());
+        assert!(
+            StartupError::DaemonExecutableMissing(PathBuf::from("iota-daemon"))
+                .suggestion()
+                .is_some()
+        );
+        assert!(
+            StartupError::IpcTimedOut(PathBuf::from("/tmp/iota.sock"))
+                .suggestion()
+                .is_some()
+        );
         assert!(StartupError::Cancelled.suggestion().is_none());
     }
 }

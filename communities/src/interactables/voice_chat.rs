@@ -1,6 +1,7 @@
 use crate::communities::{community::Community, interactables::interactable::Interactable};
 use async_trait::async_trait;
 use json::JsonValue;
+use iota_util::mtp_compat::{CommunicationValueCompat, OptionalDataValueExt};
 use std::sync::Arc;
 use std::{any::Any, sync::RwLock};
 use uuid::Uuid;

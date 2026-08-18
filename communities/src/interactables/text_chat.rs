@@ -8,6 +8,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use json::{JsonValue, array, object};
+use iota_util::mtp_compat::{CommunicationValueCompat, OptionalDataValueExt};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;

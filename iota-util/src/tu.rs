@@ -47,7 +47,10 @@ impl fmt::Debug for TuCredential {
 
 impl TuCredential {
     pub fn parse(input: &str) -> Result<Self, TuError> {
-        let (identity, encoded_keyring) = input.trim().split_once("::").ok_or(TuError::InvalidFormat)?;
+        let (identity, encoded_keyring) = input
+            .trim()
+            .split_once("::")
+            .ok_or(TuError::InvalidFormat)?;
         if encoded_keyring.is_empty() || encoded_keyring.contains("::") {
             return Err(TuError::InvalidFormat);
         }
@@ -60,7 +63,11 @@ impl TuCredential {
             return Err(TuError::InvalidUserId);
         }
         let keyring = keyring_from_base64(encoded_keyring).ok_or(TuError::InvalidKeyring)?;
-        Ok(Self { user_id, omega_host: omega_host.trim().to_owned(), keyring })
+        Ok(Self {
+            user_id,
+            omega_host: omega_host.trim().to_owned(),
+            keyring,
+        })
     }
 
     pub fn public_key_bundle(&self) -> PublicKeyBundle {
@@ -68,7 +75,12 @@ impl TuCredential {
     }
 
     pub fn to_canonical_string(&self) -> String {
-        format!("{}@{}::{}", self.user_id, self.omega_host, keyring_to_base64(&self.keyring))
+        format!(
+            "{}@{}::{}",
+            self.user_id,
+            self.omega_host,
+            keyring_to_base64(&self.keyring)
+        )
     }
 }
 
@@ -79,16 +91,31 @@ mod tests {
 
     #[test]
     fn round_trip_is_canonical() {
-        let credential = TuCredential { user_id: 42, omega_host: "omega.example:443".into(), keyring: generate_keyring() };
+        let credential = TuCredential {
+            user_id: 42,
+            omega_host: "omega.example:443".into(),
+            keyring: generate_keyring(),
+        };
         let parsed = TuCredential::parse(&credential.to_canonical_string()).unwrap();
         assert_eq!(parsed.user_id, 42);
         assert_eq!(parsed.omega_host, "omega.example:443");
-        assert_eq!(parsed.to_canonical_string(), credential.to_canonical_string());
+        assert_eq!(
+            parsed.to_canonical_string(),
+            credential.to_canonical_string()
+        );
     }
 
     #[test]
     fn rejects_malformed_credentials() {
-        for value in ["", "1@omega", "@omega::abc", "0@omega::abc", "281474976710656@omega::abc", "1@::abc", "1@omega::abc::def"] {
+        for value in [
+            "",
+            "1@omega",
+            "@omega::abc",
+            "0@omega::abc",
+            "281474976710656@omega::abc",
+            "1@::abc",
+            "1@omega::abc::def",
+        ] {
             assert!(TuCredential::parse(value).is_err(), "{value}");
         }
     }

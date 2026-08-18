@@ -163,11 +163,20 @@ pub enum ResponsePayload {
     Status(StatusResponse),
     Tasks(Vec<TaskSummary>),
     Users(Vec<UserSummary>),
-    UserCreated { user_id: i64, username: String },
+    UserCreated {
+        user_id: i64,
+        username: String,
+    },
     /// Retained only for wire compatibility. New lifecycle code never emits it.
-    UserRemoved { user_id: i64 },
-    UserDataPurged { user_id: i64 },
-    Acknowledged { message: String },
+    UserRemoved {
+        user_id: i64,
+    },
+    UserDataPurged {
+        user_id: i64,
+    },
+    Acknowledged {
+        message: String,
+    },
     DaemonStatus(DaemonStatusResponse),
     Config(ConfigResponse),
     OmikronStatus(OmikronStatusResponse),

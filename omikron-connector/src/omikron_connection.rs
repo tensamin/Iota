@@ -1,9 +1,9 @@
 use dashmap::{DashMap, DashSet};
 use iota_logger::{log, log_cv_in, log_cv_out, log_t};
 use iota_state::AppState;
-use iota_storage::util::chat_files::{self, MessageState, change_message_state};
+use iota_storage::util::chat_files;
 use iota_storage::util::config_util::{CONFIG, modify_config};
-use iota_storage::util::e2ee_storage::{self, PendingChatSecretForward, StoredChatSecret};
+use iota_storage::util::{relay_queue, relay_replay};
 use iota_util::crypto_helper::{self, keyring_from_base64};
 use iota_util::crypto_util::{self};
 use mtp::client::{Client, ClientConfig, MTPConnection, Policy, SendMode, Sender};
@@ -11,7 +11,10 @@ use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::{Keyring, PublicKeyBundle};
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{
+    Arc, LazyLock,
+    atomic::{AtomicU32, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -24,68 +27,11 @@ use crate::omega_discovery;
 
 use iota_connection::message_common::*;
 use iota_connection::message_handlers;
-
-fn pending_chat_secret_forward_from_cv(
-    cv: &CommunicationValue,
-) -> Option<PendingChatSecretForward> {
-    let recipient = chat_secret_recipients(cv)?.into_iter().next()?;
-    Some(PendingChatSecretForward {
-        recipient_user_id: recipient.user_id,
-        chat_id: data_string(cv, DataType::ChatId)?,
-        sender_user_id: cv.get_sender().to_string(),
-        secret_id: data_string(cv, DataType::SecretId)?,
-        version: data_i64(cv, DataType::VersionNumber)?,
-        encrypted_secret: recipient.encrypted_secret,
-        kem_ciphertext: recipient.kem_ciphertext,
-        wrapping_scheme: data_string(cv, DataType::WrappingScheme)?,
-        created_at: data_i64(cv, DataType::CreatedAt).unwrap_or_else(now_millis_i64),
-    })
-}
-
-fn chat_secret_forward_cv(record: &PendingChatSecretForward) -> CommunicationValue {
-    let recipient = typed_container(vec![
-        (
-            DataType::UserId,
-            DataValue::Str(record.recipient_user_id.clone()),
-        ),
-        (
-            DataType::EncryptedSecret,
-            DataValue::Bytes(record.encrypted_secret.clone()),
-        ),
-        (
-            DataType::KemCiphertext,
-            DataValue::Bytes(record.kem_ciphertext.clone()),
-        ),
-    ]);
-
-    CommunicationValue::new(CommunicationType::SetChatSecret)
-        .with_sender(record.sender_user_id.parse::<u64>().unwrap_or(0))
-        .with_receiver(record.recipient_user_id.parse::<u64>().unwrap_or(0))
-        .add_typed_default(DataType::ChatId, DataValue::Str(record.chat_id.clone()))
-        .add_typed_default(
-            DataType::SenderUserId,
-            DataValue::Str(record.sender_user_id.clone()),
-        )
-        .add_typed_default(DataType::SecretId, DataValue::Str(record.secret_id.clone()))
-        .add_typed_default(
-            DataType::VersionNumber,
-            DataValue::SignedNumber(record.version as i128),
-        )
-        .add_typed_default(
-            DataType::WrappingScheme,
-            DataValue::Str(record.wrapping_scheme.clone()),
-        )
-        .add_typed_default(
-            DataType::CreatedAt,
-            DataValue::SignedNumber(record.created_at as i128),
-        )
-        .add_typed_default(DataType::Recipients, DataValue::Array(vec![recipient]))
-}
-
-// Helper function to check if read receipts are enabled globally
-async fn is_read_receipts_enabled() -> bool {
-    CONFIG.load().read_receipts_enabled
-}
+use iota_connection::relay::{
+    RelayValidationError, forward_verified_relay, open_verified_relay_content,
+    verify_relay_metadata,
+};
+use iota_util::route_target::RouteTarget;
 
 // ============================================================================
 // Configuration
@@ -113,6 +59,8 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 const TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const TASK_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_HANDLERS: usize = 20;
+const RELAY_RETENTION_MILLIS: i64 = 30 * 24 * 60 * 60 * 1000;
+static NEXT_RELAY_FRAME_ID: AtomicU32 = AtomicU32::new(1);
 
 // ============================================================================
 // Waiting Task System
@@ -171,12 +119,21 @@ pub struct OmikronConnection {
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     reconnect_on_close: Arc<RwLock<bool>>,
     auth_failure: Arc<RwLock<Option<String>>>,
+    keyring: Arc<RwLock<Option<Arc<Keyring>>>>,
     pub app_challenges: Arc<DashMap<u64, String>>,
     pub app_sessions: Arc<DashMap<u64, (i64, String)>>,
     handler_semaphore: Arc<Semaphore>,
     cancellation: CancellationToken,
     pub(crate) active_tasks: Arc<DashSet<String>>,
     pub(crate) app: Arc<std::sync::Mutex<AppState>>,
+}
+
+fn ensure_relay_frame_id(frame: CommunicationValue) -> CommunicationValue {
+    if frame.id().is_some_and(|id| id != 0) {
+        return frame;
+    }
+    let id = NEXT_RELAY_FRAME_ID.fetch_add(1, Ordering::Relaxed).max(1);
+    frame.with_id(id)
 }
 
 impl OmikronConnection {
@@ -203,6 +160,7 @@ impl OmikronConnection {
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             reconnect_on_close: Arc::new(RwLock::new(true)),
             auth_failure: Arc::new(RwLock::new(None)),
+            keyring: Arc::new(RwLock::new(None)),
             app_challenges: Arc::new(DashMap::new()),
             app_sessions: Arc::new(DashMap::new()),
             handler_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS)),
@@ -328,7 +286,8 @@ impl OmikronConnection {
         self.set_state(ConnectionState::Connecting).await;
         log_t!("omikron_connecting");
 
-        let keyring = self.load_or_migrate_keyring().await;
+        let keyring = Arc::new(self.load_or_migrate_keyring().await);
+        *self.keyring.write().await = Some(keyring.clone());
 
         let existing_iota_id = CONFIG.load().iota_id;
 
@@ -595,6 +554,15 @@ impl OmikronConnection {
             let result = connection.receive().await;
             match result {
                 Ok(cv) => {
+                    if cv.is_type(CommunicationType::Relay) {
+                        let permit = self.handler_semaphore.clone().acquire_owned().await;
+                        let self_clone = self.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            self_clone.handle_relay(cv).await;
+                        });
+                        continue;
+                    }
                     let msg_id = cv.get_id();
                     if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
                         if (task.task)(cv.clone()) {
@@ -650,188 +618,452 @@ impl OmikronConnection {
                 self.app.lock().unwrap().push_ping_val(ping_ms as f64);
             }
 
-            self.flush_pending_chat_secret_forwards().await;
+            self.flush_pending_relays().await;
+            if let Err(error) = relay_replay::prune_completed(
+                now_millis_i64().saturating_sub(RELAY_RETENTION_MILLIS),
+            ) {
+                log!("Relay replay cleanup failed: {}", error);
+            }
         }
     }
 
-    async fn forward_chat_secret(&self, cv: &CommunicationValue) -> bool {
-        self.await_response(cv, Some(Duration::from_secs(10)))
+    async fn resolve_relay_signing_keys(
+        &self,
+        signer_id: u64,
+    ) -> Result<Vec<PublicKeyBundle>, RelayValidationError> {
+        if let Some(user) = iota_storage::users::user_manager::get_user(signer_id as i64) {
+            let key = iota_util::crypto_helper::public_key_bundle_from_base64(&user.public_key)
+                .ok_or_else(|| {
+                    RelayValidationError::KeyLookup("stored user key is invalid".into())
+                })?;
+            return Ok(vec![key]);
+        }
+
+        let request = CommunicationValue::new(CommunicationType::GetUserData).add_typed_default(
+            DataType::UserId,
+            DataValue::UnsignedNumber(signer_id as u128),
+        );
+        let response = self
+            .await_response(&request, Some(Duration::from_secs(10)))
             .await
-            .is_ok()
+            .map_err(RelayValidationError::KeyLookup)?;
+        if !response.is_type(CommunicationType::GetUserData) {
+            return Err(RelayValidationError::KeyLookup(
+                "Omega returned an unexpected user lookup response".into(),
+            ));
+        }
+        let public_key = response
+            .get_data(DataType::PublicKey)
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| RelayValidationError::KeyLookup("Omega returned no user key".into()))?;
+        let key = iota_util::crypto_helper::public_key_bundle_from_base64(public_key).ok_or_else(
+            || RelayValidationError::KeyLookup("Omega returned an invalid user key".into()),
+        )?;
+        Ok(vec![key])
     }
 
-    async fn store_pending_chat_secret_forward(&self, cv: &CommunicationValue) {
-        let Some(record) = pending_chat_secret_forward_from_cv(cv) else {
-            return;
-        };
-        let _ = e2ee_storage::put_pending_chat_secret_forward(record);
+    pub async fn hosting_iota_for_user(&self, user_id: u64) -> Result<u64, String> {
+        if iota_storage::users::user_manager::get_user(user_id as i64).is_some() {
+            return CONFIG
+                .load()
+                .iota_id
+                .ok_or_else(|| "Iota identity is not configured".into());
+        }
+
+        let request = CommunicationValue::new(CommunicationType::GetUserData)
+            .add_typed_default(DataType::UserId, DataValue::UnsignedNumber(user_id as u128));
+        let response = self
+            .await_response(&request, Some(Duration::from_secs(10)))
+            .await?;
+        response
+            .get_data(DataType::IotaId)
+            .and_then(|value| value.as_number())
+            .and_then(|value| u64::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "Omega returned no hosting Iota for the user".into())
     }
 
-    async fn flush_pending_chat_secret_forwards(&self) {
-        let Ok(records) = e2ee_storage::get_pending_chat_secret_forwards(100) else {
+    async fn send_relay_response(&self, frame_id: Option<u32>, response_type: CommunicationType) {
+        if let Some(frame_id) = frame_id {
+            let response = CommunicationValue::new(response_type).with_id(frame_id);
+            if let Err(error) = self.send_message(&response).await {
+                log!("Relay response could not be sent: {}", error);
+            }
+        }
+    }
+
+    async fn handle_relay(self: Arc<Self>, frame: CommunicationValue) {
+        let frame = ensure_relay_frame_id(frame);
+        let incoming_frame_id = frame.id();
+        let Some(local_iota_id) = CONFIG.load().iota_id else {
+            log!("Rejecting Relay because this Iota has no registered identity");
+            self.send_relay_response(incoming_frame_id, CommunicationType::ErrorInvalidData)
+                .await;
+            return;
+        };
+        let Some(keyring) = self.keyring.read().await.as_ref().cloned() else {
+            log!("Rejecting Relay because the Iota keyring is unavailable");
+            self.send_relay_response(incoming_frame_id, CommunicationType::ErrorInternal)
+                .await;
             return;
         };
 
+        let resolver_connection = self.clone();
+        let verified = verify_relay_metadata(
+            &frame,
+            local_iota_id,
+            &keyring,
+            move |signer_id| async move {
+                resolver_connection
+                    .resolve_relay_signing_keys(signer_id)
+                    .await
+            },
+        )
+        .await;
+
+        let verified = match verified {
+            Ok(value) => value,
+            Err(error) => {
+                log!("Relay metadata verification failed: {}", error);
+                self.send_relay_response(incoming_frame_id, CommunicationType::ErrorInvalidData)
+                    .await;
+                return;
+            }
+        };
+        let signer_is_local =
+            iota_storage::users::user_manager::get_user(verified.context.signer_id as i64)
+                .is_some();
+        let recipient_is_local =
+            iota_storage::users::user_manager::get_user(verified.context.final_recipient_id as i64)
+                .is_some();
+        if !signer_is_local && !recipient_is_local {
+            log!(
+                "Rejecting Relay with no local origin or destination: signer {}, recipient {}",
+                verified.context.signer_id,
+                verified.context.final_recipient_id,
+            );
+            self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                .await;
+            return;
+        }
+
+        let frame_bytes = match frame.clone().without_id().to_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log!(
+                    "Relay could not be serialized for durable acceptance: {}",
+                    error
+                );
+                self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
+                    .await;
+                return;
+            }
+        };
+        let type_map_version = verified.context.type_map.version.to_string();
+        let frame_id = frame.id().unwrap_or_default();
+        let reservation = match relay_replay::reserve(
+            verified.context.signer_id,
+            &verified.context.message_id,
+            verified.context.created_at,
+            verified.context.final_recipient_id,
+            &frame_bytes,
+            frame_id,
+            &type_map_version,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                log!("Relay durable acceptance failed: {}", error);
+                self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
+                    .await;
+                return;
+            }
+        };
+        let already_applied = match reservation {
+            relay_replay::RelayReservation::New => false,
+            relay_replay::RelayReservation::Existing {
+                frame_matches: false,
+                ..
+            } => {
+                log!(
+                    "Rejecting Relay identity collision for signer {} and message {}",
+                    verified.context.signer_id,
+                    verified.context.message_id
+                );
+                self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                    .await;
+                return;
+            }
+            relay_replay::RelayReservation::Existing { ref state, .. } if state == "delivered" => {
+                self.send_relay_response(frame.id(), CommunicationType::Success)
+                    .await;
+                return;
+            }
+            relay_replay::RelayReservation::Existing { ref state, .. }
+                if state == "applied" || state == "queued" =>
+            {
+                true
+            }
+            relay_replay::RelayReservation::Existing { ref state, .. } if state == "rejected" => {
+                self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                    .await;
+                return;
+            }
+            relay_replay::RelayReservation::Existing { .. } => false,
+        };
+
+        if signer_is_local && !recipient_is_local {
+            let router = match self
+                .hosting_iota_for_user(verified.context.final_recipient_id)
+                .await
+            {
+                Ok(destination_iota) => destination_iota,
+                Err(error) => {
+                    log!("Relay origin route lookup failed: {}", error);
+                    self.send_relay_response(frame.id(), CommunicationType::ErrorNoIota)
+                        .await;
+                    return;
+                }
+            };
+            let forwarded = match forward_verified_relay(&frame, RouteTarget::Iota(router)) {
+                Ok(value) => value,
+                Err(error) => {
+                    log!("Relay origin forwarding validation failed: {}", error);
+                    self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                        .await;
+                    return;
+                }
+            };
+            let bytes = match forwarded.to_bytes() {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    log!("Relay origin retry could not be serialized: {}", error);
+                    self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
+                        .await;
+                    return;
+                }
+            };
+            if let Err(error) = relay_queue::enqueue(
+                RouteTarget::Iota(router),
+                &bytes,
+                now_millis_i64(),
+                frame_id,
+                &type_map_version,
+            ) {
+                log!("Relay origin retry queue failed: {}", error);
+                self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
+                    .await;
+                return;
+            }
+            if let Err(error) = relay_replay::mark_state(
+                verified.context.signer_id,
+                &verified.context.message_id,
+                "queued",
+            ) {
+                log!("Relay origin state update failed: {}", error);
+            }
+            match self
+                .await_response(&forwarded, Some(Duration::from_secs(20)))
+                .await
+            {
+                Ok(response) if response.is_type(CommunicationType::Success) => {
+                    if let Err(error) = relay_queue::acknowledge_iota(router, frame_id) {
+                        log!(
+                            "Relay origin acknowledgement could not clear the queue: {}",
+                            error
+                        );
+                    }
+                    if let Err(error) = relay_replay::mark_state(
+                        verified.context.signer_id,
+                        &verified.context.message_id,
+                        "delivered",
+                    ) {
+                        log!("Relay origin delivery state update failed: {}", error);
+                    }
+                    self.send_relay_response(frame.id(), CommunicationType::Success)
+                        .await;
+                }
+                Ok(response) => {
+                    log!("Relay origin route returned {}", response.get_type());
+                    self.send_relay_response(
+                        frame.id(),
+                        response
+                            .get_comm_type_enum()
+                            .unwrap_or(CommunicationType::ErrorInternal),
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    log!("Relay origin forwarding failed: {}", error);
+                    self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
+                        .await;
+                }
+            }
+            return;
+        }
+
+        let destination = verified.context.final_recipient_id;
+        let forwarded = match forward_verified_relay(&frame, RouteTarget::User(destination)) {
+            Ok(value) => value,
+            Err(error) => {
+                log!("Relay forwarding validation failed: {}", error);
+                self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                    .await;
+                return;
+            }
+        };
+        let bytes = match forwarded.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log!(
+                    "Relay could not be serialized for client delivery: {}",
+                    error
+                );
+                self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
+                    .await;
+                return;
+            }
+        };
+        if let Err(error) = relay_queue::enqueue(
+            RouteTarget::User(destination),
+            &bytes,
+            now_millis_i64(),
+            forwarded.id().unwrap_or_default(),
+            &type_map_version,
+        ) {
+            log!("Relay could not be queued for client delivery: {}", error);
+            self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
+                .await;
+            return;
+        }
+
+        if !already_applied {
+            let content = match open_verified_relay_content(
+                &verified,
+                &[&keyring],
+                verified.context.final_recipient_id,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    log!("Relay content verification failed: {}", error);
+                    if let Err(queue_error) =
+                        relay_queue::remove_for_frame(RouteTarget::User(destination), frame_id)
+                    {
+                        log!(
+                            "Relay invalid-content queue cleanup failed: {}",
+                            queue_error
+                        );
+                    }
+                    let _ = relay_replay::mark_state(
+                        verified.context.signer_id,
+                        &verified.context.message_id,
+                        "rejected",
+                    );
+                    self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                        .await;
+                    return;
+                }
+            };
+            if let Err(error) =
+                message_handlers::apply_verified_relay_content(&verified.context, &content)
+            {
+                log!("Relay application dispatch failed: {}", error);
+                if let Err(queue_error) =
+                    relay_queue::remove_for_frame(RouteTarget::User(destination), frame_id)
+                {
+                    log!("Relay application queue cleanup failed: {}", queue_error);
+                }
+                let _ = relay_replay::mark_state(
+                    verified.context.signer_id,
+                    &verified.context.message_id,
+                    "rejected",
+                );
+                self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                    .await;
+                return;
+            }
+            if let Err(error) = relay_replay::mark_state(
+                verified.context.signer_id,
+                &verified.context.message_id,
+                "applied",
+            ) {
+                log!("Relay application state update failed: {}", error);
+                self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
+                    .await;
+                return;
+            }
+        }
+
+        if let Err(error) = relay_replay::mark_state(
+            verified.context.signer_id,
+            &verified.context.message_id,
+            "queued",
+        ) {
+            log!("Relay queue state update failed: {}", error);
+        }
+        self.send_relay_response(frame.id(), CommunicationType::Success)
+            .await;
+        if let Err(error) = self.send_message(&forwarded).await {
+            log!("Relay delivery to local client failed: {}", error);
+        }
+    }
+
+    async fn flush_pending_relays(&self) {
+        let Ok(records) = relay_queue::list(100) else {
+            return;
+        };
         for record in records {
-            let Ok(recipient) = record.recipient_user_id.parse::<u64>() else {
-                let _ = e2ee_storage::delete_pending_chat_secret_forward(
-                    &record.recipient_user_id,
-                    &record.chat_id,
-                    &record.secret_id,
+            let Some(version) = mtp::type_map::Version::parse(&record.type_map_version) else {
+                log!(
+                    "Retaining pending Relay {} with invalid type-map version {}",
+                    record.id,
+                    record.type_map_version
                 );
                 continue;
             };
-
-            let message = chat_secret_forward_cv(&record).with_receiver(recipient);
-            if self.forward_chat_secret(&message).await {
-                let _ = e2ee_storage::delete_pending_chat_secret_forward(
-                    &record.recipient_user_id,
-                    &record.chat_id,
-                    &record.secret_id,
+            let type_map = mtp::codec::TypeMap::new(version);
+            let Ok(frame) = CommunicationValue::from_bytes_with(&record.frame, &type_map) else {
+                log!("Retaining pending Relay {} with invalid frame", record.id);
+                continue;
+            };
+            let Ok(forwarded) = forward_verified_relay(&frame, record.target) else {
+                log!(
+                    "Retaining pending Relay {} with invalid route target",
+                    record.id
                 );
-            }
-        }
-    }
-
-    async fn forward_message_live(
-        &self,
-        message_id: u32,
-        receiver_id: u64,
-        sender_id: i64,
-        timestamp: i64,
-        content: &str,
-        height: i64,
-        reply_to: Option<i64>,
-    ) -> Option<MessageState> {
-        let mut msg_fields = vec![
-            (DataType::Content, DataValue::Str(content.to_string())),
-            (
-                DataType::SendTime,
-                DataValue::SignedNumber(timestamp as i128),
-            ),
-            (DataType::Height, DataValue::SignedNumber(height as i128)),
-        ];
-        if let Some(rt) = reply_to {
-            msg_fields.push((
-                DataType::ReplyId,
-                DataValue::UnsignedNumber(rt as u64 as u128),
-            ));
-        }
-
-        let user_forward = CommunicationValue::new(CommunicationType::MessageLive)
-            .with_id(message_id)
-            .with_receiver(receiver_id)
-            .add_typed_default(
-                DataType::SenderId,
-                DataValue::SignedNumber(sender_id as i128),
-            )
-            .add_typed_default(DataType::Message, typed_container(msg_fields));
-
-        match self
-            .await_response(&user_forward, Some(Duration::from_secs(3)))
-            .await
-        {
-            Ok(user_resp) => {
-                let ms_raw = user_resp
-                    .get_data(DataType::MessageState)
-                    .as_string()
-                    .unwrap_or_else(|| "".to_string());
-                Some(MessageState::from_str(&ms_raw).upgrade(MessageState::Received))
-            }
-            Err(_) => None,
-        }
-    }
-
-    async fn forward_to_remote_iota(
-        &self,
-        cv: &CommunicationValue,
-        sender_id: i64,
-        receiver_id: i64,
-        timestamp: i64,
-        content: &str,
-        height: i64,
-        reply_to: Option<i64>,
-    ) {
-        let mut fw_msg = CommunicationValue::new(CommunicationType::MessageOtherIota)
-            .with_id(cv.get_id())
-            .with_receiver(receiver_id as u64)
-            .with_sender(sender_id as u64)
-            .add_typed_default(DataType::Height, DataValue::SignedNumber(height as i128))
-            .add_typed_default(DataType::Content, DataValue::Str(content.to_string()))
-            .add_typed_default(
-                DataType::SendTime,
-                DataValue::SignedNumber(timestamp as i128),
-            );
-        if let Some(rt) = reply_to {
-            fw_msg = fw_msg.add_typed_default(
-                DataType::ReplyId,
-                DataValue::UnsignedNumber(rt as u64 as u128),
-            );
-        }
-
-        match self
-            .await_response(&fw_msg, Some(Duration::from_secs(10)))
-            .await
-        {
-            Ok(resp) => {
-                let ms_raw = resp
-                    .get_data(DataType::MessageState)
-                    .as_string()
-                    .unwrap_or_else(|| "".to_string());
-                let ms = MessageState::from_str(&ms_raw).upgrade(MessageState::Received);
-
-                let _ =
-                    chat_files::change_message_state(timestamp, sender_id, receiver_id, ms.clone());
-
-                let _ = self
-                    .send_message(
-                        &CommunicationValue::new(CommunicationType::MessageState)
-                            .with_id(cv.get_id())
-                            .with_receiver(sender_id as u64)
-                            .with_sender(receiver_id as u64)
-                            .add_typed_default(
-                                DataType::ChatPartnerId,
-                                DataValue::SignedNumber(receiver_id as i128),
-                            )
-                            .add_typed_default(
-                                DataType::SendTime,
-                                DataValue::SignedNumber(timestamp as i128),
-                            )
-                            .add_typed_default(
-                                DataType::MessageState,
-                                DataValue::Str(ms.as_str().to_string()),
-                            ),
-                    )
-                    .await;
-            }
-            Err(_) => {
-                let _ = chat_files::change_message_state(
-                    timestamp,
-                    sender_id,
-                    receiver_id,
-                    MessageState::Sent,
-                );
-
-                let _ = self
-                    .send_message(
-                        &CommunicationValue::new(CommunicationType::MessageState)
-                            .with_id(cv.get_id())
-                            .with_receiver(sender_id as u64)
-                            .with_sender(receiver_id as u64)
-                            .add_typed_default(
-                                DataType::ChatPartnerId,
-                                DataValue::SignedNumber(receiver_id as i128),
-                            )
-                            .add_typed_default(
-                                DataType::SendTime,
-                                DataValue::SignedNumber(timestamp as i128),
-                            )
-                            .add_typed_default(
-                                DataType::MessageState,
-                                DataValue::Str(MessageState::Sent.as_str().to_string()),
-                            ),
-                    )
-                    .await;
+                continue;
+            };
+            match record.target {
+                RouteTarget::Iota(destination_iota) => {
+                    match self
+                        .await_response(&forwarded, Some(Duration::from_secs(20)))
+                        .await
+                    {
+                        Ok(response) if response.is_type(CommunicationType::Success) => {
+                            if let Err(error) =
+                                relay_queue::acknowledge_iota(destination_iota, record.frame_id)
+                            {
+                                log!(
+                                    "Pending Relay {} acknowledgement could not clear the queue: {}",
+                                    record.id,
+                                    error
+                                );
+                            }
+                        }
+                        Ok(response) => log!(
+                            "Pending Relay {} route returned {}",
+                            record.id,
+                            response.get_type()
+                        ),
+                        Err(error) => {
+                            log!("Pending Relay {} delivery failed: {}", record.id, error)
+                        }
+                    }
+                }
+                RouteTarget::User(_) => {
+                    if let Err(error) = self.send_message(&forwarded).await {
+                        log!("Pending Relay {} delivery failed: {}", record.id, error);
+                    }
+                }
             }
         }
     }
@@ -842,6 +1074,27 @@ impl OmikronConnection {
 
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
         log_cv_in!(&cv);
+
+        if cv.is_type(CommunicationType::Success)
+            && let Some(frame_id) = cv.id()
+            && let Some(destination_id) = cv
+                .get_data(DataType::UserId)
+                .as_number()
+                .and_then(|value| u64::try_from(value).ok())
+        {
+            match relay_queue::acknowledge(destination_id, frame_id) {
+                Ok(true) => {
+                    if let Err(error) =
+                        relay_replay::mark_delivered_for_frame(destination_id, frame_id)
+                    {
+                        log!("Relay delivery state update failed: {}", error);
+                    }
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => log!("Relay delivery acknowledgement failed: {}", error),
+            }
+        }
 
         let msg_id = cv.get_id();
 
@@ -855,6 +1108,22 @@ impl OmikronConnection {
     }
 
     async fn handle_message_impl(self: Arc<Self>, cv: CommunicationValue) {
+        if cv.is_type(CommunicationType::Relay) {
+            self.handle_relay(cv).await;
+            return;
+        }
+
+        if matches!(
+            iota_connection::relay::message_security_class(&cv),
+            iota_connection::relay::MessageSecurityClass::RelayOnly
+        ) {
+            log!("Rejecting sender-based application mutation outside Relay");
+            let _ = self
+                .send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                .await;
+            return;
+        }
+
         macro_rules! dispatch {
             ($ty:ident, $method:ident) => {
                 if cv.is_type(CommunicationType::$ty) {
@@ -864,9 +1133,7 @@ impl OmikronConnection {
             };
         }
 
-        dispatch!(SetChatSecret, handle_set_chat_secret);
         dispatch!(GetChatSecret, handle_get_chat_secret);
-        dispatch!(ChatSecretForward, handle_chat_secret_forward);
         dispatch!(AppIdentification, handle_app_identification);
         dispatch!(AppChallengeResponse, handle_app_challenge_response);
         dispatch!(SaveAppData, handle_save_app_data);
@@ -876,14 +1143,12 @@ impl OmikronConnection {
         dispatch!(ClientConnected, handle_client_connected);
         dispatch!(ClientStateAck, handle_client_state_ack);
         dispatch!(MessageState, handle_message_state);
-        dispatch!(MessageSend, handle_message_send);
         dispatch!(MessageEdit, handle_message_edit);
         dispatch!(MessageEditLive, handle_message_edit_live);
         dispatch!(MessageReactionAdd, handle_message_reaction_add);
         dispatch!(MessageReactionRemove, handle_message_reaction_remove);
         dispatch!(MessageReactionLive, handle_message_reaction_live);
         dispatch!(MessageDeleteLive, handle_message_delete_live);
-        dispatch!(MessageOtherIota, handle_message_other_iota);
         dispatch!(MessageGet, handle_message_get);
         dispatch!(MessagesGet, handle_messages_get);
         dispatch!(GetChats, handle_get_chats);
@@ -931,121 +1196,10 @@ impl OmikronConnection {
         let _ = self.send_message(&acknowledgement).await;
     }
 
-    async fn handle_set_chat_secret(self: Arc<Self>, cv: &CommunicationValue) {
-        let sender_id = cv.get_sender().to_string();
-        let recipients = match chat_secret_recipients(cv) {
-            Some(recipients) => recipients,
-            None => {
-                let _ = self
-                    .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
-                    .await;
-                return;
-            }
-        };
-        let now = now_millis_i64();
-        let chat_id = data_string(cv, DataType::ChatId);
-        let secret_id = data_string(cv, DataType::SecretId);
-        let version = data_i64(cv, DataType::VersionNumber);
-        let wrapping_scheme = data_string(cv, DataType::WrappingScheme);
-        let created_at = data_i64(cv, DataType::CreatedAt).unwrap_or(now);
-
-        let Some((((chat_id, secret_id), version), wrapping_scheme)) =
-            chat_id.zip(secret_id).zip(version).zip(wrapping_scheme)
-        else {
-            let _ = self
-                .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
-                .await;
-            return;
-        };
-
-        let mut non_local_forwards: Vec<CommunicationValue> = Vec::new();
-
-        for recipient in &recipients {
-            let recipient_id = recipient.user_id.parse::<i64>().unwrap_or(0);
-            let is_local = iota_storage::users::user_manager::get_user(recipient_id).is_some();
-
-            if is_local {
-                if e2ee_storage::put_chat_secret(StoredChatSecret {
-                    user_id: recipient.user_id.clone(),
-                    chat_id: chat_id.clone(),
-                    secret_id: secret_id.clone(),
-                    version,
-                    encrypted_secret: recipient.encrypted_secret.clone(),
-                    kem_ciphertext: recipient.kem_ciphertext.clone(),
-                    wrapping_scheme: wrapping_scheme.clone(),
-                    created_at,
-                    updated_at: now,
-                })
-                .is_err()
-                {
-                    let _ = self
-                        .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
-                        .await;
-                    return;
-                }
-                continue;
-            }
-
-            if recipient.user_id != sender_id {
-                non_local_forwards.push(set_chat_secret_cv_for_recipient(cv, recipient));
-            }
-        }
-
-        if !non_local_forwards.is_empty() {
-            let mut handles = Vec::new();
-            for forward in &non_local_forwards {
-                let self_clone = self.clone();
-                let fwd = forward.clone();
-                handles.push(tokio::spawn(async move {
-                    self_clone.forward_chat_secret(&fwd).await
-                }));
-            }
-
-            for (forward, handle) in non_local_forwards.into_iter().zip(handles) {
-                match handle.await {
-                    Ok(true) => {}
-                    _ => self.store_pending_chat_secret_forward(&forward).await,
-                }
-            }
-        }
-
-        let _ = self
-            .send_message(&error_response(cv, CommunicationType::Success))
-            .await;
-    }
-
     async fn handle_get_chat_secret(self: Arc<Self>, cv: &CommunicationValue) {
         let _ = self
             .send_message(&message_handlers::handle_get_chat_secret(cv))
             .await;
-    }
-
-    async fn handle_chat_secret_forward(self: Arc<Self>, cv: &CommunicationValue) {
-        let sender_id = cv.get_sender().to_string();
-        let recipient_user_id = data_string(cv, DataType::RecipientUserId).unwrap_or_default();
-        if data_string(cv, DataType::SenderUserId).as_deref() != Some(sender_id.as_str())
-            || recipient_user_id.is_empty()
-            || pending_chat_secret_forward_from_cv(cv).is_none()
-        {
-            let _ = self
-                .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
-                .await;
-            return;
-        }
-
-        let forward = cv
-            .clone()
-            .with_receiver(recipient_user_id.parse::<u64>().unwrap_or(0));
-        if self.forward_chat_secret(&forward).await {
-            let _ = self
-                .send_message(&error_response(cv, CommunicationType::Success))
-                .await;
-        } else {
-            self.store_pending_chat_secret_forward(cv).await;
-            let _ = self
-                .send_message(&error_response(cv, CommunicationType::Success))
-                .await;
-        }
     }
 
     async fn handle_app_identification(self: Arc<Self>, cv: &CommunicationValue) {
@@ -1113,7 +1267,7 @@ impl OmikronConnection {
     async fn handle_app_challenge_response(self: Arc<Self>, cv: &CommunicationValue) {
         let sender_id = cv.get_sender();
         if let Some((_, expected_challenge)) = self.app_challenges.remove(&sender_id) {
-            if let DataValue::Str(response) = cv.get_data(DataType::Challenge) {
+            if let Some(DataValue::Str(response)) = cv.get_data(DataType::Challenge) {
                 if expected_challenge == *response {
                     let res = CommunicationValue::new(CommunicationType::AppIdentificationResponse)
                         .with_id(cv.get_id())
@@ -1446,301 +1600,6 @@ impl OmikronConnection {
         }
         let _ = self.send_message(&response).await;
         let _ = self.send_message(&live).await;
-    }
-
-    async fn handle_message_send(self: Arc<Self>, cv: &CommunicationValue) {
-        let sender_id: u64 = cv.get_sender();
-
-        let receiver_id: i64 = if let Some(n) = cv.get_data(DataType::ReceiverId).as_number() {
-            n as i64
-        } else if let Some(s) = cv.get_data(DataType::ReceiverId).as_str() {
-            s.parse::<i64>().unwrap_or(0)
-        } else {
-            0
-        };
-
-        let timestamp_i64 = if let Some(n) = cv.get_data(DataType::SendTime).as_number() {
-            n as i64
-        } else if let Some(s) = cv.get_data(DataType::SendTime).as_str() {
-            s.parse::<i64>().unwrap_or_else(|_| now_millis_i64())
-        } else {
-            now_millis_i64()
-        };
-        let timestamp_u128 = timestamp_i64 as u128;
-
-        let content = cv
-            .get_data(DataType::Content)
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-
-        let height = cv.get_data(DataType::Height).as_number().unwrap_or(0) as i64;
-        let reply_to = cv.get_data(DataType::ReplyId).as_number().map(|n| n as i64);
-
-        if let Some(reply_to) = reply_to {
-            match chat_files::get_message(sender_id as i64, reply_to, Some(receiver_id)) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    let _ = self
-                        .send_message(&error_response(cv, CommunicationType::ErrorNotFound))
-                        .await;
-                    return;
-                }
-                Err(_) => {
-                    let _ = self
-                        .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
-                        .await;
-                    return;
-                }
-            }
-        }
-
-        let is_local = iota_storage::users::user_manager::get_user(receiver_id).is_some();
-
-        if is_local {
-            chat_files::add_message(
-                timestamp_u128,
-                false,
-                receiver_id as i64,
-                sender_id as i64,
-                &content,
-                height,
-                reply_to,
-            );
-        }
-
-        chat_files::add_message(
-            timestamp_u128,
-            true,
-            sender_id as i64,
-            receiver_id as i64,
-            &content,
-            height,
-            reply_to,
-        );
-
-        let conf_msg = CommunicationValue::new(CommunicationType::MessageSend)
-            .with_id(cv.get_id())
-            .with_receiver(sender_id as u64);
-        let _ = self.send_message(&conf_msg).await;
-
-        if !is_local {
-            self.forward_to_remote_iota(
-                cv,
-                sender_id as i64,
-                receiver_id,
-                timestamp_i64,
-                &content,
-                height,
-                reply_to,
-            )
-            .await;
-        } else {
-            match self
-                .forward_message_live(
-                    cv.get_id(),
-                    receiver_id as u64,
-                    sender_id as i64,
-                    timestamp_i64,
-                    &content,
-                    height,
-                    reply_to,
-                )
-                .await
-            {
-                Some(ms) => {
-                    let _ = chat_files::change_message_state(
-                        timestamp_i64,
-                        receiver_id,
-                        sender_id as i64,
-                        ms.clone(),
-                    );
-                    let _ = chat_files::change_message_state(
-                        timestamp_i64,
-                        sender_id as i64,
-                        receiver_id,
-                        ms.clone(),
-                    );
-                    if is_read_receipts_enabled().await {
-                        let _ = self
-                            .send_message(
-                                &CommunicationValue::new(CommunicationType::MessageState)
-                                    .with_id(cv.get_id())
-                                    .with_receiver(sender_id as u64)
-                                    .with_sender(receiver_id as u64)
-                                    .add_typed_default(
-                                        DataType::ChatPartnerId,
-                                        DataValue::SignedNumber(receiver_id as i128),
-                                    )
-                                    .add_typed_default(
-                                        DataType::SendTime,
-                                        DataValue::SignedNumber(timestamp_i64 as i128),
-                                    )
-                                    .add_typed_default(
-                                        DataType::MessageState,
-                                        DataValue::Str(ms.as_str().to_string()),
-                                    ),
-                            )
-                            .await;
-                    }
-                }
-                None => {
-                    let _ = chat_files::change_message_state(
-                        timestamp_i64,
-                        receiver_id,
-                        sender_id as i64,
-                        MessageState::Sent,
-                    );
-                    let _ = chat_files::change_message_state(
-                        timestamp_i64,
-                        sender_id as i64,
-                        receiver_id,
-                        MessageState::Sent,
-                    );
-                    let push_msg = CommunicationValue::new(CommunicationType::PushNotification)
-                        .with_receiver(receiver_id as u64)
-                        .add_typed_default(
-                            DataType::SenderId,
-                            DataValue::SignedNumber(sender_id as i128),
-                        );
-                    let _ = self.send_message(&push_msg).await;
-                    let _ = self
-                        .send_message(
-                            &CommunicationValue::new(CommunicationType::MessageState)
-                                .with_id(cv.get_id())
-                                .with_receiver(sender_id as u64)
-                                .with_sender(receiver_id as u64)
-                                .add_typed_default(
-                                    DataType::SendTime,
-                                    DataValue::SignedNumber(timestamp_i64 as i128),
-                                )
-                                .add_typed_default(
-                                    DataType::ChatPartnerId,
-                                    DataValue::SignedNumber(receiver_id as i128),
-                                )
-                                .add_typed_default(
-                                    DataType::MessageState,
-                                    DataValue::Str(MessageState::Sent.as_str().to_string()),
-                                ),
-                        )
-                        .await;
-                }
-            }
-        }
-    }
-
-    async fn handle_message_other_iota(self: Arc<Self>, cv: &CommunicationValue) {
-        let sender_id = &cv.get_sender();
-        let receiver_id = &cv.get_receiver();
-
-        let timestamp = if let Some(n) = cv.get_data(DataType::SendTime).as_number() {
-            n as i64
-        } else if let Some(s) = cv.get_data(DataType::SendTime).as_str() {
-            s.parse::<i64>().unwrap_or_else(|_| now_millis_i64())
-        } else {
-            now_millis_i64()
-        };
-
-        let content = cv
-            .get_data(DataType::Content)
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-
-        let height = cv.get_data(DataType::Height).as_number().unwrap_or(0) as i64;
-        let reply_to = cv.get_data(DataType::ReplyId).as_number().map(|n| n as i64);
-
-        chat_files::add_message(
-            timestamp as u128,
-            false,
-            *receiver_id as i64,
-            *sender_id as i64,
-            &content,
-            height,
-            reply_to,
-        );
-
-        match self
-            .forward_message_live(
-                cv.get_id(),
-                *receiver_id,
-                *sender_id as i64,
-                timestamp,
-                &content,
-                height,
-                reply_to,
-            )
-            .await
-        {
-            Some(ms) => {
-                let _ = change_message_state(
-                    timestamp,
-                    *receiver_id as i64,
-                    *sender_id as i64,
-                    ms.clone(),
-                );
-
-                if is_read_receipts_enabled().await {
-                    let _ = self
-                        .send_message(
-                            &CommunicationValue::new(CommunicationType::MessageState)
-                                .with_id(cv.get_id())
-                                .with_receiver(*sender_id)
-                                .with_sender(*receiver_id)
-                                .add_typed_default(
-                                    DataType::SendTime,
-                                    DataValue::SignedNumber(timestamp as i128),
-                                )
-                                .add_typed_default(
-                                    DataType::ChatPartnerId,
-                                    DataValue::SignedNumber(*sender_id as i128),
-                                )
-                                .add_typed_default(
-                                    DataType::MessageState,
-                                    DataValue::Str(ms.as_str().to_string()),
-                                ),
-                        )
-                        .await;
-                }
-            }
-            None => {
-                let _ = chat_files::change_message_state(
-                    timestamp,
-                    *receiver_id as i64,
-                    *sender_id as i64,
-                    MessageState::Sent,
-                );
-
-                let push_msg = CommunicationValue::new(CommunicationType::PushNotification)
-                    .with_receiver(*receiver_id)
-                    .add_typed_default(
-                        DataType::SenderId,
-                        DataValue::SignedNumber(*sender_id as i128),
-                    );
-                let _ = self.send_message(&push_msg).await;
-
-                let _ = self
-                    .send_message(
-                        &CommunicationValue::new(CommunicationType::MessageState)
-                            .with_id(cv.get_id())
-                            .with_receiver(*sender_id)
-                            .with_sender(*receiver_id)
-                            .add_typed_default(
-                                DataType::SendTime,
-                                DataValue::SignedNumber(timestamp as i128),
-                            )
-                            .add_typed_default(
-                                DataType::ChatPartnerId,
-                                DataValue::SignedNumber(*receiver_id as i128),
-                            )
-                            .add_typed_default(
-                                DataType::MessageState,
-                                DataValue::Str(MessageState::Sent.as_str().to_string()),
-                            ),
-                    )
-                    .await;
-            }
-        }
     }
 
     async fn handle_messages_get(self: Arc<Self>, cv: &CommunicationValue) {
@@ -2154,6 +2013,7 @@ impl OmikronClient for OmikronConnection {
             shutdown_tx: self.shutdown_tx.clone(),
             reconnect_on_close: self.reconnect_on_close.clone(),
             auth_failure: self.auth_failure.clone(),
+            keyring: self.keyring.clone(),
             app_challenges: self.app_challenges.clone(),
             app_sessions: self.app_sessions.clone(),
             handler_semaphore: self.handler_semaphore.clone(),
@@ -2177,6 +2037,7 @@ impl OmikronClient for OmikronConnection {
             shutdown_tx: self.shutdown_tx.clone(),
             reconnect_on_close: self.reconnect_on_close.clone(),
             auth_failure: self.auth_failure.clone(),
+            keyring: self.keyring.clone(),
             app_challenges: self.app_challenges.clone(),
             app_sessions: self.app_sessions.clone(),
             handler_semaphore: self.handler_semaphore.clone(),

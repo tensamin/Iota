@@ -11,12 +11,17 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-fn connection_badge(state: &IpcConnectionState, theme: &ResolvedTheme) -> (&'static str, ratatui::style::Style) {
+fn connection_badge(
+    state: &IpcConnectionState,
+    theme: &ResolvedTheme,
+) -> (&'static str, ratatui::style::Style) {
     match state {
         IpcConnectionState::Connected => ("OK", theme.status.success),
         IpcConnectionState::Connecting => ("..", theme.status.warning),
         IpcConnectionState::Reconnecting { .. } => ("WARN", theme.status.warning),
-        IpcConnectionState::Failed { .. } | IpcConnectionState::Incompatible { .. } => ("FAIL", theme.status.error),
+        IpcConnectionState::Failed { .. } | IpcConnectionState::Incompatible { .. } => {
+            ("FAIL", theme.status.error)
+        }
         IpcConnectionState::Disconnected => ("WARN", theme.status.warning),
     }
 }
@@ -52,7 +57,8 @@ pub fn render_header(
         format!(" v{}", daemon.version)
     };
 
-    let rows = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
+    let rows =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
     let cells = Layout::horizontal([
         Constraint::Min(28),
         Constraint::Length(12),
@@ -94,10 +100,34 @@ pub fn render_header(
     hits.register(brand_area, AppAction::OpenMain);
 
     for (index, (top, _bottom, label, intent, action)) in [
-        (cells[1], cells2[1], "Overview", ButtonIntent::Primary, AppAction::OpenOverview),
-        (cells[2], cells2[2], "Users", ButtonIntent::Neutral, AppAction::OpenUsers),
-        (cells[3], cells2[3], "Settings", ButtonIntent::Neutral, AppAction::OpenSettings),
-        (cells[4], cells2[4], "Quit", ButtonIntent::Destructive, AppAction::Quit),
+        (
+            cells[1],
+            cells2[1],
+            "Overview",
+            ButtonIntent::Primary,
+            AppAction::OpenOverview,
+        ),
+        (
+            cells[2],
+            cells2[2],
+            "Users",
+            ButtonIntent::Neutral,
+            AppAction::OpenUsers,
+        ),
+        (
+            cells[3],
+            cells2[3],
+            "Settings",
+            ButtonIntent::Neutral,
+            AppAction::OpenSettings,
+        ),
+        (
+            cells[4],
+            cells2[4],
+            "Quit",
+            ButtonIntent::Destructive,
+            AppAction::Quit,
+        ),
     ]
     .into_iter()
     .enumerate()

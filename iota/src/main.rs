@@ -386,17 +386,11 @@ fn writable_socket_path(path: &Path) -> Result<(), StartupError> {
 
 fn print_help() {
     let color = cli_color::ColorConfig::new();
-    println!(
-        "{}",
-        cli_color::heading(&color, "Iota Operator Console")
-    );
+    println!("{}", cli_color::heading(&color, "Iota Operator Console"));
     println!();
     println!("Usage: iota [OPTIONS] [COMMAND]");
     println!();
-    println!(
-        "{}",
-        cli_color::info(&color, "Commands:")
-    );
+    println!("{}", cli_color::info(&color, "Commands:"));
     println!("  (no command)           Launch the interactive dashboard");
     println!("  status                 Show daemon status");
     println!("  tasks                  List active tasks");
@@ -432,10 +426,7 @@ fn print_help() {
     println!("  completions <SHELL>    Generate shell completions");
     println!("  man                    Show the man page");
     println!();
-    println!(
-        "{}",
-        cli_color::info(&color, "Options:")
-    );
+    println!("{}", cli_color::info(&color, "Options:"));
     println!("  --theme <THEME>        Theme: monospace, binary, ansi, surface");
     println!("  --output <FORMAT>      Output format: text, json, yaml, table");
     println!("  --color <WHEN>         Color: auto, always, never");
@@ -445,10 +436,7 @@ fn print_help() {
     println!("  -h, --help             Show help");
     println!("  -V, --version          Show version");
     println!();
-    println!(
-        "{}",
-        cli_color::info(&color, "Examples:")
-    );
+    println!("{}", cli_color::info(&color, "Examples:"));
     println!("  iota                        Launch the interactive dashboard");
     println!("  iota status                 Show daemon status");
     println!("  iota users list --output=json   List users in JSON format");
@@ -458,19 +446,13 @@ fn print_help() {
     println!("  iota logs --limit 50       Show last 50 log entries");
     println!("  iota completions bash      Generate bash completions");
     println!();
-    println!(
-        "{}",
-        cli_color::info(&color, "Exit Codes:")
-    );
+    println!("{}", cli_color::info(&color, "Exit Codes:"));
     println!("  0    Success");
     println!("  1    General error");
     println!("  2    Invalid command or arguments");
     println!("  130  Interrupted (Ctrl+C)");
     println!();
-    println!(
-        "{}",
-        cli_color::muted(&color, "Environment Variables:")
-    );
+    println!("{}", cli_color::muted(&color, "Environment Variables:"));
     println!("  NO_COLOR      Disable colored output when set");
     println!("  TERM          Terminal type (dumb disables colors)");
     println!("  IOTA_THEME    Default theme override");
@@ -566,13 +548,26 @@ async fn run_command(
         Command::Tasks => LocalRequest::ListTasks,
         Command::UsersList => LocalRequest::ListUsers,
         Command::UsersShow { user_id } => LocalRequest::GetUser { user_id },
-        Command::UsersAdd { username: Some(username), tu: None } => LocalRequest::CreateUser { username },
-        Command::UsersAdd { username: None, tu: Some(path) } => {
-            let contents = std::fs::read_to_string(&path)
-                .map_err(|error| StartupError::InvalidCommand(format!("Cannot read {}: {error}", path.display())))?;
-            iota_util::tu::TuCredential::parse(&contents)
-                .map_err(|error| StartupError::InvalidCommand(format!("Invalid credential {}: {error}", path.display())))?;
-            LocalRequest::AttachUserFromTu { credential: iota_ipc::SecretString(contents) }
+        Command::UsersAdd {
+            username: Some(username),
+            tu: None,
+        } => LocalRequest::CreateUser { username },
+        Command::UsersAdd {
+            username: None,
+            tu: Some(path),
+        } => {
+            let contents = std::fs::read_to_string(&path).map_err(|error| {
+                StartupError::InvalidCommand(format!("Cannot read {}: {error}", path.display()))
+            })?;
+            iota_util::tu::TuCredential::parse(&contents).map_err(|error| {
+                StartupError::InvalidCommand(format!(
+                    "Invalid credential {}: {error}",
+                    path.display()
+                ))
+            })?;
+            LocalRequest::AttachUserFromTu {
+                credential: iota_ipc::SecretString(contents),
+            }
         }
         Command::UsersAdd { .. } => {
             return Err(StartupError::InvalidCommand(
@@ -583,22 +578,43 @@ async fn run_command(
             user_id,
             confirmed: true,
         } => LocalRequest::ReleaseUser { user_id },
-        Command::UsersPurgeData { user_id, confirmed: true } => LocalRequest::PurgeUserData { user_id },
-        Command::UsersCompleteDelete { user_id, tu, confirmed: true } => {
+        Command::UsersPurgeData {
+            user_id,
+            confirmed: true,
+        } => LocalRequest::PurgeUserData { user_id },
+        Command::UsersCompleteDelete {
+            user_id,
+            tu,
+            confirmed: true,
+        } => {
             let credential = match tu {
                 Some(path) => {
-                    let contents = std::fs::read_to_string(&path)
-                        .map_err(|error| StartupError::InvalidCommand(format!("Cannot read {}: {error}", path.display())))?;
-                    let parsed = iota_util::tu::TuCredential::parse(&contents)
-                        .map_err(|error| StartupError::InvalidCommand(format!("Invalid credential {}: {error}", path.display())))?;
+                    let contents = std::fs::read_to_string(&path).map_err(|error| {
+                        StartupError::InvalidCommand(format!(
+                            "Cannot read {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                    let parsed =
+                        iota_util::tu::TuCredential::parse(&contents).map_err(|error| {
+                            StartupError::InvalidCommand(format!(
+                                "Invalid credential {}: {error}",
+                                path.display()
+                            ))
+                        })?;
                     if parsed.user_id != user_id {
-                        return Err(StartupError::InvalidCommand("credential user ID does not match complete-delete target".into()));
+                        return Err(StartupError::InvalidCommand(
+                            "credential user ID does not match complete-delete target".into(),
+                        ));
                     }
                     Some(iota_ipc::SecretString(contents))
                 }
                 None => None,
             };
-            LocalRequest::CompleteDeleteUser { user_id, credential }
+            LocalRequest::CompleteDeleteUser {
+                user_id,
+                credential,
+            }
         }
         Command::OmikronReconnect => LocalRequest::ReconnectOmikron,
         Command::IdentityRotate { confirmed: true } => LocalRequest::RotateIotaIdentity,
@@ -621,8 +637,12 @@ async fn run_command(
         Command::UsersRelease {
             confirmed: false, ..
         }
-        | Command::UsersPurgeData { confirmed: false, .. }
-        | Command::UsersCompleteDelete { confirmed: false, .. }
+        | Command::UsersPurgeData {
+            confirmed: false, ..
+        }
+        | Command::UsersCompleteDelete {
+            confirmed: false, ..
+        }
         | Command::IdentityRotate { confirmed: false }
         | Command::RegenerateKeys { confirmed: false }
         | Command::DaemonRestart { confirmed: false }
@@ -715,14 +735,14 @@ async fn run_command(
                     );
                 }
                 ResponsePayload::UserRemoved { user_id } => {
-                    println!(
-                        "{} {}",
-                        cli_color::warning(&color, "Removed user"),
-                        user_id
-                    );
+                    println!("{} {}", cli_color::warning(&color, "Removed user"), user_id);
                 }
                 ResponsePayload::UserDataPurged { user_id } => {
-                    println!("{} hosted data for {}. Account remains managed by this Iota.", cli_color::success(&color, "Purged"), user_id);
+                    println!(
+                        "{} hosted data for {}. Account remains managed by this Iota.",
+                        cli_color::success(&color, "Purged"),
+                        user_id
+                    );
                 }
                 ResponsePayload::Acknowledged { message } => {
                     println!("{}", message);
@@ -740,11 +760,7 @@ async fn run_command(
                         status.connected
                     );
                     if let Some(id) = status.iota_id {
-                        println!(
-                            "{}: {}",
-                            cli_color::info(&color, "Iota ID"),
-                            id
-                        );
+                        println!("{}: {}", cli_color::info(&color, "Iota ID"), id);
                     }
                 }
                 ResponsePayload::Components(components) => {
@@ -756,9 +772,7 @@ async fn run_command(
                     } else {
                         for comp in &components {
                             let (status_str, style) = match comp.status {
-                                iota_ipc::HealthStatus::Healthy => {
-                                    ("healthy", cli_color::SUCCESS)
-                                }
+                                iota_ipc::HealthStatus::Healthy => ("healthy", cli_color::SUCCESS),
                                 iota_ipc::HealthStatus::Degraded => {
                                     ("degraded", cli_color::WARNING)
                                 }
@@ -811,15 +825,9 @@ async fn run_command(
                 }
                 ResponsePayload::UpdateStatus(status) => {
                     if status.available {
-                        println!(
-                            "{}",
-                            cli_color::success(&color, "Update available.")
-                        );
+                        println!("{}", cli_color::success(&color, "Update available."));
                     } else {
-                        println!(
-                            "{}",
-                            cli_color::info(&color, "Up to date.")
-                        );
+                        println!("{}", cli_color::info(&color, "Up to date."));
                     }
                 }
                 ResponsePayload::Communities(communities) => {
@@ -827,11 +835,7 @@ async fn run_command(
                         println!("{}", cli_color::muted(&color, "No communities."));
                     } else {
                         for c in &communities {
-                            println!(
-                                "{} ({})",
-                                cli_color::heading(&color, &c.title),
-                                c.name
-                            );
+                            println!("{} ({})", cli_color::heading(&color, &c.title), c.name);
                         }
                     }
                 }
@@ -905,7 +909,12 @@ fn render_table(payload: &ResponsePayload) {
                     iota_ipc::HealthStatus::Failed => "failed",
                 };
                 let message = comp.message.as_deref().unwrap_or("-");
-                println!("{:<20} {:<10} {}", format!("{:?}", comp.id), status_str, message);
+                println!(
+                    "{:<20} {:<10} {}",
+                    format!("{:?}", comp.id),
+                    status_str,
+                    message
+                );
             }
         }
         ResponsePayload::Communities(communities) => {
@@ -924,8 +933,14 @@ fn render_table(payload: &ResponsePayload) {
                 println!("No log entries.");
                 return;
             }
-            println!("{:<20} {:<6} {:<12} {}", "TIMESTAMP", "LEVEL", "SENDER", "MESSAGE");
-            println!("{:<20} {:<6} {:<12} {}", "--------", "--------", "--------", "--------");
+            println!(
+                "{:<20} {:<6} {:<12} {}",
+                "TIMESTAMP", "LEVEL", "SENDER", "MESSAGE"
+            );
+            println!(
+                "{:<20} {:<6} {:<12} {}",
+                "--------", "--------", "--------", "--------"
+            );
             for entry in &logs.entries {
                 let level = if entry.is_error { "ERR" } else { "INF" };
                 println!(

@@ -215,8 +215,14 @@ async fn main() -> ExitCode {
         .spawn_tracked("user-lifecycle-reconciliation", async move {
             let mut states = omikron_reconcile.connection_state();
             loop {
-                if matches!(*states.borrow(), omikron_connector::omikron_connection::ConnectionState::Connected { .. }) {
-                    omikron_connector::user_ops::reconcile_managed_users(omikron_reconcile.as_ref()).await;
+                if matches!(
+                    *states.borrow(),
+                    omikron_connector::omikron_connection::ConnectionState::Connected { .. }
+                ) {
+                    omikron_connector::user_ops::reconcile_managed_users(
+                        omikron_reconcile.as_ref(),
+                    )
+                    .await;
                 }
                 tokio::select! {
                     changed = states.changed() => if changed.is_err() { break },

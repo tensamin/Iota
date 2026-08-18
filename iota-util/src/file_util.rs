@@ -44,7 +44,9 @@ pub fn delete_user_directory(user_id: i64) -> io::Result<()> {
 }
 
 pub fn credential_path(user_id: i64) -> PathBuf {
-    storage_directory().join("credentials").join(format!("{user_id}.tu"))
+    storage_directory()
+        .join("credentials")
+        .join(format!("{user_id}.tu"))
 }
 
 pub fn read_user_credential(user_id: i64) -> io::Result<Option<String>> {
@@ -58,7 +60,10 @@ pub fn read_user_credential(user_id: i64) -> io::Result<Option<String>> {
 
 /// Resolve a credential by immutable account id. A valid legacy
 /// `<username>.tu` is migrated atomically the first time it is encountered.
-pub fn read_user_credential_with_legacy(user_id: i64, username: &str) -> io::Result<Option<String>> {
+pub fn read_user_credential_with_legacy(
+    user_id: i64,
+    username: &str,
+) -> io::Result<Option<String>> {
     if let Some(credential) = read_user_credential(user_id)? {
         return Ok(Some(credential));
     }
@@ -71,7 +76,10 @@ pub fn read_user_credential_with_legacy(user_id: i64, username: &str) -> io::Res
     let parsed = crate::tu::TuCredential::parse(&credential)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if parsed.user_id != user_id {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "legacy credential user id mismatch"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy credential user id mismatch",
+        ));
     }
     write_user_credential(user_id, &parsed.to_canonical_string())?;
     fs::remove_file(legacy)?;

@@ -14,6 +14,7 @@ mtp = { git = "https://git.methanium.net/Methanium/mtp.git", features = [
     "client",
     "crypto",
     "files",
+    "raw",
 ] }
 
 dashmap = "6.2.1"

@@ -186,8 +186,7 @@ impl Screen for SettingsScreen {
         let inner = header_block.inner(area);
         frame.render_widget(header_block, area);
 
-        let sections = Layout::vertical([Constraint::Length(2), Constraint::Min(1)])
-            .split(inner);
+        let sections = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
 
         frame.render_widget(
             Paragraph::new(format!(

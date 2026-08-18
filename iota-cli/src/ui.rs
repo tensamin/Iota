@@ -306,7 +306,10 @@ impl UI {
     }
 
     pub async fn notifications(&self) -> Vec<Notification> {
-        self.notifications.lock().map(|n| n.clone()).unwrap_or_default()
+        self.notifications
+            .lock()
+            .map(|n| n.clone())
+            .unwrap_or_default()
     }
 
     pub async fn set_screen(&self, screen: Box<dyn Screen>) {
@@ -611,7 +614,9 @@ impl UI {
                     Ok(iota_ipc::ResponseResult::Error(error)) => {
                         Err(format!("Cannot load users: {error}"))
                     }
-                    Ok(_) => Err("Daemon returned an unexpected response while loading users.".into()),
+                    Ok(_) => {
+                        Err("Daemon returned an unexpected response while loading users.".into())
+                    }
                     Err(error) => Err(format!("Cannot load users: {error}")),
                 }
             };
@@ -705,7 +710,12 @@ impl UI {
                             width: 40.min(rows[1].width),
                             height: 3.min(rows[1].height),
                         };
-                        render_notification_area(f, notification_area, &notifications, context.theme);
+                        render_notification_area(
+                            f,
+                            notification_area,
+                            &notifications,
+                            context.theme,
+                        );
                     }
                 }
             })?;

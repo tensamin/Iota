@@ -19,7 +19,10 @@ pub struct UserResidency {
 }
 
 fn now_millis() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 pub fn add_user(user: UserProfile) {
@@ -235,7 +238,10 @@ pub fn release_user(user_id: i64) -> Result<(), crate::storage_error::StorageErr
     })?;
     db::with_db(|conn| {
         let tx = conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM trusted_apps WHERE user_id = ?1", params![user_id])?;
+        tx.execute(
+            "DELETE FROM trusted_apps WHERE user_id = ?1",
+            params![user_id],
+        )?;
         tx.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
         tx.execute(
             r#"INSERT INTO user_residency (user_id, username, lifecycle_state, data_state, updated_at)
@@ -246,7 +252,8 @@ pub fn release_user(user_id: i64) -> Result<(), crate::storage_error::StorageErr
         tx.commit()?;
         Ok(())
     })?;
-    remove_user_credential(user_id).map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))
+    remove_user_credential(user_id)
+        .map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))
 }
 
 /// Authoritative hosted-data erasure used by local purge and future Omega
@@ -256,14 +263,35 @@ pub fn purge_user_data(user_id: i64) -> Result<(), crate::storage_error::Storage
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM message_edits WHERE message_id IN (SELECT id FROM messages WHERE storage_owner = ?1)", params![user_id])?;
         tx.execute("DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE storage_owner = ?1)", params![user_id])?;
-        tx.execute("DELETE FROM messages WHERE storage_owner = ?1", params![user_id])?;
-        tx.execute("DELETE FROM contacts WHERE storage_owner = ?1", params![user_id])?;
-        tx.execute("DELETE FROM communities WHERE storage_owner = ?1", params![user_id])?;
+        tx.execute(
+            "DELETE FROM messages WHERE storage_owner = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM contacts WHERE storage_owner = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM communities WHERE storage_owner = ?1",
+            params![user_id],
+        )?;
         tx.execute("DELETE FROM settings WHERE user_id = ?1", params![user_id])?;
-        tx.execute("DELETE FROM sync_events WHERE user_id = ?1", params![user_id])?;
-        tx.execute("DELETE FROM sync_heads WHERE user_id = ?1", params![user_id])?;
-        tx.execute("DELETE FROM client_sync_state WHERE user_id = ?1", params![user_id])?;
-        tx.execute("DELETE FROM trusted_apps WHERE user_id = ?1", params![user_id])?;
+        tx.execute(
+            "DELETE FROM sync_events WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM sync_heads WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM client_sync_state WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM trusted_apps WHERE user_id = ?1",
+            params![user_id],
+        )?;
         tx.execute(
             "UPDATE user_residency SET data_state = 'empty', updated_at = ?2 WHERE user_id = ?1",
             params![user_id, now_millis()],
@@ -273,7 +301,8 @@ pub fn purge_user_data(user_id: i64) -> Result<(), crate::storage_error::Storage
     })?;
     crate::util::e2ee_storage::purge_user(user_id)
         .map_err(crate::storage_error::StorageError::Other)?;
-    delete_user_directory(user_id).map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))
+    delete_user_directory(user_id)
+        .map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))
 }
 
 /// Complete local erasure is idempotent and is the target for a durable
@@ -281,12 +310,19 @@ pub fn purge_user_data(user_id: i64) -> Result<(), crate::storage_error::Storage
 pub fn erase_user_locally(user_id: i64) -> Result<(), crate::storage_error::StorageError> {
     purge_user_data(user_id)?;
     db::with_db(|conn| {
-        conn.execute("DELETE FROM trusted_apps WHERE user_id = ?1", params![user_id])?;
+        conn.execute(
+            "DELETE FROM trusted_apps WHERE user_id = ?1",
+            params![user_id],
+        )?;
         conn.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
-        conn.execute("DELETE FROM user_residency WHERE user_id = ?1", params![user_id])?;
+        conn.execute(
+            "DELETE FROM user_residency WHERE user_id = ?1",
+            params![user_id],
+        )?;
         Ok(())
     })?;
-    remove_user_credential(user_id).map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))
+    remove_user_credential(user_id)
+        .map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))
 }
 
 pub fn get_residency() -> Vec<UserResidency> {
@@ -306,13 +342,14 @@ pub fn get_residency() -> Vec<UserResidency> {
 
 pub fn clear() {
     if let Err(e) = db::with_db(|conn| {
-        conn.execute_batch("DELETE FROM trusted_apps; DELETE FROM users; DELETE FROM user_residency;")?;
+        conn.execute_batch(
+            "DELETE FROM trusted_apps; DELETE FROM users; DELETE FROM user_residency;",
+        )?;
         Ok(())
     }) {
         eprintln!("Failed to clear users: {}", e);
     }
 }
-
 
 pub fn save_users() {
     // No-op: users are auto-saved via SQLite.

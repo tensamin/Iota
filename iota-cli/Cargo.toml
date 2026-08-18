@@ -23,7 +23,7 @@ iota-process-manager = { path = "../iota-process-manager" }
 iota-paths = { path = "../iota-paths" }
 omikron-connector = { path = "../omikron-connector", optional = true }
 
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git", optional = true }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git",  optional = true }
 
 
 actix-web = { version = "4", features = ["rustls-0_23"] }

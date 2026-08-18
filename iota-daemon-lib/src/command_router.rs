@@ -100,10 +100,25 @@ impl CommandRouter {
                     .into_iter()
                     .map(|user| UserSummary {
                         credential_present: user.state == user_manager::LocalUserState::Managed
-                            && user_manager::get_user(user.user_id).is_some_and(|profile| iota_util::file_util::read_user_credential_with_legacy(user.user_id, &profile.username).ok().flatten().is_some()),
+                            && user_manager::get_user(user.user_id).is_some_and(|profile| {
+                                iota_util::file_util::read_user_credential_with_legacy(
+                                    user.user_id,
+                                    &profile.username,
+                                )
+                                .ok()
+                                .flatten()
+                                .is_some()
+                            }),
                         user_id: user.user_id,
                         username: user.username,
-                        state: match user.state { user_manager::LocalUserState::Managed => iota_ipc::LocalUserState::Managed, user_manager::LocalUserState::Released => iota_ipc::LocalUserState::Released },
+                        state: match user.state {
+                            user_manager::LocalUserState::Managed => {
+                                iota_ipc::LocalUserState::Managed
+                            }
+                            user_manager::LocalUserState::Released => {
+                                iota_ipc::LocalUserState::Released
+                            }
+                        },
                         data_present: user.data_present,
                     })
                     .collect();
@@ -145,7 +160,8 @@ impl CommandRouter {
                     }
                 }
             }
-            LocalRequest::PurgeUserData { user_id } => match user_manager::purge_user_data(user_id) {
+            LocalRequest::PurgeUserData { user_id } => match user_manager::purge_user_data(user_id)
+            {
                 Ok(()) => ResponseResult::Ok(ResponsePayload::UserDataPurged { user_id }),
                 Err(error) => {
                     log!("User data purge failed for {user_id}: {error}");
@@ -153,25 +169,51 @@ impl CommandRouter {
                 }
             },
             LocalRequest::AttachUserFromTu { credential } => {
-                match omikron_connector::user_ops::attach_user_from_tu(self.services.omikron.as_ref(), &credential.0).await {
-                    Ok(user) => ResponseResult::Ok(ResponsePayload::Acknowledged { message: format!("Added {} ({}) to this Iota", user.username, user.user_id) }),
+                match omikron_connector::user_ops::attach_user_from_tu(
+                    self.services.omikron.as_ref(),
+                    &credential.0,
+                )
+                .await
+                {
+                    Ok(user) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: format!("Added {} ({}) to this Iota", user.username, user.user_id),
+                    }),
                     Err(error) => {
                         log!("Credential attach failed: {error:?}");
                         ResponseResult::Error(IpcErrorCode::Unauthorized)
                     }
                 }
             }
-            LocalRequest::CompleteDeleteUser { user_id, credential } => {
+            LocalRequest::CompleteDeleteUser {
+                user_id,
+                credential,
+            } => {
                 let contents = match credential {
                     Some(value) => Ok(value.0),
                     None => user_manager::get_user(user_id)
                         .ok_or(())
-                        .and_then(|user| iota_util::file_util::read_user_credential_with_legacy(user_id, &user.username).map_err(|_| ()))
+                        .and_then(|user| {
+                            iota_util::file_util::read_user_credential_with_legacy(
+                                user_id,
+                                &user.username,
+                            )
+                            .map_err(|_| ())
+                        })
                         .and_then(|value| value.ok_or(())),
                 };
-                let Ok(contents) = contents else { return ResponseResult::Error(IpcErrorCode::Unauthorized); };
-                match omikron_connector::user_ops::complete_delete_user_with_tu(self.services.omikron.as_ref(), &contents, user_id).await {
-                    Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged { message: format!("Deleted Tensamin account {user_id}") }),
+                let Ok(contents) = contents else {
+                    return ResponseResult::Error(IpcErrorCode::Unauthorized);
+                };
+                match omikron_connector::user_ops::complete_delete_user_with_tu(
+                    self.services.omikron.as_ref(),
+                    &contents,
+                    user_id,
+                )
+                .await
+                {
+                    Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: format!("Deleted Tensamin account {user_id}"),
+                    }),
                     Err(error) => {
                         log!("Credential deletion failed for {user_id}: {error:?}");
                         ResponseResult::Error(IpcErrorCode::Unauthorized)
@@ -185,19 +227,34 @@ impl CommandRouter {
                 }
                 let request = CommunicationValue::new(CommunicationType::ReleaseUserFromIota)
                     .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
-                match self.services.omikron.await_response(&request, Duration::from_secs(20)).await {
-                    Ok(response) if response.is_type(CommunicationType::Success) => match user_manager::release_user(user_id) {
-                        Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
-                            message: format!("Released user {user_id}; hosted data was retained"),
-                        }),
-                        Err(error) => {
-                            log!("Remote release succeeded but local cleanup failed for {user_id}: {error}");
-                            ResponseResult::Error(IpcErrorCode::StorageFailure)
+                match self
+                    .services
+                    .omikron
+                    .await_response(&request, Duration::from_secs(20))
+                    .await
+                {
+                    Ok(response) if response.is_type(CommunicationType::Success) => {
+                        match user_manager::release_user(user_id) {
+                            Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                                message: format!(
+                                    "Released user {user_id}; hosted data was retained"
+                                ),
+                            }),
+                            Err(error) => {
+                                log!(
+                                    "Remote release succeeded but local cleanup failed for {user_id}: {error}"
+                                );
+                                ResponseResult::Error(IpcErrorCode::StorageFailure)
+                            }
                         }
-                    },
-                    Ok(response) if response.is_type(CommunicationType::ErrorNotAuthenticated) => ResponseResult::Error(IpcErrorCode::Unauthorized),
+                    }
+                    Ok(response) if response.is_type(CommunicationType::ErrorNotAuthenticated) => {
+                        ResponseResult::Error(IpcErrorCode::Unauthorized)
+                    }
                     Ok(_) => ResponseResult::Error(IpcErrorCode::Conflict),
-                    Err(omikron_connector::OmikronError::Timeout(_)) => ResponseResult::Error(IpcErrorCode::Timeout),
+                    Err(omikron_connector::OmikronError::Timeout(_)) => {
+                        ResponseResult::Error(IpcErrorCode::Timeout)
+                    }
                     Err(_) => ResponseResult::Error(IpcErrorCode::OmikronUnavailable),
                 }
             }
@@ -294,18 +351,28 @@ impl CommandRouter {
             }
             LocalRequest::GetUser { user_id } => match user_manager::get_user(user_id) {
                 Some(user) => {
-                    let credential_present = iota_util::file_util::read_user_credential_with_legacy(user_id, &user.username).ok().flatten().is_some();
+                    let credential_present =
+                        iota_util::file_util::read_user_credential_with_legacy(
+                            user_id,
+                            &user.username,
+                        )
+                        .ok()
+                        .flatten()
+                        .is_some();
                     ResponseResult::Ok(ResponsePayload::UserDetail(UserDetailResponse {
-                    user_id: user.user_id,
-                    username: user.username,
-                    display_name: user.display_name,
-                    created_at: user.created_at,
-                    trusted_apps: user.trusted_apps.keys().cloned().collect(),
-                    state: iota_ipc::LocalUserState::Managed,
-                    data_present: user_manager::get_residency().iter().find(|entry| entry.user_id == user_id).is_none_or(|entry| entry.data_present),
-                    credential_present,
-                }))
-                },
+                        user_id: user.user_id,
+                        username: user.username,
+                        display_name: user.display_name,
+                        created_at: user.created_at,
+                        trusted_apps: user.trusted_apps.keys().cloned().collect(),
+                        state: iota_ipc::LocalUserState::Managed,
+                        data_present: user_manager::get_residency()
+                            .iter()
+                            .find(|entry| entry.user_id == user_id)
+                            .is_none_or(|entry| entry.data_present),
+                        credential_present,
+                    }))
+                }
                 None => ResponseResult::Error(IpcErrorCode::NotFound),
             },
             LocalRequest::ImportUser { .. } => ResponseResult::Error(IpcErrorCode::InvalidRequest),

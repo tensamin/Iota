@@ -189,9 +189,7 @@ impl Screen for ConfirmDialog {
         let button_widths: Vec<u16> = self
             .buttons
             .iter()
-            .map(|b| {
-                crate::controls::button::button_minimum_width(&b.label)
-            })
+            .map(|b| crate::controls::button::button_minimum_width(&b.label))
             .collect();
 
         let total_width: u16 = button_widths.iter().sum();
@@ -200,9 +198,7 @@ impl Screen for ConfirmDialog {
         let start_x = buttons_area.x + available.saturating_sub(total_width + spacing) / 2;
 
         let mut x = start_x;
-        for (i, (button_config, &width)) in
-            self.buttons.iter().zip(&button_widths).enumerate()
-        {
+        for (i, (button_config, &width)) in self.buttons.iter().zip(&button_widths).enumerate() {
             let button_area = Rect {
                 x,
                 y: buttons_area.y,

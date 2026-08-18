@@ -122,10 +122,7 @@ impl UsersScreen {
         if self.loading {
             const SPINNERS: &[u8] = b"|/-\\";
             let ch = SPINNERS[self.tick.fetch_add(1, Ordering::Relaxed) as usize % SPINNERS.len()];
-            f.render_widget(
-                Paragraph::new(format!("{ch} Loading users…")),
-                inner,
-            );
+            f.render_widget(Paragraph::new(format!("{ch} Loading users…")), inner);
             return;
         }
         if visible_indices.is_empty() {
@@ -149,9 +146,20 @@ impl UsersScreen {
                 let user = &self.users[*user_index];
                 (
                     *user_index,
-                    format!("{:>6}  {}  {}{}", user.user_id, user.username,
-                        match user.state { iota_ipc::LocalUserState::Managed => "managed", iota_ipc::LocalUserState::Released => "released" },
-                        if user.data_present { "" } else { ", data purged" }),
+                    format!(
+                        "{:>6}  {}  {}{}",
+                        user.user_id,
+                        user.username,
+                        match user.state {
+                            iota_ipc::LocalUserState::Managed => "managed",
+                            iota_ipc::LocalUserState::Released => "released",
+                        },
+                        if user.data_present {
+                            ""
+                        } else {
+                            ", data purged"
+                        }
+                    ),
                 )
             })
             .collect();
@@ -533,11 +541,14 @@ impl Screen for UsersScreen {
                 match result {
                     Ok(()) => {
                         self.pending_dialog = None;
-                        if let Some(user) = self.users.iter_mut().find(|user| user.user_id == user_id) {
+                        if let Some(user) =
+                            self.users.iter_mut().find(|user| user.user_id == user_id)
+                        {
                             user.state = iota_ipc::LocalUserState::Released;
                             user.credential_present = false;
                         }
-                        self.message = Some(format!("Released user {user_id}; hosted data retained."));
+                        self.message =
+                            Some(format!("Released user {user_id}; hosted data retained."));
                     }
                     Err(error) => {
                         self.dialog = self.pending_dialog.take();

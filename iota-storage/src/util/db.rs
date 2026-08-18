@@ -77,12 +77,22 @@ fn add_column_if_missing(
     column: &str,
     definition: &str,
 ) -> Result<(), StorageError> {
-    let mut statement =
-        conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
+    add_table_column_if_missing(conn, "messages", column, definition)
+}
+
+fn add_table_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), StorageError> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+    ))?;
     let exists = statement.exists([column])?;
 
     if !exists {
-        conn.execute_batch(&format!("ALTER TABLE messages ADD COLUMN {definition};"))?;
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition};"))?;
     }
 
     Ok(())
@@ -266,6 +276,72 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    if current_version < 8 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS relay_replay (
+                signer_id INTEGER NOT NULL,
+                message_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (signer_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_relay_replay_created_at
+                ON relay_replay (created_at);
+            CREATE TABLE IF NOT EXISTS pending_relays (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                destination_id INTEGER NOT NULL,
+                target_kind INTEGER NOT NULL DEFAULT 0,
+                frame BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                frame_id INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(destination_id, frame)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_relays_destination
+                ON pending_relays (destination_id, id);
+            PRAGMA user_version = 8;
+            "#,
+        )?;
+    }
+
+    if current_version < 9 {
+        add_table_column_if_missing(
+            conn,
+            "pending_relays",
+            "target_kind",
+            "target_kind INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_table_column_if_missing(
+            conn,
+            "pending_relays",
+            "type_map_version",
+            "type_map_version TEXT NOT NULL DEFAULT '1.0'",
+        )?;
+        add_table_column_if_missing(
+            conn,
+            "pending_relays",
+            "frame_id",
+            "frame_id INTEGER NOT NULL DEFAULT 0",
+        )?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS relay_inbox (
+                signer_id INTEGER NOT NULL,
+                message_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                destination_id INTEGER NOT NULL,
+                frame BLOB NOT NULL,
+                type_map_version TEXT NOT NULL,
+                frame_id INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('received', 'applied', 'queued', 'delivered', 'rejected')),
+                PRIMARY KEY (signer_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_relay_inbox_state
+                ON relay_inbox (state, created_at);
+            PRAGMA user_version = 9;
+            "#,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -335,7 +411,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 7);
+        assert_eq!(version, 9);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -352,14 +428,27 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 7);
-        for table in ["sync_heads", "sync_events", "client_sync_state", "user_residency"] {
+        assert_eq!(version, 9);
+        for table in [
+            "sync_heads",
+            "sync_events",
+            "client_sync_state",
+            "user_residency",
+            "relay_replay",
+            "pending_relays",
+            "relay_inbox",
+        ] {
             let exists: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
                 [table],
                 |row| row.get(0),
             )?;
             assert_eq!(exists, 1);
+        }
+        for column in ["frame_id", "target_kind", "type_map_version"] {
+            let mut statement =
+                conn.prepare("SELECT 1 FROM pragma_table_info('pending_relays') WHERE name = ?1")?;
+            assert!(statement.exists([column])?);
         }
         Ok(())
     }

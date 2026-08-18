@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git", features = ["client"] }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git",  features = ["client", "crypto"] }
 iota-connection = { path = "../iota-connection" }
 iota-logger = { path = "../iota-logger" }
 iota-util = { path = "../iota-util" }

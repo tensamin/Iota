@@ -2,6 +2,8 @@ use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::type_map::TypeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use iota_util::mtp_compat::{CommunicationValueCompat, OptionalDataValueExt};
+
 pub fn typed_container(items: Vec<(DataType, DataValue)>) -> DataValue {
     use mtp::type_map::{DataTypeId, TypeMap};
     let tm = TypeMap::latest();
@@ -15,22 +17,34 @@ pub fn typed_container(items: Vec<(DataType, DataValue)>) -> DataValue {
 
 pub fn data_string(cv: &CommunicationValue, dt: DataType) -> Option<String> {
     cv.get_data(dt)
-        .as_str()
+        .and_then(DataValue::as_str)
         .map(|s| s.to_string())
-        .or_else(|| cv.get_data(dt).as_number().map(|n| n.to_string()))
-        .or_else(|| cv.get_data(dt).as_signed_number().map(|n| n.to_string()))
+        .or_else(|| {
+            cv.get_data(dt)
+                .and_then(DataValue::as_number)
+                .map(|n| n.to_string())
+        })
+        .or_else(|| {
+            cv.get_data(dt)
+                .and_then(DataValue::as_signed_number)
+                .map(|n| n.to_string())
+        })
 }
 
 pub fn data_i64(cv: &CommunicationValue, dt: DataType) -> Option<i64> {
     cv.get_data(dt)
-        .as_number()
+        .and_then(DataValue::as_number)
         .and_then(|n| i64::try_from(n).ok())
         .or_else(|| {
             cv.get_data(dt)
-                .as_signed_number()
+                .and_then(DataValue::as_signed_number)
                 .and_then(|n| i64::try_from(n).ok())
         })
-        .or_else(|| cv.get_data(dt).as_str().and_then(|s| s.parse::<i64>().ok()))
+        .or_else(|| {
+            cv.get_data(dt)
+                .and_then(DataValue::as_str)
+                .and_then(|s| s.parse::<i64>().ok())
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -67,7 +81,7 @@ pub fn recipient_from_value(value: &DataValue) -> Option<ChatSecretRecipient> {
 }
 
 pub fn chat_secret_recipients(cv: &CommunicationValue) -> Option<Vec<ChatSecretRecipient>> {
-    let recipients = cv.get_data(DataType::Recipients).as_array()?;
+    let recipients = cv.get_data(DataType::Recipients)?.as_array()?;
     let parsed = recipients
         .iter()
         .map(recipient_from_value)
@@ -80,49 +94,6 @@ pub fn chat_secret_recipients(cv: &CommunicationValue) -> Option<Vec<ChatSecretR
     }
 }
 
-pub fn set_chat_secret_cv_for_recipient(
-    source: &CommunicationValue,
-    recipient: &ChatSecretRecipient,
-) -> CommunicationValue {
-    let recipient_value = typed_container(vec![
-        (DataType::UserId, DataValue::Str(recipient.user_id.clone())),
-        (
-            DataType::EncryptedSecret,
-            DataValue::Bytes(recipient.encrypted_secret.clone()),
-        ),
-        (
-            DataType::KemCiphertext,
-            DataValue::Bytes(recipient.kem_ciphertext.clone()),
-        ),
-    ]);
-
-    CommunicationValue::new(CommunicationType::SetChatSecret)
-        .with_id(source.get_id())
-        .with_sender(source.get_sender())
-        .with_receiver(recipient.user_id.parse::<u64>().unwrap_or(0))
-        .add_typed_default(DataType::ChatId, source.get_data(DataType::ChatId).clone())
-        .add_typed_default(
-            DataType::SecretId,
-            source.get_data(DataType::SecretId).clone(),
-        )
-        .add_typed_default(
-            DataType::VersionNumber,
-            source.get_data(DataType::VersionNumber).clone(),
-        )
-        .add_typed_default(
-            DataType::WrappingScheme,
-            source.get_data(DataType::WrappingScheme).clone(),
-        )
-        .add_typed_default(
-            DataType::CreatedAt,
-            source.get_data(DataType::CreatedAt).clone(),
-        )
-        .add_typed_default(
-            DataType::Recipients,
-            DataValue::Array(vec![recipient_value]),
-        )
-}
-
 pub fn now_millis_i64() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -131,7 +102,9 @@ pub fn now_millis_i64() -> i64 {
 }
 
 pub fn error_response(request: &CommunicationValue, ty: CommunicationType) -> CommunicationValue {
-    CommunicationValue::new(ty)
-        .with_id(request.get_id())
-        .with_receiver(request.get_sender())
+    let mut response = CommunicationValue::new(ty).with_id(request.id().unwrap_or_default());
+    if let Some(sender) = request.sender() {
+        response = response.with_receiver(sender);
+    }
+    response
 }

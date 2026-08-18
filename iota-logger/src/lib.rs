@@ -318,28 +318,29 @@ pub fn log_cv_internal(
 pub fn format_cv(cv: &CommunicationValue) -> String {
     let mut parts = Vec::new();
 
-    let sender = cv.get_sender();
-    let receiver = cv.get_receiver();
-
-    if sender > 0 && receiver > 0 {
-        parts.push(format!("{} > {}", sender, receiver));
-    } else if sender > 0 {
-        parts.push(format!("{}", sender));
-    } else if receiver > 0 {
-        parts.push(format!("> {}", receiver));
+    match (cv.sender(), cv.receiver()) {
+        (Some(sender), Some(receiver)) => parts.push(format!("{} > {}", sender, receiver)),
+        (Some(sender), None) => parts.push(sender.to_string()),
+        (None, Some(receiver)) => parts.push(format!("> {}", receiver)),
+        (None, None) => {}
     }
 
     let comm_type = cv
         .get_comm_type_enum()
         .map(|kind| kind.to_string())
         .unwrap_or_else(|| cv.get_type().to_string());
-    parts.push(format!("{} (id={})", comm_type, cv.get_id()));
+    let id = cv
+        .id()
+        .map_or_else(|| "none".to_string(), |value| value.to_string());
+    parts.push(format!("{} (id={})", comm_type, id));
 
-    let data = cv.data();
-
-    let formated_data = format_data_container(
-        data.iter().map(|(k, v)| (*k, v.clone())).collect(),
-        Version(1, 0),
+    let version = cv
+        .type_map()
+        .map(|type_map| type_map.version.clone())
+        .unwrap_or_else(|| Version(3, 0));
+    let formated_data = cv.data().map_or_else(
+        || "<opaque payload>".to_string(),
+        |data| format_data_container(data.to_vec(), version),
     );
 
     parts.push(format!("{}", formated_data));
