@@ -1,7 +1,7 @@
 use crate::communities::{community::Community, interactables::interactable::Interactable};
 use async_trait::async_trait;
 use json::JsonValue;
-use iota_util::mtp_compat::{CommunicationValueCompat, OptionalDataValueExt};
+use iota_util::mtp_compat::OptionalDataValueExt;
 use std::sync::Arc;
 use std::{any::Any, sync::RwLock};
 use uuid::Uuid;
@@ -131,7 +131,7 @@ impl Interactable for VoiceChat {
             response_payload["send_time"] = JsonValue::String(send_time.to_string());
 
             return CommunicationValue::new(CommunicationType::Function)
-                .with_id(cv.get_id())
+                .with_request_id(&cv)
                 .add_data_str(DataType::Name, self.name.clone())
                 .add_data_str(DataType::Path, self.path.clone())
                 .add_data_str(DataType::Result, "getting_call".to_string())
@@ -159,13 +159,13 @@ impl Interactable for VoiceChat {
             response_payload["streaming"] = JsonValue::Boolean(streaming);
 
             return CommunicationValue::new(CommunicationType::Update)
-                .with_id(cv.get_id())
+                .with_request_id(&cv)
                 .add_data_str(DataType::Name, self.name.clone())
                 .add_data_str(DataType::Path, self.path.clone())
                 .add_data_str(DataType::Result, "user_changed".to_string())
                 .add_data(DataType::Payload, response_payload);
         }
-        CommunicationValue::new(CommunicationType::ErrorInternal).with_id(cv.get_id())
+        CommunicationValue::new(CommunicationType::ErrorInternal).with_request_id(&cv)
     }
 
     fn to_json(&self) -> JsonValue {

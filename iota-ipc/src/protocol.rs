@@ -97,6 +97,59 @@ pub enum LocalRequest {
     ListCommunities,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpcRole {
+    Read,
+    Operate,
+    Admin,
+}
+
+impl IpcRole {
+    pub fn allows(self, required: IpcRole) -> bool {
+        matches!(
+            (self, required),
+            (IpcRole::Admin, _)
+                | (IpcRole::Operate, IpcRole::Operate | IpcRole::Read)
+                | (IpcRole::Read, IpcRole::Read)
+        )
+    }
+}
+
+impl LocalRequest {
+    /// Return the minimum authenticated local role required to execute a
+    /// request. New request variants must be assigned explicitly here.
+    pub fn required_role(&self) -> IpcRole {
+        match self {
+            Self::GetStatus
+            | Self::ListTasks
+            | Self::ListUsers
+            | Self::GetDaemonStatus
+            | Self::GetOmikronStatus
+            | Self::ListComponents
+            | Self::GetUser { .. }
+            | Self::GetLogs { .. }
+            | Self::CheckUpdate
+            | Self::ListCommunities => IpcRole::Read,
+
+            Self::ReconnectOmikron | Self::ReloadConfig => IpcRole::Operate,
+
+            Self::CreateUser { .. }
+            | Self::AttachUserFromTu { .. }
+            | Self::PurgeUserData { .. }
+            | Self::ReleaseUser { .. }
+            | Self::CompleteDeleteUser { .. }
+            | Self::RemoveUser { .. }
+            | Self::RotateIotaIdentity
+            | Self::RequestProcessExit { .. }
+            | Self::RestartDaemon
+            | Self::StopDaemon
+            | Self::GetConfig
+            | Self::SetConfig { .. }
+            | Self::ImportUser { .. } => IpcRole::Admin,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExitIntent {
@@ -296,7 +349,9 @@ impl std::fmt::Display for IpcErrorCode {
             Self::Disconnected => "the daemon connection was lost",
             Self::Timeout => "the daemon did not respond in time",
             Self::Cancelled => "the daemon cancelled the request",
-            Self::Unauthorized => "the daemon denied this operation",
+            Self::Unauthorized => {
+                "the daemon denied this operation because the IPC account lacks the required role"
+            }
             Self::InternalFailure => "the daemon encountered an internal failure",
         })
     }
@@ -316,6 +371,11 @@ mod error_tests {
             !IpcErrorCode::InternalFailure
                 .to_string()
                 .contains("InternalFailure")
+        );
+        assert!(
+            IpcErrorCode::Unauthorized
+                .to_string()
+                .contains("required role")
         );
     }
 }

@@ -1,23 +1,26 @@
 use crate::deployment::from_environment;
 use crate::log_buffer::LogBuffer;
-use crate::{CommandRouter, DaemonRuntime, DaemonServices};
+use crate::{CommandRouter, DaemonRuntime, DaemonServices, IpcRole, PeerContext};
 use iota_ipc::{
     ClientMessage, DaemonMessage, HelloAck, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, read_msg,
     write_msg,
 };
 use iota_logger::log;
+use iota_storage::util::config_util;
 use std::io::Result;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::{env, fs::File, os::fd::FromRawFd, os::unix::net::UnixListener as StdUnixListener};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, watch};
 use tokio::time::timeout;
 use uuid::Uuid;
 
 /// Per-client outbound queue capacity.
 const CLIENT_CHANNEL_SIZE: usize = 256;
+const MAX_CONFIGURED_IPC_CLIENTS: usize = 4096;
 
 /// Maximum handshake retries before giving up.
 const MAX_HANDSHAKE_RETRIES: u32 = 1;
@@ -36,6 +39,20 @@ struct ClientSubscription {
     metric_interval_ms: u64,
 }
 
+enum WriterCommand {
+    Message(DaemonMessage),
+    Flush {
+        complete: tokio::sync::oneshot::Sender<()>,
+    },
+}
+
+fn configured_client_limit() -> usize {
+    config_util::CONFIG
+        .load()
+        .max_ipc_clients
+        .clamp(1, MAX_CONFIGURED_IPC_CLIENTS)
+}
+
 pub struct IpcServer {
     listener: UnixListener,
     runtime: Arc<DaemonRuntime>,
@@ -45,6 +62,7 @@ pub struct IpcServer {
     state_rx: watch::Receiver<iota_ipc::StateSnapshot>,
     instance_id: String,
     _instance_lock: File,
+    client_limit: Arc<Semaphore>,
 }
 
 impl IpcServer {
@@ -96,11 +114,18 @@ impl IpcServer {
                 }
                 remove_stale_socket(&path).await?;
                 let listener = UnixListener::bind(&path)?;
-                let _ = tokio::fs::set_permissions(
-                    &path,
-                    std::os::unix::fs::PermissionsExt::from_mode(0o600),
-                )
-                .await;
+                if let Err(error) =
+                    tokio::fs::set_permissions(&path, PermissionsExt::from_mode(0o600)).await
+                {
+                    drop(listener);
+                    let _ = tokio::fs::remove_file(&path).await;
+                    return Err(error);
+                }
+                if let Err(error) = validate_manual_socket(&path).await {
+                    drop(listener);
+                    let _ = tokio::fs::remove_file(&path).await;
+                    return Err(error);
+                }
                 return Ok(Self {
                     listener,
                     runtime,
@@ -110,6 +135,7 @@ impl IpcServer {
                     state_rx,
                     instance_id: Uuid::new_v4().to_string(),
                     _instance_lock: lock,
+                    client_limit: Arc::new(Semaphore::new(configured_client_limit())),
                 });
             }
         };
@@ -122,12 +148,21 @@ impl IpcServer {
             state_rx,
             instance_id: Uuid::new_v4().to_string(),
             _instance_lock: File::options().read(true).open("/dev/null")?,
+            client_limit: Arc::new(Semaphore::new(configured_client_limit())),
         })
     }
 
     pub async fn serve(self) -> Result<()> {
         loop {
             let (stream, _addr) = self.listener.accept().await?;
+            let permit = match self.client_limit.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    eprintln!("IPC connection rejected: active client limit reached");
+                    drop(stream);
+                    continue;
+                }
+            };
             eprintln!("IPC client accepted");
             let runtime = self.runtime.clone();
             let services = self.services.clone();
@@ -136,6 +171,7 @@ impl IpcServer {
             let state_rx = self.state_rx.clone();
             let instance_id = self.instance_id.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(error) = handle_client(
                     stream,
                     runtime,
@@ -232,6 +268,33 @@ async fn remove_stale_socket(path: &Path) -> Result<()> {
     }
 }
 
+async fn validate_manual_socket(path: &Path) -> Result<()> {
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bound IPC path is no longer a Unix socket",
+        ));
+    }
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("IPC socket has unexpected mode {mode:o}"),
+        ));
+    }
+
+    let expected_uid = unsafe { libc::geteuid() } as u32;
+    if metadata.uid() != expected_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "IPC socket ownership changed after bind",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct PeerIdentity {
     pid: i32,
@@ -274,6 +337,14 @@ fn peer_credentials(stream: &UnixStream) -> Result<PeerIdentity> {
     }
 }
 
+fn role_for_peer(_peer: &PeerIdentity) -> IpcRole {
+    // This deployment has one IPC listener. Its Unix socket permissions are
+    // the admission boundary: systemd grants access to root, the daemon, and
+    // members of iota-operators. Once a peer has passed that boundary, it is
+    // an administrator for the operator console protocol.
+    IpcRole::Admin
+}
+
 async fn handle_client(
     stream: UnixStream,
     runtime: Arc<DaemonRuntime>,
@@ -283,16 +354,17 @@ async fn handle_client(
     mut state_rx: watch::Receiver<iota_ipc::StateSnapshot>,
     instance_id: String,
 ) -> Result<()> {
-    let peer = peer_credentials(&stream)?;
-    // Access control belongs to the Unix socket.  The systemd socket grants
-    // iota-operators group access (0660); rejecting every UID other than the
-    // service account here would make that authorization ineffective.  Manual
-    // sockets remain owner-only (0600) at bind time.
+    let peer_identity = peer_credentials(&stream)?;
+    let peer = PeerContext {
+        pid: peer_identity.pid,
+        uid: peer_identity.uid,
+        role: role_for_peer(&peer_identity),
+    };
     let (mut reader, mut writer) = stream.into_split();
     // A failed writer must stop the reader and any subsequent command work
     // for this client; otherwise the reader can remain parked forever.
     let session_cancellation = runtime.cancellation.child_token();
-    let (directed_tx, directed_rx) = mpsc::channel::<DaemonMessage>(CLIENT_CHANNEL_SIZE);
+    let (directed_tx, directed_rx) = mpsc::channel::<WriterCommand>(CLIENT_CHANNEL_SIZE);
     eprintln!("IPC handshake started (pid={}, uid={})", peer.pid, peer.uid);
 
     // --- Handshake ---
@@ -343,7 +415,7 @@ async fn handle_client(
                     break;
                 }
                 Ok(_) => {
-                    // Unexpected first message — send error and close.
+                    // Unexpected first message, send an error and close.
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "Expected Hello as first message",
@@ -353,7 +425,7 @@ async fn handle_client(
             },
         }
     }
-    let _version = negotiated_version.ok_or_else(|| {
+    let negotiated_version = negotiated_version.ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::Other, "Handshake failed after retries")
     })?;
 
@@ -361,7 +433,7 @@ async fn handle_client(
 
     // --- Send initial state snapshot ---
     let initial = DaemonMessage::StateUpdate(runtime.snapshot());
-    let _ = directed_tx.send(initial).await;
+    let _ = directed_tx.send(WriterCommand::Message(initial)).await;
 
     // --- Writer task: merge directed responses + shared log events ---
     let mut log_rx = log_tx.subscribe();
@@ -375,18 +447,28 @@ async fn handle_client(
         tokio::spawn(async move {
             let mut directed_rx = directed_rx;
             let mut last_metric_sent = tokio::time::Instant::now();
+            let mut state_updates_open = true;
             loop {
                 let metric_interval = sub_rx.borrow().metric_interval_ms;
                 tokio::select! {
+                    _ = session_cancellation.cancelled() => break,
                     // Directed messages (responses to this client's requests)
-                    msg = directed_rx.recv() => {
-                        match msg {
-                            Some(message) => {
+                    command = directed_rx.recv() => {
+                        match command {
+                            Some(WriterCommand::Message(message)) => {
                                 if let Err(error) = write_client_message(&mut writer, &message).await {
                                     eprintln!("IPC client writer stopped while sending directed message: {error}");
                                     session_cancellation.cancel();
                                     break;
                                 }
+                            }
+                            Some(WriterCommand::Flush { complete }) => {
+                                if let Err(error) = writer.flush().await {
+                                    eprintln!("IPC client writer stopped while flushing: {error}");
+                                    session_cancellation.cancel();
+                                    break;
+                                }
+                                let _ = complete.send(());
                             }
                             None => break,
                         }
@@ -435,12 +517,16 @@ async fn handle_client(
                                     break;
                                 }
                             }
-                            Err(broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Closed) => {
+                                session_cancellation.cancel();
+                                break;
+                            }
                         }
                     }
-                    changed = state_rx.changed() => {
+                    changed = state_rx.changed(), if state_updates_open => {
                         if changed.is_err() {
-                            break;
+                            state_updates_open = false;
+                            continue;
                         }
                         let snapshot = state_rx.borrow().clone();
                         if let Err(error) = write_client_message(&mut writer, &DaemonMessage::StateUpdate(snapshot)).await {
@@ -475,9 +561,14 @@ async fn handle_client(
                     iota_ipc::LocalRequest::StopDaemon => Some("shutdown requested"),
                     _ => None,
                 };
-                let response = if envelope.protocol_version < MIN_PROTOCOL_VERSION
-                    || envelope.protocol_version > PROTOCOL_VERSION
-                {
+                let response = if envelope.protocol_version != negotiated_version {
+                    log!(
+                        "IPC protocol mismatch: pid={}, uid={}, negotiated={}, request={}",
+                        peer.pid,
+                        peer.uid,
+                        negotiated_version,
+                        envelope.protocol_version
+                    );
                     iota_ipc::ResponseEnvelope {
                         request_id: envelope.request_id,
                         result: iota_ipc::ResponseResult::Error(
@@ -485,21 +576,42 @@ async fn handle_client(
                         ),
                     }
                 } else {
-                    router.route(envelope.request_id, envelope.request).await
+                    router
+                        .route(&peer, envelope.request_id, envelope.request)
+                        .await
                 };
-                let _ = directed_tx.send(DaemonMessage::Response(response)).await;
-                if let Some(reason) = shutdown_reason {
+                let should_shutdown = shutdown_reason.is_some()
+                    && matches!(&response.result, iota_ipc::ResponseResult::Ok(_));
+                let _ = directed_tx
+                    .send(WriterCommand::Message(DaemonMessage::Response(response)))
+                    .await;
+                if let Some(reason) = shutdown_reason.filter(|_| should_shutdown) {
                     let _ = directed_tx
-                        .send(DaemonMessage::LifecycleEvent(
+                        .send(WriterCommand::Message(DaemonMessage::LifecycleEvent(
                             iota_ipc::LifecycleEvent::Shutdown {
                                 reason: reason.into(),
                             },
-                        ))
+                        )))
                         .await;
-                    // The request itself initiates daemon cancellation. Give
-                    // the dedicated writer a chance to flush the response
-                    // and lifecycle event before this session is torn down.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let (flush_tx, flush_rx) = tokio::sync::oneshot::channel();
+                    let _ = directed_tx
+                        .send(WriterCommand::Flush { complete: flush_tx })
+                        .await;
+                    timeout(CLIENT_IO_TIMEOUT, flush_rx)
+                        .await
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "IPC shutdown response flush timed out",
+                            )
+                        })?
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "IPC writer stopped before shutdown flush",
+                            )
+                        })?;
+                    runtime.begin_shutdown();
                     break;
                 }
             }
@@ -515,26 +627,51 @@ async fn handle_client(
                     metric_interval_ms: interval,
                 });
                 let snapshot = DaemonMessage::StateUpdate(runtime.snapshot());
-                let _ = directed_tx.send(snapshot).await;
-                let _ = directed_tx.send(DaemonMessage::Subscribed).await;
+                let _ = directed_tx.send(WriterCommand::Message(snapshot)).await;
+                let _ = directed_tx
+                    .send(WriterCommand::Message(DaemonMessage::Subscribed))
+                    .await;
             }
             Ok(ClientMessage::Ping { seq }) => {
-                let _ = directed_tx.send(DaemonMessage::Pong { seq }).await;
+                let _ = directed_tx
+                    .send(WriterCommand::Message(DaemonMessage::Pong { seq }))
+                    .await;
             }
             Ok(ClientMessage::Hello { .. }) => {
                 // Re-handshake on existing connection: treat as resubscribe
                 let snapshot = DaemonMessage::StateUpdate(runtime.snapshot());
-                let _ = directed_tx.send(snapshot).await;
+                let _ = directed_tx.send(WriterCommand::Message(snapshot)).await;
             }
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(error) => {
-                writer_task.abort();
+                session_cancellation.cancel();
+                drop(directed_tx);
+                let mut writer_task = writer_task;
+                match timeout(CLIENT_IO_TIMEOUT, &mut writer_task).await {
+                    Ok(_) => {}
+                    Err(_) => {
+                        writer_task.abort();
+                        let _ = writer_task.await;
+                    }
+                }
                 return Err(error);
             }
         }
     }
+    drop(directed_tx);
     session_cancellation.cancel();
-    writer_task.abort();
+    let mut writer_task = writer_task;
+    match timeout(CLIENT_IO_TIMEOUT, &mut writer_task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("IPC client writer task failed: {error}");
+        }
+        Err(_) => {
+            eprintln!("IPC client writer did not stop before timeout");
+            writer_task.abort();
+            let _ = writer_task.await;
+        }
+    }
     log!(
         "IPC client disconnected (pid={}, uid={})",
         peer.pid,
@@ -562,5 +699,47 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn manual_socket_validation_requires_owner_only_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ipc.sock");
+        let listener = StdUnixListener::bind(&path).expect("test socket binds");
+        tokio::fs::set_permissions(&path, PermissionsExt::from_mode(0o600))
+            .await
+            .expect("test socket permissions apply");
+
+        validate_manual_socket(&path)
+            .await
+            .expect("manual socket validation succeeds");
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn manual_socket_validation_rejects_unexpected_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ipc.sock");
+        let listener = StdUnixListener::bind(&path).expect("test socket binds");
+        tokio::fs::set_permissions(&path, PermissionsExt::from_mode(0o660))
+            .await
+            .expect("test socket permissions apply");
+
+        let error = validate_manual_socket(&path)
+            .await
+            .expect_err("group-accessible manual socket must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        drop(listener);
+    }
+
+    #[test]
+    fn an_admitted_operator_peer_receives_administrator_role() {
+        let peer = PeerIdentity {
+            pid: 123,
+            uid: 1000,
+            _gid: 1000,
+        };
+
+        assert_eq!(role_for_peer(&peer), IpcRole::Admin);
     }
 }

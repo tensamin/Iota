@@ -167,26 +167,66 @@ pub async fn detect() -> Option<Arc<dyn ProcessManager>> {
 mod systemd {
     use super::*;
     use std::{path::Path, process::Stdio};
-    use tokio::{process::Command, time::timeout};
+    use tokio::{io::AsyncRead, process::Command, time::timeout};
 
     const SERVICE: &str = "iota-daemon.service";
     const SOCKET: &str = "iota-daemon.socket";
     const COMMON: [&str; 2] = ["--no-pager", "--no-ask-password"];
+    const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 
     pub struct RealExecutor;
-    #[async_trait]
-    impl CommandExecutor for RealExecutor {
-        async fn output(
+
+    async fn read_bounded<R>(reader: R) -> std::io::Result<Vec<u8>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let mut output = Vec::new();
+        reader
+            .take((MAX_COMMAND_OUTPUT_BYTES + 1) as u64)
+            .read_to_end(&mut output)
+            .await?;
+        if output.len() > MAX_COMMAND_OUTPUT_BYTES {
+            output.truncate(MAX_COMMAND_OUTPUT_BYTES);
+        }
+        Ok(output)
+    }
+
+    async fn collect_output(
+        stdout: tokio::process::ChildStdout,
+        stderr: tokio::process::ChildStderr,
+    ) -> Result<(Vec<u8>, Vec<u8>), ProcessManagerError> {
+        let (stdout_result, stderr_result) =
+            tokio::join!(read_bounded(stdout), read_bounded(stderr));
+        let stdout = stdout_result.map_err(|error| {
+            ProcessManagerError::new(
+                ProcessManagerErrorKind::CommandFailed,
+                format!("stdout read failed: {error}"),
+            )
+        })?;
+        let stderr = stderr_result.map_err(|error| {
+            ProcessManagerError::new(
+                ProcessManagerErrorKind::CommandFailed,
+                format!("stderr read failed: {error}"),
+            )
+        })?;
+        Ok((stdout, stderr))
+    }
+
+    impl RealExecutor {
+        async fn output_with_timeout(
             &self,
             program: &str,
             args: &[&str],
+            process_timeout: std::time::Duration,
         ) -> Result<CommandOutput, ProcessManagerError> {
-            let child = Command::new(program)
+            let mut child = Command::new(program)
                 .args(args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .kill_on_drop(false)
+                .kill_on_drop(true)
                 .spawn()
                 .map_err(|e| {
                     ProcessManagerError::new(
@@ -194,25 +234,76 @@ mod systemd {
                         format!("Could not run {program}: {e}"),
                     )
                 })?;
-            let output = timeout(PROCESS_MANAGER_TIMEOUT, child.wait_with_output())
-                .await
-                .map_err(|_| {
-                    ProcessManagerError::new(
+
+            let stdout = child.stdout.take().ok_or_else(|| {
+                ProcessManagerError::new(
+                    ProcessManagerErrorKind::CommandFailed,
+                    "command stdout pipe was not created",
+                )
+            })?;
+            let stderr = child.stderr.take().ok_or_else(|| {
+                ProcessManagerError::new(
+                    ProcessManagerErrorKind::CommandFailed,
+                    "command stderr pipe was not created",
+                )
+            })?;
+            let output_task = tokio::spawn(collect_output(stdout, stderr));
+
+            let status = match timeout(process_timeout, child.wait()).await {
+                Ok(result) => result.map_err(|e| {
+                    ProcessManagerError::new(ProcessManagerErrorKind::CommandFailed, e.to_string())
+                })?,
+                Err(_) => {
+                    // Keep the Child alive across the timeout. Explicitly
+                    // terminate it and await wait() so the OS child is
+                    // reaped before reporting the timeout.
+                    let kill_error = child.start_kill().err();
+                    let wait_error = child.wait().await.err();
+                    output_task.abort();
+                    let _ = output_task.await;
+
+                    if let Some(error) = wait_error {
+                        return Err(ProcessManagerError::new(
+                            ProcessManagerErrorKind::CommandFailed,
+                            format!("{program} timed out and could not be reaped: {error}"),
+                        ));
+                    }
+                    let termination_detail = kill_error
+                        .map(|error| format!("; termination request reported: {error}"))
+                        .unwrap_or_default();
+                    return Err(ProcessManagerError::new(
                         ProcessManagerErrorKind::TimedOut,
                         format!(
-                            "{program} timed out after {} seconds",
-                            PROCESS_MANAGER_TIMEOUT.as_secs()
+                            "{program} timed out after {} seconds{termination_detail}",
+                            process_timeout.as_secs(),
                         ),
-                    )
-                })?
-                .map_err(|e| {
-                    ProcessManagerError::new(ProcessManagerErrorKind::CommandFailed, e.to_string())
-                })?;
+                    ));
+                }
+            };
+
+            let (stdout, stderr) = output_task.await.map_err(|error| {
+                ProcessManagerError::new(
+                    ProcessManagerErrorKind::CommandFailed,
+                    format!("command output task failed: {error}"),
+                )
+            })??;
             Ok(CommandOutput {
-                success: output.status.success(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                success: status.success(),
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
             })
+        }
+    }
+
+    #[async_trait]
+    impl CommandExecutor for RealExecutor {
+        async fn output(
+            &self,
+            program: &str,
+            args: &[&str],
+        ) -> Result<CommandOutput, ProcessManagerError> {
+            self.output_with_timeout(program, args, PROCESS_MANAGER_TIMEOUT)
+                .await
         }
     }
 
@@ -460,6 +551,51 @@ mod systemd {
             let call = &fake.calls.lock().unwrap()[0];
             assert!(call.contains(&"--no-pager".into()));
             assert!(call.contains(&"--no-ask-password".into()));
+        }
+
+        #[tokio::test]
+        async fn timed_out_real_child_is_terminated_and_reaped() {
+            use std::fs;
+            use std::time::Duration;
+
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("child.pid");
+            let script = format!(
+                "printf '%s' \"$$\" > '{}'; exec sleep 60",
+                pid_file.display()
+            );
+            let executor = RealExecutor;
+            let task = tokio::spawn(async move {
+                executor
+                    .output_with_timeout("sh", &["-c", &script], Duration::from_millis(50))
+                    .await
+            });
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let pid = loop {
+                if let Ok(contents) = fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = contents.parse::<libc::pid_t>() {
+                        break pid;
+                    }
+                }
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::task::yield_now().await;
+            };
+
+            let result = task.await.unwrap();
+            assert_eq!(
+                result.unwrap_err().kind(),
+                ProcessManagerErrorKind::TimedOut
+            );
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+
+            let mut status = 0;
+            let wait_result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            assert_eq!(wait_result, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
         }
     }
 }

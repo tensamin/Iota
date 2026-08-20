@@ -29,6 +29,8 @@ pub struct IotaConfig {
     pub private_key: Option<String>,
     #[serde(default = "default_read_receipts_enabled")]
     pub read_receipts_enabled: bool,
+    #[serde(default = "default_max_ipc_clients")]
+    pub max_ipc_clients: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +89,10 @@ const fn default_read_receipts_enabled() -> bool {
     true
 }
 
+const fn default_max_ipc_clients() -> usize {
+    64
+}
+
 impl Default for IotaConfig {
     fn default() -> Self {
         Self {
@@ -99,6 +105,7 @@ impl Default for IotaConfig {
             public_key: None,
             private_key: None,
             read_receipts_enabled: default_read_receipts_enabled(),
+            max_ipc_clients: default_max_ipc_clients(),
         }
     }
 }
@@ -198,6 +205,14 @@ pub fn modify_config_value(key: &str, value: &str) -> Result<(), &'static str> {
         "read_receipts_enabled" => {
             let parsed: bool = value.parse().map_err(|_| "invalid boolean")?;
             modify_config(|cfg| cfg.read_receipts_enabled = parsed);
+            Ok(())
+        }
+        "max_ipc_clients" => {
+            let parsed: usize = value.parse().map_err(|_| "invalid max_ipc_clients")?;
+            if parsed == 0 {
+                return Err("max_ipc_clients must be greater than zero");
+            }
+            modify_config(|cfg| cfg.max_ipc_clients = parsed);
             Ok(())
         }
         "web.mode" => {

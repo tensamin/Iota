@@ -1,8 +1,9 @@
 use iota_util::route_target::RouteTarget;
 use mtp::codec::{
-    CommunicationValue, ProtectionPolicy, RelayError, SignaturePolicy, TypeMap,
+    CommunicationValue, ProtectionPolicy, RelayError, RelayOpenOptions, SignaturePolicy, TypeMap,
     VerifiedRelayContent, VerifiedRelayMetadata, forward_relay_frame,
-    open_relay_content_with_keyrings, open_relay_metadata_with, relay_metadata_claimed_signer_id,
+    open_relay_content_with_limits_without_replay, open_relay_metadata_with_without_replay,
+    relay_metadata_claimed_signer_id_with_options,
 };
 use mtp::crypto::{Keyring, PublicKeyBundle};
 use std::fmt;
@@ -146,7 +147,13 @@ where
         return Err(RelayValidationError::OuterSenderNotAllowed);
     }
 
-    let claimed_signer = relay_metadata_claimed_signer_id(frame, &[keyring])?;
+    let open_options = RelayOpenOptions::new(RELAY_PROTECTION_POLICY);
+    let claimed_signer = relay_metadata_claimed_signer_id_with_options(
+        frame,
+        &[keyring],
+        open_options.decode_limits,
+        open_options.protected_limits,
+    )?;
     let signing_keys = resolve_signing_keys(claimed_signer).await?;
     if signing_keys.is_empty() {
         return Err(RelayValidationError::MissingSigningKeys(claimed_signer));
@@ -157,13 +164,12 @@ where
         .type_map()
         .cloned()
         .ok_or(RelayValidationError::MissingTypeMap)?;
-    let metadata = open_relay_metadata_with(
+    let metadata = open_relay_metadata_with_without_replay(
         frame,
         &[keyring],
         Some(claimed_signer),
         move |signer_id| (signer_id == claimed_signer).then(|| resolver_keys.clone()),
-        RELAY_PROTECTION_POLICY,
-        None,
+        open_options,
     )?;
 
     let context = VerifiedRelayContext {
@@ -186,12 +192,17 @@ pub fn open_verified_relay_content(
     keyrings: &[&Keyring],
     expected_recipient_id: u64,
 ) -> Result<VerifiedRelayContent, RelayValidationError> {
-    Ok(open_relay_content_with_keyrings(
+    Ok(open_relay_content_with_limits_without_replay(
         &relay.metadata,
         keyrings,
         &relay.signing_keys,
         Some(expected_recipient_id),
-        RELAY_PROTECTION_POLICY,
+        RelayOpenOptions {
+            policy: RELAY_PROTECTION_POLICY,
+            decode_limits: relay.metadata.decode_limits(),
+            encode_limits: relay.metadata.encode_limits(),
+            protected_limits: relay.metadata.protected_limits(),
+        },
     )?)
 }
 

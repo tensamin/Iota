@@ -140,6 +140,12 @@
               description = "Environment files to load for the Iota service.";
             };
 
+            identitySecretFile = lib.mkOption {
+              type = lib.types.nullOr lib.types.path;
+              default = null;
+              description = "Owner-readable file containing the passphrase for the protected Iota identity.";
+            };
+
             openFirewall = lib.mkOption {
               type = lib.types.bool;
               default = true;
@@ -261,6 +267,9 @@
                 }
                 // lib.optionalAttrs (cfg.environmentFiles != []) {
                   EnvironmentFile = cfg.environmentFiles;
+                }
+                // lib.optionalAttrs (cfg.identitySecretFile != null) {
+                  LoadCredential = "iota-identity:${cfg.identitySecretFile}";
                 };
             };
 

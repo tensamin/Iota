@@ -10,15 +10,26 @@ use mtp::codec::{
 
 use crate::relay::VerifiedRelayContext;
 
+#[derive(Debug)]
 pub struct MessageMutation {
     pub sender_id: i64,
     pub partner_id: i64,
     pub send_time: i64,
 }
 
-pub fn message_mutation(cv: &CommunicationValue) -> Result<MessageMutation, CommunicationValue> {
-    let sender_id = i64::try_from(cv.get_sender())
+fn required_sender_id(cv: &CommunicationValue) -> Result<i64, CommunicationValue> {
+    let sender = cv
+        .require_sender()
         .map_err(|_| error_response(cv, CommunicationType::ErrorInvalidData))?;
+    i64::try_from(sender).map_err(|_| error_response(cv, CommunicationType::ErrorInvalidData))
+}
+
+fn sender_wire_id(sender_id: i64) -> u64 {
+    u64::try_from(sender_id).expect("validated authenticated sender is non-negative")
+}
+
+pub fn message_mutation(cv: &CommunicationValue) -> Result<MessageMutation, CommunicationValue> {
+    let sender_id = required_sender_id(cv)?;
     let partner_id = data_i64(cv, DataType::ChatPartnerId)
         .filter(|id| *id > 0)
         .ok_or_else(|| error_response(cv, CommunicationType::ErrorInvalidData))?;
@@ -115,7 +126,7 @@ pub fn apply_verified_relay_content(
 
     match content.message_type.as_str() {
         "MessageSend" => {
-            let message = relay_string(&content.content, DataType::Content, &context.type_map)
+            let message = relay_string(&content.content, DataType::AppContent, &context.type_map)
                 .ok_or_else(|| "Relay MessageSend is missing Content".to_string())?;
             let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
                 .and_then(|value| i64::try_from(value).ok())
@@ -138,7 +149,7 @@ pub fn apply_verified_relay_content(
             Ok(())
         }
         "MessageEdit" => {
-            let message = relay_string(&content.content, DataType::Content, &context.type_map)
+            let message = relay_string(&content.content, DataType::AppContent, &context.type_map)
                 .ok_or_else(|| "Relay MessageEdit is missing Content".to_string())?;
             let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
                 .and_then(|value| i64::try_from(value).ok())
@@ -206,7 +217,7 @@ pub fn handle_message_edit(cv: &CommunicationValue) -> CommunicationValue {
         Ok(mutation) => mutation,
         Err(response) => return response,
     };
-    let Some(content) = cv.get_data(DataType::Content).as_str() else {
+    let Some(content) = cv.get_data(DataType::AppContent).as_str() else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
 
@@ -277,14 +288,17 @@ fn stored_message_fields(
 ) -> Vec<(DataType, DataValue)> {
     let mut fields = vec![
         (
-            DataType::MessageId,
+            DataType::AppMessageId,
             DataValue::SignedNumber(message.id as i128),
         ),
         (
             DataType::SendTime,
             DataValue::SignedNumber(message.message_time as i128),
         ),
-        (DataType::Content, DataValue::Str(message.content.clone())),
+        (
+            DataType::AppContent,
+            DataValue::Str(message.content.clone()),
+        ),
         (
             DataType::MessageState,
             DataValue::Str(message.message_state.clone()),
@@ -293,22 +307,22 @@ fn stored_message_fields(
             DataType::Height,
             DataValue::SignedNumber(message.height as i128),
         ),
-        (
-            DataType::SenderId,
-            DataValue::UnsignedNumber(if message.sent_by_self {
-                storage_owner as u128
-            } else {
-                partner_id as u128
-            }),
-        ),
     ];
+    let sender_id = if message.sent_by_self {
+        storage_owner
+    } else {
+        partner_id
+    };
+    if let Ok(sender_id) = u128::try_from(sender_id) {
+        fields.push((DataType::SenderId, DataValue::UnsignedNumber(sender_id)));
+    }
     if message.edited {
         fields.push((DataType::Edited, DataValue::Bool(true)));
     }
-    if let Some(reply_to) = message.reply_to {
+    if let Some(reply_to) = message.reply_to.and_then(|id| u64::try_from(id).ok()) {
         fields.push((
             DataType::ReplyId,
-            DataValue::UnsignedNumber(reply_to as u64 as u128),
+            DataValue::UnsignedNumber(u128::from(reply_to)),
         ));
     }
     if !message.reactions.is_empty() {
@@ -345,7 +359,11 @@ pub fn handle_get_chat_secret(cv: &CommunicationValue) -> CommunicationValue {
     let Some(user_id) = data_string(cv, DataType::UserId) else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
-    if user_id != cv.get_sender().to_string() {
+    let sender_id = match required_sender_id(cv) {
+        Ok(sender_id) => sender_id,
+        Err(response) => return response,
+    };
+    if user_id != sender_id.to_string() {
         return error_response(cv, CommunicationType::ErrorNotFound);
     }
     let Some(chat_id) = data_string(cv, DataType::ChatId) else {
@@ -358,8 +376,8 @@ pub fn handle_get_chat_secret(cv: &CommunicationValue) -> CommunicationValue {
         secret_id: data_string(cv, DataType::SecretId),
     }) {
         Ok(Some(record)) => CommunicationValue::new(CommunicationType::ChatSecretResponse)
-            .with_id(cv.get_id())
-            .with_receiver(cv.get_sender())
+            .with_request_id(cv)
+            .with_receiver(sender_wire_id(sender_id))
             .add_typed_default(DataType::UserId, DataValue::Str(record.user_id))
             .add_typed_default(DataType::ChatId, DataValue::Str(record.chat_id))
             .add_typed_default(DataType::SecretId, DataValue::Str(record.secret_id))
@@ -380,7 +398,7 @@ pub fn handle_get_chat_secret(cv: &CommunicationValue) -> CommunicationValue {
                 DataValue::Str(record.wrapping_scheme),
             )
             .add_typed_default(
-                DataType::CreatedAt,
+                DataType::AppCreatedAt,
                 DataValue::SignedNumber(record.created_at as i128),
             )
             .add_typed_default(
@@ -393,7 +411,10 @@ pub fn handle_get_chat_secret(cv: &CommunicationValue) -> CommunicationValue {
 }
 
 pub fn handle_create_app(cv: &CommunicationValue) -> CommunicationValue {
-    let sender_id = cv.get_sender() as i64;
+    let sender_id = match required_sender_id(cv) {
+        Ok(sender_id) => sender_id,
+        Err(response) => return response,
+    };
     let app_identifier = cv
         .get_data(DataType::AppIdentifier)
         .as_str()
@@ -415,12 +436,15 @@ pub fn handle_create_app(cv: &CommunicationValue) -> CommunicationValue {
     }
 
     CommunicationValue::new(CommunicationType::CreateApp)
-        .with_id(cv.get_id())
-        .with_receiver(sender_id as u64)
+        .with_request_id(cv)
+        .with_receiver(sender_wire_id(sender_id))
 }
 
 pub fn handle_delete_app(cv: &CommunicationValue) -> CommunicationValue {
-    let sender_id = cv.get_sender() as i64;
+    let sender_id = match required_sender_id(cv) {
+        Ok(sender_id) => sender_id,
+        Err(response) => return response,
+    };
     let app_identifier = cv
         .get_data(DataType::AppIdentifier)
         .as_str()
@@ -437,8 +461,8 @@ pub fn handle_delete_app(cv: &CommunicationValue) -> CommunicationValue {
     }
 
     CommunicationValue::new(CommunicationType::DeleteApp)
-        .with_id(cv.get_id())
-        .with_receiver(sender_id as u64)
+        .with_request_id(cv)
+        .with_receiver(sender_wire_id(sender_id))
 }
 
 fn contact_value(
@@ -495,8 +519,8 @@ fn contact_ids_value(ids: impl IntoIterator<Item = i64>) -> DataValue {
 
 #[cfg(test)]
 mod presence_tests {
-    use super::contact_ids_value;
-    use mtp::codec::DataValue;
+    use super::{contact_ids_value, handle_get_chats, message_mutation};
+    use mtp::codec::{CommunicationType, CommunicationValue, DataValue};
 
     #[test]
     fn contact_snapshot_is_sorted_and_deduplicated() {
@@ -508,6 +532,26 @@ mod presence_tests {
                 DataValue::SignedNumber(9),
             ])
         );
+    }
+
+    #[test]
+    fn message_mutation_rejects_a_missing_authenticated_sender() {
+        let request = CommunicationValue::new(CommunicationType::MessageEdit).with_id(11);
+        let response = message_mutation(&request).expect_err("missing sender must be rejected");
+
+        assert!(response.is_type(CommunicationType::ErrorInvalidData));
+        assert_eq!(response.id(), Some(11));
+        assert_eq!(response.receiver(), None);
+    }
+
+    #[test]
+    fn read_handler_rejects_a_missing_authenticated_sender() {
+        let request = CommunicationValue::new(CommunicationType::GetChats).with_id(12);
+        let response = handle_get_chats(&request);
+
+        assert!(response.is_type(CommunicationType::ErrorInvalidData));
+        assert_eq!(response.id(), Some(12));
+        assert_eq!(response.receiver(), None);
     }
 }
 
@@ -523,7 +567,7 @@ fn sync_error(cv: &CommunicationValue) -> CommunicationValue {
 /// The sender is authenticated by MTP; a UserId embedded by a client is never trusted here.
 pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
     use iota_storage::util::sync::{self, CACHE_SCHEMA_VERSION};
-    let user_id = match i64::try_from(cv.get_sender()) {
+    let user_id = match required_sender_id(cv) {
         Ok(id) if id > 0 => id,
         _ => return sync_error(cv),
     };
@@ -578,8 +622,8 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
         .map(|message| stored_message_value(message, user_id, message.external_user))
         .collect();
     CommunicationValue::new(CommunicationType::ClientStateSync)
-        .with_id(cv.get_id())
-        .with_receiver(cv.get_sender())
+        .with_request_id(cv)
+        .with_receiver(sender_wire_id(user_id))
         .add_typed_default(
             DataType::SessionId,
             DataValue::SignedNumber(session_id as i128),
@@ -604,6 +648,10 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
         )
         .add_typed_default(DataType::Messages, DataValue::Array(message_values))
         .add_typed_default(
+            DataType::Communities,
+            DataValue::Array(community_values(user_id)),
+        )
+        .add_typed_default(
             DataType::DeletedMessageIds,
             DataValue::Array(
                 deleted_messages
@@ -627,7 +675,7 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
 
 pub fn handle_client_state_ack(cv: &CommunicationValue) -> CommunicationValue {
     use iota_storage::util::sync::{self, CACHE_SCHEMA_VERSION};
-    let user_id = match i64::try_from(cv.get_sender()) {
+    let user_id = match required_sender_id(cv) {
         Ok(id) if id > 0 => id,
         _ => return sync_error(cv),
     };
@@ -654,46 +702,50 @@ pub fn handle_client_state_ack(cv: &CommunicationValue) -> CommunicationValue {
 }
 
 pub fn handle_message_state(cv: &CommunicationValue) {
-    let sender_id = &cv.get_sender();
-    let receiver_id = match cv.get_data(DataType::ChatPartnerId).as_number() {
-        Some(id) => id,
+    let sender_id = match required_sender_id(cv) {
+        Ok(sender_id) => sender_id,
+        Err(_) => return,
+    };
+    let receiver_id = match data_i64(cv, DataType::ChatPartnerId) {
+        Some(id) if id > 0 => id,
         _ => return,
     };
 
-    let timestamp_i64 = if let Some(n) = cv.get_data(DataType::SendTime).as_number() {
-        n as i64
-    } else if let Some(s) = cv.get_data(DataType::SendTime).as_str() {
-        s.parse::<i64>().unwrap_or_else(|_| now_millis_i64())
-    } else {
-        now_millis_i64()
-    };
+    let timestamp_i64 = data_i64(cv, DataType::SendTime).unwrap_or_else(now_millis_i64);
 
     let _ = chat_files::change_message_state(
         timestamp_i64,
-        receiver_id as i64,
-        *sender_id as i64,
+        receiver_id,
+        sender_id,
         MessageState::from_str(cv.get_data(DataType::MessageState).as_str().unwrap_or("")),
     );
 }
 
 pub fn handle_messages_get(cv: &CommunicationValue) -> CommunicationValue {
-    let my_id = cv.get_sender();
-    let partner_id = cv.get_data(DataType::UserId).as_number().unwrap_or(0);
-    let offset = cv.get_data(DataType::Offset).as_number().unwrap_or(0);
-    let amount = cv.get_data(DataType::Amount).as_number().unwrap_or(0);
-    let messages = chat_files::get_messages(
-        my_id as i64,
-        partner_id as i64,
-        offset as i64,
-        amount as i64,
-    );
+    let my_id = match cv.require_sender() {
+        Ok(my_id) => my_id,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+    };
+    let Ok(my_id_i64) = i64::try_from(my_id) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let Some(partner_id) = data_i64(cv, DataType::UserId).filter(|id| *id > 0) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let Some(offset) = data_i64(cv, DataType::Offset).filter(|offset| *offset >= 0) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let Some(amount) = data_i64(cv, DataType::Amount).filter(|amount| *amount > 0) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let messages = chat_files::get_messages(my_id_i64, partner_id, offset, amount);
     let mut msg_array: Vec<DataValue> = Vec::new();
     for m in &messages {
-        msg_array.push(stored_message_value(m, my_id as i64, partner_id as i64));
+        msg_array.push(stored_message_value(m, my_id_i64, partner_id));
     }
 
     CommunicationValue::new(CommunicationType::MessagesGet)
-        .with_id(cv.get_id())
+        .with_request_id(cv)
         .with_receiver(my_id)
         .add_typed_default(DataType::Messages, DataValue::Array(msg_array))
 }
@@ -703,7 +755,10 @@ pub fn handle_message_get(cv: &CommunicationValue) -> CommunicationValue {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
     let partner_id = data_i64(cv, DataType::ChatPartnerId);
-    let owner = cv.get_sender() as i64;
+    let owner = match required_sender_id(cv) {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
 
     let message = match chat_files::get_message(owner, send_time, partner_id) {
         Ok(Some(message)) => message,
@@ -712,8 +767,8 @@ pub fn handle_message_get(cv: &CommunicationValue) -> CommunicationValue {
     };
 
     let mut response = CommunicationValue::new(CommunicationType::MessageGet)
-        .with_id(cv.get_id())
-        .with_receiver(cv.get_sender());
+        .with_request_id(cv)
+        .with_receiver(u64::try_from(owner).expect("authenticated sender is non-negative"));
     for (data_type, value) in stored_message_fields(&message, owner, message.external_user) {
         response = response.add_typed_default(data_type, value);
     }
@@ -721,8 +776,14 @@ pub fn handle_message_get(cv: &CommunicationValue) -> CommunicationValue {
 }
 
 pub fn handle_get_chats(cv: &CommunicationValue) -> CommunicationValue {
-    let user_id = cv.get_sender();
-    let users = chats_util::get_users(user_id as i64);
+    let user_id = match cv.require_sender() {
+        Ok(user_id) => user_id,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+    };
+    let Ok(user_id_i64) = i64::try_from(user_id) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let users = chats_util::get_users(user_id_i64);
     let mut user_array = Vec::new();
     for user in users {
         let mut container = Vec::new();
@@ -739,27 +800,28 @@ pub fn handle_get_chats(cv: &CommunicationValue) -> CommunicationValue {
         user_array.push(typed_container(container));
     }
     CommunicationValue::new(CommunicationType::GetChats)
-        .with_id(cv.get_id())
+        .with_request_id(cv)
         .with_receiver(user_id)
         .add_typed_default(DataType::UserIds, DataValue::Array(user_array))
 }
 
 pub fn handle_add_conversation(cv: &CommunicationValue) -> CommunicationValue {
-    let user_id = cv.get_sender();
+    let user_id = match cv.require_sender() {
+        Ok(user_id) => user_id,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+    };
+    let Ok(user_id_i64) = i64::try_from(user_id) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
     let session_id = match data_i64(cv, DataType::SessionId) {
         Some(id) if id > 0 => id,
         _ => return sync_error(cv),
     };
-    let other_id = match cv.get_data(DataType::ChatPartnerId).as_number() {
-        Some(n) => n as i64,
-        None => cv
-            .get_data(DataType::ChatPartnerId)
-            .as_str()
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0),
+    let other_id = match data_i64(cv, DataType::ChatPartnerId) {
+        Some(id) if id > 0 => id,
+        _ => return error_response(cv, CommunicationType::ErrorInvalidData),
     };
-    let mut contact = get_user(user_id as i64, other_id)
+    let mut contact = get_user(user_id_i64, other_id)
         .unwrap_or(iota_storage::users::contact::Contact::new(other_id));
 
     if let Some(name) = cv.get_data(DataType::ChatPartnerName).as_str() {
@@ -767,75 +829,97 @@ pub fn handle_add_conversation(cv: &CommunicationValue) -> CommunicationValue {
     }
 
     contact.set_last_message_at(now_millis_i64());
-    mod_user(user_id as i64, &contact);
+    mod_user(user_id_i64, &contact);
     CommunicationValue::new(CommunicationType::AddConversation)
-        .with_id(cv.get_id())
+        .with_request_id(cv)
         .with_receiver(user_id)
         .add_typed_default(
             DataType::SessionId,
             DataValue::SignedNumber(session_id as i128),
         )
-        .add_typed_default(DataType::UserIds, current_contact_ids(user_id as i64))
+        .add_typed_default(DataType::UserIds, current_contact_ids(user_id_i64))
 }
 
 pub fn handle_add_community(cv: &CommunicationValue) -> CommunicationValue {
+    let sender_id = match required_sender_id(cv) {
+        Ok(sender_id) => sender_id,
+        Err(response) => return response,
+    };
+    let Some(address) = cv.get_data(DataType::CommunityAddress).as_str() else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let Some(title) = cv.get_data(DataType::CommunityTitle).as_str() else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let Some(position) = cv.get_data(DataType::Position).as_str() else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
     CommunitiesUtil::add_community(
-        cv.get_sender() as i64,
-        cv.get_data(DataType::CommunityAddress)
-            .as_str()
-            .unwrap()
-            .to_string(),
-        cv.get_data(DataType::CommunityTitle)
-            .as_str()
-            .unwrap()
-            .to_string(),
-        cv.get_data(DataType::Position)
-            .as_str()
-            .unwrap()
-            .to_string(),
+        sender_id,
+        address.to_string(),
+        title.to_string(),
+        position.to_string(),
     );
     CommunicationValue::new(CommunicationType::AddCommunity)
-        .with_id(cv.get_id())
-        .with_receiver(cv.get_sender())
+        .with_request_id(cv)
+        .with_receiver(sender_wire_id(sender_id))
 }
 
 pub fn handle_get_communities(cv: &CommunicationValue) -> CommunicationValue {
-    let mut comm_array = Vec::new();
-    for c in CommunitiesUtil::get_communities(cv.get_sender() as i64) {
-        let mut container: Vec<(DataType, DataValue)> = Vec::new();
-        container.push((
-            DataType::CommunityAddress,
-            DataValue::Str(c.address.clone()),
-        ));
-        container.push((DataType::CommunityTitle, DataValue::Str(c.title.clone())));
-        container.push((DataType::Position, DataValue::Str(c.position.clone())));
-        comm_array.push(typed_container(container));
-    }
-
+    let sender_id = match required_sender_id(cv) {
+        Ok(sender_id) => sender_id,
+        Err(response) => return response,
+    };
     CommunicationValue::new(CommunicationType::GetCommunities)
-        .with_id(cv.get_id())
-        .with_receiver(cv.get_sender())
-        .add_typed_default(DataType::Communities, DataValue::Array(comm_array))
+        .with_request_id(cv)
+        .with_receiver(sender_wire_id(sender_id))
+        .add_typed_default(
+            DataType::Communities,
+            DataValue::Array(community_values(sender_id)),
+        )
+}
+
+fn community_values(storage_owner: i64) -> Vec<DataValue> {
+    CommunitiesUtil::get_communities(storage_owner)
+        .into_iter()
+        .map(|community| {
+            typed_container(vec![
+                (
+                    DataType::CommunityAddress,
+                    DataValue::Str(community.address),
+                ),
+                (DataType::CommunityTitle, DataValue::Str(community.title)),
+                (DataType::Position, DataValue::Str(community.position)),
+            ])
+        })
+        .collect()
 }
 
 pub fn handle_remove_community(cv: &CommunicationValue) -> CommunicationValue {
-    CommunitiesUtil::remove_community(
-        cv.get_sender() as i64,
-        cv.get_data(DataType::CommunityAddress)
-            .as_str()
-            .unwrap()
-            .to_string(),
-    );
+    let sender_id = match required_sender_id(cv) {
+        Ok(sender_id) => sender_id,
+        Err(response) => return response,
+    };
+    let Some(address) = cv.get_data(DataType::CommunityAddress).as_str() else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    CommunitiesUtil::remove_community(sender_id, address.to_string());
     CommunicationValue::new(CommunicationType::RemoveCommunity)
-        .with_id(cv.get_id())
-        .with_receiver(cv.get_sender())
+        .with_request_id(cv)
+        .with_receiver(sender_wire_id(sender_id))
 }
 
 pub fn handle_global_settings_save(cv: &CommunicationValue) -> CommunicationValue {
-    let my_id = cv.get_sender();
+    let my_id = match cv.require_sender() {
+        Ok(my_id) => my_id,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+    };
+    let Ok(my_id_i64) = i64::try_from(my_id) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
     let Some(settings_value) = cv.get_data(DataType::Payload).as_str() else {
         return CommunicationValue::new(CommunicationType::ErrorInvalidData)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(my_id)
             .add_typed_default(
                 DataType::Message,
@@ -843,13 +927,13 @@ pub fn handle_global_settings_save(cv: &CommunicationValue) -> CommunicationValu
             );
     };
 
-    if settings::save_global(my_id as i64, settings_value).is_err() {
+    if settings::save_global(my_id_i64, settings_value).is_err() {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     }
 
     let mut response = CommunicationValue::new(CommunicationType::GlobalSettingsSave)
         .with_receiver(my_id)
-        .with_id(cv.get_id());
+        .with_request_id(cv);
 
     if let Some(session_id) = cv.get_data(DataType::SessionId).as_number() {
         response = response.add_typed_default(
@@ -862,13 +946,19 @@ pub fn handle_global_settings_save(cv: &CommunicationValue) -> CommunicationValu
 }
 
 pub fn handle_global_settings_load(cv: &CommunicationValue) -> CommunicationValue {
-    let my_id = cv.get_sender();
-    let Ok(settings_value) = settings::load_global(my_id as i64) else {
+    let my_id = match cv.require_sender() {
+        Ok(my_id) => my_id,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+    };
+    let Ok(my_id_i64) = i64::try_from(my_id) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let Ok(settings_value) = settings::load_global(my_id_i64) else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
     let Some(settings_value_str) = settings_value else {
         let mut response = CommunicationValue::new(CommunicationType::ErrorNotFound)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(my_id)
             .add_typed_default(
                 DataType::Path,
@@ -886,7 +976,7 @@ pub fn handle_global_settings_load(cv: &CommunicationValue) -> CommunicationValu
     };
 
     let mut response = CommunicationValue::new(CommunicationType::GlobalSettingsLoad)
-        .with_id(cv.get_id())
+        .with_request_id(cv)
         .with_receiver(my_id)
         .add_typed_default(DataType::Payload, DataValue::Str(settings_value_str));
 
@@ -904,10 +994,16 @@ pub fn handle_settings_save(
     cv: &CommunicationValue,
     _expected_session_id: i128,
 ) -> CommunicationValue {
-    let my_id = cv.get_sender();
+    let my_id = match cv.require_sender() {
+        Ok(my_id) => my_id,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+    };
+    let Ok(my_id_i64) = i64::try_from(my_id) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
     let Some(session_id) = cv.get_data(DataType::SessionId).as_number() else {
         return CommunicationValue::new(CommunicationType::ErrorInvalidData)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(my_id)
             .add_typed_default(
                 DataType::Message,
@@ -916,7 +1012,7 @@ pub fn handle_settings_save(
     };
     if session_id == 0 || session_id > 1_000_000 {
         return CommunicationValue::new(CommunicationType::ErrorInvalidData)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(my_id)
             .add_typed_default(
                 DataType::Message,
@@ -929,7 +1025,7 @@ pub fn handle_settings_save(
     };
     let Some(settings_name) = cv.get_data(DataType::SettingsName).as_str() else {
         return CommunicationValue::new(CommunicationType::ErrorInvalidData)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(my_id)
             .add_typed_default(
                 DataType::Message,
@@ -942,7 +1038,7 @@ pub fn handle_settings_save(
     };
     let Some(settings_value) = cv.get_data(DataType::Payload).as_str() else {
         return CommunicationValue::new(CommunicationType::ErrorInvalidData)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(my_id)
             .add_typed_default(
                 DataType::Message,
@@ -960,7 +1056,7 @@ pub fn handle_settings_save(
         || settings_name.contains("..")
     {
         return CommunicationValue::new(CommunicationType::ErrorInvalidData)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(my_id)
             .add_typed_default(
                 DataType::Message,
@@ -975,21 +1071,17 @@ pub fn handle_settings_save(
                 DataValue::SignedNumber(session_id as i128),
             );
     }
+    let Ok(session_id_i64) = i64::try_from(session_id) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
 
-    if settings::save(
-        my_id as i64,
-        session_id as i64,
-        settings_name,
-        settings_value,
-    )
-    .is_err()
-    {
+    if settings::save(my_id_i64, session_id_i64, settings_name, settings_value).is_err() {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     }
 
     CommunicationValue::new(CommunicationType::SettingsSave)
         .with_receiver(my_id)
-        .with_id(cv.get_id())
+        .with_request_id(cv)
         .add_typed_default(
             DataType::SettingsName,
             DataValue::Str(settings_name.to_string()),
@@ -1004,10 +1096,16 @@ pub fn handle_settings_load(
     cv: &CommunicationValue,
     _expected_session_id: i128,
 ) -> CommunicationValue {
-    let my_id = cv.get_sender();
+    let my_id = match cv.require_sender() {
+        Ok(my_id) => my_id,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+    };
+    let Ok(my_id_i64) = i64::try_from(my_id) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
     let Some(session_id) = cv.get_data(DataType::SessionId).as_number() else {
         return CommunicationValue::new(CommunicationType::ErrorInvalidData)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(my_id)
             .add_typed_default(
                 DataType::Message,
@@ -1016,7 +1114,7 @@ pub fn handle_settings_load(
     };
     if session_id == 0 || session_id > 1_000_000 {
         return CommunicationValue::new(CommunicationType::ErrorInvalidData)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(my_id)
             .add_typed_default(
                 DataType::Message,
@@ -1027,9 +1125,12 @@ pub fn handle_settings_load(
                 DataValue::SignedNumber(session_id as i128),
             );
     }
+    let Ok(session_id_i64) = i64::try_from(session_id) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
     let Some(settings_name) = cv.get_data(DataType::SettingsName).as_str() else {
         return CommunicationValue::new(CommunicationType::ErrorInvalidData)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(my_id)
             .add_typed_default(
                 DataType::Message,
@@ -1047,7 +1148,7 @@ pub fn handle_settings_load(
         || settings_name.contains("..")
     {
         return CommunicationValue::new(CommunicationType::ErrorInvalidData)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(my_id)
             .add_typed_default(
                 DataType::Message,
@@ -1063,12 +1164,12 @@ pub fn handle_settings_load(
             );
     }
 
-    let Ok(settings_value) = settings::load(my_id as i64, session_id as i64, settings_name) else {
+    let Ok(settings_value) = settings::load(my_id_i64, session_id_i64, settings_name) else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
     let Some(settings_value_str) = settings_value else {
         return CommunicationValue::new(CommunicationType::ErrorNotFound)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(my_id)
             .add_typed_default(
                 DataType::SettingsName,
@@ -1081,7 +1182,7 @@ pub fn handle_settings_load(
     };
 
     CommunicationValue::new(CommunicationType::SettingsLoad)
-        .with_id(cv.get_id())
+        .with_request_id(cv)
         .with_receiver(my_id)
         .add_typed_default(DataType::Payload, DataValue::Str(settings_value_str))
         .add_typed_default(
@@ -1098,10 +1199,16 @@ pub fn handle_settings_list(
     cv: &CommunicationValue,
     _expected_session_id: i128,
 ) -> CommunicationValue {
-    let my_id = cv.get_sender();
+    let my_id = match cv.require_sender() {
+        Ok(my_id) => my_id,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+    };
+    let Ok(my_id_i64) = i64::try_from(my_id) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
     let Some(session_id) = cv.get_data(DataType::SessionId).as_number() else {
         return CommunicationValue::new(CommunicationType::ErrorInvalidData)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(my_id)
             .add_typed_default(
                 DataType::Message,
@@ -1110,7 +1217,7 @@ pub fn handle_settings_list(
     };
     if session_id == 0 || session_id > 1_000_000 {
         return CommunicationValue::new(CommunicationType::ErrorInvalidData)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(my_id)
             .add_typed_default(
                 DataType::Message,
@@ -1121,13 +1228,16 @@ pub fn handle_settings_list(
                 DataValue::SignedNumber(session_id as i128),
             );
     }
+    let Ok(session_id_i64) = i64::try_from(session_id) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
 
-    let Ok(settings) = settings::list(my_id as i64, session_id as i64) else {
+    let Ok(settings) = settings::list(my_id_i64, session_id_i64) else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
     let settings_json = settings.into_iter().map(DataValue::Str).collect();
     CommunicationValue::new(CommunicationType::SettingsList)
-        .with_id(cv.get_id())
+        .with_request_id(cv)
         .with_receiver(my_id)
         .add_typed_default(DataType::Settings, DataValue::Array(settings_json))
         .add_typed_default(

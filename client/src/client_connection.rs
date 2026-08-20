@@ -140,7 +140,11 @@ impl ClientConnection {
             return;
         }
 
-        let _msg_id = cv.get_id();
+        if cv.require_id().is_err() {
+            self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                .await;
+            return;
+        }
 
         if cv.is_type(CommunicationType::Challenge) {
             self.handle_challenge(&cv).await;
@@ -154,7 +158,14 @@ impl ClientConnection {
         }
 
         if cv.is_type(CommunicationType::SaveAppData) {
-            let sender_id = cv.get_sender();
+            let sender_id = match cv.require_sender() {
+                Ok(sender_id) => sender_id,
+                Err(_) => {
+                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                        .await;
+                    return;
+                }
+            };
             let _app_data = cv
                 .get_data(DataType::AppData)
                 .as_str()
@@ -162,18 +173,25 @@ impl ClientConnection {
                 .to_string();
 
             let res = CommunicationValue::new(CommunicationType::SaveAppData)
-                .with_id(cv.get_id())
+                .with_request_id(&cv)
                 .with_receiver(sender_id);
             self.send_message(&res).await;
             return;
         }
 
         if cv.is_type(CommunicationType::LoadAppData) {
-            let sender_id = cv.get_sender();
+            let sender_id = match cv.require_sender() {
+                Ok(sender_id) => sender_id,
+                Err(_) => {
+                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                        .await;
+                    return;
+                }
+            };
             let app_data = String::new();
 
             let res = CommunicationValue::new(CommunicationType::LoadAppData)
-                .with_id(cv.get_id())
+                .with_request_id(&cv)
                 .with_receiver(sender_id)
                 .add_typed_default(DataType::AppData, DataValue::Str(app_data));
             self.send_message(&res).await;
@@ -287,12 +305,32 @@ impl ClientConnection {
         }
 
         if cv.is_type(CommunicationType::SettingsSave) {
-            let my_id = cv.get_sender();
-            let settings_name = cv.get_data(DataType::SettingsName).as_str().unwrap();
-            let settings_value = cv.get_data(DataType::Payload).as_str().unwrap();
+            let my_id = match cv.require_sender() {
+                Ok(my_id) => my_id,
+                Err(_) => {
+                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                        .await;
+                    return;
+                }
+            };
+            let Ok(my_id_i64) = i64::try_from(my_id) else {
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                    .await;
+                return;
+            };
+            let Some(settings_name) = cv.get_data(DataType::SettingsName).as_str() else {
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                    .await;
+                return;
+            };
+            let Some(settings_value) = cv.get_data(DataType::Payload).as_str() else {
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                    .await;
+                return;
+            };
 
             let _ = iota_storage::util::settings::save(
-                my_id as i64,
+                my_id_i64,
                 iota_storage::util::settings::GLOBAL_SESSION_ID,
                 settings_name,
                 settings_value,
@@ -300,17 +338,33 @@ impl ClientConnection {
 
             let response = CommunicationValue::new(CommunicationType::SettingsSave)
                 .with_receiver(my_id)
-                .with_id(cv.get_id());
+                .with_request_id(&cv);
 
             self.send_message(&response).await;
             return;
         }
 
         if cv.is_type(CommunicationType::SettingsLoad) {
-            let my_id = cv.get_sender();
-            let settings_name = cv.get_data(DataType::SettingsName).as_string().unwrap();
+            let my_id = match cv.require_sender() {
+                Ok(my_id) => my_id,
+                Err(_) => {
+                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                        .await;
+                    return;
+                }
+            };
+            let Ok(my_id_i64) = i64::try_from(my_id) else {
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                    .await;
+                return;
+            };
+            let Some(settings_name) = cv.get_data(DataType::SettingsName).as_string() else {
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                    .await;
+                return;
+            };
             let settings_value_str = iota_storage::util::settings::load(
-                my_id as i64,
+                my_id_i64,
                 iota_storage::util::settings::GLOBAL_SESSION_ID,
                 &settings_name,
             )
@@ -318,7 +372,7 @@ impl ClientConnection {
             .flatten()
             .unwrap_or_default();
             let response = CommunicationValue::new(CommunicationType::SettingsLoad)
-                .with_id(cv.get_id())
+                .with_request_id(&cv)
                 .with_receiver(my_id)
                 .add_typed_default(DataType::Payload, DataValue::Str(settings_value_str))
                 .add_typed_default(DataType::SettingsName, DataValue::Str(settings_name));
@@ -328,15 +382,27 @@ impl ClientConnection {
         }
 
         if cv.is_type(CommunicationType::SettingsList) {
-            let my_id = cv.get_sender();
+            let my_id = match cv.require_sender() {
+                Ok(my_id) => my_id,
+                Err(_) => {
+                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                        .await;
+                    return;
+                }
+            };
+            let Ok(my_id_i64) = i64::try_from(my_id) else {
+                self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                    .await;
+                return;
+            };
             let settings = iota_storage::util::settings::list(
-                my_id as i64,
+                my_id_i64,
                 iota_storage::util::settings::GLOBAL_SESSION_ID,
             )
             .unwrap_or_default();
             let settings_json = settings.into_iter().map(DataValue::Str).collect();
             let response = CommunicationValue::new(CommunicationType::SettingsList)
-                .with_id(cv.get_id())
+                .with_request_id(&cv)
                 .with_receiver(my_id)
                 .add_typed_default(DataType::Settings, DataValue::Array(settings_json));
 
@@ -356,7 +422,7 @@ impl ClientConnection {
 
         if let Some(solved) = solved {
             let response = CommunicationValue::new(CommunicationType::ChallengeResponse)
-                .with_id(cv.get_id())
+                .with_request_id(&cv)
                 .add_typed_default(DataType::Challenge, DataValue::Str(solved));
 
             self.send_message(&response).await;
@@ -405,7 +471,9 @@ impl ClientConnection {
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
         let (tx, mut rx) = mpsc::channel(1);
-        let msg_id = cv.get_id();
+        let msg_id = cv
+            .require_id()
+            .map_err(|error| format!("cannot await response without a message id: {error}"))?;
 
         let task_tx = tx.clone();
         self.waiting_tasks.insert(

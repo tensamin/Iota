@@ -52,8 +52,12 @@ document without accepting it.
 # Linux daemon installation
 
 The system-managed daemon runs as the dedicated `iota` account and listens on
-`/run/iota/iota.sock` through socket activation. Operator access is granted
-through the `iota-operators` group. After installing, add an account with:
+`/run/iota/iota.sock` through socket activation. The system IPC socket is the
+privilege boundary. Operator access is granted through the `iota-operators`
+group, and every account admitted through that socket is authorized for the
+full operator-console role, including user management, identity rotation,
+configuration, and daemon lifecycle commands. After installing, add an
+account with:
 
 ```text
 usermod -aG iota-operators USER

@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1"
 tokio = { version = "1.50", features = ["process", "time", "io-util", "macros", "rt"] }
+
+[dev-dependencies]
+libc = "0.2"
+tempfile = "3"
