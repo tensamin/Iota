@@ -185,6 +185,9 @@ pub fn apply_verified_relay_content(
                 &context.type_map,
             )
             .ok_or_else(|| "Relay MessageSend is missing RelayMessageId".to_string())?;
+            if relay_message_id != context.message_id {
+                return Err("Relay MessageSend identity does not match its protected message ID".into());
+            }
             chat_files::add_message(chat_files::NewMessage {
                 relay_signer_id: sender_id,
                 relay_message_id,

@@ -81,13 +81,12 @@ pub fn mark_delivered_for_frame(destination_id: u64, frame_id: u32) -> Result<()
     })
 }
 
-pub fn mark_state(signer_id: u64, message_id: &str, state: &str) -> Result<(), StorageError> {
-    if !matches!(
-        state,
-        "received" | "applied" | "queued" | "delivered" | "rejected"
-    ) {
-        return Err(StorageError::Other("invalid relay inbox state".into()));
-    }
+fn mark_transition(
+    signer_id: u64,
+    message_id: &str,
+    state: &str,
+    column: &str,
+) -> Result<(), StorageError> {
     let signer_id = i64::try_from(signer_id)
         .map_err(|_| StorageError::Other("relay signer ID exceeds SQLite range".into()))?;
     let timestamp = std::time::SystemTime::now()
@@ -95,20 +94,28 @@ pub fn mark_state(signer_id: u64, message_id: &str, state: &str) -> Result<(), S
         .unwrap_or_default()
         .as_millis() as i64;
     db::with_db(|connection| {
-        let column = match state {
-            "applied" => "applied_at",
-            "queued" => "queued_at",
-            "delivered" => "downstream_acked_at",
-            "rejected" => "rejected_at",
-            "received" => "accepted_at",
-            _ => return Err(StorageError::Other("invalid relay inbox state".into())),
-        };
         connection.execute(
             &format!("UPDATE relay_inbox SET state = ?3, {column} = COALESCE({column}, ?4) WHERE signer_id = ?1 AND message_id = ?2"),
             params![signer_id, message_id, state, timestamp],
         )?;
         Ok(())
     })
+}
+
+pub fn mark_applied(signer_id: u64, message_id: &str) -> Result<(), StorageError> {
+    mark_transition(signer_id, message_id, "applied", "applied_at")
+}
+
+pub fn mark_queued(signer_id: u64, message_id: &str) -> Result<(), StorageError> {
+    mark_transition(signer_id, message_id, "queued", "queued_at")
+}
+
+pub fn mark_downstream_acked(signer_id: u64, message_id: &str) -> Result<(), StorageError> {
+    mark_transition(signer_id, message_id, "delivered", "downstream_acked_at")
+}
+
+pub fn mark_rejected(signer_id: u64, message_id: &str) -> Result<(), StorageError> {
+    mark_transition(signer_id, message_id, "rejected", "rejected_at")
 }
 
 pub fn prune_completed(before_terminal_at: i64) -> Result<(), StorageError> {

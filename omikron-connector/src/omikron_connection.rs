@@ -893,6 +893,7 @@ impl OmikronConnection {
         iota_id: u64,
         relay_message_id: &str,
         accepted_at: i64,
+        include_origin_timestamp: bool,
     ) {
         let Some(frame_id) = frame_id else { return };
         let response = CommunicationValue::new(CommunicationType::Success)
@@ -906,6 +907,19 @@ impl OmikronConnection {
                 DataType::RelayAcceptedAt,
                 DataValue::SignedNumber(accepted_at.into()),
             );
+        let response = if include_origin_timestamp {
+            response
+                .add_typed_default(
+                    DataType::OriginIotaReceivedAt,
+                    DataValue::SignedNumber(accepted_at.into()),
+                )
+                .add_typed_default(
+                    DataType::DestinationIotaReceivedAt,
+                    DataValue::SignedNumber(accepted_at.into()),
+                )
+        } else {
+            response
+        };
         if let Err(error) = self.send_message(&response).await {
             log!("Relay response could not be sent: {}", error);
         }
@@ -1039,6 +1053,63 @@ impl OmikronConnection {
             relay_replay::RelayReservation::Existing { .. } => false,
         };
 
+        /* A shared Iota owns both independent replicas before delivering to its
+         * local recipient. The destination path below writes the recipient copy. */
+        if signer_is_local && recipient_is_local && !already_applied {
+            let content = match open_verified_relay_content(
+                &verified,
+                &[&keyring],
+                verified.context.signer_id,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    log!("Relay shared-Iota origin content verification failed: {}", error);
+                    let _ = relay_replay::mark_rejected(
+                        verified.context.signer_id,
+                        &verified.context.message_id,
+                    );
+                    self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                        .await;
+                    return;
+                }
+            };
+            let owner = match i64::try_from(verified.context.signer_id) {
+                Ok(value) => value,
+                Err(_) => {
+                    self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                        .await;
+                    return;
+                }
+            };
+            if let Err(error) = message_handlers::apply_verified_relay_content(
+                &verified.context,
+                &content,
+                accepted_at,
+                owner,
+                true,
+            ) {
+                log!("Relay shared-Iota origin application failed: {}", error);
+                let _ = relay_replay::mark_rejected(
+                    verified.context.signer_id,
+                    &verified.context.message_id,
+                );
+                self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                    .await;
+                return;
+            }
+            if let Err(error) = chat_files::record_destination_iota_received(
+                owner,
+                owner,
+                &verified.context.message_id,
+                accepted_at,
+            ) {
+                log!("Relay shared-Iota destination timestamp storage failed: {}", error);
+                self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
+                    .await;
+                return;
+            }
+        }
+
         if signer_is_local && !recipient_is_local {
             if !already_applied {
                 let content = match open_verified_relay_content(
@@ -1049,10 +1120,9 @@ impl OmikronConnection {
                     Ok(value) => value,
                     Err(error) => {
                         log!("Relay origin content verification failed: {}", error);
-                        let _ = relay_replay::mark_state(
+                        let _ = relay_replay::mark_rejected(
                             verified.context.signer_id,
                             &verified.context.message_id,
-                            "rejected",
                         );
                         self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
                             .await;
@@ -1067,10 +1137,9 @@ impl OmikronConnection {
                     true,
                 ) {
                     log!("Relay origin application failed: {}", error);
-                    let _ = relay_replay::mark_state(
+                    let _ = relay_replay::mark_rejected(
                         verified.context.signer_id,
                         &verified.context.message_id,
-                        "rejected",
                     );
                     self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
                         .await;
@@ -1119,10 +1188,9 @@ impl OmikronConnection {
                     .await;
                 return;
             }
-            if let Err(error) = relay_replay::mark_state(
+            if let Err(error) = relay_replay::mark_queued(
                 verified.context.signer_id,
                 &verified.context.message_id,
-                "queued",
             ) {
                 log!("Relay origin state update failed: {}", error);
             }
@@ -1134,7 +1202,7 @@ impl OmikronConnection {
                     let returned_id = response
                         .get_data(DataType::RelayMessageId)
                         .as_str();
-                    let accepted_at = response
+                    let destination_accepted_at = response
                         .get_data(DataType::RelayAcceptedAt)
                         .as_number()
                         .and_then(|value| i64::try_from(value).ok());
@@ -1144,19 +1212,23 @@ impl OmikronConnection {
                             .await;
                         return;
                     }
-                    if let Some(accepted_at) = accepted_at {
-                        if let (Ok(owner), Ok(signer)) = (
-                            i64::try_from(verified.context.signer_id),
-                            i64::try_from(verified.context.signer_id),
+                    let Some(destination_accepted_at) = destination_accepted_at else {
+                        log!("Relay acknowledgement is missing RelayAcceptedAt");
+                        self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                            .await;
+                        return;
+                    };
+                    if let (Ok(owner), Ok(signer)) = (
+                        i64::try_from(verified.context.signer_id),
+                        i64::try_from(verified.context.signer_id),
+                    ) {
+                        if let Err(error) = chat_files::record_destination_iota_received(
+                            owner,
+                            signer,
+                            &verified.context.message_id,
+                            destination_accepted_at,
                         ) {
-                            if let Err(error) = chat_files::record_destination_iota_received(
-                                owner,
-                                signer,
-                                &verified.context.message_id,
-                                accepted_at,
-                            ) {
-                                log!("Relay destination acknowledgement storage failed: {}", error);
-                            }
+                            log!("Relay destination acknowledgement storage failed: {}", error);
                         }
                     }
                     if let Err(error) = relay_queue::acknowledge_iota(router, frame_id) {
@@ -1165,14 +1237,22 @@ impl OmikronConnection {
                             error
                         );
                     }
-                    if let Err(error) = relay_replay::mark_state(
+                    if let Err(error) = relay_replay::mark_downstream_acked(
                         verified.context.signer_id,
                         &verified.context.message_id,
-                        "delivered",
                     ) {
                         log!("Relay origin delivery state update failed: {}", error);
                     }
-                    let response = response.with_id(frame_id);
+                    let response = response
+                        .add_typed_default(
+                            DataType::OriginIotaReceivedAt,
+                            DataValue::SignedNumber(accepted_at.into()),
+                        )
+                        .add_typed_default(
+                            DataType::DestinationIotaReceivedAt,
+                            DataValue::SignedNumber(destination_accepted_at.into()),
+                        )
+                        .with_id(frame_id);
                     if let Err(error) = self.send_message(&response).await {
                         log!("Relay response could not be sent: {}", error);
                     }
@@ -1248,10 +1328,9 @@ impl OmikronConnection {
                             queue_error
                         );
                     }
-                    let _ = relay_replay::mark_state(
+                    let _ = relay_replay::mark_rejected(
                         verified.context.signer_id,
                         &verified.context.message_id,
-                        "rejected",
                     );
                     self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
                         .await;
@@ -1284,19 +1363,17 @@ impl OmikronConnection {
                 {
                     log!("Relay application queue cleanup failed: {}", queue_error);
                 }
-                let _ = relay_replay::mark_state(
+                let _ = relay_replay::mark_rejected(
                     verified.context.signer_id,
                     &verified.context.message_id,
-                    "rejected",
                 );
                 self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
                     .await;
                 return;
             }
-            if let Err(error) = relay_replay::mark_state(
+            if let Err(error) = relay_replay::mark_applied(
                 verified.context.signer_id,
                 &verified.context.message_id,
-                "applied",
             ) {
                 log!("Relay application state update failed: {}", error);
                 self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
@@ -1305,10 +1382,9 @@ impl OmikronConnection {
             }
         }
 
-        if let Err(error) = relay_replay::mark_state(
+        if let Err(error) = relay_replay::mark_queued(
             verified.context.signer_id,
             &verified.context.message_id,
-            "queued",
         ) {
             log!("Relay queue state update failed: {}", error);
         }
@@ -1317,6 +1393,7 @@ impl OmikronConnection {
             local_iota_id,
             &verified.context.message_id,
             accepted_at,
+            signer_is_local,
         )
         .await;
         if let Err(error) = self.send_message(&forwarded).await {

@@ -4,7 +4,7 @@ use crate::util::db;
 use rusqlite::{Transaction, params};
 use std::collections::BTreeMap;
 
-pub const CACHE_SCHEMA_VERSION: i64 = 1;
+pub const CACHE_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityType {
