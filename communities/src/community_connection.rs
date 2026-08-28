@@ -52,7 +52,9 @@ impl CommunityConnection {
     pub async fn send_message(&self, message: &CommunicationValue) {
         let mut sender = self.sender.write().await; // Access the SplitSink
         let message_text = Message::Text(Utf8Bytes::from(message.to_json().to_string()));
-        sender.send(message_text).await.unwrap(); // Send the message via the SplitSink
+        if let Err(error) = sender.send(message_text).await {
+            log::error!("failed to send community message: {error}");
+        }
     }
     pub async fn get_community(&self) -> Option<Arc<Community>> {
         self.community.read().await.clone()
@@ -94,14 +96,15 @@ impl CommunityConnection {
         }
     }
     async fn handle_function(&self, cv: CommunicationValue) {
-        let name = cv.get_data(DataType::Name).unwrap().as_str().unwrap();
-        let path = cv.get_data(DataType::Path).unwrap().as_str().unwrap();
-        let function = cv.get_data(DataType::Function).unwrap().as_str().unwrap();
+        let Some(name) = cv.get_data(DataType::Name).as_str() else { return };
+        let Some(path) = cv.get_data(DataType::Path).as_str() else { return };
+        let Some(function) = cv.get_data(DataType::Function).as_str() else { return };
 
         let result = self
             .get_community()
             .await
-            .unwrap()
+            .ok_or(())
+            .unwrap_or_else(|_| return)
             .run_function(self.get_user_id().await, name, path, function, &cv)
             .await;
 
@@ -364,13 +367,9 @@ impl CommunityConnection {
     pub async fn handle_close(self: Arc<Self>) {
         if self.is_identified().await {
             if self.get_user_id().await != 0 {
-                self.community
-                    .read()
-                    .await
-                    .as_ref()
-                    .unwrap()
-                    .remove_connection(self.clone())
-                    .await;
+                if let Some(community) = self.community.read().await.as_ref() {
+                    community.remove_connection(self.clone()).await;
+                }
             }
         }
     }

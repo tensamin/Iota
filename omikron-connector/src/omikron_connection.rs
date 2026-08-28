@@ -39,11 +39,18 @@ use iota_util::route_target::RouteTarget;
 
 const IOTA_KEYRING_PATH: &str = "iota.mk";
 static IDENTITY_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static OMIKRON_PUBLIC_KEY_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
-/// Must be called by the daemon before any Omikron connection is attempted.
-/// It keeps identity material independent from the working directory.
+/*
+ * Keeps identity and pinned Omikron key files independent from the process
+ * working directory, so restarts use the same trusted material.
+ */
 pub fn configure_identity_path(path: PathBuf) {
+    let key_path = path.parent().map(|parent| parent.join("omikron.mpkb"));
     let _ = IDENTITY_PATH.set(path);
+    if let Some(key_path) = key_path {
+        let _ = OMIKRON_PUBLIC_KEY_PATH.set(key_path);
+    }
 }
 fn identity_path() -> &'static Path {
     IDENTITY_PATH
@@ -51,7 +58,51 @@ fn identity_path() -> &'static Path {
         .map(PathBuf::as_path)
         .unwrap_or_else(|| Path::new(IOTA_KEYRING_PATH))
 }
-const OMIKRON_PUBLIC_KEY_PATH: &str = "omikron.mpkb";
+fn omikron_public_key_path() -> &'static Path {
+    OMIKRON_PUBLIC_KEY_PATH
+        .get()
+        .map(PathBuf::as_path)
+        .unwrap_or_else(|| Path::new("omikron.mpkb"))
+}
+
+fn save_keyring(keyring: &Keyring, path: &Path) -> Result<(), String> {
+    let temporary = serialization_path(path)?;
+    mtp::files::save_keyring_raw(keyring, &temporary)
+        .map_err(|error| format!("serialize keyring: {error}"))?;
+    let bytes =
+        std::fs::read(&temporary).map_err(|error| format!("read serialized keyring: {error}"));
+    let _ = std::fs::remove_file(&temporary);
+    let bytes = bytes?;
+    iota_util::atomic_file::replace_private(path, &bytes, 3)
+        .map_err(|error| format!("write {}: {error}", path.display()))
+}
+
+fn save_omikron_public_key(key: &PublicKeyBundle, path: &Path) -> Result<(), String> {
+    let temporary = serialization_path(path)?;
+    mtp::files::save_public_key_bundle(key, &temporary)
+        .map_err(|error| format!("serialize Omikron public key: {error}"))?;
+    let bytes = std::fs::read(&temporary)
+        .map_err(|error| format!("read serialized Omikron public key: {error}"));
+    let _ = std::fs::remove_file(&temporary);
+    let bytes = bytes?;
+    iota_util::atomic_file::replace(path, &bytes, 3)
+        .map_err(|error| format!("write {}: {error}", path.display()))
+}
+
+fn serialization_path(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", path.display()))?;
+    Ok(parent.join(format!(
+        ".{}.serialize-{}",
+        name.to_string_lossy(),
+        Uuid::new_v4()
+    )))
+}
+
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -434,7 +485,7 @@ impl OmikronConnection {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(e) = mtp::files::save_keyring_raw(&keyring, path) {
+        if let Err(e) = save_keyring(&keyring, path) {
             log!("Failed to persist {}: {}", path.display(), e);
         }
 
@@ -469,21 +520,29 @@ impl OmikronConnection {
             let port: u16 = port_str
                 .parse()
                 .map_err(|_| format!("Invalid OMIKRON_PORT: {}", port_str))?;
-            let public_key = mtp::files::load_public_key_bundle(OMIKRON_PUBLIC_KEY_PATH)
+            let key_path = omikron_public_key_path();
+            let public_key = mtp::files::load_public_key_bundle(key_path)
                 .map_err(|e| {
                     format!(
-                        "Failed to load Omikron public key bundle from {}: {}. Obtain {} from the Omikron operator and place it in the working directory.",
-                        OMIKRON_PUBLIC_KEY_PATH, e, OMIKRON_PUBLIC_KEY_PATH
+                        "Failed to load Omikron public key bundle from {}: {}. Obtain {} from the Omikron operator and place it at that path.",
+                        key_path.display(), e, key_path.display()
                     )
                 })?;
             return Ok((host, port, public_key));
         }
 
-        let cached_key = mtp::files::load_public_key_bundle(OMIKRON_PUBLIC_KEY_PATH).ok();
+        let key_path = omikron_public_key_path();
+        let cached_key = mtp::files::load_public_key_bundle(key_path).ok();
         let cached_host_port = {
             let conf = CONFIG.load();
             match (&conf.omikron_host, conf.omikron_port) {
-                (Some(host), Some(port)) => Some((host.clone(), port)),
+                (Some(host), Some(port)) if !host.trim().is_empty() && port != 0 => {
+                    Some((host.clone(), port))
+                }
+                (Some(_), Some(_)) => {
+                    log!("Ignoring invalid cached Omikron endpoint in Iota configuration");
+                    None
+                }
                 _ => None,
             }
         };
@@ -504,21 +563,35 @@ impl OmikronConnection {
 
         let (host, port, public_key) = if let Some(endpoint) = discovered {
             match &cached_key {
-                Some(cached) if cached.as_bytes() != endpoint.public_key.as_bytes() => {
-                    log!(
-                        "Fetched Omikron public key differs from the cached {} - keeping the \
-                         cached key. Delete {} manually if this is an expected key rotation.",
-                        OMIKRON_PUBLIC_KEY_PATH,
-                        OMIKRON_PUBLIC_KEY_PATH
-                    );
-                    (endpoint.host, endpoint.port, cached.clone())
+                Some(cached) => {
+                    let keys_match =
+                        match (cached.try_as_bytes(), endpoint.public_key.try_as_bytes()) {
+                            (Ok(cached_bytes), Ok(discovered_bytes)) => {
+                                cached_bytes == discovered_bytes
+                            }
+                            _ => false,
+                        };
+                    if !keys_match {
+                        log!(
+                            "Fetched Omikron public key differs from the cached {} - keeping the \
+                             cached key. Delete {} manually if this is an expected key rotation.",
+                            key_path.display(),
+                            key_path.display()
+                        );
+                        if let Some((cached_host, cached_port)) = &cached_host_port {
+                            (cached_host.clone(), *cached_port, cached.clone())
+                        } else {
+                            return Err(format!(
+                                "Omega returned an Omikron key that differs from {} and no validated cached endpoint is available",
+                                key_path.display()
+                            ));
+                        }
+                    } else {
+                        (endpoint.host, endpoint.port, cached.clone())
+                    }
                 }
-                Some(cached) => (endpoint.host, endpoint.port, cached.clone()),
                 None => {
-                    if let Err(e) = mtp::files::save_public_key_bundle(
-                        &endpoint.public_key,
-                        OMIKRON_PUBLIC_KEY_PATH,
-                    ) {
+                    if let Err(e) = save_omikron_public_key(&endpoint.public_key, key_path) {
                         log!("Failed to cache Omikron public key: {}", e);
                     }
                     (endpoint.host, endpoint.port, endpoint.public_key)
@@ -1885,7 +1958,7 @@ impl OmikronConnection {
                 ))
             })?;
         }
-        mtp::files::save_keyring_raw(&keyring, path).map_err(|error| {
+        save_keyring(&keyring, path).map_err(|error| {
             OmikronError::Internal(format!(
                 "could not save new identity {}: {error}",
                 path.display()
@@ -2050,5 +2123,27 @@ impl OmikronClient for OmikronConnection {
 
     async fn is_connected(&self) -> bool {
         Self::is_connected(self).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_keyring_save_preserves_mtp_format() {
+        let directory = std::env::temp_dir().join(format!("iota-keyring-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(IOTA_KEYRING_PATH);
+        let keyring = crypto_helper::generate_keyring();
+
+        save_keyring(&keyring, &path).unwrap();
+
+        let loaded = mtp::files::load_keyring_raw(&path).unwrap();
+        assert_eq!(
+            keyring.try_to_bytes().unwrap(),
+            loaded.try_to_bytes().unwrap()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

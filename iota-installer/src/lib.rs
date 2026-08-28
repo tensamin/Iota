@@ -19,6 +19,10 @@ pub fn install_linux_bundle(bundle: &Path) -> Result<()> {
     install_linux_bundle_with_operator(bundle, None)
 }
 
+pub fn bootstrap_linux_bundle(bundle: &Path, operator: Option<&str>) -> Result<()> {
+    install_linux_bundle_with_operator(bundle, operator)
+}
+
 pub fn install_linux_bundle_with_operator(bundle: &Path, operator: Option<&str>) -> Result<()> {
     if std::env::consts::OS != "linux" {
         bail!("Linux systemd bundles are not supported on this platform");
@@ -118,6 +122,12 @@ pub fn install_linux_bundle_with_operator(bundle: &Path, operator: Option<&str>)
         ],
     )?;
     run("systemd-sysusers", &[])?;
+    for directory in ["/var/lib/iota", "/var/cache/iota", "/var/log/iota"] {
+        run(
+            "install",
+            &["-d", "-m", "0750", "-o", "iota", "-g", "iota", directory],
+        )?;
+    }
     if let Some(operator) = operator {
         run("usermod", &["-aG", "iota-operators", operator])?;
     } else {

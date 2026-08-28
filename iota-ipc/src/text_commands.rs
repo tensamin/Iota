@@ -15,6 +15,7 @@ pub const COMMANDS: &[&str] = &[
     "config get",
     "config set ",
     "config reload",
+    "health",
     "components",
     "logs",
     "update check",
@@ -84,6 +85,7 @@ pub fn parse(line: &str) -> Option<LocalRequest> {
         }),
         ["config", "reload"] => Some(LocalRequest::ReloadConfig),
         ["omikron", "status"] => Some(LocalRequest::GetOmikronStatus),
+        ["health"] => Some(LocalRequest::ListComponents),
         ["components"] => Some(LocalRequest::ListComponents),
         ["logs"] => Some(LocalRequest::GetLogs { limit: 100 }),
         ["update", "check"] => Some(LocalRequest::CheckUpdate),
@@ -225,6 +227,14 @@ mod tests {
     fn parses_components() {
         assert!(matches!(
             parse("components"),
+            Some(LocalRequest::ListComponents)
+        ));
+    }
+
+    #[test]
+    fn parses_health() {
+        assert!(matches!(
+            parse("health"),
             Some(LocalRequest::ListComponents)
         ));
     }

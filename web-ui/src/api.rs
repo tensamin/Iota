@@ -128,7 +128,10 @@ async fn users_remove(
         return forbidden();
     }
 
-    let uuid = payload.get("uuid").and_then(|v| v.as_i64()).unwrap_or(0);
+    let uuid = match user_id(&payload) {
+        Ok(uuid) => uuid,
+        Err(response) => return response,
+    };
 
     iota_storage::users::user_manager::remove_user(uuid);
     iota_storage::users::user_manager::save_users();
@@ -194,7 +197,14 @@ fn success() -> HttpResponse {
 }
 
 fn error() -> HttpResponse {
-    HttpResponse::Ok().json(json!({ "type": "error" }))
+    HttpResponse::BadRequest().json(json!({ "type": "error" }))
+}
+
+fn user_id(payload: &Value) -> Result<i64, HttpResponse> {
+    payload
+        .get("uuid")
+        .and_then(Value::as_i64)
+        .ok_or_else(error)
 }
 
 fn is_allowed(addr: SocketAddr, ssl: bool) -> bool {
@@ -206,5 +216,22 @@ fn is_allowed_req(req: &HttpRequest, ssl: bool) -> bool {
         is_allowed(addr, ssl)
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_response_is_bad_request() {
+        assert_eq!(error().status(), actix_web::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn user_id_rejects_missing_or_non_integer_uuid() {
+        assert!(user_id(&json!({})).is_err());
+        assert!(user_id(&json!({ "uuid": "0" })).is_err());
+        assert_eq!(user_id(&json!({ "uuid": 0 })).ok(), Some(0));
     }
 }

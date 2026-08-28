@@ -70,20 +70,37 @@ pub struct IotaPaths {
 impl IotaPaths {
     pub fn resolve(scope: Scope) -> Result<Self, PathError> {
         let defaults = Defaults::for_scope(scope)?;
-        let config_dir = override_first(&["IOTA_CONFIG_DIR"])?.unwrap_or(defaults.config_dir);
+        let data_root = if scope == Scope::User {
+            absolute_env("IOTA_DATA_ROOT")?
+        } else {
+            None
+        };
+        let config_dir = override_first(&["IOTA_CONFIG_DIR"])?
+            .or_else(|| data_root.as_ref().map(|root| root.join("config")))
+            .unwrap_or(defaults.config_dir);
         // IOTA_DATA_DIR is intentionally only a compatibility alias.  Parse it
         // exactly like every other override; do not hide an invalid value.
-        let state_dir =
-            override_first(&["IOTA_STATE_DIR", "IOTA_DATA_DIR"])?.unwrap_or(defaults.state_dir);
-        let cache_dir = override_first(&["IOTA_CACHE_DIR"])?.unwrap_or(defaults.cache_dir);
-        let runtime_dir = override_first(&["IOTA_RUNTIME_DIR"])?.or(defaults.runtime_dir);
-        let log_dir = override_first(&["IOTA_LOG_DIR"])?.unwrap_or(defaults.log_dir);
+        let state_dir = override_first(&["IOTA_STATE_DIR", "IOTA_DATA_DIR"])?
+            .or_else(|| data_root.as_ref().map(|root| root.join("state")))
+            .unwrap_or(defaults.state_dir);
+        let cache_dir = override_first(&["IOTA_CACHE_DIR"])?
+            .or_else(|| data_root.as_ref().map(|root| root.join("cache")))
+            .unwrap_or(defaults.cache_dir);
+        let runtime_dir = override_first(&["IOTA_RUNTIME_DIR"])?
+            .or_else(|| data_root.as_ref().map(|root| root.join("runtime")))
+            .or(defaults.runtime_dir);
+        let log_dir = override_first(&["IOTA_LOG_DIR"])?
+            .or_else(|| data_root.as_ref().map(|root| root.join("logs")))
+            .unwrap_or(defaults.log_dir);
         let asset_dir = override_first(&["IOTA_ASSET_DIR", "IOTA_WEB_ASSET_DIR"])?
+            .or_else(|| data_root.as_ref().map(|root| root.join("web")))
             .unwrap_or(defaults.asset_dir);
-        let install_root = override_first(&["IOTA_INSTALL_ROOT"])?.unwrap_or(defaults.install_root);
+        let install_root = override_first(&["IOTA_INSTALL_ROOT"])?
+            .or_else(|| data_root.as_ref().map(|root| root.join("bin")))
+            .unwrap_or(defaults.install_root);
         let config_file = override_first(&["IOTA_CONFIG_FILE"])?
             .unwrap_or_else(|| config_dir.join("config.yaml"));
-        let ipc_endpoint = resolve_ipc(scope, defaults.ipc_endpoint)?;
+        let ipc_endpoint = resolve_ipc(scope, defaults.ipc_endpoint, data_root.as_deref())?;
         let runtime_dir = runtime_dir.or_else(|| match &ipc_endpoint {
             IpcEndpoint::UnixSocket(path) => path.parent().map(Path::to_path_buf),
             IpcEndpoint::WindowsPipe(_) => None,
@@ -136,10 +153,20 @@ impl IotaPaths {
             &self.cache_dir,
             &self.log_dir,
         ] {
-            create_directory(directory, self.scope == Scope::User)?;
+            create_directory(directory, self.scope == Scope::User).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("cannot prepare {}: {error}", directory.display()),
+                )
+            })?;
         }
         if let Some(runtime) = &self.runtime_dir {
-            create_directory(runtime, self.scope == Scope::User)?;
+            create_directory(runtime, self.scope == Scope::User).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("cannot prepare {}: {error}", runtime.display()),
+                )
+            })?;
         }
         Ok(())
     }
@@ -337,11 +364,18 @@ fn override_first(names: &[&'static str]) -> Result<Option<PathBuf>, PathError> 
     }
     Ok(None)
 }
-fn resolve_ipc(scope: Scope, default: Option<IpcEndpoint>) -> Result<IpcEndpoint, PathError> {
+fn resolve_ipc(
+    scope: Scope,
+    default: Option<IpcEndpoint>,
+    data_root: Option<&Path>,
+) -> Result<IpcEndpoint, PathError> {
     #[cfg(unix)]
     {
         if let Some(path) = absolute_env("IOTA_SOCKET")? {
             return Ok(IpcEndpoint::UnixSocket(path));
+        }
+        if let Some(root) = data_root {
+            return Ok(IpcEndpoint::UnixSocket(root.join("runtime/iota.sock")));
         }
         if scope == Scope::User {
             return Err(PathError::MissingRequiredOverride("IOTA_SOCKET"));
@@ -451,9 +485,13 @@ pub fn daemon_endpoints() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
+    static ENVIRONMENT: Mutex<()> = Mutex::new(());
     #[test]
     fn system_layout_is_fhs() {
         let p = IotaPaths::resolve(Scope::System).unwrap();
@@ -500,5 +538,32 @@ mod tests {
         assert!(paths.config_file.is_file());
         assert!(state.join("path-layout-v2.json").is_file());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn data_root_keeps_unmanaged_user_paths_together() {
+        let _guard = ENVIRONMENT.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "iota-data-root-test-{}-{}",
+            std::process::id(),
+            TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        unsafe {
+            std::env::set_var("IOTA_DATA_ROOT", &root);
+        }
+        let paths = IotaPaths::resolve(Scope::User).unwrap();
+        unsafe {
+            std::env::remove_var("IOTA_DATA_ROOT");
+        }
+
+        assert_eq!(paths.config_file, root.join("config/config.yaml"));
+        assert_eq!(paths.state_dir, root.join("state"));
+        assert_eq!(paths.cache_dir, root.join("cache"));
+        assert_eq!(paths.log_dir, root.join("logs"));
+        assert_eq!(paths.runtime_dir, Some(root.join("runtime")));
+        assert_eq!(
+            paths.ipc_endpoint,
+            IpcEndpoint::UnixSocket(root.join("runtime/iota.sock"))
+        );
     }
 }

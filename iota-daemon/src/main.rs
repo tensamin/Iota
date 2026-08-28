@@ -102,15 +102,18 @@ async fn main() -> ExitCode {
     let (state_tx, state_rx) = watch::channel(runtime.snapshot());
 
     runtime.set_startup_phase(StartupPhase::LoadingUsers);
-    if tokio::task::spawn_blocking(user_manager::load_users_sync)
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .is_none()
-    {
+    let storage_error = match iota_storage::util::db::verify_and_backup_database() {
+        Ok(()) => tokio::task::spawn_blocking(user_manager::load_users_sync)
+            .await
+            .map_err(|error| format!("user storage task failed: {error}"))
+            .and_then(|result| result.map_err(|error| error.to_string()))
+            .err(),
+        Err(error) => Some(error.to_string()),
+    };
+    if let Some(error) = storage_error {
         runtime.set_component_failed(
             iota_ipc::ComponentId::Storage,
-            "user storage failed to load".into(),
+            format!("user storage failed to load: {error}"),
         );
     } else {
         runtime.set_component_healthy(iota_ipc::ComponentId::Storage, None);

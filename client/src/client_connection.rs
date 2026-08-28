@@ -288,8 +288,8 @@ impl ClientConnection {
 
         if cv.is_type(CommunicationType::SettingsSave) {
             let my_id = cv.get_sender();
-            let settings_name = cv.get_data(DataType::SettingsName).as_str().unwrap();
-            let settings_value = cv.get_data(DataType::Payload).as_str().unwrap();
+            let Some(settings_name) = cv.get_data(DataType::SettingsName).as_str() else { return };
+            let Some(settings_value) = cv.get_data(DataType::Payload).as_str() else { return };
 
             let _ = iota_storage::util::settings::save(
                 my_id as i64,
@@ -308,7 +308,7 @@ impl ClientConnection {
 
         if cv.is_type(CommunicationType::SettingsLoad) {
             let my_id = cv.get_sender();
-            let settings_name = cv.get_data(DataType::SettingsName).as_string().unwrap();
+        let Some(settings_name) = cv.get_data(DataType::SettingsName).as_string() else { return };
             let settings_value_str = iota_storage::util::settings::load(
                 my_id as i64,
                 iota_storage::util::settings::GLOBAL_SESSION_ID,
@@ -350,7 +350,7 @@ impl ClientConnection {
             return;
         };
 
-        let encrypted_challenge = cv.get_data(DataType::Challenge).as_str().unwrap();
+        let Some(encrypted_challenge) = cv.get_data(DataType::Challenge).as_str() else { return };
 
         let solved = crypto_util::decrypt_challenge(encrypted_challenge, &keyring).ok();
 

@@ -30,14 +30,13 @@ impl Category {
                 .find(|child| child.get_name() == &name)
                 .cloned()
         } else {
-            let sub_module = path.split("/").next().unwrap();
+            let sub_module = path.split('/').next()?;
             let next = self
                 .children
                 .iter()
-                .find(|child| child.get_name() == sub_module)
-                .unwrap();
+                .find(|child| child.get_name() == sub_module)?;
             if next.get_codec() == "category" {
-                let next_cat = next.as_any().downcast_ref::<Category>().unwrap();
+                let next_cat = next.as_any().downcast_ref::<Category>()?;
                 next_cat.get_child(path, name)
             } else {
                 Some(next.clone())

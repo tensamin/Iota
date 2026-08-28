@@ -40,7 +40,7 @@ impl ConsentRecord {
 }
 
 fn matches_doc(value: &Option<(String, String)>, doc: &Doc) -> bool {
-    matches!(value, Some((version, hash)) if version == &doc.get_version() && hash == &doc.get_hash())
+    matches!(value, Some((_, hash)) if hash == &doc.get_hash())
 }
 
 pub fn load(state_dir: &Path) -> ConsentRecord {
@@ -82,8 +82,5 @@ pub fn save(state_dir: &Path, record: &ConsentRecord) -> io::Result<()> {
             text.push_str(&format!("{name}={version}:{hash}\n"));
         }
     }
-    let path = state_dir.join(FILE_NAME);
-    let temporary = state_dir.join(format!(".{FILE_NAME}.{}.tmp", std::process::id()));
-    fs::write(&temporary, text)?;
-    fs::rename(temporary, path)
+    iota_util::atomic_file::replace(&state_dir.join(FILE_NAME), text.as_bytes(), 3)
 }

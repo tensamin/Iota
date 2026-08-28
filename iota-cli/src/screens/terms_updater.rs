@@ -201,7 +201,7 @@ impl Screen for TermsUpdaterScreen {
             if self.eula_future {
                 if size.width < 80 {
                     text_lines.push(checkbox(
-                        "EULA ¹³ (https://legal.tensamin.net/eula/newest/)",
+                        "EULA ¹³ (https://legal.methanium.net/tensamin/eula)",
                         self.eula,
                         self.focus == Focus::Eula,
                         true,
@@ -214,7 +214,7 @@ impl Screen for TermsUpdaterScreen {
                     text_lines.push(Line::from(format!("    Goes into effect on {}", date)));
                 } else {
                     text_lines.push(checkbox(
-                        "End User Licence Agreement ¹³ (https://legal.tensamin.net/eula/newest/)",
+                        "End User Licence Agreement ¹³ (https://legal.methanium.net/tensamin/eula)",
                         self.eula,
                         self.focus == Focus::Eula,
                         true,
@@ -229,14 +229,14 @@ impl Screen for TermsUpdaterScreen {
             } else {
                 if size.width < 80 {
                     text_lines.push(checkbox(
-                        "EULA ¹ (https://legal.tensamin.net/eula/newest/)",
+                        "EULA ¹ (https://legal.methanium.net/tensamin/eula)",
                         self.eula,
                         self.focus == Focus::Eula,
                         true,
                     ));
                 } else {
                     text_lines.push(checkbox(
-                        "End User Licence Agreement ¹ (https://legal.tensamin.net/eula/newest/)",
+                        "End User Licence Agreement ¹ (https://legal.methanium.net/tensamin/eula)",
                         self.eula,
                         self.focus == Focus::Eula,
                         true,
@@ -250,7 +250,7 @@ impl Screen for TermsUpdaterScreen {
             if self.tos_future {
                 if size.width < 80 {
                     text_lines.push(checkbox(
-                        "ToS ²³ (https://legal.tensamin.net/tos/newest/)",
+                        "ToS ²³ (https://legal.methanium.net/tensamin/terms-of-service)",
                         self.tos,
                         self.focus == Focus::Tos,
                         self.eula,
@@ -263,7 +263,7 @@ impl Screen for TermsUpdaterScreen {
                     text_lines.push(Line::from(format!("    Goes into effect on {}", date)));
                 } else {
                     text_lines.push(checkbox(
-                        "Terms of Service ²³ (https://legal.tensamin.net/terms-of-service/newest/)",
+                        "Terms of Service ²³ (https://legal.methanium.net/tensamin/terms-of-service)",
                         self.tos,
                         self.focus == Focus::Tos,
                         self.eula,
@@ -278,14 +278,14 @@ impl Screen for TermsUpdaterScreen {
             } else {
                 if size.width < 80 {
                     text_lines.push(checkbox(
-                        "ToS ² (https://legal.tensamin.net/tos/newest/)",
+                        "ToS ² (https://legal.methanium.net/tensamin/terms-of-service)",
                         self.tos,
                         self.focus == Focus::Tos,
                         self.eula,
                     ));
                 } else {
                     text_lines.push(checkbox(
-                        "Terms of Service ² (https://legal.tensamin.net/terms-of-service/newest/)",
+                        "Terms of Service ² (https://legal.methanium.net/tensamin/terms-of-service)",
                         self.tos,
                         self.focus == Focus::Tos,
                         self.eula,
@@ -299,7 +299,7 @@ impl Screen for TermsUpdaterScreen {
             if self.pp_future {
                 if size.width < 80 {
                     text_lines.push(checkbox(
-                        "PP ²³ (https://legal.tensamin.net/privacy-policy/newest/)",
+                        "PP ²³ (https://legal.methanium.net/tensamin/privacy-policy)",
                         self.pp,
                         self.focus == Focus::Pp,
                         self.eula,
@@ -312,7 +312,7 @@ impl Screen for TermsUpdaterScreen {
                     text_lines.push(Line::from(format!("    Goes into effect on {}", date)));
                 } else {
                     text_lines.push(checkbox(
-                        "Privacy Policy ²³ (https://legal.tensamin.net/privacy-policy/newest/)",
+                        "Privacy Policy ²³ (https://legal.methanium.net/tensamin/privacy-policy)",
                         self.pp,
                         self.focus == Focus::Pp,
                         self.eula,
@@ -327,14 +327,14 @@ impl Screen for TermsUpdaterScreen {
             } else {
                 if size.width < 80 {
                     text_lines.push(checkbox(
-                        "PP ² (https://legal.tensamin.net/privacy-policy/newest/)",
+                        "PP ² (https://legal.methanium.net/tensamin/privacy-policy)",
                         self.pp,
                         self.focus == Focus::Pp,
                         self.eula,
                     ));
                 } else {
                     text_lines.push(checkbox(
-                        "Privacy Policy ² (https://legal.tensamin.net/privacy-policy/newest/)",
+                        "Privacy Policy ² (https://legal.methanium.net/tensamin/privacy-policy)",
                         self.pp,
                         self.focus == Focus::Pp,
                         self.eula,

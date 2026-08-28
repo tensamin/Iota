@@ -5,33 +5,17 @@ edition = "2024"
 
 [dependencies]
 iota-logger = { path = "../iota-logger" }
-iota-state = { path = "../iota-state" }
 iota-util = { path = "../iota-util" }
 iota-paths = { path = "../iota-paths" }
 
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git" }
-
-aes-gcm = "0.10.3"
 base64 = "0.22.1"
-hex = "*"
-hkdf = "0.12.4"
 json = "*"
 arc-swap = "1"
 once_cell = "1.21.3"
 r2d2 = "0.8"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 serde_yaml = "0.9"
 thiserror = "2"
 rand = "0.8"
-rand_core = { version = "0.6", features = ["getrandom", "std"] }
-ratatui = "0.30.0"
-reqwest = "0.13.2"
 rusqlite = "0.40.0"
-sha2 = "0.11.0"
-sysinfo = "0.39.0"
 tokio = { version = "1.50.0", features = ["full"] }
-uuid = { version = "*", features = ["v4"] }
-walkdir = "2.5.0"
-x448 = { version = "*" }
-zip = "6.0.0"

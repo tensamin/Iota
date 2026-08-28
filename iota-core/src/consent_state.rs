@@ -2,9 +2,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iota_cli::screens::terms_checker::{TermsCheckerScreen, UserChoice};
-use iota_cli::screens::terms_updater::{TermsUpdaterScreen, UpdateDecision};
 use iota_cli::ui::UI;
-use iota_terms::{Doc, TermsType as Type, get_current_docs, get_newest_docs};
+use iota_terms::{Doc, TermsType as Type, get_current_docs};
 use iota_util::file_util::{load_file, save_file};
 use tokio::sync::oneshot;
 
@@ -12,9 +11,11 @@ pub async fn check(ui: Arc<UI>) -> Result<(bool, bool), String> {
     let mut state = ConsentState::load_state();
 
     ensure_initial_consent(ui.clone(), &mut state).await?;
-    // A mandatory document update is a hard bootstrap gate. In particular,
-    // refusing it must not allow service setup or daemon access to continue.
-    ensure_updates(ui, &mut state).await?;
+    /*
+     * The raw legal endpoint exposes only the current document. Restore this
+     * flow when it provides future versions that users can accept early.
+     */
+    // ensure_updates(ui, &mut state).await?;
 
     state = state.sanitize();
     state.save_state();
@@ -42,11 +43,9 @@ async fn ensure_initial_consent(ui: Arc<UI>, state: &mut ConsentState) -> Result
         return Ok(());
     }
 
-    let docs = get_current_docs().await;
-    if docs.is_none() {
-        return Err("Could not connect to the legal endpoint to fetch the current agreements. Please check your internet connection.".to_string());
-    }
-    let (current_eula, current_tos, current_privacy) = docs.unwrap();
+    let (current_eula, current_tos, current_privacy) = get_current_docs().await.ok_or_else(|| {
+        "Could not connect to the legal endpoint to fetch the current agreements. Please check your internet connection.".to_string()
+    })?;
 
     let (tx, rx) = oneshot::channel();
 
@@ -73,6 +72,7 @@ async fn ensure_initial_consent(ui: Arc<UI>, state: &mut ConsentState) -> Result
         UserChoice::Deny => Ok(()),
     }
 }
+/*
 async fn ensure_updates(ui: Arc<UI>, state: &mut ConsentState) -> Result<(), String> {
     let Some((eula_update, tos_update, privacy_update)) = get_updates().await else {
         return Ok(());
@@ -115,6 +115,8 @@ async fn ensure_updates(ui: Arc<UI>, state: &mut ConsentState) -> Result<(), Str
     state.save_state();
     Ok(())
 }
+*/
+/*
 fn apply_future_updates(
     state: &mut ConsentState,
     result: UserChoice,
@@ -225,6 +227,7 @@ async fn get_updates() -> Option<(
         None
     }
 }
+*/
 
 #[derive(Debug, Clone)]
 pub struct ConsentState {
@@ -299,7 +302,7 @@ impl ConsentState {
 
         if let Some(eula) = &self.eula {
             file_out.push_str(&format!("\
-            \n\"EULA=true\" indicates that you read, understood and accepted Tensamin's End User Licence agreement. You can find our EULA at https://legal.tensamin.net/eula/\
+            \n\"EULA=true\" indicates that you read, understood and accepted Tensamin's End User Licence agreement. You can find our EULA at https://legal.methanium.net/tensamin/eula\
             \nEULA={}\
             \nEULA-VERSION={}\
             \nEULA-HASH={}\
@@ -309,7 +312,7 @@ impl ConsentState {
                 && let Some(tos) = &self.tos
             {
                 file_out.push_str(&format!("\
-                \n\"Terms-of-Service=true\" indicates that you read, understood and accepted Tensamin's Terms of Service. You can find our Terms of Serivce at https://legal.tensamin.net/tos/\
+                \n\"Terms-of-Service=true\" indicates that you read, understood and accepted Tensamin's Terms of Service. You can find our Terms of Serivce at https://legal.methanium.net/tensamin/terms-of-service\
                 \nTerms-of-Service={}\
                 \nTerms-of-Service-VERSION={}\
                 \nTerms-of-Service-HASH={}\
@@ -319,7 +322,7 @@ impl ConsentState {
                 && let Some(pp) = &self.privacy
             {
                 file_out.push_str(&format!("\
-                \n\"Privacy-Policy=true\" indicates that you read, understood and accepted Tensamin's Privacy Policy. You can find our Privacy Policy at https://legal.tensamin.net/privacy/\
+                \n\"Privacy-Policy=true\" indicates that you read, understood and accepted Tensamin's Privacy Policy. You can find our Privacy Policy at https://legal.methanium.net/tensamin/privacy-policy\
                 \nPrivacy-Policy={}\
                 \nPrivacy-Policy-VERSION={}\
                 \nPrivacy-Policy-HASH={}\
@@ -327,7 +330,7 @@ impl ConsentState {
             }
         } else {
             file_out.push_str("\
-                \n\"EULA=true\" indicates that you read, understood and accepted Tensamin's End User Licence Agreement. You can find Tensamin's EULA at https://legal.tensamin.net/eula/\
+                \n\"EULA=true\" indicates that you read, understood and accepted Tensamin's End User Licence Agreement. You can find Tensamin's EULA at https://legal.methanium.net/tensamin/eula\
                 \nEULA=false\
                 ");
         }

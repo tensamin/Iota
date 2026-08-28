@@ -1,6 +1,5 @@
-use json::JsonValue::Object;
-
 use crate::doc::Doc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Type {
@@ -13,8 +12,8 @@ impl Type {
     pub fn to_str(&self) -> &str {
         match self {
             Self::EULA => "eula",
-            Self::TOS => "tos",
-            Self::PP => "privacy",
+            Self::TOS => "terms-of-service",
+            Self::PP => "privacy-policy",
         }
     }
     pub fn to_string(&self) -> String {
@@ -27,79 +26,73 @@ impl Type {
 }
 
 pub fn get_link(terms_type: Type) -> String {
-    format!("https://legal.tensamin.net/{}/", terms_type.to_str())
+    format!(
+        "https://legal.methanium.net/tensamin/{}",
+        terms_type.to_str()
+    )
 }
+
+/*
+ * The legal service exposes only its latest raw documents. Keep this helper
+ * for the dormant pre-emptive-acceptance UI until it has a source of future
+ * document versions again.
+ */
 pub fn get_newest_link(terms_type: Type) -> String {
-    format!("https://legal.tensamin.net/{}/newest/", terms_type.to_str())
+    get_link(terms_type)
 }
 
 pub async fn get_current_docs() -> Option<(Doc, Doc, Doc)> {
-    let body = reqwest::get("https://legal.tensamin.net/api/current/")
-        .await
-        .ok()?
-        .text()
-        .await
-        .ok()?;
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let (eula, tos, privacy) = tokio::join!(
+        get_terms(Type::EULA),
+        get_terms(Type::TOS),
+        get_terms(Type::PP),
+    );
 
-    let json = json::parse(&body).ok()?;
-
-    if let Object(eula) = &json["eula"] {
-        if let Object(tos) = &json["tos"] {
-            if let Object(pp) = &json["pp"] {
-                Some((
-                    Doc::from_json(Type::EULA, eula.clone())?,
-                    Doc::from_json(Type::TOS, tos.clone())?,
-                    Doc::from_json(Type::PP, pp.clone())?,
-                ))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+    Some((
+        Doc::from_raw(Type::EULA, eula?, timestamp),
+        Doc::from_raw(Type::TOS, tos?, timestamp),
+        Doc::from_raw(Type::PP, privacy?, timestamp),
+    ))
 }
 
+/*
+ * Future documents are unavailable from the raw endpoint. Restore this API
+ * with the pre-emptive-acceptance flow when the service provides them again.
+ *
 pub async fn get_newest_docs() -> Option<(Doc, Doc, Doc)> {
-    let body = reqwest::get("https://legal.tensamin.net/api/newest/")
-        .await
-        .ok()?
-        .text()
-        .await
-        .ok()?;
-
-    let json = json::parse(&body).ok()?;
-
-    if let Object(eula) = &json["eula"] {
-        if let Object(tos) = &json["tos"] {
-            if let Object(pp) = &json["pp"] {
-                Some((
-                    Doc::from_json(Type::EULA, eula.clone())?,
-                    Doc::from_json(Type::TOS, tos.clone())?,
-                    Doc::from_json(Type::PP, pp.clone())?,
-                ))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+    None
 }
+*/
+
 pub async fn get_terms(terms_type: Type) -> Option<String> {
-    let body = reqwest::get(format!(
-        "https://legal.tensamin.net/api/text/{}/",
+    reqwest::get(format!(
+        "https://legal.methanium.net/tensamin/{}/raw",
         terms_type.to_str()
     ))
     .await
     .ok()?
     .text()
     .await
-    .ok()?;
+    .ok()
+}
 
-    Some(body)
+#[cfg(test)]
+mod tests {
+    use super::{Type, get_link};
+
+    #[test]
+    fn maps_document_types_to_tensamin_raw_document_names() {
+        assert_eq!(Type::EULA.to_str(), "eula");
+        assert_eq!(Type::TOS.to_str(), "terms-of-service");
+        assert_eq!(Type::PP.to_str(), "privacy-policy");
+    }
+
+    #[test]
+    fn links_to_the_tensamin_document_page() {
+        assert_eq!(
+            get_link(Type::TOS),
+            "https://legal.methanium.net/tensamin/terms-of-service"
+        );
+    }
 }

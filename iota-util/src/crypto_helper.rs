@@ -6,7 +6,10 @@ pub fn generate_keyring() -> Keyring {
 }
 
 pub fn keyring_to_base64(keyring: &Keyring) -> String {
-    STANDARD.encode(keyring.to_bytes())
+    keyring
+        .try_to_bytes()
+        .map(|bytes| STANDARD.encode(bytes))
+        .unwrap_or_default()
 }
 
 pub fn keyring_from_base64(s: &str) -> Option<Keyring> {
@@ -15,7 +18,10 @@ pub fn keyring_from_base64(s: &str) -> Option<Keyring> {
 }
 
 pub fn public_key_bundle_to_base64(bundle: &PublicKeyBundle) -> String {
-    STANDARD.encode(bundle.as_bytes())
+    bundle
+        .try_as_bytes()
+        .map(|bytes| STANDARD.encode(bytes))
+        .unwrap_or_default()
 }
 
 pub fn public_key_bundle_from_base64(s: &str) -> Option<PublicKeyBundle> {

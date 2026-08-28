@@ -40,7 +40,7 @@ impl Community {
         let mut buf = [0u8; 56];
         let mut rng = OsRng;
         rng.fill_bytes(&mut buf);
-        let private_key = Secret::from_bytes(&buf).unwrap();
+        let private_key = Secret::from(buf);
         let public_key = PublicKey::from(&private_key);
         Community {
             name: String::new(),
@@ -58,7 +58,7 @@ impl Community {
         let mut buf = [0u8; 56];
         let mut rng = OsRng;
         rng.fill_bytes(&mut buf);
-        let private_key = Secret::from_bytes(&buf).unwrap();
+        let private_key = Secret::from(buf);
         let public_key = PublicKey::from(&private_key);
         let c = Community {
             name,
@@ -125,7 +125,7 @@ impl Community {
         self.members.clone()
     }
     pub fn get_private_key(&self) -> Secret {
-        Secret::from_bytes(self.private_key.as_bytes()).unwrap()
+        Secret::from(*self.private_key.as_bytes())
     }
     pub fn get_public_key(&self) -> &PublicKey {
         &self.public_key
@@ -222,12 +222,14 @@ impl Community {
             for interactable in target_interactables.iter() {
                 if interactable.get_name() == name {
                     if interactable.get_codec() == "category" {
-                        let category: &Category =
-                            interactable.as_any().downcast_ref::<Category>().unwrap();
+                        let Some(category) = interactable.as_any().downcast_ref::<Category>() else {
+                            return CommunicationValue::new(CommunicationType::ErrorInternal);
+                        };
                         // cannot move a value of type dyn Interactable the size of dyn Interactable cannot be statically determined (rustc E0161)
                         return category
                             .get_child(path.to_string(), name.to_string())
-                            .unwrap()
+                            .ok_or(CommunicationValue::new(CommunicationType::ErrorInternal))
+                            .unwrap_or_else(|error| return error)
                             .run_function(cv.clone())
                             .await;
                     } else {
@@ -267,7 +269,7 @@ impl Community {
             let mut data = JsonValue::new_object();
 
             let mut permissions = JsonValue::new_array();
-            for perm in self.permissions.get(user).unwrap() {
+            for perm in self.permissions.get(user).into_iter().flatten() {
                 if let Ok(_) = permissions.push(perm.to_string()) {}
             }
 
@@ -287,10 +289,10 @@ impl Community {
 }
 pub async fn load(name: &String) -> Option<Arc<Community>> {
     let file_contents = file_util::load_file(&format!("communities/{}/", name), "config.json");
-    let json_content = json::parse(&file_contents).unwrap();
+    let json_content = json::parse(&file_contents).ok()?;
 
     let user_data = file_util::load_file(&format!("communities/{}/", name), "users.json");
-    let user_json: JsonValue = json::parse(&user_data).unwrap();
+    let user_json: JsonValue = json::parse(&user_data).ok()?;
     let mut users = Vec::new();
     let mut permissions: HashMap<i64, Vec<Permission>> = HashMap::new();
 
@@ -318,25 +320,17 @@ pub async fn load(name: &String) -> Option<Arc<Community>> {
     };
 
     let community = Community {
-        name: json_content["name"].as_str().unwrap().to_string(),
+        name: json_content["name"].as_str()?.to_string(),
         owner_id: Arc::new(RwLock::new(json_content["owner_id"].as_i64().unwrap_or(0))),
         members: users,
         roles,
         permissions,
         private_key: Secret::from_bytes(
-            &STANDARD
-                .decode(json_content["private_key"].as_str().unwrap())
-                .unwrap(),
-        )
-        .unwrap(),
-        public_key: PublicKey::from(
-            &Secret::from_bytes(
-                &STANDARD
-                    .decode(json_content["private_key"].as_str().unwrap())
-                    .unwrap(),
-            )
-            .unwrap(),
-        ),
+            &STANDARD.decode(json_content["private_key"].as_str()?).ok()?,
+        )?,
+        public_key: PublicKey::from(&Secret::from_bytes(
+            &STANDARD.decode(json_content["private_key"].as_str()?).ok()?,
+        )?),
         interactables: Arc::new(RwLock::new(Vec::new())),
         connections: Arc::new(RwLock::new(HashMap::new())),
     };
@@ -346,7 +340,7 @@ pub async fn load(name: &String) -> Option<Arc<Community>> {
         file_util::get_children(&format!("communities/{}/interactables/", name));
     for file in interactable_files {
         if file.contains(".json") {
-            let name = file.split('.').next().unwrap().to_string();
+            let Some(name) = file.split('.').next().map(str::to_string) else { continue };
             let interactable: Box<dyn Interactable> =
                 registry::load(comarc.clone(), String::new(), name).await;
             comarc.add_interactable(Arc::new(interactable)).await;

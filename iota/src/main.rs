@@ -40,33 +40,6 @@ async fn run() -> Result<(), StartupError> {
         unicode,
         command,
     } = invocation;
-    let local_endpoint = match iota_paths::IotaPaths::resolve(iota_paths::Scope::User)
-        .map_err(|error| StartupError::Other(format!("Cannot resolve user IPC path: {error}")))?
-        .ipc_endpoint
-    {
-        iota_paths::IpcEndpoint::UnixSocket(path) => path,
-        iota_paths::IpcEndpoint::WindowsPipe(name) => {
-            return Err(StartupError::Other(format!(
-                "Windows IPC endpoint {name} is not supported by this client build"
-            )));
-        }
-    };
-    let system_endpoint = match iota_paths::IotaPaths::resolve(iota_paths::Scope::System)
-        .map_err(|error| StartupError::Other(format!("Cannot resolve system IPC path: {error}")))?
-        .ipc_endpoint
-    {
-        iota_paths::IpcEndpoint::UnixSocket(path) => path,
-        iota_paths::IpcEndpoint::WindowsPipe(name) => {
-            return Err(StartupError::Other(format!(
-                "Windows IPC endpoint {name} is not supported by this client build"
-            )));
-        }
-    };
-    let endpoints = daemon_setup_flow::DaemonEndpoints {
-        local: local_endpoint,
-        system: system_endpoint,
-    };
-
     match command {
         Command::Help => {
             print_help();
@@ -91,7 +64,12 @@ async fn run() -> Result<(), StartupError> {
             )
             .map_err(|error| StartupError::Other(format!("Installation failed: {error}")))
         }
+        Command::Bootstrap { bundle, operator } => {
+            iota_installer::bootstrap_linux_bundle(Path::new(&bundle), operator.as_deref())
+                .map_err(|error| StartupError::Other(format!("Bootstrap failed: {error}")))
+        }
         command => {
+            let endpoints = resolve_endpoints()?;
             if matches!(
                 command,
                 Command::DaemonEnable { .. }
@@ -121,6 +99,32 @@ async fn run() -> Result<(), StartupError> {
             run_dashboard(theme_override, color, unicode, endpoints).await
         }
     }
+}
+
+fn resolve_endpoints() -> Result<daemon_setup_flow::DaemonEndpoints, StartupError> {
+    let local = match iota_paths::IotaPaths::resolve(iota_paths::Scope::User)
+        .map_err(|error| StartupError::Other(format!("Cannot resolve user IPC path: {error}")))?
+        .ipc_endpoint
+    {
+        iota_paths::IpcEndpoint::UnixSocket(path) => path,
+        iota_paths::IpcEndpoint::WindowsPipe(name) => {
+            return Err(StartupError::Other(format!(
+                "Windows IPC endpoint {name} is not supported by this client build"
+            )));
+        }
+    };
+    let system = match iota_paths::IotaPaths::resolve(iota_paths::Scope::System)
+        .map_err(|error| StartupError::Other(format!("Cannot resolve system IPC path: {error}")))?
+        .ipc_endpoint
+    {
+        iota_paths::IpcEndpoint::UnixSocket(path) => path,
+        iota_paths::IpcEndpoint::WindowsPipe(name) => {
+            return Err(StartupError::Other(format!(
+                "Windows IPC endpoint {name} is not supported by this client build"
+            )));
+        }
+    };
+    Ok(daemon_setup_flow::DaemonEndpoints { local, system })
 }
 
 async fn run_startup_command(command: Command) -> Result<(), StartupError> {
@@ -406,6 +410,7 @@ fn print_help() {
     println!("  config get             Show current configuration");
     println!("  config set <KEY> <VAL> Set a configuration value");
     println!("  config reload          Reload configuration");
+    println!("  health                 Show component health");
     println!("  components             Show component health");
     println!("  logs [--limit N]       Show recent log entries");
     println!("  update check           Check for updates");
@@ -422,6 +427,7 @@ fn print_help() {
     println!("  daemon restart-service Restart the daemon service");
     println!("  daemon stop-service    Stop the daemon service");
     println!("  daemon install         Install from a bundle");
+    println!("  daemon bootstrap       Install and enable a Linux systemd bundle");
     println!("  help                   Show this help message");
     println!("  completions <SHELL>    Generate shell completions");
     println!("  man                    Show the man page");
@@ -630,6 +636,7 @@ async fn run_command(
         Command::ConfigGet => LocalRequest::GetConfig,
         Command::ConfigSet { key, value } => LocalRequest::SetConfig { key, value },
         Command::ConfigReload => LocalRequest::ReloadConfig,
+        Command::Health => LocalRequest::ListComponents,
         Command::Components => LocalRequest::ListComponents,
         Command::Logs { limit } => LocalRequest::GetLogs { limit },
         Command::UpdateCheck => LocalRequest::CheckUpdate,
@@ -657,6 +664,7 @@ async fn run_command(
         | Command::Completions { .. }
         | Command::ManPage
         | Command::Install { .. }
+        | Command::Bootstrap { .. }
         | Command::TermsStatus { .. }
         | Command::TermsShow { .. }
         | Command::TermsAccept { .. }

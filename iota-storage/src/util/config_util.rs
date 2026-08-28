@@ -149,10 +149,8 @@ pub fn save_config_to(path: &Path) {
                 return;
             }
         }
-        let temporary = path.with_extension("yaml.tmp");
-        if let Err(error) = fs::write(&temporary, yaml).and_then(|_| fs::rename(&temporary, path)) {
+        if let Err(error) = iota_util::atomic_file::replace(path, yaml.as_bytes(), 3) {
             eprintln!("Cannot save {}: {error}", path.display());
-            let _ = fs::remove_file(temporary);
         }
     }
 }

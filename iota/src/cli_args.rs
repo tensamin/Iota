@@ -93,6 +93,7 @@ enum CliCommand {
         yes: bool,
     },
     Components,
+    Health,
     Logs {
         #[arg(long, default_value_t = 100)]
         limit: usize,
@@ -209,6 +210,12 @@ enum DaemonAction {
         #[arg(long)]
         operator: Option<String>,
     },
+    Bootstrap {
+        #[arg(long)]
+        bundle: String,
+        #[arg(long)]
+        operator: Option<String>,
+    },
 }
 #[derive(Args, Debug)]
 struct UpdateArgs {
@@ -276,6 +283,10 @@ pub enum Command {
         bundle: String,
         operator: Option<String>,
     },
+    Bootstrap {
+        bundle: String,
+        operator: Option<String>,
+    },
     Status,
     Tasks,
     UsersList,
@@ -329,6 +340,7 @@ pub enum Command {
         confirmed: bool,
     },
     Components,
+    Health,
     Logs {
         limit: usize,
     },
@@ -388,6 +400,7 @@ impl CliInvocation {
             Some(CliCommand::Status) => Command::Status,
             Some(CliCommand::Tasks) => Command::Tasks,
             Some(CliCommand::Components) => Command::Components,
+            Some(CliCommand::Health) => Command::Health,
             Some(CliCommand::Completions { shell }) => Command::Completions { shell },
             Some(CliCommand::Man) => Command::ManPage,
             Some(CliCommand::Users(users)) => match users.action {
@@ -463,6 +476,9 @@ impl CliInvocation {
                 DaemonAction::RestartService => Command::DaemonRestartService,
                 DaemonAction::StopService => Command::DaemonStopService,
                 DaemonAction::Install { bundle, operator } => Command::Install { bundle, operator },
+                DaemonAction::Bootstrap { bundle, operator } => {
+                    Command::Bootstrap { bundle, operator }
+                }
             },
         };
         Ok(Self {
@@ -542,6 +558,12 @@ mod tests {
     }
 
     #[test]
+    fn parses_health() {
+        let invocation = CliInvocation::parse(["health".into()]).unwrap();
+        assert_eq!(invocation.command, Command::Health);
+    }
+
+    #[test]
     fn parses_terminal_capability_overrides() {
         let invocation =
             CliInvocation::parse(["--color=never".into(), "--unicode".into(), "always".into()])
@@ -593,6 +615,26 @@ mod tests {
         assert_eq!(
             invocation.command,
             Command::Install {
+                bundle: "release.zip".into(),
+                operator: Some("alice".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_bootstrap_operator() {
+        let invocation = CliInvocation::parse([
+            "daemon".into(),
+            "bootstrap".into(),
+            "--bundle".into(),
+            "release.zip".into(),
+            "--operator".into(),
+            "alice".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            invocation.command,
+            Command::Bootstrap {
                 bundle: "release.zip".into(),
                 operator: Some("alice".into()),
             }

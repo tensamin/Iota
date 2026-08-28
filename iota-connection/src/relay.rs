@@ -1,8 +1,9 @@
 use iota_util::route_target::RouteTarget;
 use mtp::codec::{
-    CommunicationValue, ProtectionPolicy, RelayError, SignaturePolicy, TypeMap,
+    CommunicationValue, ProtectionPolicy, RelayError, RelayOpenOptions, SignaturePolicy, TypeMap,
     VerifiedRelayContent, VerifiedRelayMetadata, forward_relay_frame,
-    open_relay_content_with_keyrings, open_relay_metadata_with, relay_metadata_claimed_signer_id,
+    open_relay_content_with_keyrings, open_relay_metadata_with_without_replay,
+    relay_metadata_claimed_signer_id,
 };
 use mtp::crypto::{Keyring, PublicKeyBundle};
 use std::fmt;
@@ -157,13 +158,12 @@ where
         .type_map()
         .cloned()
         .ok_or(RelayValidationError::MissingTypeMap)?;
-    let metadata = open_relay_metadata_with(
+    let metadata = open_relay_metadata_with_without_replay(
         frame,
         &[keyring],
         Some(claimed_signer),
         move |signer_id| (signer_id == claimed_signer).then(|| resolver_keys.clone()),
-        RELAY_PROTECTION_POLICY,
-        None,
+        RelayOpenOptions::new(RELAY_PROTECTION_POLICY),
     )?;
 
     let context = VerifiedRelayContext {
