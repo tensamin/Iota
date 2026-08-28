@@ -1,6 +1,6 @@
 use once_cell::sync::Lazy;
 use r2d2::ManageConnection;
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +53,17 @@ where
 {
     let conn = POOL.get().map_err(|e| StorageError::Pool(e.to_string()))?;
     f(&conn)
+}
+
+pub fn with_immediate_transaction<T, F>(f: F) -> Result<T, StorageError>
+where
+    F: FnOnce(&Transaction<'_>) -> Result<T, StorageError>,
+{
+    let mut conn = POOL.get().map_err(|e| StorageError::Pool(e.to_string()))?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let value = f(&tx)?;
+    tx.commit()?;
+    Ok(value)
 }
 
 /* Verify the persistent database before the pool is initialized. A corrupt
@@ -388,6 +399,71 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    if current_version < 10 {
+        conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_messages_history
+                ON messages (
+                    storage_owner,
+                    external_user,
+                    deleted_by_external,
+                    message_time DESC,
+                    id DESC
+                );
+            PRAGMA user_version = 10;
+            "#,
+        )?;
+    }
+
+    if current_version < 11 {
+        for (column, definition) in [
+            ("relay_signer_id", "relay_signer_id INTEGER"),
+            ("relay_message_id", "relay_message_id TEXT"),
+            ("authored_at", "authored_at INTEGER"),
+            ("origin_iota_received_at", "origin_iota_received_at INTEGER"),
+            ("destination_iota_received_at", "destination_iota_received_at INTEGER"),
+            ("client_received_at", "client_received_at INTEGER"),
+            ("client_received_recorded_at", "client_received_recorded_at INTEGER"),
+            ("read_at", "read_at INTEGER"),
+            ("read_recorded_at", "read_recorded_at INTEGER"),
+        ] {
+            add_column_if_missing(conn, column, definition)?;
+        }
+        for (column, definition) in [
+            ("accepted_at", "accepted_at INTEGER"),
+            ("applied_at", "applied_at INTEGER"),
+            ("queued_at", "queued_at INTEGER"),
+            ("downstream_acked_at", "downstream_acked_at INTEGER"),
+            ("rejected_at", "rejected_at INTEGER"),
+        ] {
+            add_table_column_if_missing(conn, "relay_inbox", column, definition)?;
+        }
+        conn.execute_batch(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_relay_identity
+                ON messages (storage_owner, relay_signer_id, relay_message_id)
+                WHERE relay_message_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS message_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                storage_owner INTEGER NOT NULL,
+                target_signer_id INTEGER NOT NULL,
+                target_message_id TEXT NOT NULL,
+                receipt_signer_id INTEGER NOT NULL,
+                receipt_message_id TEXT NOT NULL,
+                receipt_type TEXT NOT NULL CHECK (receipt_type IN ('received', 'read')),
+                event_at INTEGER NOT NULL,
+                recorded_at INTEGER NOT NULL,
+                UNIQUE(receipt_signer_id, receipt_message_id),
+                UNIQUE(storage_owner, target_signer_id, target_message_id,
+                       receipt_signer_id, receipt_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_receipts_target
+                ON message_receipts (storage_owner, target_signer_id, target_message_id);
+            PRAGMA user_version = 11;
+            "#,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -457,7 +533,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 9);
+        assert_eq!(version, 11);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -470,11 +546,13 @@ mod tests {
     #[test]
     fn migrates_version_five_once_and_is_idempotent() -> Result<(), StorageError> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch("PRAGMA user_version = 5;")?;
+        conn.execute_batch(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, storage_owner INTEGER NOT NULL, external_user INTEGER NOT NULL, message_time INTEGER NOT NULL, content TEXT NOT NULL, sent_by_self INTEGER NOT NULL, message_state TEXT NOT NULL, height INTEGER NOT NULL DEFAULT 0, reply_to INTEGER, edited_count INTEGER NOT NULL DEFAULT 0, deleted_by_external INTEGER NOT NULL DEFAULT 0); PRAGMA user_version = 5;",
+        )?;
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 9);
+        assert_eq!(version, 11);
         for table in [
             "sync_heads",
             "sync_events",

@@ -115,6 +115,9 @@ fn validate_relay_identity(
 pub fn apply_verified_relay_content(
     context: &VerifiedRelayContext,
     content: &VerifiedRelayContent,
+    accepted_at: i64,
+    storage_owner: i64,
+    sent_by_self: bool,
 ) -> Result<(), String> {
     validate_relay_identity(context, &content.content)?;
     let sender_id = i64::try_from(context.signer_id)
@@ -125,8 +128,48 @@ pub fn apply_verified_relay_content(
         .map_err(|_| "Relay creation time exceeds the local storage range".to_string())?;
 
     match content.message_type.as_str() {
+        "MessageState" => {
+            let partner_id = relay_number(
+                &content.content,
+                DataType::ChatPartnerId,
+                &context.type_map,
+            )
+            .and_then(|value| i64::try_from(value).ok())
+            .filter(|id| *id == recipient_id)
+            .ok_or_else(|| "Relay MessageState has an invalid ChatPartnerId".to_string())?;
+            let relay_message_id = relay_string(
+                &content.content,
+                DataType::RelayMessageId,
+                &context.type_map,
+            )
+            .ok_or_else(|| "Relay MessageState is missing RelayMessageId".to_string())?;
+            let event_at = relay_number(&content.content, DataType::EventAt, &context.type_map)
+                .and_then(|value| i64::try_from(value).ok())
+                .ok_or_else(|| "Relay MessageState is missing EventAt".to_string())?;
+            let state = relay_string(
+                &content.content,
+                DataType::MessageState,
+                &context.type_map,
+            )
+            .map(MessageState::from_str)
+            .filter(|state| matches!(state, MessageState::Received | MessageState::Read))
+            .ok_or_else(|| "Relay MessageState has an invalid state".to_string())?;
+            chat_files::record_message_receipt(
+                storage_owner,
+                recipient_id,
+                relay_message_id,
+                sender_id,
+                &context.message_id,
+                state,
+                event_at,
+                now_millis_i64(),
+            )
+            .map_err(|error| error.to_string())?;
+            let _ = partner_id;
+            Ok(())
+        }
         "MessageSend" => {
-            let message = relay_string(&content.content, DataType::AppContent, &context.type_map)
+            let message = relay_string(&content.content, DataType::Content, &context.type_map)
                 .ok_or_else(|| "Relay MessageSend is missing Content".to_string())?;
             let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
                 .and_then(|value| i64::try_from(value).ok())
@@ -136,20 +179,32 @@ pub fn apply_verified_relay_content(
                 .unwrap_or_default();
             let reply_to = relay_number(&content.content, DataType::ReplyId, &context.type_map)
                 .and_then(|value| i64::try_from(value).ok());
-            chat_files::add_message(
-                u128::try_from(send_time)
-                    .map_err(|_| "Relay MessageSend has a negative SendTime".to_string())?,
-                false,
-                recipient_id,
-                sender_id,
-                message,
+            let relay_message_id = relay_string(
+                &content.content,
+                DataType::RelayMessageId,
+                &context.type_map,
+            )
+            .ok_or_else(|| "Relay MessageSend is missing RelayMessageId".to_string())?;
+            chat_files::add_message(chat_files::NewMessage {
+                relay_signer_id: sender_id,
+                relay_message_id,
+                authored_at: created_at,
+                send_time,
+                storage_owner,
+                external_user: if sent_by_self { recipient_id } else { sender_id },
+                sent_by_self,
+                content: message,
                 height,
                 reply_to,
-            );
+                origin_iota_received_at: sent_by_self.then_some(accepted_at),
+                destination_iota_received_at: (!sent_by_self).then_some(accepted_at),
+                initial_state: MessageState::Sent,
+            })
+            .map_err(|error| error.to_string())?;
             Ok(())
         }
         "MessageEdit" => {
-            let message = relay_string(&content.content, DataType::AppContent, &context.type_map)
+            let message = relay_string(&content.content, DataType::Content, &context.type_map)
                 .ok_or_else(|| "Relay MessageEdit is missing Content".to_string())?;
             let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
                 .and_then(|value| i64::try_from(value).ok())
@@ -217,7 +272,7 @@ pub fn handle_message_edit(cv: &CommunicationValue) -> CommunicationValue {
         Ok(mutation) => mutation,
         Err(response) => return response,
     };
-    let Some(content) = cv.get_data(DataType::AppContent).as_str() else {
+    let Some(content) = cv.get_data(DataType::Content).as_str() else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
 
@@ -265,6 +320,9 @@ pub fn handle_message_reaction(cv: &CommunicationValue, add: bool) -> Communicat
 
     match result {
         Ok(()) => success_response(cv),
+        Err(iota_storage::storage_error::StorageError::ReactionLimitReached) => {
+            error_response(cv, CommunicationType::ErrorInvalidData)
+        }
         Err(_) => error_response(cv, CommunicationType::ErrorNotFound),
     }
 }
@@ -288,7 +346,7 @@ fn stored_message_fields(
 ) -> Vec<(DataType, DataValue)> {
     let mut fields = vec![
         (
-            DataType::AppMessageId,
+            DataType::MessageId,
             DataValue::SignedNumber(message.id as i128),
         ),
         (
@@ -296,7 +354,7 @@ fn stored_message_fields(
             DataValue::SignedNumber(message.message_time as i128),
         ),
         (
-            DataType::AppContent,
+            DataType::Content,
             DataValue::Str(message.content.clone()),
         ),
         (
@@ -315,6 +373,25 @@ fn stored_message_fields(
     };
     if let Ok(sender_id) = u128::try_from(sender_id) {
         fields.push((DataType::SenderId, DataValue::UnsignedNumber(sender_id)));
+    }
+    if let Some(relay_message_id) = &message.relay_message_id {
+        fields.push((
+            DataType::RelayMessageId,
+            DataValue::Str(relay_message_id.clone()),
+        ));
+    }
+    for (data_type, timestamp) in [
+        (DataType::AuthoredAt, message.authored_at),
+        (DataType::OriginIotaReceivedAt, message.origin_iota_received_at),
+        (DataType::DestinationIotaReceivedAt, message.destination_iota_received_at),
+        (DataType::ClientReceivedAt, message.client_received_at),
+        (DataType::ClientReceivedRecordedAt, message.client_received_recorded_at),
+        (DataType::ReadAt, message.read_at),
+        (DataType::ReadRecordedAt, message.read_recorded_at),
+    ] {
+        if let Some(timestamp) = timestamp {
+            fields.push((data_type, DataValue::SignedNumber(timestamp.into())));
+        }
     }
     if message.edited {
         fields.push((DataType::Edited, DataValue::Bool(true)));
@@ -398,7 +475,7 @@ pub fn handle_get_chat_secret(cv: &CommunicationValue) -> CommunicationValue {
                 DataValue::Str(record.wrapping_scheme),
             )
             .add_typed_default(
-                DataType::AppCreatedAt,
+                DataType::CreatedAt,
                 DataValue::SignedNumber(record.created_at as i128),
             )
             .add_typed_default(
@@ -760,10 +837,18 @@ pub fn handle_message_get(cv: &CommunicationValue) -> CommunicationValue {
         Err(response) => return response,
     };
 
-    let message = match chat_files::get_message(owner, send_time, partner_id) {
-        Ok(Some(message)) => message,
-        Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
-        Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+    let (message, offset) = match partner_id {
+        Some(partner_id) => match chat_files::get_message_with_offset(owner, partner_id, send_time)
+        {
+            Ok(Some((message, offset))) => (message, Some(offset)),
+            Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
+            Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+        },
+        None => match chat_files::get_message(owner, send_time, None) {
+            Ok(Some(message)) => (message, None),
+            Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
+            Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+        },
     };
 
     let mut response = CommunicationValue::new(CommunicationType::MessageGet)
@@ -771,6 +856,10 @@ pub fn handle_message_get(cv: &CommunicationValue) -> CommunicationValue {
         .with_receiver(u64::try_from(owner).expect("authenticated sender is non-negative"));
     for (data_type, value) in stored_message_fields(&message, owner, message.external_user) {
         response = response.add_typed_default(data_type, value);
+    }
+    if let Some(offset) = offset {
+        response =
+            response.add_typed_default(DataType::Offset, DataValue::SignedNumber(offset as i128));
     }
     response
 }

@@ -2,7 +2,9 @@ use crate::storage_error::StorageError;
 use crate::util::db;
 use crate::util::sync::{self, EntityType, Operation};
 use iota_logger::log;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
+
+pub const MAX_UNIQUE_REACTIONS_PER_MESSAGE: usize = 10;
 
 #[derive(PartialEq, Debug, Clone)]
 pub enum MessageState {
@@ -48,7 +50,16 @@ impl MessageState {
 pub struct StoredMessage {
     pub id: i64,
     pub external_user: i64,
+    pub relay_signer_id: Option<i64>,
+    pub relay_message_id: Option<String>,
     pub message_time: i64,
+    pub authored_at: Option<i64>,
+    pub origin_iota_received_at: Option<i64>,
+    pub destination_iota_received_at: Option<i64>,
+    pub client_received_at: Option<i64>,
+    pub client_received_recorded_at: Option<i64>,
+    pub read_at: Option<i64>,
+    pub read_recorded_at: Option<i64>,
     pub content: String,
     pub edited: bool,
     pub sent_by_self: bool,
@@ -56,6 +67,22 @@ pub struct StoredMessage {
     pub height: i64,
     pub reply_to: Option<i64>,
     pub reactions: Vec<StoredReaction>,
+}
+
+pub struct NewMessage<'a> {
+    pub relay_signer_id: i64,
+    pub relay_message_id: &'a str,
+    pub authored_at: i64,
+    pub send_time: i64,
+    pub storage_owner: i64,
+    pub external_user: i64,
+    pub sent_by_self: bool,
+    pub content: &'a str,
+    pub height: i64,
+    pub reply_to: Option<i64>,
+    pub origin_iota_received_at: Option<i64>,
+    pub destination_iota_received_at: Option<i64>,
+    pub initial_state: MessageState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,7 +176,7 @@ fn update_message_content(
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as i64;
 
         let tx = conn.unchecked_transaction()?;
@@ -351,8 +378,8 @@ pub fn add_reaction(
     user_id: i64,
     reaction: &str,
 ) -> Result<(), StorageError> {
-    db::with_db(|conn| {
-        let msg_id: i64 = conn.query_row(
+    db::with_immediate_transaction(|tx| {
+        let msg_id: i64 = tx.query_row(
             r#"
             SELECT id FROM messages
             WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
@@ -362,28 +389,46 @@ pub fn add_reaction(
             |row| row.get(0),
         )?;
 
+        let reaction_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM reactions WHERE message_id = ?1 AND reaction = ?2)",
+            params![msg_id, reaction],
+            |row| row.get(0),
+        )?;
+        if !reaction_exists {
+            let unique_reactions: i64 = tx.query_row(
+                "SELECT COUNT(DISTINCT reaction) FROM reactions WHERE message_id = ?1",
+                [msg_id],
+                |row| row.get(0),
+            )?;
+            if unique_reactions >= MAX_UNIQUE_REACTIONS_PER_MESSAGE as i64 {
+                return Err(StorageError::ReactionLimitReached);
+            }
+        }
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as i64;
 
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
+        let inserted = tx.execute(
             r#"
             INSERT OR IGNORE INTO reactions (message_id, user_id, reaction, created_at)
             VALUES (?1, ?2, ?3, ?4)
             "#,
             params![msg_id, user_id, reaction, now],
         )?;
-        sync::record_event(
-            &tx,
-            storage_owner,
-            EntityType::Message,
-            msg_id,
-            Operation::Upsert,
-        )?;
-        tx.commit()?;
-        Ok(())
+        if inserted > 0 {
+            sync::record_event(
+                tx,
+                storage_owner,
+                EntityType::Message,
+                msg_id,
+                Operation::Upsert,
+            )?;
+            Ok(())
+        } else {
+            Ok(())
+        }
     })
 }
 
@@ -422,45 +467,46 @@ pub fn remove_reaction(
     })
 }
 
-pub fn add_message(
-    send_time: u128,
-    storage_owner_is_sender: bool,
-    storage_owner: i64,
-    external_user: i64,
-    message: &str,
-    height: i64,
-    reply_to: Option<i64>,
-) {
-    let message_time = match i64::try_from(send_time) {
-        Ok(v) => v,
-        Err(_) => {
-            log!("Failed to store message: send_time out of range for i64 ({send_time})");
-            return;
-        }
-    };
-
-    if let Err(e) = db::with_db(|conn| {
+pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
+    let NewMessage {
+        relay_signer_id,
+        relay_message_id,
+        authored_at,
+        send_time,
+        storage_owner,
+        external_user,
+        sent_by_self,
+        content,
+        height,
+        reply_to,
+        origin_iota_received_at,
+        destination_iota_received_at,
+        initial_state,
+    } = message;
+    let msg_id = db::with_db(|conn| {
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             r#"
             INSERT INTO messages (
-                storage_owner, external_user, message_time, content,
-                sent_by_self, message_state, height, reply_to
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                storage_owner, external_user, message_time, content, sent_by_self,
+                message_state, height, reply_to, relay_signer_id, relay_message_id,
+                authored_at, origin_iota_received_at, destination_iota_received_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             "#,
             params![
                 storage_owner,
                 external_user,
-                message_time,
-                message,
-                if storage_owner_is_sender {
-                    1_i64
-                } else {
-                    0_i64
-                },
-                MessageState::Sending.as_str(),
+                send_time,
+                content,
+                i64::from(sent_by_self),
+                initial_state.as_str(),
                 height,
                 reply_to,
+                relay_signer_id,
+                relay_message_id,
+                authored_at,
+                origin_iota_received_at,
+                destination_iota_received_at,
             ],
         )?;
         let msg_id = tx.last_insert_rowid();
@@ -472,15 +518,122 @@ pub fn add_message(
             Operation::Upsert,
         )?;
         tx.commit()?;
-        Ok(())
-    }) {
-        log!("Failed to insert message into sqlite: {}", e);
-        return;
-    }
+        Ok(msg_id)
+    })?;
 
     let mut contact = crate::users::contact::Contact::new(external_user);
-    contact.set_last_message_at(message_time);
+    contact.set_last_message_at(send_time);
     crate::util::chats_util::mod_user(storage_owner, &contact);
+    Ok(msg_id)
+}
+
+pub fn change_message_state_by_relay_id(
+    storage_owner: i64,
+    relay_signer_id: i64,
+    relay_message_id: &str,
+    new_state: MessageState,
+) -> Result<(), StorageError> {
+    db::with_db(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        let Some((msg_id, current)) = tx
+            .query_row(
+                "SELECT id, message_state FROM messages WHERE storage_owner = ?1 AND relay_signer_id = ?2 AND relay_message_id = ?3",
+                params![storage_owner, relay_signer_id, relay_message_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(());
+        };
+        let state = MessageState::from_str(&current).upgrade(new_state).as_str();
+        tx.execute("UPDATE messages SET message_state = ?1 WHERE id = ?2", params![state, msg_id])?;
+        sync::record_event(&tx, storage_owner, EntityType::Message, msg_id, Operation::Upsert)?;
+        tx.commit()?;
+        Ok(())
+    })
+}
+
+pub fn record_message_receipt(
+    storage_owner: i64,
+    target_signer_id: i64,
+    target_message_id: &str,
+    receipt_signer_id: i64,
+    receipt_message_id: &str,
+    receipt_type: MessageState,
+    event_at: i64,
+    recorded_at: i64,
+) -> Result<(), StorageError> {
+    let receipt_type = match receipt_type {
+        MessageState::Received => "received",
+        MessageState::Read => "read",
+        _ => return Err(StorageError::Other("invalid message receipt state".into())),
+    };
+    db::with_db(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        let Some((message_id, external_user)) = tx
+            .query_row(
+                "SELECT id, external_user FROM messages WHERE storage_owner = ?1 AND relay_signer_id = ?2 AND relay_message_id = ?3",
+                params![storage_owner, target_signer_id, target_message_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        else {
+            return Err(StorageError::Other("message receipt target was not found".into()));
+        };
+        if external_user != receipt_signer_id {
+            return Err(StorageError::Other("message receipt signer is not the chat partner".into()));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO message_receipts (storage_owner, target_signer_id, target_message_id, receipt_signer_id, receipt_message_id, receipt_type, event_at, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![storage_owner, target_signer_id, target_message_id, receipt_signer_id, receipt_message_id, receipt_type, event_at, recorded_at],
+        )?;
+        let (state_column, recorded_column) = if receipt_type == "read" {
+            ("read_at", "read_recorded_at")
+        } else {
+            ("client_received_at", "client_received_recorded_at")
+        };
+        let state = MessageState::from_str(
+            &tx.query_row("SELECT message_state FROM messages WHERE id = ?1", [message_id], |row| row.get::<_, String>(0))?,
+        )
+        .upgrade(MessageState::from_str(receipt_type))
+        .as_str()
+        .to_string();
+        tx.execute(
+            &format!("UPDATE messages SET {state_column} = COALESCE({state_column}, ?1), {recorded_column} = COALESCE({recorded_column}, ?2), message_state = ?3 WHERE id = ?4"),
+            params![event_at, recorded_at, state, message_id],
+        )?;
+        sync::record_event(&tx, storage_owner, EntityType::Message, message_id, Operation::Upsert)?;
+        tx.commit()?;
+        Ok(())
+    })
+}
+
+pub fn record_destination_iota_received(
+    storage_owner: i64,
+    relay_signer_id: i64,
+    relay_message_id: &str,
+    accepted_at: i64,
+) -> Result<(), StorageError> {
+    db::with_db(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        let Some(message_id) = tx
+            .query_row(
+                "SELECT id FROM messages WHERE storage_owner = ?1 AND relay_signer_id = ?2 AND relay_message_id = ?3",
+                params![storage_owner, relay_signer_id, relay_message_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(());
+        };
+        tx.execute(
+            "UPDATE messages SET destination_iota_received_at = COALESCE(destination_iota_received_at, ?1), message_state = CASE WHEN message_state = 'sending' THEN 'sent' ELSE message_state END WHERE id = ?2",
+            params![accepted_at, message_id],
+        )?;
+        sync::record_event(&tx, storage_owner, EntityType::Message, message_id, Operation::Upsert)?;
+        tx.commit()?;
+        Ok(())
+    })
 }
 
 pub fn change_message_state(
@@ -574,7 +727,15 @@ fn load_reactions(
             ))
         }) {
             for row in rows.flatten() {
-                map.entry(row.0).or_default().push(row.1);
+                let reactions = map.entry(row.0).or_default();
+                if reactions
+                    .iter()
+                    .any(|stored: &StoredReaction| stored.reaction == row.1.reaction)
+                {
+                    reactions.push(row.1);
+                } else if reactions.len() < MAX_UNIQUE_REACTIONS_PER_MESSAGE {
+                    reactions.push(row.1);
+                }
             }
         }
     }
@@ -594,7 +755,11 @@ pub fn get_messages(
     match db::with_db(|conn| {
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, message_time, content, sent_by_self, message_state, height, reply_to, edited_count
+            SELECT id, relay_signer_id, relay_message_id, message_time, authored_at,
+                   origin_iota_received_at, destination_iota_received_at,
+                   client_received_at, client_received_recorded_at, read_at,
+                   read_recorded_at, content, sent_by_self, message_state, height,
+                   reply_to, edited_count
             FROM messages
             WHERE storage_owner = ?1 AND external_user = ?2 AND deleted_by_external = 0
             ORDER BY message_time DESC, id DESC
@@ -608,13 +773,22 @@ pub fn get_messages(
                 Ok(StoredMessage {
                     id: row.get(0)?,
                     external_user,
-                    message_time: row.get(1)?,
-                    content: row.get(2)?,
-                    sent_by_self: row.get::<_, i64>(3)? != 0,
-                    message_state: row.get(4)?,
-                    height: row.get(5).unwrap_or(0),
-                    reply_to: row.get(6).ok().flatten(),
-                    edited: row.get::<_, i64>(7).unwrap_or(0) > 0,
+                    relay_signer_id: row.get(1)?,
+                    relay_message_id: row.get(2)?,
+                    message_time: row.get(3)?,
+                    authored_at: row.get(4)?,
+                    origin_iota_received_at: row.get(5)?,
+                    destination_iota_received_at: row.get(6)?,
+                    client_received_at: row.get(7)?,
+                    client_received_recorded_at: row.get(8)?,
+                    read_at: row.get(9)?,
+                    read_recorded_at: row.get(10)?,
+                    content: row.get(11)?,
+                    sent_by_self: row.get::<_, i64>(12)? != 0,
+                    message_state: row.get(13)?,
+                    height: row.get(14).unwrap_or(0),
+                    reply_to: row.get(15).ok().flatten(),
+                    edited: row.get::<_, i64>(16).unwrap_or(0) > 0,
                     reactions: Vec::new(),
                 })
             },
@@ -652,7 +826,10 @@ pub fn get_message(
     db::with_db(|conn| {
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, message_time, content, sent_by_self, message_state, height,
+            SELECT id, relay_signer_id, relay_message_id, message_time, authored_at,
+                   origin_iota_received_at, destination_iota_received_at,
+                   client_received_at, client_received_recorded_at, read_at,
+                   read_recorded_at, content, sent_by_self, message_state, height,
                    reply_to, edited_count, external_user
             FROM messages
             WHERE storage_owner = ?1
@@ -666,14 +843,23 @@ pub fn get_message(
         let rows = stmt.query_map(params![storage_owner, message_time, external_user], |row| {
             Ok(StoredMessage {
                 id: row.get(0)?,
-                message_time: row.get(1)?,
-                content: row.get(2)?,
-                sent_by_self: row.get::<_, i64>(3)? != 0,
-                message_state: row.get(4)?,
-                height: row.get(5).unwrap_or(0),
-                reply_to: row.get(6).ok().flatten(),
-                edited: row.get::<_, i64>(7).unwrap_or(0) > 0,
-                external_user: row.get(8)?,
+                relay_signer_id: row.get(1)?,
+                relay_message_id: row.get(2)?,
+                message_time: row.get(3)?,
+                authored_at: row.get(4)?,
+                origin_iota_received_at: row.get(5)?,
+                destination_iota_received_at: row.get(6)?,
+                client_received_at: row.get(7)?,
+                client_received_recorded_at: row.get(8)?,
+                read_at: row.get(9)?,
+                read_recorded_at: row.get(10)?,
+                content: row.get(11)?,
+                sent_by_self: row.get::<_, i64>(12)? != 0,
+                message_state: row.get(13)?,
+                height: row.get(14).unwrap_or(0),
+                reply_to: row.get(15).ok().flatten(),
+                edited: row.get::<_, i64>(16).unwrap_or(0) > 0,
+                external_user: row.get(17)?,
                 reactions: Vec::new(),
             })
         })?;
@@ -700,6 +886,40 @@ pub fn get_message(
     })
 }
 
+pub fn get_message_with_offset(
+    storage_owner: i64,
+    external_user: i64,
+    message_time: i64,
+) -> Result<Option<(StoredMessage, i64)>, StorageError> {
+    let Some(message) = get_message(storage_owner, message_time, Some(external_user))? else {
+        return Ok(None);
+    };
+    let offset = db::with_db(|conn| {
+        conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM messages
+            WHERE storage_owner = ?1
+              AND external_user = ?2
+              AND deleted_by_external = 0
+              AND (
+                   message_time > ?3
+                   OR (message_time = ?3 AND id > ?4)
+              )
+            "#,
+            params![
+                storage_owner,
+                external_user,
+                message.message_time,
+                message.id
+            ],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::from)
+    })?;
+    Ok(Some((message, offset)))
+}
+
 pub fn get_messages_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<StoredMessage> {
     if ids.is_empty() {
         return Vec::new();
@@ -708,19 +928,28 @@ pub fn get_messages_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<StoredMessage
     // A journal id uniquely identifies a row. Load all messages for this owner and retain only
     // those ids; this keeps reaction hydration identical to normal message loading.
     match db::with_db(|conn| {
-        let mut stmt = conn.prepare("SELECT id, message_time, content, sent_by_self, message_state, height, reply_to, edited_count, external_user FROM messages WHERE storage_owner = ?1 AND deleted_by_external = 0")?;
+        let mut stmt = conn.prepare("SELECT id, relay_signer_id, relay_message_id, message_time, authored_at, origin_iota_received_at, destination_iota_received_at, client_received_at, client_received_recorded_at, read_at, read_recorded_at, content, sent_by_self, message_state, height, reply_to, edited_count, external_user FROM messages WHERE storage_owner = ?1 AND deleted_by_external = 0")?;
         let rows = stmt.query_map([storage_owner], |row| {
-            let external_user: i64 = row.get(8)?;
+            let external_user: i64 = row.get(17)?;
             Ok(StoredMessage {
                 id: row.get(0)?,
                 external_user,
-                message_time: row.get(1)?,
-                content: row.get(2)?,
-                sent_by_self: row.get::<_, i64>(3)? != 0,
-                message_state: row.get(4)?,
-                height: row.get(5).unwrap_or(0),
-                reply_to: row.get(6).ok().flatten(),
-                edited: row.get::<_, i64>(7).unwrap_or(0) > 0,
+                relay_signer_id: row.get(1)?,
+                relay_message_id: row.get(2)?,
+                message_time: row.get(3)?,
+                authored_at: row.get(4)?,
+                origin_iota_received_at: row.get(5)?,
+                destination_iota_received_at: row.get(6)?,
+                client_received_at: row.get(7)?,
+                client_received_recorded_at: row.get(8)?,
+                read_at: row.get(9)?,
+                read_recorded_at: row.get(10)?,
+                content: row.get(11)?,
+                sent_by_self: row.get::<_, i64>(12)? != 0,
+                message_state: row.get(13)?,
+                height: row.get(14).unwrap_or(0),
+                reply_to: row.get(15).ok().flatten(),
+                edited: row.get::<_, i64>(16).unwrap_or(0) > 0,
                 reactions: Vec::new(),
             })
         })?;

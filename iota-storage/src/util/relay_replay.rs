@@ -12,6 +12,7 @@ pub fn reserve(
     signer_id: u64,
     message_id: &str,
     created_at: u64,
+    accepted_at: i64,
     destination_id: u64,
     frame: &[u8],
     frame_id: u32,
@@ -26,11 +27,12 @@ pub fn reserve(
 
     db::with_db(|connection| {
         let inserted = connection.execute(
-            "INSERT OR IGNORE INTO relay_inbox (signer_id, message_id, created_at, destination_id, frame, frame_id, type_map_version, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'received')",
+            "INSERT OR IGNORE INTO relay_inbox (signer_id, message_id, created_at, accepted_at, destination_id, frame, frame_id, type_map_version, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'received')",
             params![
                 signer_id,
                 message_id,
                 created_at,
+                accepted_at,
                 destination_id,
                 frame,
                 i64::from(frame_id),
@@ -67,9 +69,13 @@ pub fn mark_delivered_for_frame(destination_id: u64, frame_id: u32) -> Result<()
     let destination_id = i64::try_from(destination_id)
         .map_err(|_| StorageError::Other("relay destination ID exceeds SQLite range".into()))?;
     db::with_db(|connection| {
+        let delivered_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
         connection.execute(
-            "UPDATE relay_inbox SET state = 'delivered' WHERE destination_id = ?1 AND frame_id = ?2",
-            params![destination_id, i64::from(frame_id)],
+            "UPDATE relay_inbox SET state = 'delivered', downstream_acked_at = COALESCE(downstream_acked_at, ?3) WHERE destination_id = ?1 AND frame_id = ?2",
+            params![destination_id, i64::from(frame_id), delivered_at],
         )?;
         Ok(())
     })
@@ -84,24 +90,36 @@ pub fn mark_state(signer_id: u64, message_id: &str, state: &str) -> Result<(), S
     }
     let signer_id = i64::try_from(signer_id)
         .map_err(|_| StorageError::Other("relay signer ID exceeds SQLite range".into()))?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
     db::with_db(|connection| {
+        let column = match state {
+            "applied" => "applied_at",
+            "queued" => "queued_at",
+            "delivered" => "downstream_acked_at",
+            "rejected" => "rejected_at",
+            "received" => "accepted_at",
+            _ => return Err(StorageError::Other("invalid relay inbox state".into())),
+        };
         connection.execute(
-            "UPDATE relay_inbox SET state = ?3 WHERE signer_id = ?1 AND message_id = ?2",
-            params![signer_id, message_id, state],
+            &format!("UPDATE relay_inbox SET state = ?3, {column} = COALESCE({column}, ?4) WHERE signer_id = ?1 AND message_id = ?2"),
+            params![signer_id, message_id, state, timestamp],
         )?;
         Ok(())
     })
 }
 
-pub fn prune_completed(before_created_at: i64) -> Result<(), StorageError> {
+pub fn prune_completed(before_terminal_at: i64) -> Result<(), StorageError> {
     db::with_db(|connection| {
         connection.execute(
-            "DELETE FROM relay_inbox WHERE created_at < ?1 AND state IN ('delivered', 'rejected')",
-            params![before_created_at],
+            "DELETE FROM relay_inbox WHERE COALESCE(downstream_acked_at, rejected_at) < ?1 AND state IN ('delivered', 'rejected')",
+            params![before_terminal_at],
         )?;
         connection.execute(
-            "DELETE FROM relay_replay WHERE created_at < ?1",
-            params![before_created_at],
+            "DELETE FROM relay_replay WHERE NOT EXISTS (SELECT 1 FROM relay_inbox WHERE relay_inbox.signer_id = relay_replay.signer_id AND relay_inbox.message_id = relay_replay.message_id)",
+            [],
         )?;
         Ok(())
     })

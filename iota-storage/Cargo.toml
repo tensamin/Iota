@@ -7,10 +7,6 @@ edition = "2024"
 iota-logger = { path = "../iota-logger" }
 iota-util = { path = "../iota-util" }
 iota-paths = { path = "../iota-paths" }
-<<<<<<< HEAD
-
-=======
->>>>>>> refs/remotes/origin/main
 base64 = "0.22.1"
 json = "*"
 arc-swap = "1"

@@ -8,6 +8,8 @@ pub enum StorageError {
     Pool(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("message has reached the unique reaction limit")]
+    ReactionLimitReached,
     #[error("{0}")]
     Other(String),
 }

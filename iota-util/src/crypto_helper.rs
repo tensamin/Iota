@@ -6,17 +6,10 @@ pub fn generate_keyring() -> Keyring {
 }
 
 pub fn keyring_to_base64(keyring: &Keyring) -> String {
-<<<<<<< HEAD
     keyring
         .try_to_bytes()
         .map(|bytes| STANDARD.encode(bytes))
         .unwrap_or_default()
-=======
-    let bytes = keyring
-        .try_to_bytes()
-        .expect("keyring fields must fit the wire format");
-    STANDARD.encode(bytes)
->>>>>>> refs/remotes/origin/main
 }
 
 pub fn keyring_from_base64(s: &str) -> Option<Keyring> {
@@ -25,17 +18,10 @@ pub fn keyring_from_base64(s: &str) -> Option<Keyring> {
 }
 
 pub fn public_key_bundle_to_base64(bundle: &PublicKeyBundle) -> String {
-<<<<<<< HEAD
     bundle
         .try_as_bytes()
         .map(|bytes| STANDARD.encode(bytes))
         .unwrap_or_default()
-=======
-    let bytes = bundle
-        .try_as_bytes()
-        .expect("public key bundle fields must fit the wire format");
-    STANDARD.encode(bytes)
->>>>>>> refs/remotes/origin/main
 }
 
 pub fn public_key_bundle_from_base64(s: &str) -> Option<PublicKeyBundle> {

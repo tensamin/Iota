@@ -68,18 +68,6 @@ fn omikron_public_key_path() -> &'static Path {
         .unwrap_or_else(|| Path::new("omikron.mpkb"))
 }
 
-fn save_keyring(keyring: &Keyring, path: &Path) -> Result<(), String> {
-    let temporary = serialization_path(path)?;
-    mtp::files::save_keyring_raw(keyring, &temporary)
-        .map_err(|error| format!("serialize keyring: {error}"))?;
-    let bytes =
-        std::fs::read(&temporary).map_err(|error| format!("read serialized keyring: {error}"));
-    let _ = std::fs::remove_file(&temporary);
-    let bytes = bytes?;
-    iota_util::atomic_file::replace_private(path, &bytes, 3)
-        .map_err(|error| format!("write {}: {error}", path.display()))
-}
-
 fn save_omikron_public_key(key: &PublicKeyBundle, path: &Path) -> Result<(), String> {
     let temporary = serialization_path(path)?;
     mtp::files::save_public_key_bundle(key, &temporary)
@@ -609,46 +597,8 @@ impl OmikronConnection {
     // Identity (own Keyring, migrated from the legacy base64-in-config format)
     // -------------------------------------------------------------------------
 
-<<<<<<< HEAD
-    /*
-     * `iota.mk` is now the source of truth for this Iota's identity. A
-     * pre-existing base64 keyring in config.json (from before the MTP auth
-     * migration) is imported once so already-registered Iotas keep their
-     * identity, and mirrored back into config.json for older code paths
-     * that still read it directly.
-     */
-    async fn load_or_migrate_keyring(&self) -> Keyring {
-        let path = identity_path();
-        if let Ok(kr) = mtp::files::load_keyring_raw(path) {
-            return kr;
-        }
-
-        let legacy = CONFIG.load().keyring.clone();
-        let keyring = legacy
-            .and_then(|b64| keyring_from_base64(&b64))
-            .unwrap_or_else(|| {
-                log!(
-                    "WARNING: No existing keyring found. Neither {} nor config.json \
-                     contain a keyring; generating a new identity. If you already had \
-                     an Iota identity, restore {} from a backup to avoid losing access.",
-                    path.display(),
-                    path.display()
-                );
-                crypto_helper::generate_keyring()
-            });
-
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(e) = save_keyring(&keyring, path) {
-            log!("Failed to persist {}: {}", path.display(), e);
-        }
-
-        keyring
-=======
     async fn load_or_migrate_keyring(&self, passphrase: &[u8]) -> Result<Keyring, IdentityError> {
         load_or_migrate_keyring_at(identity_path(), CONFIG.load().keyring.clone(), passphrase)
->>>>>>> refs/remotes/origin/main
     }
 
     // -------------------------------------------------------------------------
@@ -721,12 +671,8 @@ impl OmikronConnection {
         };
 
         let (host, port, public_key) = if let Some(endpoint) = discovered {
-            let discovered_key_bytes = endpoint.public_key.try_as_bytes().map_err(|error| {
-                format!("Failed to serialize discovered Omikron public key: {error}")
-            })?;
             match &cached_key {
                 Some(cached) => {
-<<<<<<< HEAD
                     let keys_match =
                         match (cached.try_as_bytes(), endpoint.public_key.try_as_bytes()) {
                             (Ok(cached_bytes), Ok(discovered_bytes)) => {
@@ -752,20 +698,6 @@ impl OmikronConnection {
                     } else {
                         (endpoint.host, endpoint.port, cached.clone())
                     }
-=======
-                    let cached_key_bytes = cached.try_as_bytes().map_err(|error| {
-                        format!("Failed to serialize cached Omikron public key: {error}")
-                    })?;
-                    if cached_key_bytes != discovered_key_bytes {
-                        log!(
-                            "Fetched Omikron public key differs from the cached {} - keeping the \
-                             cached key. Delete {} manually if this is an expected key rotation.",
-                            OMIKRON_PUBLIC_KEY_PATH,
-                            OMIKRON_PUBLIC_KEY_PATH
-                        );
-                    }
-                    (endpoint.host, endpoint.port, cached.clone())
->>>>>>> refs/remotes/origin/main
                 }
                 None => {
                     if let Err(e) = save_omikron_public_key(&endpoint.public_key, key_path) {
@@ -955,6 +887,30 @@ impl OmikronConnection {
         }
     }
 
+    async fn send_relay_success(
+        &self,
+        frame_id: Option<u32>,
+        iota_id: u64,
+        relay_message_id: &str,
+        accepted_at: i64,
+    ) {
+        let Some(frame_id) = frame_id else { return };
+        let response = CommunicationValue::new(CommunicationType::Success)
+            .with_id(frame_id)
+            .add_typed_default(DataType::IotaId, DataValue::UnsignedNumber(iota_id.into()))
+            .add_typed_default(
+                DataType::RelayMessageId,
+                DataValue::Str(relay_message_id.to_string()),
+            )
+            .add_typed_default(
+                DataType::RelayAcceptedAt,
+                DataValue::SignedNumber(accepted_at.into()),
+            );
+        if let Err(error) = self.send_message(&response).await {
+            log!("Relay response could not be sent: {}", error);
+        }
+    }
+
     async fn handle_relay(self: Arc<Self>, frame: CommunicationValue) {
         let Some(incoming_frame_id) = frame.id() else {
             log!("Rejecting Relay without a message id");
@@ -998,6 +954,7 @@ impl OmikronConnection {
                 return;
             }
         };
+        let accepted_at = now_millis_i64();
         let signer_is_local = i64::try_from(verified.context.signer_id)
             .ok()
             .and_then(iota_storage::users::user_manager::get_user)
@@ -1035,6 +992,7 @@ impl OmikronConnection {
             verified.context.signer_id,
             &verified.context.message_id,
             verified.context.created_at,
+            accepted_at,
             verified.context.final_recipient_id,
             &frame_bytes,
             frame_id,
@@ -1082,6 +1040,43 @@ impl OmikronConnection {
         };
 
         if signer_is_local && !recipient_is_local {
+            if !already_applied {
+                let content = match open_verified_relay_content(
+                    &verified,
+                    &[&keyring],
+                    verified.context.signer_id,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        log!("Relay origin content verification failed: {}", error);
+                        let _ = relay_replay::mark_state(
+                            verified.context.signer_id,
+                            &verified.context.message_id,
+                            "rejected",
+                        );
+                        self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                            .await;
+                        return;
+                    }
+                };
+                if let Err(error) = message_handlers::apply_verified_relay_content(
+                    &verified.context,
+                    &content,
+                    accepted_at,
+                    i64::try_from(verified.context.signer_id).unwrap_or_default(),
+                    true,
+                ) {
+                    log!("Relay origin application failed: {}", error);
+                    let _ = relay_replay::mark_state(
+                        verified.context.signer_id,
+                        &verified.context.message_id,
+                        "rejected",
+                    );
+                    self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                        .await;
+                    return;
+                }
+            }
             let router = match self
                 .hosting_iota_for_user(verified.context.final_recipient_id)
                 .await
@@ -1136,6 +1131,34 @@ impl OmikronConnection {
                 .await
             {
                 Ok(response) if response.is_type(CommunicationType::Success) => {
+                    let returned_id = response
+                        .get_data(DataType::RelayMessageId)
+                        .as_str();
+                    let accepted_at = response
+                        .get_data(DataType::RelayAcceptedAt)
+                        .as_number()
+                        .and_then(|value| i64::try_from(value).ok());
+                    if returned_id != Some(verified.context.message_id.as_str()) {
+                        log!("Relay acknowledgement returned a different RelayMessageId");
+                        self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                            .await;
+                        return;
+                    }
+                    if let Some(accepted_at) = accepted_at {
+                        if let (Ok(owner), Ok(signer)) = (
+                            i64::try_from(verified.context.signer_id),
+                            i64::try_from(verified.context.signer_id),
+                        ) {
+                            if let Err(error) = chat_files::record_destination_iota_received(
+                                owner,
+                                signer,
+                                &verified.context.message_id,
+                                accepted_at,
+                            ) {
+                                log!("Relay destination acknowledgement storage failed: {}", error);
+                            }
+                        }
+                    }
                     if let Err(error) = relay_queue::acknowledge_iota(router, frame_id) {
                         log!(
                             "Relay origin acknowledgement could not clear the queue: {}",
@@ -1149,8 +1172,10 @@ impl OmikronConnection {
                     ) {
                         log!("Relay origin delivery state update failed: {}", error);
                     }
-                    self.send_relay_response(frame.id(), CommunicationType::Success)
-                        .await;
+                    let response = response.with_id(frame_id);
+                    if let Err(error) = self.send_message(&response).await {
+                        log!("Relay response could not be sent: {}", error);
+                    }
                 }
                 Ok(response) => {
                     log!("Relay origin route returned {}", response.get_type());
@@ -1234,7 +1259,24 @@ impl OmikronConnection {
                 }
             };
             if let Err(error) =
-                message_handlers::apply_verified_relay_content(&verified.context, &content)
+                message_handlers::apply_verified_relay_content(
+                    &verified.context,
+                    &content,
+                    accepted_at,
+                    match i64::try_from(destination) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            log!("Relay destination ID exceeds storage range");
+                            self.send_relay_response(
+                                frame.id(),
+                                CommunicationType::ErrorInvalidData,
+                            )
+                            .await;
+                            return;
+                        }
+                    },
+                    false,
+                )
             {
                 log!("Relay application dispatch failed: {}", error);
                 if let Err(queue_error) =
@@ -1270,8 +1312,13 @@ impl OmikronConnection {
         ) {
             log!("Relay queue state update failed: {}", error);
         }
-        self.send_relay_response(frame.id(), CommunicationType::Success)
-            .await;
+        self.send_relay_success(
+            frame.id(),
+            local_iota_id,
+            &verified.context.message_id,
+            accepted_at,
+        )
+        .await;
         if let Err(error) = self.send_message(&forwarded).await {
             log!("Relay delivery to local client failed: {}", error);
         }
@@ -1707,7 +1754,7 @@ impl OmikronConnection {
         let Some(send_time) = data_i64(cv, DataType::SendTime).filter(|time| *time > 0) else {
             return;
         };
-        let Some(content) = cv.get_data(DataType::AppContent).as_str() else {
+        let Some(content) = cv.get_data(DataType::Content).as_str() else {
             return;
         };
         if chat_files::apply_remote_edit(receiver_id, sender_id, send_time, sender_id, content)
@@ -1790,7 +1837,7 @@ impl OmikronConnection {
                 .await;
             return;
         };
-        let Some(content) = cv.get_data(DataType::AppContent).as_str() else {
+        let Some(content) = cv.get_data(DataType::Content).as_str() else {
             let _ = self
                 .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
                 .await;
@@ -1800,7 +1847,7 @@ impl OmikronConnection {
             CommunicationType::MessageEditLive,
             cv,
             &mutation,
-            vec![(DataType::AppContent, DataValue::Str(content.to_string()))],
+            vec![(DataType::Content, DataValue::Str(content.to_string()))],
         );
         if iota_storage::users::user_manager::get_user(mutation.partner_id).is_some()
             && chat_files::apply_remote_edit(
@@ -2237,11 +2284,7 @@ impl OmikronConnection {
                 ))
             })?;
         }
-<<<<<<< HEAD
-        save_keyring(&keyring, path).map_err(|error| {
-=======
         save_protected_keyring_verified(&keyring, path, &identity_secret).map_err(|error| {
->>>>>>> refs/remotes/origin/main
             OmikronError::Internal(format!(
                 "could not save new identity {}: {error}",
                 path.display()
@@ -2410,27 +2453,7 @@ impl OmikronClient for OmikronConnection {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
 mod tests {
-    use super::*;
-
-    #[test]
-    fn durable_keyring_save_preserves_mtp_format() {
-        let directory = std::env::temp_dir().join(format!("iota-keyring-test-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join(IOTA_KEYRING_PATH);
-        let keyring = crypto_helper::generate_keyring();
-
-        save_keyring(&keyring, &path).unwrap();
-
-        let loaded = mtp::files::load_keyring_raw(&path).unwrap();
-        assert_eq!(
-            keyring.try_to_bytes().unwrap(),
-            loaded.try_to_bytes().unwrap()
-        );
-        std::fs::remove_dir_all(directory).unwrap();
-=======
-mod identity_tests {
     use super::*;
 
     fn test_path(name: &str) -> PathBuf {
@@ -2503,6 +2526,5 @@ mod identity_tests {
         }
 
         assert!(jittered_reconnect_delay(Duration::from_secs(600)) <= MAX_RECONNECT_DELAY);
->>>>>>> refs/remotes/origin/main
     }
 }

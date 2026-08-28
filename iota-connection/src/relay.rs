@@ -2,8 +2,6 @@ use iota_util::route_target::RouteTarget;
 use mtp::codec::{
     CommunicationValue, ProtectionPolicy, RelayError, RelayOpenOptions, SignaturePolicy, TypeMap,
     VerifiedRelayContent, VerifiedRelayMetadata, forward_relay_frame,
-    open_relay_content_with_keyrings, open_relay_metadata_with_without_replay,
-    relay_metadata_claimed_signer_id,
     open_relay_content_with_limits_without_replay, open_relay_metadata_with_without_replay,
     relay_metadata_claimed_signer_id_with_options,
 };
