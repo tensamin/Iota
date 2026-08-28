@@ -4,6 +4,8 @@ use mtp::codec::{
     VerifiedRelayContent, VerifiedRelayMetadata, forward_relay_frame,
     open_relay_content_with_keyrings, open_relay_metadata_with_without_replay,
     relay_metadata_claimed_signer_id,
+    open_relay_content_with_limits_without_replay, open_relay_metadata_with_without_replay,
+    relay_metadata_claimed_signer_id_with_options,
 };
 use mtp::crypto::{Keyring, PublicKeyBundle};
 use std::fmt;
@@ -147,7 +149,13 @@ where
         return Err(RelayValidationError::OuterSenderNotAllowed);
     }
 
-    let claimed_signer = relay_metadata_claimed_signer_id(frame, &[keyring])?;
+    let open_options = RelayOpenOptions::new(RELAY_PROTECTION_POLICY);
+    let claimed_signer = relay_metadata_claimed_signer_id_with_options(
+        frame,
+        &[keyring],
+        open_options.decode_limits,
+        open_options.protected_limits,
+    )?;
     let signing_keys = resolve_signing_keys(claimed_signer).await?;
     if signing_keys.is_empty() {
         return Err(RelayValidationError::MissingSigningKeys(claimed_signer));
@@ -186,12 +194,17 @@ pub fn open_verified_relay_content(
     keyrings: &[&Keyring],
     expected_recipient_id: u64,
 ) -> Result<VerifiedRelayContent, RelayValidationError> {
-    Ok(open_relay_content_with_keyrings(
+    Ok(open_relay_content_with_limits_without_replay(
         &relay.metadata,
         keyrings,
         &relay.signing_keys,
         Some(expected_recipient_id),
-        RELAY_PROTECTION_POLICY,
+        RelayOpenOptions {
+            policy: RELAY_PROTECTION_POLICY,
+            decode_limits: relay.metadata.decode_limits(),
+            encode_limits: relay.metadata.encode_limits(),
+            protected_limits: relay.metadata.protected_limits(),
+        },
     )?)
 }
 

@@ -572,7 +572,7 @@ impl IpcClient {
             iota_ipc::IpcErrorCode::Timeout => "The daemon request timed out.",
             iota_ipc::IpcErrorCode::Cancelled => "The daemon request was cancelled.",
             iota_ipc::IpcErrorCode::Unauthorized => {
-                "The daemon rejected this operation as unauthorized."
+                "The daemon rejected this operation: the connected IPC account lacks the required role. Use the configured operator socket or ask an administrator to grant access."
             }
             iota_ipc::IpcErrorCode::InternalFailure => "The daemon reported an internal failure.",
         }

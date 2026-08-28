@@ -17,6 +17,7 @@ Environment=IOTA_SOCKET=/run/iota/iota.sock
 Environment=IOTA_DATA_DIR=/var/lib/iota
 Environment=IOTA_DEPLOYMENT_MODE=system_always_on
 Environment=IOTA_SUPERVISOR=systemd
+LoadCredential=iota-identity:/etc/iota/iota-identity.secret
 
 # Exit code 75 = restart requested (daemon-specific convention)
 RestartPreventExitStatus=0

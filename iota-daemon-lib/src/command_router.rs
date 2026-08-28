@@ -1,10 +1,10 @@
 use crate::log_buffer::LogBuffer;
 use crate::{DaemonRuntime, DaemonServices};
 use iota_ipc::{
-    CommunitySummary, ComponentStatusResponse, ConfigResponse, ExitIntent, IpcErrorCode,
-    LocalRequest, LogEntriesResponse, OmikronStatusResponse, ResponseEnvelope, ResponsePayload,
-    ResponseResult, StatusResponse, TaskSummary, UpdateStatusResponse, UserDetailResponse,
-    UserSummary,
+    CommunitySummary, ComponentStatusResponse, ConfigResponse, DaemonMessage, ExitIntent,
+    IpcErrorCode, LocalRequest, LogEntriesResponse, LogEntry, MAX_MESSAGE_SIZE,
+    OmikronStatusResponse, ResponseEnvelope, ResponsePayload, ResponseResult, StatusResponse,
+    TaskSummary, UpdateStatusResponse, UserDetailResponse, UserSummary,
 };
 use iota_logger::{log, log_command};
 use iota_storage::users::user_manager;
@@ -14,6 +14,37 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::daemon_state::{ShutdownReason, StartupPhase};
+
+pub use iota_ipc::IpcRole;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerContext {
+    pub pid: i32,
+    pub uid: u32,
+    pub role: IpcRole,
+}
+
+const MAX_LOG_ENTRIES_PER_RESPONSE: usize = 512;
+
+fn bounded_log_entries(mut entries: Vec<LogEntry>) -> Vec<LogEntry> {
+    entries.truncate(MAX_LOG_ENTRIES_PER_RESPONSE);
+    while !entries.is_empty() {
+        let response = DaemonMessage::Response(ResponseEnvelope {
+            request_id: u64::MAX,
+            result: ResponseResult::Ok(ResponsePayload::LogEntries(LogEntriesResponse {
+                entries: entries.clone(),
+            })),
+        });
+        let fits = serde_json::to_vec(&response)
+            .map(|encoded| encoded.len() <= MAX_MESSAGE_SIZE)
+            .unwrap_or(false);
+        if fits {
+            return entries;
+        }
+        entries.remove(0);
+    }
+    entries
+}
 
 #[derive(Clone)]
 pub struct CommandRouter {
@@ -35,8 +66,33 @@ impl CommandRouter {
         }
     }
 
-    pub async fn route(&self, request_id: u64, request: LocalRequest) -> ResponseEnvelope {
-        log_command!("{:?}", request);
+    pub async fn route(
+        &self,
+        peer: &PeerContext,
+        request_id: u64,
+        request: LocalRequest,
+    ) -> ResponseEnvelope {
+        if !peer.role.allows(request.required_role()) {
+            log!(
+                "IPC authorization denied: pid={}, uid={}, role={:?}, request={:?}",
+                peer.pid,
+                peer.uid,
+                peer.role,
+                request
+            );
+            return ResponseEnvelope {
+                request_id,
+                result: ResponseResult::Error(IpcErrorCode::Unauthorized),
+            };
+        }
+
+        log_command!(
+            "pid={} uid={} role={:?} request={:?}",
+            peer.pid,
+            peer.uid,
+            peer.role,
+            request
+        );
         let result = self.execute(request).await;
         ResponseEnvelope { request_id, result }
     }
@@ -284,7 +340,7 @@ impl CommandRouter {
                 {
                     return ResponseResult::Error(IpcErrorCode::Conflict);
                 }
-                self.runtime.shutdown(match intent {
+                self.runtime.request_shutdown(match intent {
                     ExitIntent::Stop => ShutdownReason::Stop,
                     ExitIntent::Restart => ShutdownReason::Restart,
                 });
@@ -298,13 +354,13 @@ impl CommandRouter {
                 },
             )),
             LocalRequest::RestartDaemon => {
-                self.runtime.shutdown(ShutdownReason::Restart);
+                self.runtime.request_shutdown(ShutdownReason::Restart);
                 ResponseResult::Ok(ResponsePayload::Acknowledged {
                     message: "Daemon restart requested".into(),
                 })
             }
             LocalRequest::StopDaemon => {
-                self.runtime.shutdown(ShutdownReason::Stop);
+                self.runtime.request_shutdown(ShutdownReason::Stop);
                 ResponseResult::Ok(ResponsePayload::Acknowledged {
                     message: "Daemon shutdown requested".into(),
                 })
@@ -378,7 +434,7 @@ impl CommandRouter {
             LocalRequest::ImportUser { .. } => ResponseResult::Error(IpcErrorCode::InvalidRequest),
             LocalRequest::GetLogs { limit } => {
                 let entries = if let Ok(buf) = self.log_buffer.lock() {
-                    buf.recent(limit)
+                    bounded_log_entries(buf.recent(limit.min(MAX_LOG_ENTRIES_PER_RESPONSE)))
                 } else {
                     Vec::new()
                 };
@@ -393,11 +449,10 @@ impl CommandRouter {
                 Err(_e) => ResponseResult::Error(IpcErrorCode::InternalFailure),
             },
             LocalRequest::ListCommunities => {
-                let iota_id = config_util::CONFIG
-                    .load()
-                    .iota_id
-                    .map(|id| id as i64)
-                    .unwrap_or(0);
+                let iota_id = config_util::CONFIG.load().iota_id;
+                let Ok(iota_id) = iota_id.map(i64::try_from).unwrap_or(Ok(0)) else {
+                    return ResponseResult::Ok(ResponsePayload::Communities(Vec::new()));
+                };
                 let stored =
                     iota_storage::util::communities_util::CommunitiesUtil::get_communities(iota_id);
                 let summaries: Vec<CommunitySummary> = stored
@@ -410,5 +465,79 @@ impl CommandRouter {
                 ResponseResult::Ok(ResponsePayload::Communities(summaries))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IpcRole, LocalRequest, bounded_log_entries};
+    use iota_ipc::{ExitIntent, LogEntry, SecretString};
+
+    #[test]
+    fn every_request_has_an_explicit_role_policy() {
+        let requests = [
+            LocalRequest::GetStatus,
+            LocalRequest::ListTasks,
+            LocalRequest::ListUsers,
+            LocalRequest::CreateUser {
+                username: "alice".into(),
+            },
+            LocalRequest::AttachUserFromTu {
+                credential: SecretString("credential".into()),
+            },
+            LocalRequest::PurgeUserData { user_id: 1 },
+            LocalRequest::ReleaseUser { user_id: 1 },
+            LocalRequest::CompleteDeleteUser {
+                user_id: 1,
+                credential: None,
+            },
+            LocalRequest::RemoveUser { user_id: 1 },
+            LocalRequest::ReconnectOmikron,
+            LocalRequest::RotateIotaIdentity,
+            LocalRequest::RequestProcessExit {
+                intent: ExitIntent::Stop,
+            },
+            LocalRequest::GetDaemonStatus,
+            LocalRequest::RestartDaemon,
+            LocalRequest::StopDaemon,
+            LocalRequest::GetConfig,
+            LocalRequest::SetConfig {
+                key: "port".into(),
+                value: "1984".into(),
+            },
+            LocalRequest::ReloadConfig,
+            LocalRequest::GetOmikronStatus,
+            LocalRequest::ListComponents,
+            LocalRequest::GetUser { user_id: 1 },
+            LocalRequest::ImportUser {
+                username: "alice".into(),
+            },
+            LocalRequest::GetLogs { limit: 10 },
+            LocalRequest::CheckUpdate,
+            LocalRequest::ListCommunities,
+        ];
+
+        assert_eq!(requests.len(), 25);
+        for request in requests {
+            let required = request.required_role();
+            assert!(IpcRole::Admin.allows(required));
+            assert_eq!(
+                IpcRole::Operate.allows(required),
+                required != IpcRole::Admin
+            );
+            assert_eq!(IpcRole::Read.allows(required), required == IpcRole::Read);
+        }
+    }
+
+    #[test]
+    fn log_responses_drop_entries_that_cannot_fit_one_ipc_frame() {
+        let entries = vec![LogEntry {
+            timestamp_ms: 0,
+            sender: "test".into(),
+            message: "x".repeat(2 * 1024 * 1024),
+            is_error: false,
+        }];
+
+        assert!(bounded_log_entries(entries).is_empty());
     }
 }

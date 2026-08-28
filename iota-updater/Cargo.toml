@@ -5,7 +5,10 @@ edition = "2024"
 
 [dependencies]
 iota-paths = { path = "../iota-paths" }
+<<<<<<< HEAD
 
+=======
+>>>>>>> refs/remotes/origin/main
 tokio = { version = "1.50.0", features = ["full"] }
 sha2 = "0.11.0"
 hex = "*"

@@ -9,12 +9,12 @@ use iota_util::crypto_util::{self};
 use mtp::client::{Client, ClientConfig, MTPConnection, Policy, SendMode, Sender};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::{Keyring, PublicKeyBundle};
+use rand_core::RngCore;
 use std::env;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, LazyLock,
-    atomic::{AtomicU32, Ordering},
-};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -38,6 +38,9 @@ use iota_util::route_target::RouteTarget;
 // ============================================================================
 
 const IOTA_KEYRING_PATH: &str = "iota.mk";
+const IDENTITY_SECRET_ENV: &str = "IOTA_IDENTITY_SECRET";
+const IDENTITY_SECRET_FILE_ENV: &str = "IOTA_IDENTITY_SECRET_FILE";
+const SYSTEMD_IDENTITY_CREDENTIAL: &str = "iota-identity";
 static IDENTITY_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 static OMIKRON_PUBLIC_KEY_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
@@ -111,7 +114,173 @@ const TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const TASK_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_HANDLERS: usize = 20;
 const RELAY_RETENTION_MILLIS: i64 = 30 * 24 * 60 * 60 * 1000;
-static NEXT_RELAY_FRAME_ID: AtomicU32 = AtomicU32::new(1);
+
+#[derive(Debug)]
+pub enum IdentityError {
+    Storage(mtp::files::FileError),
+    Directory(std::io::Error),
+    Secret(String),
+    InvalidLegacyIdentity,
+    Verification(String),
+}
+
+impl std::fmt::Display for IdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage(error) => write!(f, "identity storage error: {error}"),
+            Self::Directory(error) => write!(f, "unable to create identity directory: {error}"),
+            Self::Secret(error) => write!(f, "unable to load identity secret: {error}"),
+            Self::InvalidLegacyIdentity => f.write_str("legacy identity is invalid"),
+            Self::Verification(error) => {
+                write!(f, "persisted identity could not be verified: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for IdentityError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectionAttemptResult {
+    became_healthy: bool,
+}
+
+fn jittered_reconnect_delay(delay: Duration) -> Duration {
+    let ceiling_ms = u64::try_from(MAX_RECONNECT_DELAY.as_millis())
+        .expect("reconnect ceiling must fit in milliseconds");
+    let base_ms = u64::try_from(delay.as_millis().min(u128::from(ceiling_ms)))
+        .expect("bounded reconnect delay must fit in milliseconds");
+    let jitter_span = base_ms / 5;
+    if jitter_span == 0 {
+        return Duration::from_millis(base_ms);
+    }
+
+    let mut rng = rand_core::OsRng;
+    let range = jitter_span.saturating_mul(2).saturating_add(1);
+    let offset = (rng.next_u64() % range) as i128 - jitter_span as i128;
+    let jittered = (base_ms as i128 + offset).clamp(0, i128::from(ceiling_ms));
+    Duration::from_millis(u64::try_from(jittered).expect("bounded jitter must be non-negative"))
+}
+
+fn wire_user_id(user_id: i64) -> u64 {
+    u64::try_from(user_id).expect("validated user ID is non-negative")
+}
+
+fn load_identity_secret() -> Result<Vec<u8>, IdentityError> {
+    if let Some(path) = env::var_os(IDENTITY_SECRET_FILE_ENV) {
+        let path = PathBuf::from(path);
+        let mut secret = fs::read(&path)
+            .map_err(|error| IdentityError::Secret(format!("{}: {error}", path.display())))?;
+        while matches!(secret.last(), Some(b'\n' | b'\r')) {
+            secret.pop();
+        }
+        if secret.is_empty() {
+            return Err(IdentityError::Secret(format!(
+                "{} is empty",
+                path.display()
+            )));
+        }
+        return Ok(secret);
+    }
+
+    if let Ok(secret) = env::var(IDENTITY_SECRET_ENV) {
+        if secret.is_empty() {
+            return Err(IdentityError::Secret(format!(
+                "{IDENTITY_SECRET_ENV} is empty"
+            )));
+        }
+        return Ok(secret.into_bytes());
+    }
+
+    if let Ok(credentials_dir) = env::var("CREDENTIALS_DIRECTORY") {
+        let path = Path::new(&credentials_dir).join(SYSTEMD_IDENTITY_CREDENTIAL);
+        let mut secret = fs::read(&path)
+            .map_err(|error| IdentityError::Secret(format!("{}: {error}", path.display())))?;
+        while matches!(secret.last(), Some(b'\n' | b'\r')) {
+            secret.pop();
+        }
+        if secret.is_empty() {
+            return Err(IdentityError::Secret(format!(
+                "{} is empty",
+                path.display()
+            )));
+        }
+        return Ok(secret);
+    }
+
+    Err(IdentityError::Secret(format!(
+        "set {IDENTITY_SECRET_FILE_ENV}, {IDENTITY_SECRET_ENV}, or a systemd identity credential"
+    )))
+}
+
+fn load_legacy_raw_keyring(path: &Path) -> Result<Keyring, IdentityError> {
+    let bytes = fs::read(path).map_err(|error| IdentityError::Storage(error.into()))?;
+    if bytes.len() < 5 || bytes[..4] != *b"MTMK" || bytes[4] != 1 {
+        return Err(IdentityError::InvalidLegacyIdentity);
+    }
+    Keyring::from_bytes(&bytes[5..]).map_err(|_| IdentityError::InvalidLegacyIdentity)
+}
+
+fn save_protected_keyring_verified(
+    keyring: &Keyring,
+    path: &Path,
+    passphrase: &[u8],
+) -> Result<(), IdentityError> {
+    mtp::files::save_keyring(keyring, path, passphrase).map_err(IdentityError::Storage)?;
+    let persisted = mtp::files::load_keyring(path, passphrase).map_err(IdentityError::Storage)?;
+    let expected = keyring
+        .try_to_bytes()
+        .map_err(|error| IdentityError::Verification(error.to_string()))?;
+    let actual = persisted
+        .try_to_bytes()
+        .map_err(|error| IdentityError::Verification(error.to_string()))?;
+    if expected != actual {
+        return Err(IdentityError::Verification(
+            "persisted keyring differs from the requested identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_or_migrate_keyring_at(
+    path: &Path,
+    legacy: Option<String>,
+    passphrase: &[u8],
+) -> Result<Keyring, IdentityError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(IdentityError::Directory)?;
+    }
+
+    match mtp::files::load_keyring(path, passphrase) {
+        Ok(keyring) => return Ok(keyring),
+        Err(mtp::files::FileError::Io(error)) if error.kind() == ErrorKind::NotFound => {}
+        Err(mtp::files::FileError::UnprotectedKeyring) => {
+            let keyring = load_legacy_raw_keyring(path)?;
+            save_protected_keyring_verified(&keyring, path, passphrase)?;
+            return Ok(keyring);
+        }
+        Err(error) => return Err(IdentityError::Storage(error)),
+    }
+
+    let keyring = match legacy {
+        Some(encoded) => {
+            keyring_from_base64(&encoded).ok_or(IdentityError::InvalidLegacyIdentity)?
+        }
+        None => {
+            log!(
+                "No existing Iota identity found at {}; generating a new identity",
+                path.display()
+            );
+            crypto_helper::generate_keyring()
+        }
+    };
+
+    save_protected_keyring_verified(&keyring, path, passphrase)?;
+    Ok(keyring)
+}
 
 // ============================================================================
 // Waiting Task System
@@ -177,14 +346,6 @@ pub struct OmikronConnection {
     cancellation: CancellationToken,
     pub(crate) active_tasks: Arc<DashSet<String>>,
     pub(crate) app: Arc<std::sync::Mutex<AppState>>,
-}
-
-fn ensure_relay_frame_id(frame: CommunicationValue) -> CommunicationValue {
-    if frame.id().is_some_and(|id| id != 0) {
-        return frame;
-    }
-    let id = NEXT_RELAY_FRAME_ID.fetch_add(1, Ordering::Relaxed).max(1);
-    frame.with_id(id)
 }
 
 impl OmikronConnection {
@@ -299,29 +460,29 @@ impl OmikronConnection {
                 break;
             }
 
-            match self.clone().connect_once().await {
-                Ok(()) => {
-                    if *self.reconnect_on_close.read().await {
-                        log!("Connection lost, reconnecting in {:?}...", reconnect_delay);
-                    } else {
+            let retry_reason = match self.clone().connect_once().await {
+                Ok(result) => {
+                    if result.became_healthy {
+                        reconnect_delay = RECONNECT_DELAY;
+                    }
+                    if !*self.reconnect_on_close.read().await {
                         break;
                     }
+                    "Connection lost".to_string()
                 }
                 Err(e) => {
                     if self.auth_failure.read().await.is_some() {
                         log!("Authentication failed, stopping reconnection: {}", e);
                         break;
                     }
-                    log!(
-                        "Connection failed: {}, retrying in {:?}...",
-                        e,
-                        reconnect_delay
-                    );
+                    format!("Connection failed: {e}")
                 }
-            }
+            };
 
+            let delay = jittered_reconnect_delay(reconnect_delay);
+            log!("{}, retrying in {:?}...", retry_reason, delay);
             tokio::select! {
-                _ = sleep(reconnect_delay) => {}
+                _ = sleep(delay) => {}
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         break;
@@ -333,11 +494,16 @@ impl OmikronConnection {
         }
     }
 
-    async fn connect_once(self: Arc<Self>) -> Result<(), String> {
+    async fn connect_once(self: Arc<Self>) -> Result<ConnectionAttemptResult, String> {
         self.set_state(ConnectionState::Connecting).await;
         log_t!("omikron_connecting");
 
-        let keyring = Arc::new(self.load_or_migrate_keyring().await);
+        let identity_secret = load_identity_secret().map_err(|error| error.to_string())?;
+        let keyring = Arc::new(
+            self.load_or_migrate_keyring(&identity_secret)
+                .await
+                .map_err(|error| format!("Iota identity initialization failed: {error}"))?,
+        );
         *self.keyring.write().await = Some(keyring.clone());
 
         let existing_iota_id = CONFIG.load().iota_id;
@@ -349,29 +515,21 @@ impl OmikronConnection {
 
         log!("Connecting to Omikron at {}", addr_str);
 
+        let policy = Policy::default()
+            .with_send_mode(SendMode::SingleStreamPerMessage)
+            .with_timeouts(
+                Duration::from_millis(2_000),
+                Duration::from_millis(2_000),
+                Duration::from_millis(30_000),
+            )
+            .with_keep_alive(Some(Duration::from_secs(6)))
+            .with_receiver_queue_capacity(1000)
+            .with_max_concurrent_stream_tasks(10)
+            .with_persistent_stream_retries(5, Duration::from_secs(5));
         let client_config = ClientConfig::new(&addr_str)
             .with_description("iota")
-            .with_policy(Policy {
-                send_mode: SendMode::SingleStreamPerMessage,
-                max_message_size: 1_000_000_000,
-                handshake_max_message_size: 1_000_000_000,
-                close_frame_len: u32::MAX,
-                application_close_code: 0,
-                open_stream_timeout: Duration::from_millis(2_000),
-                write_timeout: Duration::from_millis(2_000),
-                accept_stream_timeout: Duration::from_millis(10_000),
-                read_timeout: Duration::from_millis(30_000),
-                keep_alive_interval: Some(Duration::from_secs(6)),
-                max_idle_timeout: None,
-                force_close_delay: Duration::from_millis(300),
-                receiver_queue_capacity: 1000,
-                max_concurrent_stream_tasks: 10,
-                persistent_stream_max_retries: 5,
-                persistent_stream_retry_backoff: Duration::from_secs(5),
-                max_frames_per_stream: None,
-            })
-            .with_ping_interval(MAINTENANCE_INTERVAL)
-            .with_max_missed_pings(0);
+            .with_policy(policy)
+            .with_ping_interval(MAINTENANCE_INTERVAL);
 
         let connection = match Client::auth_connect_or_register(
             client_config,
@@ -440,13 +598,9 @@ impl OmikronConnection {
         }
 
         match result {
-            Ok(()) => {
-                if *self.reconnect_on_close.read().await {
-                    Err("Connection closed, will reconnect".to_string())
-                } else {
-                    Ok(())
-                }
-            }
+            Ok(()) => Ok(ConnectionAttemptResult {
+                became_healthy: true,
+            }),
             Err(e) => Err(format!("Read loop error: {}", e)),
         }
     }
@@ -455,6 +609,7 @@ impl OmikronConnection {
     // Identity (own Keyring, migrated from the legacy base64-in-config format)
     // -------------------------------------------------------------------------
 
+<<<<<<< HEAD
     /*
      * `iota.mk` is now the source of truth for this Iota's identity. A
      * pre-existing base64 keyring in config.json (from before the MTP auth
@@ -490,6 +645,10 @@ impl OmikronConnection {
         }
 
         keyring
+=======
+    async fn load_or_migrate_keyring(&self, passphrase: &[u8]) -> Result<Keyring, IdentityError> {
+        load_or_migrate_keyring_at(identity_path(), CONFIG.load().keyring.clone(), passphrase)
+>>>>>>> refs/remotes/origin/main
     }
 
     // -------------------------------------------------------------------------
@@ -562,8 +721,12 @@ impl OmikronConnection {
         };
 
         let (host, port, public_key) = if let Some(endpoint) = discovered {
+            let discovered_key_bytes = endpoint.public_key.try_as_bytes().map_err(|error| {
+                format!("Failed to serialize discovered Omikron public key: {error}")
+            })?;
             match &cached_key {
                 Some(cached) => {
+<<<<<<< HEAD
                     let keys_match =
                         match (cached.try_as_bytes(), endpoint.public_key.try_as_bytes()) {
                             (Ok(cached_bytes), Ok(discovered_bytes)) => {
@@ -589,6 +752,20 @@ impl OmikronConnection {
                     } else {
                         (endpoint.host, endpoint.port, cached.clone())
                     }
+=======
+                    let cached_key_bytes = cached.try_as_bytes().map_err(|error| {
+                        format!("Failed to serialize cached Omikron public key: {error}")
+                    })?;
+                    if cached_key_bytes != discovered_key_bytes {
+                        log!(
+                            "Fetched Omikron public key differs from the cached {} - keeping the \
+                             cached key. Delete {} manually if this is an expected key rotation.",
+                            OMIKRON_PUBLIC_KEY_PATH,
+                            OMIKRON_PUBLIC_KEY_PATH
+                        );
+                    }
+                    (endpoint.host, endpoint.port, cached.clone())
+>>>>>>> refs/remotes/origin/main
                 }
                 None => {
                     if let Err(e) = save_omikron_public_key(&endpoint.public_key, key_path) {
@@ -636,7 +813,13 @@ impl OmikronConnection {
                         });
                         continue;
                     }
-                    let msg_id = cv.get_id();
+                    let Some(msg_id) = cv.id() else {
+                        let self_clone = self.clone();
+                        tokio::spawn(async move {
+                            self_clone.handle_message_impl(cv).await;
+                        });
+                        continue;
+                    };
                     if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
                         if (task.task)(cv.clone()) {
                             continue;
@@ -686,7 +869,7 @@ impl OmikronConnection {
             }
 
             if let Some(ping) = connection.get_ping() {
-                let ping_ms = ping.as_millis() as i64;
+                let ping_ms = i64::try_from(ping.as_millis()).unwrap_or(i64::MAX);
                 *self.last_ping.lock().await = ping_ms;
                 self.app.lock().unwrap().push_ping_val(ping_ms as f64);
             }
@@ -704,7 +887,10 @@ impl OmikronConnection {
         &self,
         signer_id: u64,
     ) -> Result<Vec<PublicKeyBundle>, RelayValidationError> {
-        if let Some(user) = iota_storage::users::user_manager::get_user(signer_id as i64) {
+        let signer_id_i64 = i64::try_from(signer_id).map_err(|_| {
+            RelayValidationError::KeyLookup("signer ID exceeds local storage range".into())
+        })?;
+        if let Some(user) = iota_storage::users::user_manager::get_user(signer_id_i64) {
             let key = iota_util::crypto_helper::public_key_bundle_from_base64(&user.public_key)
                 .ok_or_else(|| {
                     RelayValidationError::KeyLookup("stored user key is invalid".into())
@@ -714,7 +900,7 @@ impl OmikronConnection {
 
         let request = CommunicationValue::new(CommunicationType::GetUserData).add_typed_default(
             DataType::UserId,
-            DataValue::UnsignedNumber(signer_id as u128),
+            DataValue::UnsignedNumber(u128::from(signer_id)),
         );
         let response = self
             .await_response(&request, Some(Duration::from_secs(10)))
@@ -736,15 +922,19 @@ impl OmikronConnection {
     }
 
     pub async fn hosting_iota_for_user(&self, user_id: u64) -> Result<u64, String> {
-        if iota_storage::users::user_manager::get_user(user_id as i64).is_some() {
+        let user_id_i64 = i64::try_from(user_id)
+            .map_err(|_| "user ID exceeds local storage range".to_string())?;
+        if iota_storage::users::user_manager::get_user(user_id_i64).is_some() {
             return CONFIG
                 .load()
                 .iota_id
                 .ok_or_else(|| "Iota identity is not configured".into());
         }
 
-        let request = CommunicationValue::new(CommunicationType::GetUserData)
-            .add_typed_default(DataType::UserId, DataValue::UnsignedNumber(user_id as u128));
+        let request = CommunicationValue::new(CommunicationType::GetUserData).add_typed_default(
+            DataType::UserId,
+            DataValue::UnsignedNumber(u128::from(user_id)),
+        );
         let response = self
             .await_response(&request, Some(Duration::from_secs(10)))
             .await?;
@@ -766,17 +956,19 @@ impl OmikronConnection {
     }
 
     async fn handle_relay(self: Arc<Self>, frame: CommunicationValue) {
-        let frame = ensure_relay_frame_id(frame);
-        let incoming_frame_id = frame.id();
+        let Some(incoming_frame_id) = frame.id() else {
+            log!("Rejecting Relay without a message id");
+            return;
+        };
         let Some(local_iota_id) = CONFIG.load().iota_id else {
             log!("Rejecting Relay because this Iota has no registered identity");
-            self.send_relay_response(incoming_frame_id, CommunicationType::ErrorInvalidData)
+            self.send_relay_response(Some(incoming_frame_id), CommunicationType::ErrorInvalidData)
                 .await;
             return;
         };
         let Some(keyring) = self.keyring.read().await.as_ref().cloned() else {
             log!("Rejecting Relay because the Iota keyring is unavailable");
-            self.send_relay_response(incoming_frame_id, CommunicationType::ErrorInternal)
+            self.send_relay_response(Some(incoming_frame_id), CommunicationType::ErrorInternal)
                 .await;
             return;
         };
@@ -798,24 +990,29 @@ impl OmikronConnection {
             Ok(value) => value,
             Err(error) => {
                 log!("Relay metadata verification failed: {}", error);
-                self.send_relay_response(incoming_frame_id, CommunicationType::ErrorInvalidData)
-                    .await;
+                self.send_relay_response(
+                    Some(incoming_frame_id),
+                    CommunicationType::ErrorInvalidData,
+                )
+                .await;
                 return;
             }
         };
-        let signer_is_local =
-            iota_storage::users::user_manager::get_user(verified.context.signer_id as i64)
-                .is_some();
-        let recipient_is_local =
-            iota_storage::users::user_manager::get_user(verified.context.final_recipient_id as i64)
-                .is_some();
+        let signer_is_local = i64::try_from(verified.context.signer_id)
+            .ok()
+            .and_then(iota_storage::users::user_manager::get_user)
+            .is_some();
+        let recipient_is_local = i64::try_from(verified.context.final_recipient_id)
+            .ok()
+            .and_then(iota_storage::users::user_manager::get_user)
+            .is_some();
         if !signer_is_local && !recipient_is_local {
             log!(
                 "Rejecting Relay with no local origin or destination: signer {}, recipient {}",
                 verified.context.signer_id,
                 verified.context.final_recipient_id,
             );
-            self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+            self.send_relay_response(Some(incoming_frame_id), CommunicationType::ErrorInvalidData)
                 .await;
             return;
         }
@@ -833,7 +1030,7 @@ impl OmikronConnection {
             }
         };
         let type_map_version = verified.context.type_map.version.to_string();
-        let frame_id = frame.id().unwrap_or_default();
+        let frame_id = incoming_frame_id;
         let reservation = match relay_replay::reserve(
             verified.context.signer_id,
             &verified.context.message_id,
@@ -1000,7 +1197,7 @@ impl OmikronConnection {
             RouteTarget::User(destination),
             &bytes,
             now_millis_i64(),
-            forwarded.id().unwrap_or_default(),
+            frame_id,
             &type_map_version,
         ) {
             log!("Relay could not be queued for client delivery: {}", error);
@@ -1142,7 +1339,7 @@ impl OmikronConnection {
     }
 
     // -------------------------------------------------------------------------
-    // Message Handling — Dispatch
+    // Message Handling - Dispatch
     // -------------------------------------------------------------------------
 
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
@@ -1169,7 +1366,10 @@ impl OmikronConnection {
             }
         }
 
-        let msg_id = cv.get_id();
+        let Some(msg_id) = cv.id() else {
+            self.handle_message_impl(cv).await;
+            return;
+        };
 
         if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
             if (task.task)(cv.clone()) {
@@ -1183,6 +1383,12 @@ impl OmikronConnection {
     async fn handle_message_impl(self: Arc<Self>, cv: CommunicationValue) {
         if cv.is_type(CommunicationType::Relay) {
             self.handle_relay(cv).await;
+            return;
+        }
+        if cv.require_id().is_err() {
+            let _ = self
+                .send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                .await;
             return;
         }
 
@@ -1264,7 +1470,7 @@ impl OmikronConnection {
         }
 
         let acknowledgement = CommunicationValue::new(CommunicationType::EraseHostedUserDataAck)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
         let _ = self.send_message(&acknowledgement).await;
     }
@@ -1276,7 +1482,15 @@ impl OmikronConnection {
     }
 
     async fn handle_app_identification(self: Arc<Self>, cv: &CommunicationValue) {
-        let sender_id = cv.get_sender();
+        let sender_id = match cv.require_sender() {
+            Ok(sender_id) => sender_id,
+            Err(_) => {
+                let _ = self
+                    .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
+                    .await;
+                return;
+            }
+        };
         let app_identifier = cv
             .get_data(DataType::AppIdentifier)
             .as_str()
@@ -1287,7 +1501,12 @@ impl OmikronConnection {
             .as_str()
             .unwrap_or("")
             .to_string();
-        let user_id = cv.get_data(DataType::UserId).as_number().unwrap_or(0) as i64;
+        let Some(user_id) = data_i64(cv, DataType::UserId).filter(|id| *id > 0) else {
+            let _ = self
+                .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
+                .await;
+            return;
+        };
 
         let mut trusted = false;
         if let Some(user) = iota_storage::users::user_manager::get_user(user_id) {
@@ -1308,7 +1527,8 @@ impl OmikronConnection {
             if let Some(app_pub_bundle) =
                 iota_util::crypto_helper::public_key_bundle_from_base64(&app_public_key)
             {
-                if let Ok(keyring) = mtp::files::load_keyring_raw(identity_path()) {
+                let keyring = self.keyring.read().await.as_ref().cloned();
+                if let Some(keyring) = keyring {
                     if let Ok(encrypted_challenge) =
                         crypto_util::encrypt_challenge(&challenge, &app_pub_bundle)
                     {
@@ -1316,7 +1536,7 @@ impl OmikronConnection {
                         let pub_k_b64 = crypto_helper::public_key_bundle_to_base64(&bundle);
 
                         let res = CommunicationValue::new(CommunicationType::AppChallenge)
-                            .with_id(cv.get_id())
+                            .with_request_id(cv)
                             .with_receiver(sender_id)
                             .add_typed_default(DataType::PublicKey, DataValue::Str(pub_k_b64))
                             .add_typed_default(
@@ -1332,18 +1552,26 @@ impl OmikronConnection {
         }
 
         let res = CommunicationValue::new(CommunicationType::ErrorInvalidChallenge)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(sender_id);
         let _ = self.send_message(&res).await;
     }
 
     async fn handle_app_challenge_response(self: Arc<Self>, cv: &CommunicationValue) {
-        let sender_id = cv.get_sender();
+        let sender_id = match cv.require_sender() {
+            Ok(sender_id) => sender_id,
+            Err(_) => {
+                let _ = self
+                    .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
+                    .await;
+                return;
+            }
+        };
         if let Some((_, expected_challenge)) = self.app_challenges.remove(&sender_id) {
             if let Some(DataValue::Str(response)) = cv.get_data(DataType::Challenge) {
                 if expected_challenge == *response {
                     let res = CommunicationValue::new(CommunicationType::AppIdentificationResponse)
-                        .with_id(cv.get_id())
+                        .with_request_id(cv)
                         .with_receiver(sender_id);
                     let _ = self.send_message(&res).await;
                     return;
@@ -1351,13 +1579,21 @@ impl OmikronConnection {
             }
         }
         let res = CommunicationValue::new(CommunicationType::ErrorInvalidChallenge)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(sender_id);
         let _ = self.send_message(&res).await;
     }
 
     async fn handle_save_app_data(self: Arc<Self>, cv: &CommunicationValue) {
-        let sender_id = cv.get_sender();
+        let sender_id = match cv.require_sender() {
+            Ok(sender_id) => sender_id,
+            Err(_) => {
+                let _ = self
+                    .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
+                    .await;
+                return;
+            }
+        };
         let app_data = cv
             .get_data(DataType::AppData)
             .as_str()
@@ -1370,13 +1606,21 @@ impl OmikronConnection {
         }
 
         let res = CommunicationValue::new(CommunicationType::SaveAppData)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(sender_id);
         let _ = self.send_message(&res).await;
     }
 
     async fn handle_load_app_data(self: Arc<Self>, cv: &CommunicationValue) {
-        let sender_id = cv.get_sender();
+        let sender_id = match cv.require_sender() {
+            Ok(sender_id) => sender_id,
+            Err(_) => {
+                let _ = self
+                    .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
+                    .await;
+                return;
+            }
+        };
         let mut app_data = String::new();
 
         if let Some(session) = self.app_sessions.get(&sender_id) {
@@ -1385,7 +1629,7 @@ impl OmikronConnection {
         }
 
         let res = CommunicationValue::new(CommunicationType::LoadAppData)
-            .with_id(cv.get_id())
+            .with_request_id(cv)
             .with_receiver(sender_id)
             .add_typed_default(DataType::AppData, DataValue::Str(app_data));
         let _ = self.send_message(&res).await;
@@ -1426,9 +1670,9 @@ impl OmikronConnection {
         extra: Vec<(DataType, DataValue)>,
     ) -> CommunicationValue {
         let mut message = CommunicationValue::new(ty)
-            .with_id(request.get_id())
-            .with_sender(mutation.sender_id as u64)
-            .with_receiver(mutation.partner_id as u64)
+            .with_request_id(request)
+            .with_sender(wire_user_id(mutation.sender_id))
+            .with_receiver(wire_user_id(mutation.partner_id))
             .add_typed_default(
                 DataType::ChatPartnerId,
                 DataValue::SignedNumber(mutation.sender_id as i128),
@@ -1444,18 +1688,26 @@ impl OmikronConnection {
     }
 
     async fn persist_and_deliver_remote_edit(&self, cv: &CommunicationValue) {
-        let sender_id = match i64::try_from(cv.get_sender()) {
-            Ok(sender_id) => sender_id,
-            Err(_) => return,
+        let sender_id = match cv
+            .require_sender()
+            .ok()
+            .and_then(|id| i64::try_from(id).ok())
+        {
+            Some(sender_id) => sender_id,
+            None => return,
         };
-        let receiver_id = match i64::try_from(cv.get_receiver()) {
-            Ok(receiver_id) if receiver_id > 0 => receiver_id,
+        let receiver_id = match cv
+            .require_receiver()
+            .ok()
+            .and_then(|id| i64::try_from(id).ok())
+        {
+            Some(receiver_id) if receiver_id > 0 => receiver_id,
             _ => return,
         };
         let Some(send_time) = data_i64(cv, DataType::SendTime).filter(|time| *time > 0) else {
             return;
         };
-        let Some(content) = cv.get_data(DataType::Content).as_str() else {
+        let Some(content) = cv.get_data(DataType::AppContent).as_str() else {
             return;
         };
         if chat_files::apply_remote_edit(receiver_id, sender_id, send_time, sender_id, content)
@@ -1466,12 +1718,20 @@ impl OmikronConnection {
     }
 
     async fn persist_and_deliver_remote_reaction(&self, cv: &CommunicationValue, add: bool) {
-        let sender_id = match i64::try_from(cv.get_sender()) {
-            Ok(sender_id) => sender_id,
-            Err(_) => return,
+        let sender_id = match cv
+            .require_sender()
+            .ok()
+            .and_then(|id| i64::try_from(id).ok())
+        {
+            Some(sender_id) => sender_id,
+            None => return,
         };
-        let receiver_id = match i64::try_from(cv.get_receiver()) {
-            Ok(receiver_id) if receiver_id > 0 => receiver_id,
+        let receiver_id = match cv
+            .require_receiver()
+            .ok()
+            .and_then(|id| i64::try_from(id).ok())
+        {
+            Some(receiver_id) if receiver_id > 0 => receiver_id,
             _ => return,
         };
         let Some(send_time) = data_i64(cv, DataType::SendTime).filter(|time| *time > 0) else {
@@ -1494,12 +1754,20 @@ impl OmikronConnection {
     }
 
     async fn persist_and_deliver_remote_delete(&self, cv: &CommunicationValue) {
-        let sender_id = match i64::try_from(cv.get_sender()) {
-            Ok(sender_id) => sender_id,
-            Err(_) => return,
+        let sender_id = match cv
+            .require_sender()
+            .ok()
+            .and_then(|id| i64::try_from(id).ok())
+        {
+            Some(sender_id) => sender_id,
+            None => return,
         };
-        let receiver_id = match i64::try_from(cv.get_receiver()) {
-            Ok(receiver_id) if receiver_id > 0 => receiver_id,
+        let receiver_id = match cv
+            .require_receiver()
+            .ok()
+            .and_then(|id| i64::try_from(id).ok())
+        {
+            Some(receiver_id) if receiver_id > 0 => receiver_id,
             _ => return,
         };
         let Some(send_time) = data_i64(cv, DataType::SendTime).filter(|time| *time > 0) else {
@@ -1522,7 +1790,7 @@ impl OmikronConnection {
                 .await;
             return;
         };
-        let Some(content) = cv.get_data(DataType::Content).as_str() else {
+        let Some(content) = cv.get_data(DataType::AppContent).as_str() else {
             let _ = self
                 .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
                 .await;
@@ -1532,7 +1800,7 @@ impl OmikronConnection {
             CommunicationType::MessageEditLive,
             cv,
             &mutation,
-            vec![(DataType::Content, DataValue::Str(content.to_string()))],
+            vec![(DataType::AppContent, DataValue::Str(content.to_string()))],
         );
         if iota_storage::users::user_manager::get_user(mutation.partner_id).is_some()
             && chat_files::apply_remote_edit(
@@ -1631,9 +1899,13 @@ impl OmikronConnection {
     }
 
     async fn handle_message_delete_live(self: Arc<Self>, cv: &CommunicationValue) {
-        let sender_id = match i64::try_from(cv.get_sender()) {
-            Ok(sender_id) => sender_id,
-            Err(_) => return,
+        let sender_id = match cv
+            .require_sender()
+            .ok()
+            .and_then(|id| i64::try_from(id).ok())
+        {
+            Some(sender_id) => sender_id,
+            None => return,
         };
         if iota_storage::users::user_manager::get_user(sender_id).is_none() {
             self.persist_and_deliver_remote_delete(cv).await;
@@ -1814,7 +2086,9 @@ impl OmikronConnection {
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
         let (tx, rx) = oneshot::channel();
-        let msg_id = cv.get_id();
+        let msg_id = cv
+            .require_id()
+            .map_err(|error| format!("cannot await response without a message id: {error}"))?;
 
         WAITING_TASKS.insert(
             msg_id,
@@ -1931,6 +2205,8 @@ impl OmikronConnection {
     /// recovery does not silently destroy the user's previous identity.
     pub async fn rotate_identity(self: &Arc<Self>) -> Result<(), OmikronError> {
         log!("Iota identity rotation requested");
+        let identity_secret =
+            load_identity_secret().map_err(|error| OmikronError::Internal(error.to_string()))?;
         self.stop().await;
 
         let path = identity_path();
@@ -1950,7 +2226,10 @@ impl OmikronConnection {
         }
 
         let keyring = crypto_helper::generate_keyring();
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent).map_err(|error| {
                 OmikronError::Internal(format!(
                     "could not create identity directory {}: {error}",
@@ -1958,7 +2237,11 @@ impl OmikronConnection {
                 ))
             })?;
         }
+<<<<<<< HEAD
         save_keyring(&keyring, path).map_err(|error| {
+=======
+        save_protected_keyring_verified(&keyring, path, &identity_secret).map_err(|error| {
+>>>>>>> refs/remotes/origin/main
             OmikronError::Internal(format!(
                 "could not save new identity {}: {error}",
                 path.display()
@@ -2127,6 +2410,7 @@ impl OmikronClient for OmikronConnection {
 }
 
 #[cfg(test)]
+<<<<<<< HEAD
 mod tests {
     use super::*;
 
@@ -2145,5 +2429,80 @@ mod tests {
             loaded.try_to_bytes().unwrap()
         );
         std::fs::remove_dir_all(directory).unwrap();
+=======
+mod identity_tests {
+    use super::*;
+
+    fn test_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "iota-identity-{name}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ))
+    }
+
+    #[test]
+    fn generated_identity_is_protected_and_survives_reload() {
+        let path = test_path("reload");
+        let passphrase = b"test identity secret";
+        let keyring = load_or_migrate_keyring_at(&path, None, passphrase).expect("identity saves");
+        let reloaded = load_or_migrate_keyring_at(&path, None, passphrase).expect("identity loads");
+        assert_eq!(
+            keyring.try_to_bytes().expect("keyring serializes"),
+            reloaded.try_to_bytes().expect("keyring serializes")
+        );
+        assert!(mtp::files::load_keyring(&path, b"wrong secret").is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn corrupt_existing_identity_does_not_generate_a_replacement() {
+        let path = test_path("corrupt");
+        fs::write(&path, b"not a keyring").expect("corrupt fixture writes");
+        let error = load_or_migrate_keyring_at(&path, None, b"test identity secret")
+            .expect_err("corrupt identity must fail");
+        assert!(matches!(error, IdentityError::Storage(_)));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_raw_identity_is_migrated_only_when_the_raw_format_is_valid() {
+        let path = test_path("legacy");
+        let keyring = crypto_helper::generate_keyring();
+        let mut raw = b"MTMK".to_vec();
+        raw.push(1);
+        raw.extend_from_slice(&keyring.try_to_bytes().expect("keyring serializes"));
+        fs::write(&path, raw).expect("legacy fixture writes");
+
+        let migrated = load_or_migrate_keyring_at(&path, None, b"test identity secret")
+            .expect("legacy identity migrates");
+        assert_eq!(
+            migrated.try_to_bytes().expect("keyring serializes"),
+            keyring.try_to_bytes().expect("keyring serializes")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn identity_directory_failure_is_returned() {
+        let parent = test_path("parent-file");
+        fs::write(&parent, b"not a directory").expect("parent fixture writes");
+        let path = parent.join("iota.mk");
+        let error = load_or_migrate_keyring_at(&path, None, b"test identity secret")
+            .expect_err("directory failure must be returned");
+        assert!(matches!(error, IdentityError::Directory(_)));
+        let _ = fs::remove_file(parent);
+    }
+
+    #[test]
+    fn reconnect_jitter_stays_bounded_by_the_exponential_delay_ceiling() {
+        for _ in 0..32 {
+            let delay = jittered_reconnect_delay(Duration::from_secs(5));
+            assert!(delay >= Duration::from_secs(4));
+            assert!(delay <= Duration::from_secs(6));
+        }
+
+        assert!(jittered_reconnect_delay(Duration::from_secs(600)) <= MAX_RECONNECT_DELAY);
+>>>>>>> refs/remotes/origin/main
     }
 }

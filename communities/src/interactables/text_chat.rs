@@ -8,7 +8,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use json::{JsonValue, array, object};
-use iota_util::mtp_compat::{CommunicationValueCompat, OptionalDataValueExt};
+use iota_util::mtp_compat::{OptionalDataValueExt, RequiredCommunicationFields};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -31,6 +31,10 @@ impl TextChat {
         }
     }
     pub fn add_message(&self, send_time: u128, sender: i64, message: &str) {
+        let Ok(send_time) = i64::try_from(send_time) else {
+            log!("Message timestamp exceeds local storage range");
+            return;
+        };
         let user_dir = &format!(
             "communities/{}/interactables/{}/{}",
             self.get_community().get_name(),
@@ -74,7 +78,7 @@ impl TextChat {
         }
 
         let json_obj = object! {
-            "timestamp" => send_time as i64,
+            "timestamp" => send_time,
             "content" => message,
             "sender" => sender.to_string(),
         };
@@ -202,7 +206,7 @@ impl Interactable for TextChat {
             let mut payload = JsonValue::new_object();
             payload["messages"] = messages;
             return CommunicationValue::new(CommunicationType::Function)
-                .with_id(cv.get_id())
+                .with_request_id(&cv)
                 .add_data_str(DataType::Name, self.name.clone())
                 .add_data_str(DataType::Path, self.path.clone())
                 .add_data_str(DataType::Result, "message_chunk".to_string())
@@ -210,19 +214,28 @@ impl Interactable for TextChat {
         }
         if cv.get_data(DataType::Function).unwrap().as_str().unwrap() == "send_message" {
             let message = payload["message"].as_str().unwrap();
+            let sender = match cv.require_sender() {
+                Ok(sender) => sender,
+                Err(_) => return CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                    .with_request_id(&cv),
+            };
             let milliseconds_timestamp: u128 = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis();
-            self.add_message(milliseconds_timestamp, cv.get_sender(), message);
+            let Ok(sender) = i64::try_from(sender) else {
+                return CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                    .with_request_id(&cv);
+            };
+            self.add_message(milliseconds_timestamp, sender, message);
 
             let mut distribution_payload = JsonValue::new_object();
             distribution_payload["message"] = JsonValue::String(message.to_string());
-            distribution_payload["sender_id"] = JsonValue::String(cv.get_sender().to_string());
+            distribution_payload["sender_id"] = JsonValue::String(sender.to_string());
             distribution_payload["send_time"] =
                 JsonValue::String(milliseconds_timestamp.to_string());
             let distribution = CommunicationValue::new(CommunicationType::Update)
-                .with_id(cv.get_id())
+                .with_request_id(&cv)
                 .add_data_str(DataType::Name, self.name.clone())
                 .add_data_str(DataType::Path, self.path.clone())
                 .add_data_str(DataType::Result, "message_live".to_string())
@@ -238,13 +251,13 @@ impl Interactable for TextChat {
                 }
             }
             return CommunicationValue::new(CommunicationType::Function)
-                .with_id(cv.get_id())
+                .with_request_id(&cv)
                 .add_data_str(DataType::Name, self.name.clone())
                 .add_data_str(DataType::Path, self.path.clone())
                 .add_data_str(DataType::Result, "message_received".to_string())
                 .add_data(DataType::Payload, JsonValue::new_object());
         }
-        CommunicationValue::new(CommunicationType::ErrorInternal).with_id(cv.get_id())
+        CommunicationValue::new(CommunicationType::ErrorInternal).with_request_id(&cv)
     }
     fn to_json(&self) -> JsonValue {
         JsonValue::new_object()

@@ -377,7 +377,7 @@ mod tests {
     use super::{CreateUserError, request_user_id, valid_username};
     use crate::{OmikronClient, OmikronError};
     use async_trait::async_trait;
-    use iota_util::mtp_compat::CommunicationValueCompat;
+    use iota_connection::message_common::CommunicationResponseExt;
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
     use std::time::Duration;
 
@@ -397,7 +397,7 @@ mod tests {
             _: Duration,
         ) -> Result<CommunicationValue, OmikronError> {
             assert!(request.is_type(CommunicationType::GetRegister));
-            Ok(self.response.clone().with_id(request.get_id()))
+            Ok(self.response.clone().with_request_id(request))
         }
 
         async fn reconnect(&self) -> Result<(), OmikronError> {

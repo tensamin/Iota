@@ -2,7 +2,21 @@ use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::type_map::TypeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use iota_util::mtp_compat::{CommunicationValueCompat, OptionalDataValueExt};
+pub use iota_util::mtp_compat::{MtpFieldError, OptionalDataValueExt, RequiredCommunicationFields};
+
+pub trait CommunicationResponseExt {
+    fn with_request_id(self, request: &CommunicationValue) -> Self;
+}
+
+impl CommunicationResponseExt for CommunicationValue {
+    fn with_request_id(mut self, request: &CommunicationValue) -> Self {
+        self = self.without_id();
+        if let Some(id) = request.id() {
+            self = self.with_id(id);
+        }
+        self
+    }
+}
 
 pub fn typed_container(items: Vec<(DataType, DataValue)>) -> DataValue {
     use mtp::type_map::{DataTypeId, TypeMap};
@@ -95,16 +109,48 @@ pub fn chat_secret_recipients(cv: &CommunicationValue) -> Option<Vec<ChatSecretR
 }
 
 pub fn now_millis_i64() -> i64 {
-    SystemTime::now()
+    let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as i64
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
 pub fn error_response(request: &CommunicationValue, ty: CommunicationType) -> CommunicationValue {
-    let mut response = CommunicationValue::new(ty).with_id(request.id().unwrap_or_default());
+    let mut response = CommunicationValue::new(ty).without_id();
+    if let Some(id) = request.id() {
+        response = response.with_id(id);
+    }
     if let Some(sender) = request.sender() {
         response = response.with_receiver(sender);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_response;
+    use mtp::codec::{CommunicationType, CommunicationValue};
+
+    #[test]
+    fn error_response_preserves_an_absent_request_id() {
+        let request = CommunicationValue::new(CommunicationType::GetChats)
+            .without_id()
+            .with_sender(42);
+        let response = error_response(&request, CommunicationType::ErrorInvalidData);
+
+        assert_eq!(response.id(), None);
+        assert_eq!(response.receiver(), Some(42));
+    }
+
+    #[test]
+    fn error_response_copies_an_existing_request_id() {
+        let request = CommunicationValue::new(CommunicationType::GetChats)
+            .with_id(7)
+            .with_sender(42);
+        let response = error_response(&request, CommunicationType::ErrorInvalidData);
+
+        assert_eq!(response.id(), Some(7));
+        assert_eq!(response.receiver(), Some(42));
+    }
 }

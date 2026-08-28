@@ -55,7 +55,7 @@ impl From<StartupPhase> for iota_ipc::StartupPhase {
 
 /* This wrapper exposes daemon state as IPC-safe snapshots while preserving a
  * single owned state instance for all daemon subsystems. The cancellation token
- * is the single lifecycle signal — all subsystems check it instead of a
+ * is the single lifecycle signal, and all subsystems check it instead of a
  * separate boolean. */
 pub struct DaemonRuntime {
     pub state: Arc<DaemonState>,
@@ -131,10 +131,18 @@ impl DaemonRuntime {
     }
 
     pub fn shutdown(&self, reason: ShutdownReason) {
+        self.request_shutdown(reason);
+        self.begin_shutdown();
+    }
+
+    pub fn request_shutdown(&self, reason: ShutdownReason) {
         if self.shutdown_tx.borrow().is_none() {
             let _ = self.shutdown_tx.send(Some(reason));
-            self.cancellation.cancel();
         }
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.cancellation.cancel();
     }
 
     pub fn shutdown_reason(&self) -> Option<ShutdownReason> {
