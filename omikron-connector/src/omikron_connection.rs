@@ -12,7 +12,6 @@ use mtp::crypto::{Keyring, PublicKeyBundle};
 use rand_core::RngCore;
 use std::env;
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,9 +37,6 @@ use iota_util::route_target::RouteTarget;
 // ============================================================================
 
 const IOTA_KEYRING_PATH: &str = "iota.mk";
-const IDENTITY_SECRET_ENV: &str = "IOTA_IDENTITY_SECRET";
-const IDENTITY_SECRET_FILE_ENV: &str = "IOTA_IDENTITY_SECRET_FILE";
-const SYSTEMD_IDENTITY_CREDENTIAL: &str = "iota-identity";
 static IDENTITY_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 static OMIKRON_PUBLIC_KEY_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
@@ -107,7 +103,6 @@ const RELAY_RETENTION_MILLIS: i64 = 30 * 24 * 60 * 60 * 1000;
 pub enum IdentityError {
     Storage(mtp::files::FileError),
     Directory(std::io::Error),
-    Secret(String),
     InvalidLegacyIdentity,
     Verification(String),
 }
@@ -117,7 +112,6 @@ impl std::fmt::Display for IdentityError {
         match self {
             Self::Storage(error) => write!(f, "identity storage error: {error}"),
             Self::Directory(error) => write!(f, "unable to create identity directory: {error}"),
-            Self::Secret(error) => write!(f, "unable to load identity secret: {error}"),
             Self::InvalidLegacyIdentity => f.write_str("legacy identity is invalid"),
             Self::Verification(error) => {
                 write!(f, "persisted identity could not be verified: {error}")
@@ -154,68 +148,13 @@ fn wire_user_id(user_id: i64) -> u64 {
     u64::try_from(user_id).expect("validated user ID is non-negative")
 }
 
-fn load_identity_secret() -> Result<Vec<u8>, IdentityError> {
-    if let Some(path) = env::var_os(IDENTITY_SECRET_FILE_ENV) {
-        let path = PathBuf::from(path);
-        let mut secret = fs::read(&path)
-            .map_err(|error| IdentityError::Secret(format!("{}: {error}", path.display())))?;
-        while matches!(secret.last(), Some(b'\n' | b'\r')) {
-            secret.pop();
-        }
-        if secret.is_empty() {
-            return Err(IdentityError::Secret(format!(
-                "{} is empty",
-                path.display()
-            )));
-        }
-        return Ok(secret);
-    }
-
-    if let Ok(secret) = env::var(IDENTITY_SECRET_ENV) {
-        if secret.is_empty() {
-            return Err(IdentityError::Secret(format!(
-                "{IDENTITY_SECRET_ENV} is empty"
-            )));
-        }
-        return Ok(secret.into_bytes());
-    }
-
-    if let Ok(credentials_dir) = env::var("CREDENTIALS_DIRECTORY") {
-        let path = Path::new(&credentials_dir).join(SYSTEMD_IDENTITY_CREDENTIAL);
-        let mut secret = fs::read(&path)
-            .map_err(|error| IdentityError::Secret(format!("{}: {error}", path.display())))?;
-        while matches!(secret.last(), Some(b'\n' | b'\r')) {
-            secret.pop();
-        }
-        if secret.is_empty() {
-            return Err(IdentityError::Secret(format!(
-                "{} is empty",
-                path.display()
-            )));
-        }
-        return Ok(secret);
-    }
-
-    Err(IdentityError::Secret(format!(
-        "set {IDENTITY_SECRET_FILE_ENV}, {IDENTITY_SECRET_ENV}, or a systemd identity credential"
-    )))
-}
-
-fn load_legacy_raw_keyring(path: &Path) -> Result<Keyring, IdentityError> {
-    let bytes = fs::read(path).map_err(|error| IdentityError::Storage(error.into()))?;
-    if bytes.len() < 5 || bytes[..4] != *b"MTMK" || bytes[4] != 1 {
-        return Err(IdentityError::InvalidLegacyIdentity);
-    }
-    Keyring::from_bytes(&bytes[5..]).map_err(|_| IdentityError::InvalidLegacyIdentity)
-}
-
-fn save_protected_keyring_verified(
-    keyring: &Keyring,
-    path: &Path,
-    passphrase: &[u8],
-) -> Result<(), IdentityError> {
-    mtp::files::save_keyring(keyring, path, passphrase).map_err(IdentityError::Storage)?;
-    let persisted = mtp::files::load_keyring(path, passphrase).map_err(IdentityError::Storage)?;
+/*
+ * The identity is stored in the Iota state directory as raw keyring bytes so
+ * daemon restarts do not depend on a separately managed passphrase.
+ */
+fn save_keyring_verified(keyring: &Keyring, path: &Path) -> Result<(), IdentityError> {
+    mtp::files::save_keyring_raw(keyring, path).map_err(IdentityError::Storage)?;
+    let persisted = mtp::files::load_keyring_raw(path).map_err(IdentityError::Storage)?;
     let expected = keyring
         .try_to_bytes()
         .map_err(|error| IdentityError::Verification(error.to_string()))?;
@@ -233,7 +172,6 @@ fn save_protected_keyring_verified(
 fn load_or_migrate_keyring_at(
     path: &Path,
     legacy: Option<String>,
-    passphrase: &[u8],
 ) -> Result<Keyring, IdentityError> {
     if let Some(parent) = path
         .parent()
@@ -242,14 +180,9 @@ fn load_or_migrate_keyring_at(
         fs::create_dir_all(parent).map_err(IdentityError::Directory)?;
     }
 
-    match mtp::files::load_keyring(path, passphrase) {
+    match mtp::files::load_keyring_raw(path) {
         Ok(keyring) => return Ok(keyring),
-        Err(mtp::files::FileError::Io(error)) if error.kind() == ErrorKind::NotFound => {}
-        Err(mtp::files::FileError::UnprotectedKeyring) => {
-            let keyring = load_legacy_raw_keyring(path)?;
-            save_protected_keyring_verified(&keyring, path, passphrase)?;
-            return Ok(keyring);
-        }
+        Err(mtp::files::FileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(IdentityError::Storage(error)),
     }
 
@@ -266,7 +199,7 @@ fn load_or_migrate_keyring_at(
         }
     };
 
-    save_protected_keyring_verified(&keyring, path, passphrase)?;
+    save_keyring_verified(&keyring, path)?;
     Ok(keyring)
 }
 
@@ -486,9 +419,8 @@ impl OmikronConnection {
         self.set_state(ConnectionState::Connecting).await;
         log_t!("omikron_connecting");
 
-        let identity_secret = load_identity_secret().map_err(|error| error.to_string())?;
         let keyring = Arc::new(
-            self.load_or_migrate_keyring(&identity_secret)
+            self.load_or_migrate_keyring()
                 .await
                 .map_err(|error| format!("Iota identity initialization failed: {error}"))?,
         );
@@ -597,8 +529,8 @@ impl OmikronConnection {
     // Identity (own Keyring, migrated from the legacy base64-in-config format)
     // -------------------------------------------------------------------------
 
-    async fn load_or_migrate_keyring(&self, passphrase: &[u8]) -> Result<Keyring, IdentityError> {
-        load_or_migrate_keyring_at(identity_path(), CONFIG.load().keyring.clone(), passphrase)
+    async fn load_or_migrate_keyring(&self) -> Result<Keyring, IdentityError> {
+        load_or_migrate_keyring_at(identity_path(), CONFIG.load().keyring.clone())
     }
 
     // -------------------------------------------------------------------------
@@ -1063,7 +995,10 @@ impl OmikronConnection {
             ) {
                 Ok(value) => value,
                 Err(error) => {
-                    log!("Relay shared-Iota origin content verification failed: {}", error);
+                    log!(
+                        "Relay shared-Iota origin content verification failed: {}",
+                        error
+                    );
                     let _ = relay_replay::mark_rejected(
                         verified.context.signer_id,
                         &verified.context.message_id,
@@ -1103,7 +1038,10 @@ impl OmikronConnection {
                 &verified.context.message_id,
                 accepted_at,
             ) {
-                log!("Relay shared-Iota destination timestamp storage failed: {}", error);
+                log!(
+                    "Relay shared-Iota destination timestamp storage failed: {}",
+                    error
+                );
                 self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
                     .await;
                 return;
@@ -1188,10 +1126,9 @@ impl OmikronConnection {
                     .await;
                 return;
             }
-            if let Err(error) = relay_replay::mark_queued(
-                verified.context.signer_id,
-                &verified.context.message_id,
-            ) {
+            if let Err(error) =
+                relay_replay::mark_queued(verified.context.signer_id, &verified.context.message_id)
+            {
                 log!("Relay origin state update failed: {}", error);
             }
             match self
@@ -1199,9 +1136,7 @@ impl OmikronConnection {
                 .await
             {
                 Ok(response) if response.is_type(CommunicationType::Success) => {
-                    let returned_id = response
-                        .get_data(DataType::RelayMessageId)
-                        .as_str();
+                    let returned_id = response.get_data(DataType::RelayMessageId).as_str();
                     let destination_accepted_at = response
                         .get_data(DataType::RelayAcceptedAt)
                         .as_number()
@@ -1228,7 +1163,10 @@ impl OmikronConnection {
                             &verified.context.message_id,
                             destination_accepted_at,
                         ) {
-                            log!("Relay destination acknowledgement storage failed: {}", error);
+                            log!(
+                                "Relay destination acknowledgement storage failed: {}",
+                                error
+                            );
                         }
                     }
                     if let Err(error) = relay_queue::acknowledge_iota(router, frame_id) {
@@ -1337,26 +1275,21 @@ impl OmikronConnection {
                     return;
                 }
             };
-            if let Err(error) =
-                message_handlers::apply_verified_relay_content(
-                    &verified.context,
-                    &content,
-                    accepted_at,
-                    match i64::try_from(destination) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            log!("Relay destination ID exceeds storage range");
-                            self.send_relay_response(
-                                frame.id(),
-                                CommunicationType::ErrorInvalidData,
-                            )
+            if let Err(error) = message_handlers::apply_verified_relay_content(
+                &verified.context,
+                &content,
+                accepted_at,
+                match i64::try_from(destination) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        log!("Relay destination ID exceeds storage range");
+                        self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
                             .await;
-                            return;
-                        }
-                    },
-                    false,
-                )
-            {
+                        return;
+                    }
+                },
+                false,
+            ) {
                 log!("Relay application dispatch failed: {}", error);
                 if let Err(queue_error) =
                     relay_queue::remove_for_frame(RouteTarget::User(destination), frame_id)
@@ -1371,10 +1304,9 @@ impl OmikronConnection {
                     .await;
                 return;
             }
-            if let Err(error) = relay_replay::mark_applied(
-                verified.context.signer_id,
-                &verified.context.message_id,
-            ) {
+            if let Err(error) =
+                relay_replay::mark_applied(verified.context.signer_id, &verified.context.message_id)
+            {
                 log!("Relay application state update failed: {}", error);
                 self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
                     .await;
@@ -1382,10 +1314,9 @@ impl OmikronConnection {
             }
         }
 
-        if let Err(error) = relay_replay::mark_queued(
-            verified.context.signer_id,
-            &verified.context.message_id,
-        ) {
+        if let Err(error) =
+            relay_replay::mark_queued(verified.context.signer_id, &verified.context.message_id)
+        {
             log!("Relay queue state update failed: {}", error);
         }
         self.send_relay_success(
@@ -1564,6 +1495,10 @@ impl OmikronConnection {
         dispatch!(SettingsSave, handle_settings_save);
         dispatch!(SettingsLoad, handle_settings_load);
         dispatch!(SettingsList, handle_settings_list);
+        dispatch!(SyncedSettingSet, handle_synced_setting_set);
+        dispatch!(SyncedSettingGet, handle_synced_setting_get);
+        dispatch!(SyncedSettingDelete, handle_synced_setting_delete);
+        dispatch!(SyncedSettingsList, handle_synced_settings_list);
         dispatch!(EraseHostedUserData, handle_erase_hosted_user_data);
     }
 
@@ -2143,6 +2078,34 @@ impl OmikronConnection {
             .await;
     }
 
+    async fn handle_synced_setting_set(self: Arc<Self>, cv: &CommunicationValue) {
+        let mutation = message_handlers::handle_synced_setting_set(cv);
+        let _ = self.send_message(&mutation.response).await;
+        if let Some(changed) = mutation.changed {
+            let _ = self.send_message(&changed).await;
+        }
+    }
+
+    async fn handle_synced_setting_get(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_synced_setting_get(cv))
+            .await;
+    }
+
+    async fn handle_synced_setting_delete(self: Arc<Self>, cv: &CommunicationValue) {
+        let mutation = message_handlers::handle_synced_setting_delete(cv);
+        let _ = self.send_message(&mutation.response).await;
+        if let Some(changed) = mutation.changed {
+            let _ = self.send_message(&changed).await;
+        }
+    }
+
+    async fn handle_synced_settings_list(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_synced_settings_list(cv))
+            .await;
+    }
+
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
@@ -2329,8 +2292,6 @@ impl OmikronConnection {
     /// recovery does not silently destroy the user's previous identity.
     pub async fn rotate_identity(self: &Arc<Self>) -> Result<(), OmikronError> {
         log!("Iota identity rotation requested");
-        let identity_secret =
-            load_identity_secret().map_err(|error| OmikronError::Internal(error.to_string()))?;
         self.stop().await;
 
         let path = identity_path();
@@ -2361,7 +2322,7 @@ impl OmikronConnection {
                 ))
             })?;
         }
-        save_protected_keyring_verified(&keyring, path, &identity_secret).map_err(|error| {
+        save_keyring_verified(&keyring, path).map_err(|error| {
             OmikronError::Internal(format!(
                 "could not save new identity {}: {error}",
                 path.display()
@@ -2542,16 +2503,15 @@ mod tests {
     }
 
     #[test]
-    fn generated_identity_is_protected_and_survives_reload() {
+    fn generated_identity_is_unprotected_and_survives_reload() {
         let path = test_path("reload");
-        let passphrase = b"test identity secret";
-        let keyring = load_or_migrate_keyring_at(&path, None, passphrase).expect("identity saves");
-        let reloaded = load_or_migrate_keyring_at(&path, None, passphrase).expect("identity loads");
+        let keyring = load_or_migrate_keyring_at(&path, None).expect("identity saves");
+        let reloaded = load_or_migrate_keyring_at(&path, None).expect("identity loads");
         assert_eq!(
             keyring.try_to_bytes().expect("keyring serializes"),
             reloaded.try_to_bytes().expect("keyring serializes")
         );
-        assert!(mtp::files::load_keyring(&path, b"wrong secret").is_err());
+        assert!(mtp::files::load_keyring_raw(&path).is_ok());
         let _ = fs::remove_file(path);
     }
 
@@ -2559,14 +2519,14 @@ mod tests {
     fn corrupt_existing_identity_does_not_generate_a_replacement() {
         let path = test_path("corrupt");
         fs::write(&path, b"not a keyring").expect("corrupt fixture writes");
-        let error = load_or_migrate_keyring_at(&path, None, b"test identity secret")
-            .expect_err("corrupt identity must fail");
+        let error =
+            load_or_migrate_keyring_at(&path, None).expect_err("corrupt identity must fail");
         assert!(matches!(error, IdentityError::Storage(_)));
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn legacy_raw_identity_is_migrated_only_when_the_raw_format_is_valid() {
+    fn legacy_raw_identity_is_loaded_only_when_the_raw_format_is_valid() {
         let path = test_path("legacy");
         let keyring = crypto_helper::generate_keyring();
         let mut raw = b"MTMK".to_vec();
@@ -2574,8 +2534,7 @@ mod tests {
         raw.extend_from_slice(&keyring.try_to_bytes().expect("keyring serializes"));
         fs::write(&path, raw).expect("legacy fixture writes");
 
-        let migrated = load_or_migrate_keyring_at(&path, None, b"test identity secret")
-            .expect("legacy identity migrates");
+        let migrated = load_or_migrate_keyring_at(&path, None).expect("legacy identity loads");
         assert_eq!(
             migrated.try_to_bytes().expect("keyring serializes"),
             keyring.try_to_bytes().expect("keyring serializes")
@@ -2588,7 +2547,7 @@ mod tests {
         let parent = test_path("parent-file");
         fs::write(&parent, b"not a directory").expect("parent fixture writes");
         let path = parent.join("iota.mk");
-        let error = load_or_migrate_keyring_at(&path, None, b"test identity secret")
+        let error = load_or_migrate_keyring_at(&path, None)
             .expect_err("directory failure must be returned");
         assert!(matches!(error, IdentityError::Directory(_)));
         let _ = fs::remove_file(parent);

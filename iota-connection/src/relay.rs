@@ -53,6 +53,28 @@ pub fn message_security_class(frame: &CommunicationValue) -> MessageSecurityClas
     }
 }
 
+#[cfg(test)]
+mod security_tests {
+    use super::{MessageSecurityClass, message_security_class};
+    use mtp::codec::{CommunicationType, CommunicationValue};
+
+    #[test]
+    fn synchronized_setting_requests_are_authenticated_local_requests() {
+        for setting_type in [
+            CommunicationType::SyncedSettingSet,
+            CommunicationType::SyncedSettingGet,
+            CommunicationType::SyncedSettingDelete,
+            CommunicationType::SyncedSettingsList,
+            CommunicationType::SyncedSettingChanged,
+        ] {
+            assert_eq!(
+                message_security_class(&CommunicationValue::new(setting_type)),
+                MessageSecurityClass::AuthenticatedLocalRequest
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UserIdentity {
     pub user_id: u64,

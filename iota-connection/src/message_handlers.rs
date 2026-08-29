@@ -1,9 +1,10 @@
 use crate::message_common::*;
 use iota_storage::util::chat_files::{self, MessageState};
-use iota_storage::util::chats_util::{self, get_user, mod_user};
+use iota_storage::util::chats_util::{self, get_user, has_user, mod_user};
 use iota_storage::util::communities_util::CommunitiesUtil;
 use iota_storage::util::e2ee_storage::{self, ChatSecretQuery};
 use iota_storage::util::settings;
+use iota_storage::util::synced_settings::{self, SettingScope, SyncedSetting};
 use mtp::codec::{
     CommunicationType, CommunicationValue, DataType, DataValue, TypeMap, VerifiedRelayContent,
 };
@@ -15,6 +16,18 @@ pub struct MessageMutation {
     pub sender_id: i64,
     pub partner_id: i64,
     pub send_time: i64,
+}
+
+#[derive(Debug)]
+pub struct SettingMutation {
+    pub response: CommunicationValue,
+    pub changed: Option<CommunicationValue>,
+}
+
+struct SettingLocator {
+    scope: SettingScope,
+    scope_key: String,
+    name: String,
 }
 
 fn required_sender_id(cv: &CommunicationValue) -> Result<i64, CommunicationValue> {
@@ -435,6 +448,29 @@ fn stored_message_value(
     typed_container(stored_message_fields(message, storage_owner, partner_id))
 }
 
+fn synced_setting_value(setting: &SyncedSetting) -> DataValue {
+    typed_container(vec![
+        (
+            DataType::SettingId,
+            DataValue::SignedNumber(setting.id.into()),
+        ),
+        (
+            DataType::SettingScope,
+            DataValue::Str(setting.scope.as_str().to_string()),
+        ),
+        (
+            DataType::SettingTarget,
+            DataValue::Str(setting.scope_key.clone()),
+        ),
+        (DataType::SettingsName, DataValue::Str(setting.name.clone())),
+        (DataType::Payload, DataValue::Str(setting.payload.clone())),
+        (
+            DataType::VersionNumber,
+            DataValue::SignedNumber(setting.revision.into()),
+        ),
+    ])
+}
+
 pub fn handle_get_chat_secret(cv: &CommunicationValue) -> CommunicationValue {
     let Some(user_id) = data_string(cv, DataType::UserId) else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
@@ -671,32 +707,56 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
         || !known_session
         || reported_version > head
         || schema != CACHE_SCHEMA_VERSION;
-    let (contacts, messages, deleted_messages, deleted_contacts, mode) = if full {
-        (
-            chats_util::get_users(user_id),
-            chat_files::get_all_messages(user_id),
-            Vec::new(),
-            Vec::new(),
-            "full",
-        )
-    } else {
-        match sync::delta(user_id, reported_version, head) {
-            Ok(delta) => (
-                chats_util::get_users_by_ids(user_id, &delta.contact_upserts),
-                chat_files::get_messages_by_ids(user_id, &delta.message_upserts),
-                delta.deleted_message_ids,
-                delta.deleted_contact_ids,
-                "delta",
-            ),
-            Err(_) => (
+    let (contacts, messages, settings, deleted_messages, deleted_contacts, deleted_settings, mode) =
+        if full {
+            let settings = match synced_settings::list(user_id) {
+                Ok(settings) => settings,
+                Err(_) => return sync_error(cv),
+            };
+            (
                 chats_util::get_users(user_id),
                 chat_files::get_all_messages(user_id),
+                settings,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 "full",
-            ),
-        }
-    };
+            )
+        } else {
+            match sync::delta(user_id, reported_version, head) {
+                Ok(delta) => {
+                    let settings =
+                        match synced_settings::list_by_ids(user_id, &delta.setting_upserts) {
+                            Ok(settings) => settings,
+                            Err(_) => return sync_error(cv),
+                        };
+                    (
+                        chats_util::get_users_by_ids(user_id, &delta.contact_upserts),
+                        chat_files::get_messages_by_ids(user_id, &delta.message_upserts),
+                        settings,
+                        delta.deleted_message_ids,
+                        delta.deleted_contact_ids,
+                        delta.deleted_setting_ids,
+                        "delta",
+                    )
+                }
+                Err(_) => {
+                    let settings = match synced_settings::list(user_id) {
+                        Ok(settings) => settings,
+                        Err(_) => return sync_error(cv),
+                    };
+                    (
+                        chats_util::get_users(user_id),
+                        chat_files::get_all_messages(user_id),
+                        settings,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        "full",
+                    )
+                }
+            }
+        };
     let message_values = messages
         .iter()
         .map(|message| stored_message_value(message, user_id, message.external_user))
@@ -728,6 +788,10 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
         )
         .add_typed_default(DataType::Messages, DataValue::Array(message_values))
         .add_typed_default(
+            DataType::Settings,
+            DataValue::Array(settings.iter().map(synced_setting_value).collect()),
+        )
+        .add_typed_default(
             DataType::Communities,
             DataValue::Array(community_values(user_id)),
         )
@@ -744,6 +808,15 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
             DataType::DeletedContactIds,
             DataValue::Array(
                 deleted_contacts
+                    .into_iter()
+                    .map(|id| DataValue::SignedNumber(id as i128))
+                    .collect(),
+            ),
+        )
+        .add_typed_default(
+            DataType::DeletedSettingIds,
+            DataValue::Array(
+                deleted_settings
                     .into_iter()
                     .map(|id| DataValue::SignedNumber(id as i128))
                     .collect(),
@@ -995,7 +1068,9 @@ pub fn handle_remove_community(cv: &CommunicationValue) -> CommunicationValue {
     let Some(address) = cv.get_data(DataType::CommunityAddress).as_str() else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
-    CommunitiesUtil::remove_community(sender_id, address.to_string());
+    if CommunitiesUtil::remove_community(sender_id, address.to_string()).is_err() {
+        return error_response(cv, CommunicationType::ErrorInternal);
+    }
     CommunicationValue::new(CommunicationType::RemoveCommunity)
         .with_request_id(cv)
         .with_receiver(sender_wire_id(sender_id))
@@ -1336,4 +1411,332 @@ pub fn handle_settings_list(
             DataType::SessionId,
             DataValue::SignedNumber(session_id as i128),
         )
+}
+
+fn setting_response(
+    cv: &CommunicationValue,
+    response_type: CommunicationType,
+    setting: &SyncedSetting,
+) -> CommunicationValue {
+    CommunicationValue::new(response_type)
+        .with_request_id(cv)
+        .with_receiver(sender_wire_id(setting.user_id))
+        .add_typed_default(
+            DataType::SettingId,
+            DataValue::SignedNumber(setting.id.into()),
+        )
+        .add_typed_default(
+            DataType::SettingScope,
+            DataValue::Str(setting.scope.as_str().to_string()),
+        )
+        .add_typed_default(
+            DataType::SettingTarget,
+            DataValue::Str(setting.scope_key.clone()),
+        )
+        .add_typed_default(DataType::SettingsName, DataValue::Str(setting.name.clone()))
+        .add_typed_default(DataType::Payload, DataValue::Str(setting.payload.clone()))
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::SignedNumber(setting.revision.into()),
+        )
+}
+
+fn setting_changed(setting: &SyncedSetting) -> CommunicationValue {
+    CommunicationValue::new(CommunicationType::SyncedSettingChanged)
+        .with_receiver(sender_wire_id(setting.user_id))
+        .add_typed_default(
+            DataType::SettingId,
+            DataValue::SignedNumber(setting.id.into()),
+        )
+        .add_typed_default(
+            DataType::SettingScope,
+            DataValue::Str(setting.scope.as_str().to_string()),
+        )
+        .add_typed_default(
+            DataType::SettingTarget,
+            DataValue::Str(setting.scope_key.clone()),
+        )
+        .add_typed_default(DataType::SettingsName, DataValue::Str(setting.name.clone()))
+        .add_typed_default(DataType::Payload, DataValue::Str(setting.payload.clone()))
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::SignedNumber(setting.revision.into()),
+        )
+}
+
+fn setting_deleted(user_id: i64, deleted: &synced_settings::DeletedSetting) -> CommunicationValue {
+    CommunicationValue::new(CommunicationType::SyncedSettingChanged)
+        .with_receiver(sender_wire_id(user_id))
+        .add_typed_default(
+            DataType::DeletedSettingIds,
+            DataValue::Array(vec![DataValue::SignedNumber(deleted.id.into())]),
+        )
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::SignedNumber(deleted.revision.into()),
+        )
+}
+
+fn parse_setting_locator(cv: &CommunicationValue) -> Result<SettingLocator, CommunicationValue> {
+    let Some(scope_name) = cv.get_data(DataType::SettingScope).as_str() else {
+        return Err(error_response(cv, CommunicationType::ErrorInvalidData));
+    };
+    let Some(scope) = SettingScope::parse(scope_name) else {
+        return Err(error_response(cv, CommunicationType::ErrorInvalidData));
+    };
+    let Some(scope_key) = cv.get_data(DataType::SettingTarget).as_str() else {
+        return Err(error_response(cv, CommunicationType::ErrorInvalidData));
+    };
+    let Some(name) = cv.get_data(DataType::SettingsName).as_str() else {
+        return Err(error_response(cv, CommunicationType::ErrorInvalidData));
+    };
+    if !synced_settings::is_valid_name(name) {
+        return Err(error_response(cv, CommunicationType::ErrorInvalidData));
+    }
+    match scope {
+        SettingScope::User if !scope_key.is_empty() => {
+            Err(error_response(cv, CommunicationType::ErrorInvalidData))
+        }
+        SettingScope::Contact if !scope_key.parse::<i64>().is_ok_and(|id| id > 0) => {
+            Err(error_response(cv, CommunicationType::ErrorInvalidData))
+        }
+        SettingScope::Community if scope_key.is_empty() => {
+            Err(error_response(cv, CommunicationType::ErrorInvalidData))
+        }
+        _ => Ok(SettingLocator {
+            scope,
+            scope_key: scope_key.to_string(),
+            name: name.to_string(),
+        }),
+    }
+}
+
+fn validate_setting_target(
+    user_id: i64,
+    locator: &SettingLocator,
+) -> Result<(), CommunicationType> {
+    match locator.scope {
+        SettingScope::User => Ok(()),
+        SettingScope::Contact => {
+            let contact_id = locator
+                .scope_key
+                .parse::<i64>()
+                .map_err(|_| CommunicationType::ErrorInvalidData)?;
+            match has_user(user_id, contact_id) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(CommunicationType::ErrorInvalidData),
+                Err(_) => Err(CommunicationType::ErrorInternal),
+            }
+        }
+        SettingScope::Community => {
+            match CommunitiesUtil::has_community(user_id, &locator.scope_key) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(CommunicationType::ErrorInvalidData),
+                Err(_) => Err(CommunicationType::ErrorInternal),
+            }
+        }
+    }
+}
+
+fn setting_mutation_error(
+    cv: &CommunicationValue,
+    error_type: CommunicationType,
+) -> SettingMutation {
+    SettingMutation {
+        response: error_response(cv, error_type),
+        changed: None,
+    }
+}
+
+pub fn handle_synced_setting_set(cv: &CommunicationValue) -> SettingMutation {
+    let user_id = match required_sender_id(cv) {
+        Ok(user_id) if user_id > 0 => user_id,
+        _ => return setting_mutation_error(cv, CommunicationType::ErrorInvalidData),
+    };
+    let locator = match parse_setting_locator(cv) {
+        Ok(locator) => locator,
+        Err(response) => {
+            return SettingMutation {
+                response,
+                changed: None,
+            };
+        }
+    };
+    if let Err(error_type) = validate_setting_target(user_id, &locator) {
+        return setting_mutation_error(cv, error_type);
+    }
+    let Some(payload) = cv.get_data(DataType::Payload).as_str() else {
+        return setting_mutation_error(cv, CommunicationType::ErrorInvalidData);
+    };
+    match synced_settings::set(
+        user_id,
+        locator.scope,
+        &locator.scope_key,
+        &locator.name,
+        payload,
+    ) {
+        Ok(setting) => SettingMutation {
+            response: setting_response(cv, CommunicationType::SyncedSettingSet, &setting),
+            changed: Some(setting_changed(&setting)),
+        },
+        Err(_) => setting_mutation_error(cv, CommunicationType::ErrorInternal),
+    }
+}
+
+pub fn handle_synced_setting_get(cv: &CommunicationValue) -> CommunicationValue {
+    let user_id = match required_sender_id(cv) {
+        Ok(user_id) if user_id > 0 => user_id,
+        _ => return error_response(cv, CommunicationType::ErrorInvalidData),
+    };
+    let locator = match parse_setting_locator(cv) {
+        Ok(locator) => locator,
+        Err(response) => return response,
+    };
+    if let Err(error_type) = validate_setting_target(user_id, &locator) {
+        return error_response(cv, error_type);
+    }
+    match synced_settings::get(user_id, locator.scope, &locator.scope_key, &locator.name) {
+        Ok(Some(setting)) => setting_response(cv, CommunicationType::SyncedSettingGet, &setting),
+        Ok(None) => error_response(cv, CommunicationType::ErrorNotFound),
+        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+    }
+}
+
+pub fn handle_synced_setting_delete(cv: &CommunicationValue) -> SettingMutation {
+    let user_id = match required_sender_id(cv) {
+        Ok(user_id) if user_id > 0 => user_id,
+        _ => return setting_mutation_error(cv, CommunicationType::ErrorInvalidData),
+    };
+    let locator = match parse_setting_locator(cv) {
+        Ok(locator) => locator,
+        Err(response) => {
+            return SettingMutation {
+                response,
+                changed: None,
+            };
+        }
+    };
+    if let Err(error_type) = validate_setting_target(user_id, &locator) {
+        return setting_mutation_error(cv, error_type);
+    }
+    match synced_settings::delete(user_id, locator.scope, &locator.scope_key, &locator.name) {
+        Ok(Some(deleted)) => SettingMutation {
+            response: CommunicationValue::new(CommunicationType::SyncedSettingDelete)
+                .with_request_id(cv)
+                .with_receiver(sender_wire_id(user_id))
+                .add_typed_default(
+                    DataType::SettingId,
+                    DataValue::SignedNumber(deleted.id.into()),
+                )
+                .add_typed_default(
+                    DataType::VersionNumber,
+                    DataValue::SignedNumber(deleted.revision.into()),
+                ),
+            changed: deleted.changed.then(|| setting_deleted(user_id, &deleted)),
+        },
+        Ok(None) => SettingMutation {
+            response: CommunicationValue::new(CommunicationType::SyncedSettingDelete)
+                .with_request_id(cv)
+                .with_receiver(sender_wire_id(user_id)),
+            changed: None,
+        },
+        Err(_) => setting_mutation_error(cv, CommunicationType::ErrorInternal),
+    }
+}
+
+pub fn handle_synced_settings_list(cv: &CommunicationValue) -> CommunicationValue {
+    let user_id = match required_sender_id(cv) {
+        Ok(user_id) if user_id > 0 => user_id,
+        _ => return error_response(cv, CommunicationType::ErrorInvalidData),
+    };
+    match synced_settings::list(user_id) {
+        Ok(settings) => CommunicationValue::new(CommunicationType::SyncedSettingsList)
+            .with_request_id(cv)
+            .with_receiver(sender_wire_id(user_id))
+            .add_typed_default(
+                DataType::Settings,
+                DataValue::Array(settings.iter().map(synced_setting_value).collect()),
+            ),
+        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+    }
+}
+
+#[cfg(test)]
+mod synced_settings_tests {
+    use super::{handle_synced_setting_get, handle_synced_setting_set, parse_setting_locator};
+    use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+
+    fn request() -> CommunicationValue {
+        CommunicationValue::new(CommunicationType::SyncedSettingSet)
+            .with_id(1)
+            .with_sender(7)
+            .add_typed_default(DataType::SettingScope, DataValue::Str("user".to_string()))
+            .add_typed_default(DataType::SettingTarget, DataValue::Str(String::new()))
+            .add_typed_default(
+                DataType::SettingsName,
+                DataValue::Str("notifications.enabled".to_string()),
+            )
+    }
+
+    #[test]
+    fn missing_sender_is_rejected_for_synced_settings() {
+        let response = handle_synced_setting_get(&request().without_sender());
+
+        assert!(response.is_type(CommunicationType::ErrorInvalidData));
+        assert_eq!(response.id(), Some(1));
+        assert_eq!(response.receiver(), None);
+    }
+
+    #[test]
+    fn user_scope_rejects_a_non_empty_target() {
+        let request =
+            request().add_typed_default(DataType::SettingTarget, DataValue::Str("123".to_string()));
+
+        let response = handle_synced_setting_set(&request).response;
+
+        assert!(response.is_type(CommunicationType::ErrorInvalidData));
+    }
+
+    #[test]
+    fn contact_scope_rejects_a_malformed_target() {
+        let request = request()
+            .add_typed_default(
+                DataType::SettingScope,
+                DataValue::Str("contact".to_string()),
+            )
+            .add_typed_default(
+                DataType::SettingTarget,
+                DataValue::Str("not-a-user".to_string()),
+            );
+
+        let response = handle_synced_setting_set(&request).response;
+
+        assert!(response.is_type(CommunicationType::ErrorInvalidData));
+    }
+
+    #[test]
+    fn community_scope_requires_an_address() {
+        let request = request()
+            .add_typed_default(
+                DataType::SettingScope,
+                DataValue::Str("community".to_string()),
+            )
+            .add_typed_default(DataType::SettingTarget, DataValue::Str(String::new()));
+
+        let response = handle_synced_setting_set(&request).response;
+
+        assert!(response.is_type(CommunicationType::ErrorInvalidData));
+    }
+
+    #[test]
+    fn invalid_setting_name_is_rejected() {
+        let request = request().add_typed_default(
+            DataType::SettingsName,
+            DataValue::Str("notifications..enabled".to_string()),
+        );
+
+        let response = parse_setting_locator(&request);
+
+        assert!(response.is_err());
+    }
 }

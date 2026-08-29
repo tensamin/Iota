@@ -1,21 +1,23 @@
-//! Durable per-user state journal used by device cache synchronization.
+/* Durable per-user state journal used by device cache synchronization. */
 use crate::storage_error::StorageError;
 use crate::util::db;
 use rusqlite::{Transaction, params};
 use std::collections::BTreeMap;
 
-pub const CACHE_SCHEMA_VERSION: i64 = 2;
+pub const CACHE_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityType {
     Message,
     Contact,
+    Setting,
 }
 impl EntityType {
     fn as_str(self) -> &'static str {
         match self {
             Self::Message => "message",
             Self::Contact => "contact",
+            Self::Setting => "setting",
         }
     }
 }
@@ -40,6 +42,8 @@ pub struct Delta {
     pub deleted_message_ids: Vec<i64>,
     pub contact_upserts: Vec<i64>,
     pub deleted_contact_ids: Vec<i64>,
+    pub setting_upserts: Vec<i64>,
+    pub deleted_setting_ids: Vec<i64>,
 }
 
 pub fn now_millis() -> i64 {
@@ -145,16 +149,174 @@ pub fn delta(user_id: i64, from_version: i64, captured_head: i64) -> Result<Delt
             let (kind, id, operation) = row?;
             final_events.insert((kind, id), operation);
         }
-        let mut out = Delta::default();
-        for ((kind, id), operation) in final_events {
-            match (kind.as_str(), operation.as_str()) {
-                ("message", "delete") => out.deleted_message_ids.push(id),
-                ("message", _) => out.message_upserts.push(id),
-                ("contact", "delete") => out.deleted_contact_ids.push(id),
-                ("contact", _) => out.contact_upserts.push(id),
-                _ => {}
-            }
-        }
-        Ok(out)
+        Ok(reduce_events(final_events))
     })
+}
+
+fn reduce_events(events: BTreeMap<(String, i64), String>) -> Delta {
+    let mut out = Delta::default();
+    for ((kind, id), operation) in events {
+        match (kind.as_str(), operation.as_str()) {
+            ("message", "delete") => out.deleted_message_ids.push(id),
+            ("message", _) => out.message_upserts.push(id),
+            ("contact", "delete") => out.deleted_contact_ids.push(id),
+            ("contact", _) => out.contact_upserts.push(id),
+            ("setting", "delete") => out.deleted_setting_ids.push(id),
+            ("setting", _) => out.setting_upserts.push(id),
+            _ => {}
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+fn reduce_event_sequence<I>(events: I) -> Delta
+where
+    I: IntoIterator<Item = (String, i64, String)>,
+{
+    let mut final_events = BTreeMap::new();
+    for (kind, id, operation) in events {
+        final_events.insert((kind, id), operation);
+    }
+    reduce_events(final_events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EntityType, Operation, reduce_event_sequence, reduce_events};
+    use rusqlite::Connection;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn setting_upsert_is_included_in_delta() {
+        let mut events = BTreeMap::new();
+        events.insert(
+            (EntityType::Setting.as_str().to_string(), 7),
+            Operation::Upsert.as_str().to_string(),
+        );
+
+        let delta = reduce_events(events);
+
+        assert_eq!(delta.setting_upserts, vec![7]);
+        assert!(delta.deleted_setting_ids.is_empty());
+    }
+
+    #[test]
+    fn setting_delete_is_included_in_delta() {
+        let mut events = BTreeMap::new();
+        events.insert(
+            (EntityType::Setting.as_str().to_string(), 7),
+            Operation::Delete.as_str().to_string(),
+        );
+
+        let delta = reduce_events(events);
+
+        assert_eq!(delta.deleted_setting_ids, vec![7]);
+        assert!(delta.setting_upserts.is_empty());
+    }
+
+    #[test]
+    fn final_setting_operation_wins() {
+        let mut events = BTreeMap::new();
+        events.insert(
+            (EntityType::Setting.as_str().to_string(), 7),
+            Operation::Upsert.as_str().to_string(),
+        );
+        events.insert(
+            (EntityType::Setting.as_str().to_string(), 8),
+            Operation::Delete.as_str().to_string(),
+        );
+
+        let delta = reduce_events(events);
+
+        assert_eq!(delta.setting_upserts, vec![7]);
+        assert_eq!(delta.deleted_setting_ids, vec![8]);
+    }
+
+    #[test]
+    fn setting_upsert_then_delete_resolves_to_delete() {
+        let delta = reduce_event_sequence([
+            (
+                EntityType::Setting.as_str().to_string(),
+                7,
+                Operation::Upsert.as_str().to_string(),
+            ),
+            (
+                EntityType::Setting.as_str().to_string(),
+                7,
+                Operation::Delete.as_str().to_string(),
+            ),
+        ]);
+
+        assert_eq!(delta.deleted_setting_ids, vec![7]);
+        assert!(delta.setting_upserts.is_empty());
+    }
+
+    #[test]
+    fn setting_delete_then_upsert_resolves_to_upsert() {
+        let delta = reduce_event_sequence([
+            (
+                EntityType::Setting.as_str().to_string(),
+                7,
+                Operation::Delete.as_str().to_string(),
+            ),
+            (
+                EntityType::Setting.as_str().to_string(),
+                7,
+                Operation::Upsert.as_str().to_string(),
+            ),
+        ]);
+
+        assert_eq!(delta.setting_upserts, vec![7]);
+        assert!(delta.deleted_setting_ids.is_empty());
+    }
+
+    #[test]
+    fn setting_events_share_the_user_sync_head() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE sync_heads (user_id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+                CREATE TABLE sync_events (
+                    user_id INTEGER NOT NULL,
+                    version INTEGER NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    entity_id INTEGER NOT NULL,
+                    operation TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (user_id, version)
+                );
+                ",
+            )
+            .unwrap();
+        let transaction = connection.unchecked_transaction().unwrap();
+        let message = super::record_event(
+            &transaction,
+            1,
+            EntityType::Message,
+            10,
+            Operation::Upsert,
+        )
+        .unwrap();
+        let setting = super::record_event(
+            &transaction,
+            1,
+            EntityType::Setting,
+            11,
+            Operation::Upsert,
+        )
+        .unwrap();
+        let contact = super::record_event(
+            &transaction,
+            1,
+            EntityType::Contact,
+            12,
+            Operation::Upsert,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        assert_eq!((message, setting, contact), (1, 2, 3));
+    }
 }

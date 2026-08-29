@@ -8,3 +8,4 @@ pub mod relay_queue;
 pub mod relay_replay;
 pub mod settings;
 pub mod sync;
+pub mod synced_settings;

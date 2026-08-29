@@ -1,4 +1,6 @@
+use crate::storage_error::StorageError;
 use crate::util::db;
+use crate::util::synced_settings::{self, SettingScope};
 use rusqlite::params;
 
 #[derive(Debug, Clone)]
@@ -11,6 +13,16 @@ pub struct StoredCommunity {
 pub struct CommunitiesUtil;
 
 impl CommunitiesUtil {
+    pub fn has_community(storage_owner: i64, address: &str) -> Result<bool, StorageError> {
+        db::with_db(|conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM communities WHERE storage_owner = ?1 AND address = ?2)",
+                params![storage_owner, address],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
     pub fn add_community(storage_owner: i64, address: String, title: String, position: String) {
         if let Err(e) = db::with_db(|conn| {
             conn.execute(
@@ -29,16 +41,22 @@ impl CommunitiesUtil {
         }
     }
 
-    pub fn remove_community(storage_owner: i64, community_address: String) {
-        if let Err(e) = db::with_db(|conn| {
-            conn.execute(
+    pub fn remove_community(
+        storage_owner: i64,
+        community_address: String,
+    ) -> Result<(), StorageError> {
+        db::with_immediate_transaction(|tx| {
+            tx.execute(
                 "DELETE FROM communities WHERE storage_owner = ?1 AND address = ?2",
                 params![storage_owner, community_address],
             )?;
-            Ok(())
-        }) {
-            eprintln!("Failed to remove_community: {}", e);
-        }
+            synced_settings::delete_scope_in_tx(
+                tx,
+                storage_owner,
+                SettingScope::Community,
+                &community_address,
+            )
+        })
     }
 
     pub fn get_communities(storage_owner: i64) -> Vec<StoredCommunity> {

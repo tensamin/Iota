@@ -464,6 +464,31 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    if current_version < 12 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS synced_settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                scope_type TEXT NOT NULL
+                    CHECK (scope_type IN ('user', 'contact', 'community')),
+                scope_key TEXT NOT NULL,
+                name TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                deleted INTEGER NOT NULL DEFAULT 0
+                    CHECK (deleted IN (0, 1)),
+                UNIQUE(user_id, scope_type, scope_key, name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_synced_settings_owner
+                ON synced_settings (user_id, deleted);
+            CREATE INDEX IF NOT EXISTS idx_synced_settings_scope
+                ON synced_settings (user_id, scope_type, scope_key, deleted);
+            PRAGMA user_version = 12;
+            "#,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -533,7 +558,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -552,7 +577,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         for table in [
             "sync_heads",
             "sync_events",
@@ -561,6 +586,7 @@ mod tests {
             "relay_replay",
             "pending_relays",
             "relay_inbox",
+            "synced_settings",
         ] {
             let exists: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -574,6 +600,24 @@ mod tests {
                 conn.prepare("SELECT 1 FROM pragma_table_info('pending_relays') WHERE name = ?1")?;
             assert!(statement.exists([column])?);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn adds_synced_settings_to_a_version_eleven_schema() -> Result<(), StorageError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA user_version = 11;")?;
+
+        run_migrations_on_connection(&conn)?;
+
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 12);
+        for column in ["id", "user_id", "scope_type", "scope_key", "name", "payload", "revision", "deleted"] {
+            let mut statement =
+                conn.prepare("SELECT 1 FROM pragma_table_info('synced_settings') WHERE name = ?1")?;
+            assert!(statement.exists([column])?);
+        }
+
         Ok(())
     }
 }

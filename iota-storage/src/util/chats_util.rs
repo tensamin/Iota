@@ -1,7 +1,18 @@
+use crate::storage_error::StorageError;
 use crate::users::contact::Contact;
 use crate::util::db;
 use crate::util::sync::{self, EntityType, Operation};
 use rusqlite::params;
+
+pub fn has_user(storage_owner: i64, user_id: i64) -> Result<bool, StorageError> {
+    db::with_db(|conn| {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM contacts WHERE storage_owner = ?1 AND user_id = ?2)",
+            params![storage_owner, user_id],
+            |row| row.get(0),
+        )?)
+    })
+}
 
 pub fn mod_user(storage_owner: i64, contact: &Contact) {
     if let Err(e) = db::with_db(|conn| {

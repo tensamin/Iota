@@ -277,6 +277,10 @@ pub fn purge_user_data(user_id: i64) -> Result<(), crate::storage_error::Storage
         )?;
         tx.execute("DELETE FROM settings WHERE user_id = ?1", params![user_id])?;
         tx.execute(
+            "DELETE FROM synced_settings WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
             "DELETE FROM sync_events WHERE user_id = ?1",
             params![user_id],
         )?;
