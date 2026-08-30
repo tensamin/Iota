@@ -72,7 +72,6 @@ fn add_conversation_for_user(
     if let Some(name) = name {
         contact.user_name = Some(name.to_string());
     }
-    contact.set_last_message_at(now_millis_i64());
     mod_user(user_id, &contact)
 }
 
@@ -228,7 +227,11 @@ pub fn apply_verified_relay_content(
                 reply_to,
                 origin_iota_received_at: sent_by_self.then_some(accepted_at),
                 destination_iota_received_at: (!sent_by_self).then_some(accepted_at),
-                initial_state: MessageState::Sent,
+                initial_state: if sent_by_self {
+                    MessageState::Sending
+                } else {
+                    MessageState::Sent
+                },
             })
             .map_err(|error| error.to_string())?;
             Ok(())
@@ -430,6 +433,12 @@ fn stored_message_fields(
             DataValue::Str(relay_message_id.clone()),
         ));
     }
+    if let Some(relay_signer_id) = message.relay_signer_id {
+        fields.push((
+            DataType::SenderId,
+            DataValue::SignedNumber(relay_signer_id.into()),
+        ));
+    }
     for (data_type, timestamp) in [
         (DataType::AuthoredAt, message.authored_at),
         (
@@ -451,6 +460,15 @@ fn stored_message_fields(
         if let Some(timestamp) = timestamp {
             fields.push((data_type, DataValue::SignedNumber(timestamp.into())));
         }
+    }
+    if let Some(failed_at) = message.delivery_failed_at {
+        fields.push((
+            DataType::UpdatedAt,
+            DataValue::SignedNumber(failed_at.into()),
+        ));
+    }
+    if let Some(failure) = &message.delivery_failure {
+        fields.push((DataType::ErrorType, DataValue::Str(failure.clone())));
     }
     if message.edited {
         fields.push((DataType::Edited, DataValue::Bool(true)));
@@ -643,6 +661,12 @@ fn contact_value(
     )];
     if let Some(name) = &contact.user_name {
         fields.push((DataType::Username, DataValue::Str(name.clone())));
+    }
+    if contact.created_at > 0 {
+        fields.push((
+            DataType::CreatedAt,
+            DataValue::SignedNumber(contact.created_at.into()),
+        ));
     }
     if let Some(last_message_at) = contact.last_message_at {
         fields.push((
@@ -918,26 +942,6 @@ pub fn handle_client_state_ack(cv: &CommunicationValue) -> CommunicationValue {
         )
 }
 
-pub fn handle_message_state(cv: &CommunicationValue) {
-    let sender_id = match required_sender_id(cv) {
-        Ok(sender_id) => sender_id,
-        Err(_) => return,
-    };
-    let receiver_id = match data_i64(cv, DataType::ChatPartnerId) {
-        Some(id) if id > 0 => id,
-        _ => return,
-    };
-
-    let timestamp_i64 = data_i64(cv, DataType::SendTime).unwrap_or_else(now_millis_i64);
-
-    let _ = chat_files::change_message_state(
-        timestamp_i64,
-        receiver_id,
-        sender_id,
-        MessageState::from_str(cv.get_data(DataType::MessageState).as_str().unwrap_or("")),
-    );
-}
-
 pub fn handle_messages_get(cv: &CommunicationValue) -> CommunicationValue {
     let my_id = match cv.require_sender() {
         Ok(my_id) => my_id,
@@ -1025,6 +1029,12 @@ pub fn handle_get_chats(cv: &CommunicationValue) -> CommunicationValue {
         ));
         if let Some(name) = user.user_name {
             container.push((DataType::Username, DataValue::Str(name)));
+        }
+        if user.created_at > 0 {
+            container.push((
+                DataType::CreatedAt,
+                DataValue::SignedNumber(user.created_at.into()),
+            ));
         }
         if let Some(ts) = user.last_message_at {
             container.push((DataType::LastMessageAt, DataValue::SignedNumber(ts as i128)));

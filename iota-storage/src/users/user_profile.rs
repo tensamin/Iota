@@ -28,16 +28,36 @@ impl UserProfile {
         private_key_hash: String,
         reset_token: String,
     ) -> Self {
+        Self::new_with_created_at(
+            user_id,
+            username,
+            display_name,
+            public_key,
+            private_key_hash,
+            reset_token,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+        )
+    }
+
+    pub fn new_with_created_at(
+        user_id: i64,
+        username: String,
+        display_name: Option<String>,
+        public_key: String,
+        private_key_hash: String,
+        reset_token: String,
+        created_at: i64,
+    ) -> Self {
         Self {
             user_id,
             username,
             display_name,
             public_key,
             private_key_hash,
-            created_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64,
+            created_at,
             reset_token,
             trusted_apps: std::collections::HashMap::new(),
         }

@@ -40,6 +40,21 @@ const IOTA_KEYRING_PATH: &str = "iota.mk";
 static IDENTITY_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 static OMIKRON_PUBLIC_KEY_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+fn record_origin_delivery_failure(signer_id: u64, relay_message_id: &str, failure: &str) {
+    let Ok(storage_owner) = i64::try_from(signer_id) else {
+        return;
+    };
+    if let Err(error) = chat_files::record_delivery_failure(
+        storage_owner,
+        storage_owner,
+        relay_message_id,
+        failure,
+        now_millis_i64(),
+    ) {
+        log!("Relay delivery failure storage failed: {error}");
+    }
+}
+
 /*
  * Keeps identity and pinned Omikron key files independent from the process
  * working directory, so restarts use the same trusted material.
@@ -1136,6 +1151,11 @@ impl OmikronConnection {
                 Ok(destination_iota) => destination_iota,
                 Err(error) => {
                     log!("Relay origin route lookup failed: {}", error);
+                    record_origin_delivery_failure(
+                        verified.context.signer_id,
+                        &verified.context.message_id,
+                        "destination_iota_not_found",
+                    );
                     self.send_relay_response(frame.id(), CommunicationType::ErrorNoIota)
                         .await;
                     return;
@@ -1145,6 +1165,11 @@ impl OmikronConnection {
                 Ok(value) => value,
                 Err(error) => {
                     log!("Relay origin forwarding validation failed: {}", error);
+                    record_origin_delivery_failure(
+                        verified.context.signer_id,
+                        &verified.context.message_id,
+                        "forwarding_validation_failed",
+                    );
                     self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
                         .await;
                     return;
@@ -1154,6 +1179,11 @@ impl OmikronConnection {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     log!("Relay origin retry could not be serialized: {}", error);
+                    record_origin_delivery_failure(
+                        verified.context.signer_id,
+                        &verified.context.message_id,
+                        "serialization_failed",
+                    );
                     self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
                         .await;
                     return;
@@ -1167,6 +1197,11 @@ impl OmikronConnection {
                 &type_map_version,
             ) {
                 log!("Relay origin retry queue failed: {}", error);
+                record_origin_delivery_failure(
+                    verified.context.signer_id,
+                    &verified.context.message_id,
+                    "queue_failed",
+                );
                 self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
                     .await;
                 return;
@@ -1242,6 +1277,11 @@ impl OmikronConnection {
                 }
                 Ok(response) => {
                     log!("Relay origin route returned {}", response.get_type());
+                    record_origin_delivery_failure(
+                        verified.context.signer_id,
+                        &verified.context.message_id,
+                        "destination_rejected",
+                    );
                     self.send_relay_response(
                         frame.id(),
                         response
@@ -1252,6 +1292,11 @@ impl OmikronConnection {
                 }
                 Err(error) => {
                     log!("Relay origin forwarding failed: {}", error);
+                    record_origin_delivery_failure(
+                        verified.context.signer_id,
+                        &verified.context.message_id,
+                        "destination_unreachable",
+                    );
                     self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
                         .await;
                 }
@@ -1521,7 +1566,6 @@ impl OmikronConnection {
         dispatch!(DeleteApp, handle_delete_app);
         dispatch!(ClientConnected, handle_client_connected);
         dispatch!(ClientStateAck, handle_client_state_ack);
-        dispatch!(MessageState, handle_message_state);
         dispatch!(MessageEdit, handle_message_edit);
         dispatch!(MessageEditLive, handle_message_edit_live);
         dispatch!(MessageReactionAdd, handle_message_reaction_add);
@@ -1769,10 +1813,6 @@ impl OmikronConnection {
         let _ = self
             .send_message(&message_handlers::handle_client_state_ack(cv))
             .await;
-    }
-
-    async fn handle_message_state(self: Arc<Self>, cv: &CommunicationValue) {
-        message_handlers::handle_message_state(cv);
     }
 
     fn mutation_live_message(

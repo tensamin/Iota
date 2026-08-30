@@ -226,11 +226,6 @@ impl ClientConnection {
         // Direct messages                                  //
         // ************************************************ //
 
-        if cv.is_type(CommunicationType::MessageState) {
-            message_handlers::handle_message_state(&cv);
-            return;
-        }
-
         if cv.is_type(CommunicationType::MessageEdit) {
             self.send_message(&message_handlers::handle_message_edit(&cv))
                 .await;

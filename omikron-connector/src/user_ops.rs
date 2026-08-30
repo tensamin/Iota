@@ -84,7 +84,7 @@ fn sign_lifecycle_payload(
 async fn inspect_credential_account(
     connection: &dyn OmikronClient,
     credential: &TuCredential,
-) -> Result<(String, String), LifecycleUserError> {
+) -> Result<(String, String, i64), LifecycleUserError> {
     if credential.omega_host != omega_discovery::omega_host() {
         return Err(LifecycleUserError::OmegaHostMismatch);
     }
@@ -108,10 +108,16 @@ async fn inspect_credential_account(
         .as_str()
         .map(str::to_owned)
         .ok_or(LifecycleUserError::RemoteRejected)?;
+    let created_at = response
+        .get_data(DataType::CreatedAt)
+        .as_signed_number()
+        .and_then(|value| i64::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or(LifecycleUserError::RemoteRejected)?;
     if public_key != public_key_bundle_to_base64(&credential.public_key_bundle()) {
         return Err(LifecycleUserError::RemoteRejected);
     }
-    Ok((username, public_key))
+    Ok((username, public_key, created_at))
 }
 
 async fn credential_proof(
@@ -168,17 +174,17 @@ pub async fn attach_user_from_tu(
 ) -> Result<UserProfile, LifecycleUserError> {
     let credential = TuCredential::parse(contents)
         .map_err(|error| LifecycleUserError::InvalidCredential(error.to_string()))?;
-    let (username, public_key) = inspect_credential_account(connection, &credential).await?;
-    let profile = UserProfile::new(
+    let (username, public_key, created_at) =
+        inspect_credential_account(connection, &credential).await?;
+    let profile = UserProfile::new_with_created_at(
         credential.user_id,
         username,
         None,
         public_key,
         hex_hash(contents),
         String::new(),
+        created_at,
     );
-    write_user_credential(&profile.username, &credential.to_canonical_string())
-        .map_err(|error| LifecycleUserError::LocalPersistence(error.to_string()))?;
     pending_operations::upsert(&PendingUserOperation {
         user_id: profile.user_id,
         operation: PendingUserOperationKind::Attach,
@@ -190,6 +196,13 @@ pub async fn attach_user_from_tu(
         phase: PendingUserOperationPhase::Prepared,
         created_at: now_millis(),
     })
+    .map_err(|error| LifecycleUserError::LocalPersistence(error.to_string()))?;
+    write_user_credential(&profile.username, &credential.to_canonical_string())
+        .map_err(|error| LifecycleUserError::LocalPersistence(error.to_string()))?;
+    pending_operations::update_phase(
+        profile.user_id,
+        PendingUserOperationPhase::CredentialWritten,
+    )
     .map_err(|error| LifecycleUserError::LocalPersistence(error.to_string()))?;
     if let Err(error) = credential_proof(
         connection,

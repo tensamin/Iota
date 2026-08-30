@@ -60,6 +60,8 @@ pub struct StoredMessage {
     pub client_received_recorded_at: Option<i64>,
     pub read_at: Option<i64>,
     pub read_recorded_at: Option<i64>,
+    pub delivery_failed_at: Option<i64>,
+    pub delivery_failure: Option<String>,
     pub content: String,
     pub edited: bool,
     pub sent_by_self: bool,
@@ -483,7 +485,7 @@ pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
         destination_iota_received_at,
         initial_state,
     } = message;
-    let msg_id = db::with_db(|conn| {
+    db::with_db(|conn| {
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             r#"
@@ -517,14 +519,16 @@ pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
             msg_id,
             Operation::Upsert,
         )?;
+        let mut contact = crate::users::contact::Contact::new(external_user);
+        contact.set_last_message_at(
+            destination_iota_received_at
+                .or(origin_iota_received_at)
+                .unwrap_or(authored_at),
+        );
+        crate::util::chats_util::upsert_contact(&tx, storage_owner, &contact)?;
         tx.commit()?;
         Ok(msg_id)
-    })?;
-
-    let mut contact = crate::users::contact::Contact::new(external_user);
-    contact.set_last_message_at(send_time);
-    crate::util::chats_util::mod_user(storage_owner, &contact)?;
-    Ok(msg_id)
+    })
 }
 
 pub fn change_message_state_by_relay_id(
@@ -579,11 +583,11 @@ pub fn record_message_receipt(
     };
     db::with_db(|conn| {
         let tx = conn.unchecked_transaction()?;
-        let Some((message_id, external_user)) = tx
+        let Some((message_id, external_user, authored_at)) = tx
             .query_row(
-                "SELECT id, external_user FROM messages WHERE storage_owner = ?1 AND relay_signer_id = ?2 AND relay_message_id = ?3",
+                "SELECT id, external_user, authored_at FROM messages WHERE storage_owner = ?1 AND relay_signer_id = ?2 AND relay_message_id = ?3",
                 params![storage_owner, target_signer_id, target_message_id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?)),
             )
             .optional()?
         else {
@@ -592,6 +596,13 @@ pub fn record_message_receipt(
         if external_user != receipt_signer_id {
             return Err(StorageError::Other(
                 "message receipt signer is not the chat partner".into(),
+            ));
+        }
+        if event_at > recorded_at.saturating_add(5 * 60 * 1000)
+            || authored_at.is_some_and(|authored_at| event_at < authored_at)
+        {
+            return Err(StorageError::Other(
+                "message receipt event time is outside the accepted clock range".into(),
             ));
         }
         tx.execute(
@@ -646,8 +657,43 @@ pub fn record_destination_iota_received(
             return Ok(());
         };
         tx.execute(
-            "UPDATE messages SET destination_iota_received_at = COALESCE(destination_iota_received_at, ?1), message_state = CASE WHEN message_state = 'sending' THEN 'sent' ELSE message_state END WHERE id = ?2",
+            "UPDATE messages SET destination_iota_received_at = COALESCE(destination_iota_received_at, ?1), delivery_failed_at = NULL, delivery_failure = NULL, message_state = CASE WHEN message_state = 'sending' THEN 'sent' ELSE message_state END WHERE id = ?2",
             params![accepted_at, message_id],
+        )?;
+        sync::record_event(
+            &tx,
+            storage_owner,
+            EntityType::Message,
+            message_id,
+            Operation::Upsert,
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+}
+
+pub fn record_delivery_failure(
+    storage_owner: i64,
+    relay_signer_id: i64,
+    relay_message_id: &str,
+    failure: &str,
+    failed_at: i64,
+) -> Result<(), StorageError> {
+    db::with_db(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        let Some(message_id) = tx
+            .query_row(
+                "SELECT id FROM messages WHERE storage_owner = ?1 AND relay_signer_id = ?2 AND relay_message_id = ?3",
+                params![storage_owner, relay_signer_id, relay_message_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(());
+        };
+        tx.execute(
+            "UPDATE messages SET delivery_failed_at = ?1, delivery_failure = ?2 WHERE id = ?3 AND destination_iota_received_at IS NULL",
+            params![failed_at, failure, message_id],
         )?;
         sync::record_event(
             &tx,
@@ -783,11 +829,11 @@ pub fn get_messages(
             SELECT id, relay_signer_id, relay_message_id, message_time, authored_at,
                    origin_iota_received_at, destination_iota_received_at,
                    client_received_at, client_received_recorded_at, read_at,
-                   read_recorded_at, content, sent_by_self, message_state, height,
+                   read_recorded_at, delivery_failed_at, delivery_failure, content, sent_by_self, message_state, height,
                    reply_to, edited_count
             FROM messages
             WHERE storage_owner = ?1 AND external_user = ?2 AND deleted_by_external = 0
-            ORDER BY message_time DESC, id DESC
+            ORDER BY COALESCE(destination_iota_received_at, origin_iota_received_at, authored_at, id) DESC, id DESC
             LIMIT ?3 OFFSET ?4
             "#,
         )?;
@@ -808,12 +854,14 @@ pub fn get_messages(
                     client_received_recorded_at: row.get(8)?,
                     read_at: row.get(9)?,
                     read_recorded_at: row.get(10)?,
-                    content: row.get(11)?,
-                    sent_by_self: row.get::<_, i64>(12)? != 0,
-                    message_state: row.get(13)?,
-                    height: row.get(14).unwrap_or(0),
-                    reply_to: row.get(15).ok().flatten(),
-                    edited: row.get::<_, i64>(16).unwrap_or(0) > 0,
+                    delivery_failed_at: row.get(11)?,
+                    delivery_failure: row.get(12)?,
+                    content: row.get(13)?,
+                    sent_by_self: row.get::<_, i64>(14)? != 0,
+                    message_state: row.get(15)?,
+                    height: row.get(16).unwrap_or(0),
+                    reply_to: row.get(17).ok().flatten(),
+                    edited: row.get::<_, i64>(18).unwrap_or(0) > 0,
                     reactions: Vec::new(),
                 })
             },
@@ -854,7 +902,7 @@ pub fn get_message(
             SELECT id, relay_signer_id, relay_message_id, message_time, authored_at,
                    origin_iota_received_at, destination_iota_received_at,
                    client_received_at, client_received_recorded_at, read_at,
-                   read_recorded_at, content, sent_by_self, message_state, height,
+                   read_recorded_at, delivery_failed_at, delivery_failure, content, sent_by_self, message_state, height,
                    reply_to, edited_count, external_user
             FROM messages
             WHERE storage_owner = ?1
@@ -878,13 +926,15 @@ pub fn get_message(
                 client_received_recorded_at: row.get(8)?,
                 read_at: row.get(9)?,
                 read_recorded_at: row.get(10)?,
-                content: row.get(11)?,
-                sent_by_self: row.get::<_, i64>(12)? != 0,
-                message_state: row.get(13)?,
-                height: row.get(14).unwrap_or(0),
-                reply_to: row.get(15).ok().flatten(),
-                edited: row.get::<_, i64>(16).unwrap_or(0) > 0,
-                external_user: row.get(17)?,
+                delivery_failed_at: row.get(11)?,
+                delivery_failure: row.get(12)?,
+                content: row.get(13)?,
+                sent_by_self: row.get::<_, i64>(14)? != 0,
+                message_state: row.get(15)?,
+                height: row.get(16).unwrap_or(0),
+                reply_to: row.get(17).ok().flatten(),
+                edited: row.get::<_, i64>(18).unwrap_or(0) > 0,
+                external_user: row.get(19)?,
                 reactions: Vec::new(),
             })
         })?;
@@ -928,14 +978,16 @@ pub fn get_message_with_offset(
               AND external_user = ?2
               AND deleted_by_external = 0
               AND (
-                   message_time > ?3
-                   OR (message_time = ?3 AND id > ?4)
+                   COALESCE(destination_iota_received_at, origin_iota_received_at, authored_at, id) >
+                       COALESCE(?3, ?4)
+                   OR (COALESCE(destination_iota_received_at, origin_iota_received_at, authored_at, id) =
+                       COALESCE(?3, ?4) AND id > ?4)
               )
             "#,
             params![
                 storage_owner,
                 external_user,
-                message.message_time,
+                message.destination_iota_received_at.or(message.origin_iota_received_at).or(message.authored_at),
                 message.id
             ],
             |row| row.get(0),
@@ -953,9 +1005,9 @@ pub fn get_messages_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<StoredMessage
     // A journal id uniquely identifies a row. Load all messages for this owner and retain only
     // those ids; this keeps reaction hydration identical to normal message loading.
     match db::with_db(|conn| {
-        let mut stmt = conn.prepare("SELECT id, relay_signer_id, relay_message_id, message_time, authored_at, origin_iota_received_at, destination_iota_received_at, client_received_at, client_received_recorded_at, read_at, read_recorded_at, content, sent_by_self, message_state, height, reply_to, edited_count, external_user FROM messages WHERE storage_owner = ?1 AND deleted_by_external = 0")?;
+        let mut stmt = conn.prepare("SELECT id, relay_signer_id, relay_message_id, message_time, authored_at, origin_iota_received_at, destination_iota_received_at, client_received_at, client_received_recorded_at, read_at, read_recorded_at, delivery_failed_at, delivery_failure, content, sent_by_self, message_state, height, reply_to, edited_count, external_user FROM messages WHERE storage_owner = ?1 AND deleted_by_external = 0")?;
         let rows = stmt.query_map([storage_owner], |row| {
-            let external_user: i64 = row.get(17)?;
+            let external_user: i64 = row.get(19)?;
             Ok(StoredMessage {
                 id: row.get(0)?,
                 external_user,
@@ -969,12 +1021,14 @@ pub fn get_messages_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<StoredMessage
                 client_received_recorded_at: row.get(8)?,
                 read_at: row.get(9)?,
                 read_recorded_at: row.get(10)?,
-                content: row.get(11)?,
-                sent_by_self: row.get::<_, i64>(12)? != 0,
-                message_state: row.get(13)?,
-                height: row.get(14).unwrap_or(0),
-                reply_to: row.get(15).ok().flatten(),
-                edited: row.get::<_, i64>(16).unwrap_or(0) > 0,
+                delivery_failed_at: row.get(11)?,
+                delivery_failure: row.get(12)?,
+                content: row.get(13)?,
+                sent_by_self: row.get::<_, i64>(14)? != 0,
+                message_state: row.get(15)?,
+                height: row.get(16).unwrap_or(0),
+                reply_to: row.get(17).ok().flatten(),
+                edited: row.get::<_, i64>(18).unwrap_or(0) > 0,
                 reactions: Vec::new(),
             })
         })?;

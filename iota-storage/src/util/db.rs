@@ -180,6 +180,7 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
                 storage_owner INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
                 user_name TEXT,
+                created_at INTEGER NOT NULL,
                 last_message_at INTEGER,
                 UNIQUE(storage_owner, user_id)
             );
@@ -527,6 +528,57 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    if current_version < 15 {
+        let messages_exist: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages')",
+            [],
+            |row| row.get(0),
+        )?;
+        if messages_exist {
+            conn.execute_batch(
+                r#"
+                DROP INDEX IF EXISTS idx_messages_history;
+                CREATE INDEX IF NOT EXISTS idx_messages_history_accepted
+                    ON messages (
+                        storage_owner,
+                        external_user,
+                        deleted_by_external,
+                        destination_iota_received_at DESC,
+                        origin_iota_received_at DESC,
+                        authored_at DESC,
+                        id DESC
+                    );
+                "#,
+            )?;
+        }
+        conn.pragma_update(None, "user_version", 15)?;
+    }
+
+    if current_version < 16 {
+        let messages_exist: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages')",
+            [],
+            |row| row.get(0),
+        )?;
+        if messages_exist {
+            add_column_if_missing(conn, "delivery_failed_at", "delivery_failed_at INTEGER")?;
+            add_column_if_missing(conn, "delivery_failure", "delivery_failure TEXT")?;
+        }
+        let contacts_exist: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'contacts')",
+            [],
+            |row| row.get(0),
+        )?;
+        if contacts_exist {
+            add_table_column_if_missing(conn, "contacts", "created_at", "created_at INTEGER")?;
+            conn.execute(
+                "UPDATE contacts SET created_at = COALESCE(created_at, last_message_at, 0)",
+                [],
+            )?;
+        }
+        conn.pragma_update(None, "user_version", 16)?;
+    }
+
     Ok(())
 }
 
@@ -596,7 +648,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 13);
+        assert_eq!(version, 16);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -615,7 +667,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 13);
+        assert_eq!(version, 16);
         for table in [
             "sync_heads",
             "sync_events",
@@ -650,7 +702,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 13);
+        assert_eq!(version, 16);
         for column in [
             "id",
             "user_id",
