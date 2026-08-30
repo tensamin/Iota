@@ -10,6 +10,7 @@ use mtp::codec::{
 };
 
 use crate::relay::VerifiedRelayContext;
+use iota_storage::storage_error::StorageError;
 
 #[derive(Debug)]
 pub struct MessageMutation {
@@ -59,6 +60,20 @@ pub fn message_mutation(cv: &CommunicationValue) -> Result<MessageMutation, Comm
 
 pub fn success_response(cv: &CommunicationValue) -> CommunicationValue {
     error_response(cv, CommunicationType::Success)
+}
+
+fn add_conversation_for_user(
+    user_id: i64,
+    other_id: i64,
+    name: Option<&str>,
+) -> Result<(), StorageError> {
+    let mut contact = get_user(user_id, other_id)?
+        .unwrap_or_else(|| iota_storage::users::contact::Contact::new(other_id));
+    if let Some(name) = name {
+        contact.user_name = Some(name.to_string());
+    }
+    contact.set_last_message_at(now_millis_i64());
+    mod_user(user_id, &contact)
 }
 
 fn relay_field<'a>(
@@ -142,14 +157,11 @@ pub fn apply_verified_relay_content(
 
     match content.message_type.as_str() {
         "MessageState" => {
-            let partner_id = relay_number(
-                &content.content,
-                DataType::ChatPartnerId,
-                &context.type_map,
-            )
-            .and_then(|value| i64::try_from(value).ok())
-            .filter(|id| *id == recipient_id)
-            .ok_or_else(|| "Relay MessageState has an invalid ChatPartnerId".to_string())?;
+            let partner_id =
+                relay_number(&content.content, DataType::ChatPartnerId, &context.type_map)
+                    .and_then(|value| i64::try_from(value).ok())
+                    .filter(|id| *id == recipient_id)
+                    .ok_or_else(|| "Relay MessageState has an invalid ChatPartnerId".to_string())?;
             let relay_message_id = relay_string(
                 &content.content,
                 DataType::RelayMessageId,
@@ -159,14 +171,10 @@ pub fn apply_verified_relay_content(
             let event_at = relay_number(&content.content, DataType::EventAt, &context.type_map)
                 .and_then(|value| i64::try_from(value).ok())
                 .ok_or_else(|| "Relay MessageState is missing EventAt".to_string())?;
-            let state = relay_string(
-                &content.content,
-                DataType::MessageState,
-                &context.type_map,
-            )
-            .map(MessageState::from_str)
-            .filter(|state| matches!(state, MessageState::Received | MessageState::Read))
-            .ok_or_else(|| "Relay MessageState has an invalid state".to_string())?;
+            let state = relay_string(&content.content, DataType::MessageState, &context.type_map)
+                .map(MessageState::from_str)
+                .filter(|state| matches!(state, MessageState::Received | MessageState::Read))
+                .ok_or_else(|| "Relay MessageState has an invalid state".to_string())?;
             chat_files::record_message_receipt(
                 storage_owner,
                 recipient_id,
@@ -192,22 +200,28 @@ pub fn apply_verified_relay_content(
                 .unwrap_or_default();
             let reply_to = relay_number(&content.content, DataType::ReplyId, &context.type_map)
                 .and_then(|value| i64::try_from(value).ok());
-            let relay_message_id = relay_string(
+            if relay_string(
                 &content.content,
                 DataType::RelayMessageId,
                 &context.type_map,
             )
-            .ok_or_else(|| "Relay MessageSend is missing RelayMessageId".to_string())?;
-            if relay_message_id != context.message_id {
-                return Err("Relay MessageSend identity does not match its protected message ID".into());
+            .is_some_and(|relay_message_id| relay_message_id != context.message_id)
+            {
+                return Err(
+                    "Relay MessageSend identity does not match its protected message ID".into(),
+                );
             }
             chat_files::add_message(chat_files::NewMessage {
                 relay_signer_id: sender_id,
-                relay_message_id,
+                relay_message_id: &context.message_id,
                 authored_at: created_at,
                 send_time,
                 storage_owner,
-                external_user: if sent_by_self { recipient_id } else { sender_id },
+                external_user: if sent_by_self {
+                    recipient_id
+                } else {
+                    sender_id
+                },
                 sent_by_self,
                 content: message,
                 height,
@@ -256,7 +270,7 @@ pub fn apply_verified_relay_content(
                 .ok_or_else(|| "Relay SetChatSecret has no recipients".to_string())?;
             let recipient = recipients
                 .into_iter()
-                .find(|value| value.user_id == context.final_recipient_id.to_string())
+                .find(|value| value.user_id == storage_owner.to_string())
                 .ok_or_else(|| "Relay SetChatSecret recipient mismatch".to_string())?;
             let chat_id = data_string(&frame, DataType::ChatId)
                 .ok_or_else(|| "Relay SetChatSecret is missing ChatId".to_string())?;
@@ -267,7 +281,7 @@ pub fn apply_verified_relay_content(
             let wrapping_scheme = data_string(&frame, DataType::WrappingScheme)
                 .ok_or_else(|| "Relay SetChatSecret is missing WrappingScheme".to_string())?;
             e2ee_storage::put_chat_secret(e2ee_storage::StoredChatSecret {
-                user_id: context.final_recipient_id.to_string(),
+                user_id: storage_owner.to_string(),
                 chat_id,
                 secret_id,
                 version,
@@ -278,6 +292,29 @@ pub fn apply_verified_relay_content(
                 updated_at: now_millis_i64(),
             })
             .map_err(|error| error.to_string())
+        }
+        "AddConversation" => {
+            let other_id =
+                relay_number(&content.content, DataType::ChatPartnerId, &context.type_map)
+                    .and_then(|value| i64::try_from(value).ok())
+                    .filter(|id| *id > 0)
+                    .ok_or_else(|| {
+                        "Relay AddConversation has an invalid ChatPartnerId".to_string()
+                    })?;
+            let user_id = storage_owner;
+            if user_id <= 0 {
+                return Err("Relay AddConversation has an invalid storage owner".into());
+            }
+            add_conversation_for_user(
+                user_id,
+                other_id,
+                relay_string(
+                    &content.content,
+                    DataType::ChatPartnerName,
+                    &context.type_map,
+                ),
+            )
+            .map_err(|error| format!("AddConversation persistence failed: {error}"))
         }
         _ => Ok(()),
     }
@@ -369,10 +406,7 @@ fn stored_message_fields(
             DataType::SendTime,
             DataValue::SignedNumber(message.message_time as i128),
         ),
-        (
-            DataType::Content,
-            DataValue::Str(message.content.clone()),
-        ),
+        (DataType::Content, DataValue::Str(message.content.clone())),
         (
             DataType::MessageState,
             DataValue::Str(message.message_state.clone()),
@@ -398,10 +432,19 @@ fn stored_message_fields(
     }
     for (data_type, timestamp) in [
         (DataType::AuthoredAt, message.authored_at),
-        (DataType::OriginIotaReceivedAt, message.origin_iota_received_at),
-        (DataType::DestinationIotaReceivedAt, message.destination_iota_received_at),
+        (
+            DataType::OriginIotaReceivedAt,
+            message.origin_iota_received_at,
+        ),
+        (
+            DataType::DestinationIotaReceivedAt,
+            message.destination_iota_received_at,
+        ),
         (DataType::ClientReceivedAt, message.client_received_at),
-        (DataType::ClientReceivedRecordedAt, message.client_received_recorded_at),
+        (
+            DataType::ClientReceivedRecordedAt,
+            message.client_received_recorded_at,
+        ),
         (DataType::ReadAt, message.read_at),
         (DataType::ReadRecordedAt, message.read_recorded_at),
     ] {
@@ -543,7 +586,11 @@ pub fn handle_create_app(cv: &CommunicationValue) -> CommunicationValue {
         .to_string();
 
     if !app_identifier.is_empty() && !app_public_key.is_empty() {
-        if let Some(mut user) = iota_storage::users::user_manager::get_user(sender_id) {
+        let user = match iota_storage::users::user_manager::get_user(sender_id) {
+            Ok(user) => user,
+            Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        };
+        if let Some(mut user) = user {
             if !user.trusted_apps.contains_key(&app_identifier) {
                 user.trusted_apps.insert(app_identifier, app_public_key);
                 iota_storage::users::user_manager::update_user(user);
@@ -568,7 +615,11 @@ pub fn handle_delete_app(cv: &CommunicationValue) -> CommunicationValue {
         .to_string();
 
     if !app_identifier.is_empty() {
-        if let Some(mut user) = iota_storage::users::user_manager::get_user(sender_id) {
+        let user = match iota_storage::users::user_manager::get_user(sender_id) {
+            Ok(user) => user,
+            Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        };
+        if let Some(mut user) = user {
             if user.trusted_apps.contains_key(&app_identifier) {
                 user.trusted_apps.remove(&app_identifier);
                 iota_storage::users::user_manager::update_user(user);
@@ -612,12 +663,12 @@ fn contact_value(
     typed_container(fields)
 }
 
-fn current_contact_ids(user_id: i64) -> DataValue {
-    contact_ids_value(
-        chats_util::get_users(user_id)
+fn current_contact_ids(user_id: i64) -> Result<DataValue, StorageError> {
+    Ok(contact_ids_value(
+        chats_util::get_users(user_id)?
             .into_iter()
             .map(|contact| contact.user_id),
-    )
+    ))
 }
 
 fn contact_ids_value(ids: impl IntoIterator<Item = i64>) -> DataValue {
@@ -714,7 +765,10 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
                 Err(_) => return sync_error(cv),
             };
             (
-                chats_util::get_users(user_id),
+                match chats_util::get_users(user_id) {
+                    Ok(contacts) => contacts,
+                    Err(_) => return sync_error(cv),
+                },
                 chat_files::get_all_messages(user_id),
                 settings,
                 Vec::new(),
@@ -731,7 +785,10 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
                             Err(_) => return sync_error(cv),
                         };
                     (
-                        chats_util::get_users_by_ids(user_id, &delta.contact_upserts),
+                        match chats_util::get_users_by_ids(user_id, &delta.contact_upserts) {
+                            Ok(contacts) => contacts,
+                            Err(_) => return sync_error(cv),
+                        },
                         chat_files::get_messages_by_ids(user_id, &delta.message_upserts),
                         settings,
                         delta.deleted_message_ids,
@@ -746,7 +803,10 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
                         Err(_) => return sync_error(cv),
                     };
                     (
-                        chats_util::get_users(user_id),
+                        match chats_util::get_users(user_id) {
+                            Ok(contacts) => contacts,
+                            Err(_) => return sync_error(cv),
+                        },
                         chat_files::get_all_messages(user_id),
                         settings,
                         Vec::new(),
@@ -761,6 +821,10 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
         .iter()
         .map(|message| stored_message_value(message, user_id, message.external_user))
         .collect();
+    let contact_ids = match current_contact_ids(user_id) {
+        Ok(contact_ids) => contact_ids,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+    };
     CommunicationValue::new(CommunicationType::ClientStateSync)
         .with_request_id(cv)
         .with_receiver(sender_wire_id(user_id))
@@ -822,7 +886,7 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
                     .collect(),
             ),
         )
-        .add_typed_default(DataType::UserIds, current_contact_ids(user_id))
+        .add_typed_default(DataType::UserIds, contact_ids)
         .add_typed_default(DataType::Calls, DataValue::Array(Vec::new()))
 }
 
@@ -948,7 +1012,10 @@ pub fn handle_get_chats(cv: &CommunicationValue) -> CommunicationValue {
     let Ok(user_id_i64) = i64::try_from(user_id) else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
-    let users = chats_util::get_users(user_id_i64);
+    let users = match chats_util::get_users(user_id_i64) {
+        Ok(users) => users,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+    };
     let mut user_array = Vec::new();
     for user in users {
         let mut container = Vec::new();
@@ -968,41 +1035,6 @@ pub fn handle_get_chats(cv: &CommunicationValue) -> CommunicationValue {
         .with_request_id(cv)
         .with_receiver(user_id)
         .add_typed_default(DataType::UserIds, DataValue::Array(user_array))
-}
-
-pub fn handle_add_conversation(cv: &CommunicationValue) -> CommunicationValue {
-    let user_id = match cv.require_sender() {
-        Ok(user_id) => user_id,
-        Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
-    };
-    let Ok(user_id_i64) = i64::try_from(user_id) else {
-        return error_response(cv, CommunicationType::ErrorInvalidData);
-    };
-    let session_id = match data_i64(cv, DataType::SessionId) {
-        Some(id) if id > 0 => id,
-        _ => return sync_error(cv),
-    };
-    let other_id = match data_i64(cv, DataType::ChatPartnerId) {
-        Some(id) if id > 0 => id,
-        _ => return error_response(cv, CommunicationType::ErrorInvalidData),
-    };
-    let mut contact = get_user(user_id_i64, other_id)
-        .unwrap_or(iota_storage::users::contact::Contact::new(other_id));
-
-    if let Some(name) = cv.get_data(DataType::ChatPartnerName).as_str() {
-        contact.user_name = Some(name.to_string());
-    }
-
-    contact.set_last_message_at(now_millis_i64());
-    mod_user(user_id_i64, &contact);
-    CommunicationValue::new(CommunicationType::AddConversation)
-        .with_request_id(cv)
-        .with_receiver(user_id)
-        .add_typed_default(
-            DataType::SessionId,
-            DataValue::SignedNumber(session_id as i128),
-        )
-        .add_typed_default(DataType::UserIds, current_contact_ids(user_id_i64))
 }
 
 pub fn handle_add_community(cv: &CommunicationValue) -> CommunicationValue {

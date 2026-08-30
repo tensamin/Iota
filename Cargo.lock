@@ -5017,7 +5017,10 @@ name = "web-ui"
 version = "0.1.0"
 dependencies = [
  "actix-web",
+ "iota-cli",
+ "iota-ipc",
  "iota-logger",
+ "iota-paths",
  "iota-state",
  "iota-storage",
  "iota-util",

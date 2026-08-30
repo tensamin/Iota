@@ -14,9 +14,8 @@ pub fn has_user(storage_owner: i64, user_id: i64) -> Result<bool, StorageError> 
     })
 }
 
-pub fn mod_user(storage_owner: i64, contact: &Contact) {
-    if let Err(e) = db::with_db(|conn| {
-        let tx = conn.unchecked_transaction()?;
+pub fn mod_user(storage_owner: i64, contact: &Contact) -> Result<(), StorageError> {
+    db::with_immediate_transaction(|tx| {
         tx.execute(
             r#"
             INSERT INTO contacts (storage_owner, user_id, user_name, last_message_at)
@@ -28,37 +27,34 @@ pub fn mod_user(storage_owner: i64, contact: &Contact) {
             params![
                 storage_owner,
                 contact.user_id,
-                contact.user_name.clone(),
+                contact.user_name,
                 contact.last_message_at,
             ],
         )?;
         sync::record_event(
-            &tx,
+            tx,
             storage_owner,
             EntityType::Contact,
             contact.user_id,
             Operation::Upsert,
         )?;
-        tx.commit()?;
         Ok(())
-    }) {
-        eprintln!("Failed to mod_user: {}", e);
-    }
+    })
 }
 
-pub fn get_users_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<Contact> {
+pub fn get_users_by_ids(storage_owner: i64, ids: &[i64]) -> Result<Vec<Contact>, StorageError> {
     if ids.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let wanted: std::collections::HashSet<i64> = ids.iter().copied().collect();
-    get_users(storage_owner)
+    Ok(get_users(storage_owner)?
         .into_iter()
         .filter(|contact| wanted.contains(&contact.user_id))
-        .collect()
+        .collect())
 }
 
-pub fn get_user(storage_owner: i64, user_id: i64) -> Option<Contact> {
-    match db::with_db(|conn| {
+pub fn get_user(storage_owner: i64, user_id: i64) -> Result<Option<Contact>, StorageError> {
+    db::with_db(|conn| {
         match conn.query_row(
             r#"
             SELECT user_id, user_name, last_message_at
@@ -79,17 +75,11 @@ pub fn get_user(storage_owner: i64, user_id: i64) -> Option<Contact> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
-    }) {
-        Ok(opt) => opt,
-        Err(e) => {
-            eprintln!("Error querying user in get_user: {}", e);
-            None
-        }
-    }
+    })
 }
 
-pub fn get_users(storage_owner: i64) -> Vec<Contact> {
-    match db::with_db(|conn| {
+pub fn get_users(storage_owner: i64) -> Result<Vec<Contact>, StorageError> {
+    db::with_db(|conn| {
         let mut stmt = conn.prepare(
             r#"
             SELECT user_id, user_name, last_message_at
@@ -112,17 +102,8 @@ pub fn get_users(storage_owner: i64) -> Vec<Contact> {
 
         let mut out = Vec::new();
         for row in rows {
-            match row {
-                Ok(contact) => out.push(contact),
-                Err(e) => eprintln!("Failed to read contact row: {}", e),
-            }
+            out.push(row?);
         }
         Ok(out)
-    }) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Failed to query contacts in get_users: {}", e);
-            Vec::new()
-        }
-    }
+    })
 }

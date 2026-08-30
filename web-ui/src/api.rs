@@ -1,5 +1,6 @@
-use crate::server::is_local_network;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
+use iota_ipc::{IpcErrorCode, LocalRequest, ResponsePayload, ResponseResult};
+use iota_paths::{Scope, socket_path};
 use iota_state::DaemonState;
 use iota_storage::util::config_util::{CONFIG, modify_config};
 use serde_json::{Value, json};
@@ -153,11 +154,27 @@ async fn users_add(
         _ => return error(),
     };
 
-    // The legacy web API is intentionally quarantined until it can use the
-    // daemon's authenticated command/service boundary. It must not create a
-    // second connector or mutate daemon storage directly.
-    let _ = username;
-    error()
+    let client = match iota_cli::ipc_client::IpcClient::connect(socket_path(Scope::User)).await {
+        Ok(client) => client,
+        Err(_) => return HttpResponse::ServiceUnavailable().json(json!({ "status": "not_ready" })),
+    };
+    match client
+        .send_request(LocalRequest::CreateUser {
+            username: username.to_string(),
+        })
+        .await
+    {
+        Ok(ResponseResult::Ok(ResponsePayload::UserCreated { user_id, username })) => {
+            HttpResponse::Created().json(json!({
+                "uuid": user_id,
+                "username": username,
+                "has_tu": true,
+            }))
+        }
+        Ok(ResponseResult::Ok(_)) => HttpResponse::Created().json(json!({ "status": "created" })),
+        Ok(ResponseResult::Error(code)) => ipc_error_response(code),
+        Err(_) => HttpResponse::GatewayTimeout().json(json!({ "status": "timeout" })),
+    }
 }
 
 async fn shutdown(
@@ -200,6 +217,26 @@ fn error() -> HttpResponse {
     HttpResponse::BadRequest().json(json!({ "type": "error" }))
 }
 
+fn ipc_error_response(code: IpcErrorCode) -> HttpResponse {
+    let status = match code {
+        IpcErrorCode::InvalidRequest => actix_web::http::StatusCode::BAD_REQUEST,
+        IpcErrorCode::Conflict => actix_web::http::StatusCode::CONFLICT,
+        IpcErrorCode::NotReady | IpcErrorCode::OmikronUnavailable => {
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        }
+        IpcErrorCode::Timeout => actix_web::http::StatusCode::GATEWAY_TIMEOUT,
+        IpcErrorCode::Unauthorized => actix_web::http::StatusCode::FORBIDDEN,
+        IpcErrorCode::StorageFailure | IpcErrorCode::InternalFailure => {
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+        IpcErrorCode::NotFound => actix_web::http::StatusCode::NOT_FOUND,
+        IpcErrorCode::UnsupportedVersion | IpcErrorCode::Disconnected | IpcErrorCode::Cancelled => {
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        }
+    };
+    HttpResponse::build(status).json(json!({ "status": code.to_string() }))
+}
+
 fn user_id(payload: &Value) -> Result<i64, HttpResponse> {
     payload
         .get("uuid")
@@ -208,7 +245,8 @@ fn user_id(payload: &Value) -> Result<i64, HttpResponse> {
 }
 
 fn is_allowed(addr: SocketAddr, ssl: bool) -> bool {
-    is_local_network(addr.ip()) || ssl
+    let _ = ssl;
+    addr.ip().is_loopback()
 }
 
 fn is_allowed_req(req: &HttpRequest, ssl: bool) -> bool {

@@ -421,9 +421,15 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
             ("relay_message_id", "relay_message_id TEXT"),
             ("authored_at", "authored_at INTEGER"),
             ("origin_iota_received_at", "origin_iota_received_at INTEGER"),
-            ("destination_iota_received_at", "destination_iota_received_at INTEGER"),
+            (
+                "destination_iota_received_at",
+                "destination_iota_received_at INTEGER",
+            ),
             ("client_received_at", "client_received_at INTEGER"),
-            ("client_received_recorded_at", "client_received_recorded_at INTEGER"),
+            (
+                "client_received_recorded_at",
+                "client_received_recorded_at INTEGER",
+            ),
             ("read_at", "read_at INTEGER"),
             ("read_recorded_at", "read_recorded_at INTEGER"),
         ] {
@@ -485,6 +491,38 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
             CREATE INDEX IF NOT EXISTS idx_synced_settings_scope
                 ON synced_settings (user_id, scope_type, scope_key, deleted);
             PRAGMA user_version = 12;
+            "#,
+        )?;
+    }
+
+    if current_version < 13 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS pending_user_operations (
+                user_id INTEGER PRIMARY KEY,
+                operation TEXT NOT NULL
+                    CHECK (operation IN ('create', 'attach', 'release')),
+                username TEXT NOT NULL,
+                public_key TEXT,
+                private_key_hash TEXT,
+                reset_token TEXT,
+                registration_token TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_user_operations_operation
+                ON pending_user_operations (operation, created_at);
+            PRAGMA user_version = 13;
+            "#,
+        )?;
+    }
+
+    if current_version < 14 {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE pending_user_operations
+                ADD COLUMN phase TEXT NOT NULL DEFAULT 'prepared'
+                CHECK (phase IN ('prepared', 'credential_written', 'remote_committed', 'local_committed'));
+            PRAGMA user_version = 14;
             "#,
         )?;
     }
@@ -558,7 +596,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -577,7 +615,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         for table in [
             "sync_heads",
             "sync_events",
@@ -587,6 +625,7 @@ mod tests {
             "pending_relays",
             "relay_inbox",
             "synced_settings",
+            "pending_user_operations",
         ] {
             let exists: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -611,8 +650,17 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 12);
-        for column in ["id", "user_id", "scope_type", "scope_key", "name", "payload", "revision", "deleted"] {
+        assert_eq!(version, 13);
+        for column in [
+            "id",
+            "user_id",
+            "scope_type",
+            "scope_key",
+            "name",
+            "payload",
+            "revision",
+            "deleted",
+        ] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('synced_settings') WHERE name = ?1")?;
             assert!(statement.exists([column])?);

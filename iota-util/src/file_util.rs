@@ -43,14 +43,35 @@ pub fn delete_user_directory(user_id: i64) -> io::Result<()> {
     fs::remove_dir_all(user_dir)
 }
 
-pub fn credential_path(user_id: i64) -> PathBuf {
-    storage_directory()
-        .join("credentials")
-        .join(format!("{user_id}.tu"))
+fn credential_filename(username: &str) -> io::Result<String> {
+    if username.is_empty()
+        || username.chars().any(char::is_control)
+        || username.contains(['/', '\\'])
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsafe credential owner name",
+        ));
+    }
+    Ok(format!("{username}.tu"))
 }
 
-pub fn read_user_credential(user_id: i64) -> io::Result<Option<String>> {
-    let path = credential_path(user_id);
+pub fn credential_path(username: &str) -> io::Result<PathBuf> {
+    credential_path_in(&storage_directory(), username)
+}
+
+fn credential_path_in(root: &Path, username: &str) -> io::Result<PathBuf> {
+    Ok(root
+        .join("credentials")
+        .join(credential_filename(username)?))
+}
+
+fn legacy_credential_path(user_id: i64) -> io::Result<PathBuf> {
+    storage_file("credentials", format!("{user_id}.tu"))
+}
+
+pub fn read_user_credential(username: &str) -> io::Result<Option<String>> {
+    let path = credential_path(username)?;
     match fs::read_to_string(path) {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -58,53 +79,64 @@ pub fn read_user_credential(user_id: i64) -> io::Result<Option<String>> {
     }
 }
 
-/// Resolve a credential by immutable account id. A valid legacy
-/// `<username>.tu` is migrated atomically the first time it is encountered.
+/* Resolve a credential by account id while using the owner's name for the
+ * canonical filename. Older ID-based and root-level files are migrated when
+ * they are encountered. */
 pub fn read_user_credential_with_legacy(
     user_id: i64,
     username: &str,
 ) -> io::Result<Option<String>> {
-    if let Some(credential) = read_user_credential(user_id)? {
+    let canonical_path = credential_path(username)?;
+    if let Some(credential) = read_user_credential(username)? {
         return Ok(Some(credential));
     }
-    let legacy = storage_file("", format!("{username}.tu"))?;
-    let credential = match fs::read_to_string(&legacy) {
-        Ok(value) => value,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let parsed = crate::tu::TuCredential::parse(&credential)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if parsed.user_id != user_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "legacy credential user id mismatch",
-        ));
+    let legacy_paths = [
+        legacy_credential_path(user_id)?,
+        storage_file("", credential_filename(username)?)?,
+    ];
+    for legacy_path in legacy_paths {
+        let credential = match fs::read_to_string(&legacy_path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let parsed = crate::tu::TuCredential::parse(&credential)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if parsed.user_id != user_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy credential user id mismatch",
+            ));
+        }
+        write_user_credential(username, &parsed.to_canonical_string())?;
+        if legacy_path != canonical_path {
+            fs::remove_file(legacy_path)?;
+        }
+        return Ok(Some(parsed.to_canonical_string()));
     }
-    write_user_credential(user_id, &parsed.to_canonical_string())?;
-    fs::remove_file(legacy)?;
-    Ok(Some(parsed.to_canonical_string()))
+    Ok(None)
 }
 
-pub fn write_user_credential(user_id: i64, credential: &str) -> io::Result<()> {
-    let path = credential_path(user_id);
-    let parent = path.parent().expect("credential path has parent");
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".{user_id}.tu.tmp"));
-    fs::write(&temporary, credential)?;
-    if let Err(error) = fs::rename(&temporary, &path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
+pub fn write_user_credential(username: &str, credential: &str) -> io::Result<()> {
+    let path = credential_path(username)?;
+    crate::atomic_file::replace_private(&path, credential.as_bytes(), 0)
+}
+
+pub fn remove_user_credential(user_id: i64, username: Option<&str>) -> io::Result<()> {
+    let mut paths = vec![legacy_credential_path(user_id)?];
+    if let Some(username) = username {
+        paths.push(credential_path(username)?);
+        paths.push(storage_file("", credential_filename(username)?)?);
+    }
+
+    for path in paths {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
-}
-
-pub fn remove_user_credential(user_id: i64) -> io::Result<()> {
-    match fs::remove_file(credential_path(user_id)) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
 }
 
 pub fn load_file_buf(path: &str, name: &str) -> io::Result<BufReader<File>> {
@@ -453,5 +485,24 @@ pub async fn download_and_extract_zip(url: &str, as_name: &str) {
         println!("Error cleaning up ZIP file {}: {}", zip_path.display(), e);
     } else if successful {
         println!("Downloaded and extracted ZIP file successfully.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::credential_path_in;
+    use std::path::Path;
+
+    #[test]
+    fn credential_path_uses_owner_name() {
+        let path = credential_path_in(Path::new("/tmp/iota"), "alice").unwrap();
+        assert!(path.ends_with("credentials/alice.tu"));
+        assert!(!path.ends_with("credentials/42.tu"));
+    }
+
+    #[test]
+    fn credential_path_rejects_unsafe_owner_name() {
+        assert!(credential_path_in(Path::new("/tmp/iota"), "../alice").is_err());
+        assert!(credential_path_in(Path::new("/tmp/iota"), "alice/bob").is_err());
     }
 }

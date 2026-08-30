@@ -1,7 +1,7 @@
 use crate::storage_error::StorageError;
 use crate::util::db;
 use crate::util::sync::{self, EntityType, Operation};
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingScope {
@@ -401,8 +401,8 @@ pub(crate) fn delete_scope_in_tx(
 #[cfg(test)]
 mod tests {
     use super::{
-        delete_in_tx, get_from_connection, is_valid_name, list_by_ids_from_connection,
-        list_from_connection, set_in_tx, SettingScope,
+        SettingScope, delete_in_tx, get_from_connection, is_valid_name,
+        list_by_ids_from_connection, list_from_connection, set_in_tx,
     };
     use rusqlite::Connection;
 
@@ -618,9 +618,11 @@ mod tests {
         assert!(deleted.changed);
         assert_eq!(journal_operation, "delete");
         assert!(list_from_connection(&connection, 1).unwrap().is_empty());
-        assert!(list_by_ids_from_connection(&connection, 1, &[stored.id])
-            .unwrap()
-            .is_empty());
+        assert!(
+            list_by_ids_from_connection(&connection, 1, &[stored.id])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

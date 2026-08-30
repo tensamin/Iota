@@ -754,7 +754,9 @@ impl OmikronConnection {
         let signer_id_i64 = i64::try_from(signer_id).map_err(|_| {
             RelayValidationError::KeyLookup("signer ID exceeds local storage range".into())
         })?;
-        if let Some(user) = iota_storage::users::user_manager::get_user(signer_id_i64) {
+        let local_user = iota_storage::users::user_manager::get_user(signer_id_i64)
+            .map_err(|error| RelayValidationError::KeyLookup(error.to_string()))?;
+        if let Some(user) = local_user {
             let key = iota_util::crypto_helper::public_key_bundle_from_base64(&user.public_key)
                 .ok_or_else(|| {
                     RelayValidationError::KeyLookup("stored user key is invalid".into())
@@ -788,7 +790,10 @@ impl OmikronConnection {
     pub async fn hosting_iota_for_user(&self, user_id: u64) -> Result<u64, String> {
         let user_id_i64 = i64::try_from(user_id)
             .map_err(|_| "user ID exceeds local storage range".to_string())?;
-        if iota_storage::users::user_manager::get_user(user_id_i64).is_some() {
+        if iota_storage::users::user_manager::get_user(user_id_i64)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
             return CONFIG
                 .load()
                 .iota_id
@@ -901,14 +906,54 @@ impl OmikronConnection {
             }
         };
         let accepted_at = now_millis_i64();
-        let signer_is_local = i64::try_from(verified.context.signer_id)
-            .ok()
-            .and_then(iota_storage::users::user_manager::get_user)
-            .is_some();
-        let recipient_is_local = i64::try_from(verified.context.final_recipient_id)
-            .ok()
-            .and_then(iota_storage::users::user_manager::get_user)
-            .is_some();
+        let signer_id = match i64::try_from(verified.context.signer_id) {
+            Ok(id) => id,
+            Err(_) => {
+                self.send_relay_response(
+                    Some(incoming_frame_id),
+                    CommunicationType::ErrorInvalidData,
+                )
+                .await;
+                return;
+            }
+        };
+        let recipient_id = match i64::try_from(verified.context.final_recipient_id) {
+            Ok(id) => id,
+            Err(_) => {
+                self.send_relay_response(
+                    Some(incoming_frame_id),
+                    CommunicationType::ErrorInvalidData,
+                )
+                .await;
+                return;
+            }
+        };
+        let signer_is_local = match iota_storage::users::user_manager::get_user(signer_id) {
+            Ok(user) => user.is_some(),
+            Err(error) => {
+                log!(
+                    "Relay locality lookup failed for signer {}: {}",
+                    signer_id,
+                    error
+                );
+                self.send_relay_response(Some(incoming_frame_id), CommunicationType::ErrorInternal)
+                    .await;
+                return;
+            }
+        };
+        let recipient_is_local = match iota_storage::users::user_manager::get_user(recipient_id) {
+            Ok(user) => user.is_some(),
+            Err(error) => {
+                log!(
+                    "Relay locality lookup failed for recipient {}: {}",
+                    recipient_id,
+                    error
+                );
+                self.send_relay_response(Some(incoming_frame_id), CommunicationType::ErrorInternal)
+                    .await;
+                return;
+            }
+        };
         if !signer_is_local && !recipient_is_local {
             log!(
                 "Rejecting Relay with no local origin or destination: signer {}, recipient {}",
@@ -991,7 +1036,7 @@ impl OmikronConnection {
             let content = match open_verified_relay_content(
                 &verified,
                 &[&keyring],
-                verified.context.signer_id,
+                verified.context.final_recipient_id,
             ) {
                 Ok(value) => value,
                 Err(error) => {
@@ -1486,7 +1531,6 @@ impl OmikronConnection {
         dispatch!(MessageGet, handle_message_get);
         dispatch!(MessagesGet, handle_messages_get);
         dispatch!(GetChats, handle_get_chats);
-        dispatch!(AddConversation, handle_add_conversation);
         dispatch!(AddCommunity, handle_add_community);
         dispatch!(GetCommunities, handle_get_communities);
         dispatch!(RemoveCommunity, handle_remove_community);
@@ -1568,7 +1612,16 @@ impl OmikronConnection {
         };
 
         let mut trusted = false;
-        if let Some(user) = iota_storage::users::user_manager::get_user(user_id) {
+        let user = match iota_storage::users::user_manager::get_user(user_id) {
+            Ok(user) => user,
+            Err(_) => {
+                let _ = self
+                    .send_message(&error_response(cv, CommunicationType::ErrorInternal))
+                    .await;
+                return;
+            }
+        };
+        if let Some(user) = user {
             if let Some(pub_k) = user.trusted_apps.get(&app_identifier) {
                 if pub_k == &app_public_key {
                     trusted = true;
@@ -1861,7 +1914,17 @@ impl OmikronConnection {
             &mutation,
             vec![(DataType::Content, DataValue::Str(content.to_string()))],
         );
-        if iota_storage::users::user_manager::get_user(mutation.partner_id).is_some()
+        let partner_is_local =
+            match iota_storage::users::user_manager::get_user(mutation.partner_id) {
+                Ok(user) => user.is_some(),
+                Err(_) => {
+                    let _ = self
+                        .send_message(&error_response(cv, CommunicationType::ErrorInternal))
+                        .await;
+                    return;
+                }
+            };
+        if partner_is_local
             && chat_files::apply_remote_edit(
                 mutation.partner_id,
                 mutation.sender_id,
@@ -1923,7 +1986,17 @@ impl OmikronConnection {
                 (DataType::Accepted, DataValue::Bool(add)),
             ],
         );
-        if iota_storage::users::user_manager::get_user(mutation.partner_id).is_some() {
+        let partner_is_local =
+            match iota_storage::users::user_manager::get_user(mutation.partner_id) {
+                Ok(user) => user.is_some(),
+                Err(_) => {
+                    let _ = self
+                        .send_message(&error_response(cv, CommunicationType::ErrorInternal))
+                        .await;
+                    return;
+                }
+            };
+        if partner_is_local {
             let result = if add {
                 chat_files::add_reaction(
                     mutation.partner_id,
@@ -1966,7 +2039,16 @@ impl OmikronConnection {
             Some(sender_id) => sender_id,
             None => return,
         };
-        if iota_storage::users::user_manager::get_user(sender_id).is_none() {
+        let sender_is_local = match iota_storage::users::user_manager::get_user(sender_id) {
+            Ok(user) => user.is_some(),
+            Err(_) => {
+                let _ = self
+                    .send_message(&error_response(cv, CommunicationType::ErrorInternal))
+                    .await;
+                return;
+            }
+        };
+        if !sender_is_local {
             self.persist_and_deliver_remote_delete(cv).await;
             return;
         }
@@ -1988,7 +2070,17 @@ impl OmikronConnection {
             &mutation,
             Vec::new(),
         );
-        if iota_storage::users::user_manager::get_user(mutation.partner_id).is_some()
+        let partner_is_local =
+            match iota_storage::users::user_manager::get_user(mutation.partner_id) {
+                Ok(user) => user.is_some(),
+                Err(_) => {
+                    let _ = self
+                        .send_message(&error_response(cv, CommunicationType::ErrorInternal))
+                        .await;
+                    return;
+                }
+            };
+        if partner_is_local
             && chat_files::apply_remote_delete(
                 mutation.partner_id,
                 mutation.sender_id,
@@ -2021,12 +2113,6 @@ impl OmikronConnection {
     async fn handle_get_chats(self: Arc<Self>, cv: &CommunicationValue) {
         let _ = self
             .send_message(&message_handlers::handle_get_chats(cv))
-            .await;
-    }
-
-    async fn handle_add_conversation(self: Arc<Self>, cv: &CommunicationValue) {
-        let _ = self
-            .send_message(&message_handlers::handle_add_conversation(cv))
             .await;
     }
 

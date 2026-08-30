@@ -1,8 +1,6 @@
-//! Strict parsing and storage-independent handling of user credentials.
-//!
-//! A `.tu` file is deliberately identified by the account id embedded in its
-//! contents.  Its filename is presentation data owned by the CLI, never an
-//! account authority.
+/* Strict parsing and storage-independent handling of user credentials. A
+ * `.tu` file is identified by the account ID in its contents, while storage
+ * names the file after its owner's username. */
 
 use crate::crypto_helper::{keyring_from_base64, keyring_to_base64};
 use mtp::crypto::{Keyring, PublicKeyBundle};

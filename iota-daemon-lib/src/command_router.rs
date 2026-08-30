@@ -7,11 +7,14 @@ use iota_ipc::{
     TaskSummary, UpdateStatusResponse, UserDetailResponse, UserSummary,
 };
 use iota_logger::{log, log_command};
+use iota_storage::users::pending_operations::{
+    self, PendingUserOperation, PendingUserOperationKind, PendingUserOperationPhase,
+};
 use iota_storage::users::user_manager;
 use iota_storage::util::config_util::{self};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::daemon_state::{ShutdownReason, StartupPhase};
 
@@ -25,6 +28,13 @@ pub struct PeerContext {
 }
 
 const MAX_LOG_ENTRIES_PER_RESPONSE: usize = 512;
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
 
 fn bounded_log_entries(mut entries: Vec<LogEntry>) -> Vec<LogEntry> {
     entries.truncate(MAX_LOG_ENTRIES_PER_RESPONSE);
@@ -152,32 +162,38 @@ impl CommandRouter {
                 ResponseResult::Ok(ResponsePayload::Tasks(tasks))
             }
             LocalRequest::ListUsers => {
-                let users: Vec<UserSummary> = user_manager::get_residency()
+                let users = user_manager::get_residency()
                     .into_iter()
-                    .map(|user| UserSummary {
-                        credential_present: user.state == user_manager::LocalUserState::Managed
-                            && user_manager::get_user(user.user_id).is_some_and(|profile| {
-                                iota_util::file_util::read_user_credential_with_legacy(
-                                    user.user_id,
-                                    &profile.username,
-                                )
-                                .ok()
-                                .flatten()
-                                .is_some()
-                            }),
-                        user_id: user.user_id,
-                        username: user.username,
-                        state: match user.state {
-                            user_manager::LocalUserState::Managed => {
-                                iota_ipc::LocalUserState::Managed
-                            }
-                            user_manager::LocalUserState::Released => {
-                                iota_ipc::LocalUserState::Released
-                            }
-                        },
-                        data_present: user.data_present,
+                    .map(|user| {
+                        let profile = user_manager::get_user(user.user_id)?;
+                        Ok(UserSummary {
+                            credential_present: user.state == user_manager::LocalUserState::Managed
+                                && profile.is_some_and(|profile| {
+                                    iota_util::file_util::read_user_credential_with_legacy(
+                                        user.user_id,
+                                        &profile.username,
+                                    )
+                                    .ok()
+                                    .flatten()
+                                    .is_some()
+                                }),
+                            user_id: user.user_id,
+                            username: user.username,
+                            state: match user.state {
+                                user_manager::LocalUserState::Managed => {
+                                    iota_ipc::LocalUserState::Managed
+                                }
+                                user_manager::LocalUserState::Released => {
+                                    iota_ipc::LocalUserState::Released
+                                }
+                            },
+                            data_present: user.data_present,
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, iota_storage::storage_error::StorageError>>();
+                let Ok(users) = users else {
+                    return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                };
                 ResponseResult::Ok(ResponsePayload::Users(users))
             }
             LocalRequest::CreateUser { username } => {
@@ -205,6 +221,9 @@ impl CommandRouter {
                             }
                             omikron_connector::user_ops::CreateUserError::RemoteRejected => {
                                 ResponseResult::Error(IpcErrorCode::Conflict)
+                            }
+                            omikron_connector::user_ops::CreateUserError::LocalFinalizationPending { .. } => {
+                                ResponseResult::Error(IpcErrorCode::StorageFailure)
                             }
                             omikron_connector::user_ops::CreateUserError::LocalPersistence(_) => {
                                 ResponseResult::Error(IpcErrorCode::StorageFailure)
@@ -247,7 +266,8 @@ impl CommandRouter {
                 let contents = match credential {
                     Some(value) => Ok(value.0),
                     None => user_manager::get_user(user_id)
-                        .ok_or(())
+                        .map_err(|_| ())
+                        .and_then(|user| user.ok_or(()))
                         .and_then(|user| {
                             iota_util::file_util::read_user_credential_with_legacy(
                                 user_id,
@@ -278,8 +298,27 @@ impl CommandRouter {
             }
             LocalRequest::RemoveUser { .. } => ResponseResult::Error(IpcErrorCode::InvalidRequest),
             LocalRequest::ReleaseUser { user_id } => {
-                if user_manager::get_user(user_id).is_none() {
+                let user = match user_manager::get_user(user_id) {
+                    Ok(user) => user,
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                let Some(user) = user else {
                     return ResponseResult::Error(IpcErrorCode::NotFound);
+                };
+                if pending_operations::upsert(&PendingUserOperation {
+                    user_id,
+                    operation: PendingUserOperationKind::Release,
+                    username: user.username,
+                    public_key: None,
+                    private_key_hash: None,
+                    reset_token: None,
+                    registration_token: None,
+                    phase: PendingUserOperationPhase::Prepared,
+                    created_at: now_millis(),
+                })
+                .is_err()
+                {
+                    return ResponseResult::Error(IpcErrorCode::StorageFailure);
                 }
                 let request = CommunicationValue::new(CommunicationType::ReleaseUserFromIota)
                     .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
@@ -291,11 +330,14 @@ impl CommandRouter {
                 {
                     Ok(response) if response.is_type(CommunicationType::Success) => {
                         match user_manager::release_user(user_id) {
-                            Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
-                                message: format!(
-                                    "Released user {user_id}; hosted data was retained"
-                                ),
-                            }),
+                            Ok(()) if pending_operations::remove(user_id).is_ok() => {
+                                ResponseResult::Ok(ResponsePayload::Acknowledged {
+                                    message: format!(
+                                        "Released user {user_id}; hosted data was retained"
+                                    ),
+                                })
+                            }
+                            Ok(()) => ResponseResult::Error(IpcErrorCode::StorageFailure),
                             Err(error) => {
                                 log!(
                                     "Remote release succeeded but local cleanup failed for {user_id}: {error}"
@@ -305,9 +347,13 @@ impl CommandRouter {
                         }
                     }
                     Ok(response) if response.is_type(CommunicationType::ErrorNotAuthenticated) => {
+                        let _ = pending_operations::remove(user_id);
                         ResponseResult::Error(IpcErrorCode::Unauthorized)
                     }
-                    Ok(_) => ResponseResult::Error(IpcErrorCode::Conflict),
+                    Ok(_) => {
+                        let _ = pending_operations::remove(user_id);
+                        ResponseResult::Error(IpcErrorCode::Conflict)
+                    }
                     Err(omikron_connector::OmikronError::Timeout(_)) => {
                         ResponseResult::Error(IpcErrorCode::Timeout)
                     }
@@ -406,7 +452,7 @@ impl CommandRouter {
                 ResponseResult::Ok(ResponsePayload::Components(components))
             }
             LocalRequest::GetUser { user_id } => match user_manager::get_user(user_id) {
-                Some(user) => {
+                Ok(Some(user)) => {
                     let credential_present =
                         iota_util::file_util::read_user_credential_with_legacy(
                             user_id,
@@ -429,7 +475,8 @@ impl CommandRouter {
                         credential_present,
                     }))
                 }
-                None => ResponseResult::Error(IpcErrorCode::NotFound),
+                Ok(None) => ResponseResult::Error(IpcErrorCode::NotFound),
+                Err(_) => ResponseResult::Error(IpcErrorCode::StorageFailure),
             },
             LocalRequest::ImportUser { .. } => ResponseResult::Error(IpcErrorCode::InvalidRequest),
             LocalRequest::GetLogs { limit } => {

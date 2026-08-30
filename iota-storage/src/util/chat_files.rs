@@ -523,7 +523,7 @@ pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
 
     let mut contact = crate::users::contact::Contact::new(external_user);
     contact.set_last_message_at(send_time);
-    crate::util::chats_util::mod_user(storage_owner, &contact);
+    crate::util::chats_util::mod_user(storage_owner, &contact)?;
     Ok(msg_id)
 }
 
@@ -546,8 +546,17 @@ pub fn change_message_state_by_relay_id(
             return Ok(());
         };
         let state = MessageState::from_str(&current).upgrade(new_state).as_str();
-        tx.execute("UPDATE messages SET message_state = ?1 WHERE id = ?2", params![state, msg_id])?;
-        sync::record_event(&tx, storage_owner, EntityType::Message, msg_id, Operation::Upsert)?;
+        tx.execute(
+            "UPDATE messages SET message_state = ?1 WHERE id = ?2",
+            params![state, msg_id],
+        )?;
+        sync::record_event(
+            &tx,
+            storage_owner,
+            EntityType::Message,
+            msg_id,
+            Operation::Upsert,
+        )?;
         tx.commit()?;
         Ok(())
     })
@@ -581,7 +590,9 @@ pub fn record_message_receipt(
             return Err(StorageError::Other("message receipt target was not found".into()));
         };
         if external_user != receipt_signer_id {
-            return Err(StorageError::Other("message receipt signer is not the chat partner".into()));
+            return Err(StorageError::Other(
+                "message receipt signer is not the chat partner".into(),
+            ));
         }
         tx.execute(
             "INSERT OR IGNORE INTO message_receipts (storage_owner, target_signer_id, target_message_id, receipt_signer_id, receipt_message_id, receipt_type, event_at, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -592,9 +603,11 @@ pub fn record_message_receipt(
         } else {
             ("client_received_at", "client_received_recorded_at")
         };
-        let state = MessageState::from_str(
-            &tx.query_row("SELECT message_state FROM messages WHERE id = ?1", [message_id], |row| row.get::<_, String>(0))?,
-        )
+        let state = MessageState::from_str(&tx.query_row(
+            "SELECT message_state FROM messages WHERE id = ?1",
+            [message_id],
+            |row| row.get::<_, String>(0),
+        )?)
         .upgrade(MessageState::from_str(receipt_type))
         .as_str()
         .to_string();
@@ -602,7 +615,13 @@ pub fn record_message_receipt(
             &format!("UPDATE messages SET {state_column} = COALESCE({state_column}, ?1), {recorded_column} = COALESCE({recorded_column}, ?2), message_state = ?3 WHERE id = ?4"),
             params![event_at, recorded_at, state, message_id],
         )?;
-        sync::record_event(&tx, storage_owner, EntityType::Message, message_id, Operation::Upsert)?;
+        sync::record_event(
+            &tx,
+            storage_owner,
+            EntityType::Message,
+            message_id,
+            Operation::Upsert,
+        )?;
         tx.commit()?;
         Ok(())
     })
@@ -630,7 +649,13 @@ pub fn record_destination_iota_received(
             "UPDATE messages SET destination_iota_received_at = COALESCE(destination_iota_received_at, ?1), message_state = CASE WHEN message_state = 'sending' THEN 'sent' ELSE message_state END WHERE id = ?2",
             params![accepted_at, message_id],
         )?;
-        sync::record_event(&tx, storage_owner, EntityType::Message, message_id, Operation::Upsert)?;
+        sync::record_event(
+            &tx,
+            storage_owner,
+            EntityType::Message,
+            message_id,
+            Operation::Upsert,
+        )?;
         tx.commit()?;
         Ok(())
     })

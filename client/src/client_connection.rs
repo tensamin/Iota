@@ -280,12 +280,6 @@ impl ClientConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::AddConversation) {
-            self.send_message(&message_handlers::handle_add_conversation(&cv))
-                .await;
-            return;
-        }
-
         if cv.is_type(CommunicationType::AddCommunity) {
             self.send_message(&message_handlers::handle_add_community(&cv))
                 .await;
@@ -416,7 +410,9 @@ impl ClientConnection {
             return;
         };
 
-        let Some(encrypted_challenge) = cv.get_data(DataType::Challenge).as_str() else { return };
+        let Some(encrypted_challenge) = cv.get_data(DataType::Challenge).as_str() else {
+            return;
+        };
 
         let solved = crypto_util::decrypt_challenge(encrypted_challenge, &keyring).ok();
 

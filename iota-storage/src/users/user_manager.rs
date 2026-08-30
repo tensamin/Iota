@@ -32,8 +32,8 @@ pub fn add_user(user: UserProfile) {
 }
 
 pub fn try_add_user(user: UserProfile) -> Result<(), crate::storage_error::StorageError> {
-    db::with_db(|conn| {
-        conn.execute(
+    db::with_immediate_transaction(|tx| {
+        tx.execute(
             r#"
             INSERT INTO users (user_id, username, public_key, private_key_hash, reset_token, created_at, display_name)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -56,7 +56,7 @@ pub fn try_add_user(user: UserProfile) -> Result<(), crate::storage_error::Stora
         )?;
 
         for (app_id, app_secret) in &user.trusted_apps {
-            conn.execute(
+            tx.execute(
                 r#"
                 INSERT OR REPLACE INTO trusted_apps (user_id, app_id, app_secret)
                 VALUES (?1, ?2, ?3)
@@ -64,7 +64,7 @@ pub fn try_add_user(user: UserProfile) -> Result<(), crate::storage_error::Stora
                 params![user.user_id, app_id, app_secret],
             )?;
         }
-        conn.execute(
+        tx.execute(
             r#"INSERT INTO user_residency (user_id, username, lifecycle_state, data_state, updated_at)
                VALUES (?1, ?2, 'managed', COALESCE((SELECT data_state FROM user_residency WHERE user_id = ?1), 'present'), ?3)
                ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, lifecycle_state = 'managed', updated_at = excluded.updated_at"#,
@@ -93,7 +93,7 @@ pub fn get_user_by_username(username: &str) -> Option<UserProfile> {
                     private_key_hash: r.get(3)?,
                     created_at: r.get(5)?,
                     reset_token: r.get(4)?,
-                    trusted_apps: load_trusted_apps(user_id),
+                    trusted_apps: std::collections::HashMap::new(),
                 })
             },
         ) {
@@ -110,8 +110,8 @@ pub fn get_user_by_username(username: &str) -> Option<UserProfile> {
     }
 }
 
-pub fn get_user(user_id: i64) -> Option<UserProfile> {
-    match db::with_db(|conn| {
+pub fn get_user(user_id: i64) -> Result<Option<UserProfile>, crate::storage_error::StorageError> {
+    let user = db::with_db(|conn| {
         match conn.query_row(
             "SELECT user_id, username, public_key, private_key_hash, reset_token, created_at, display_name FROM users WHERE user_id = ?1 LIMIT 1",
             params![user_id],
@@ -125,7 +125,7 @@ pub fn get_user(user_id: i64) -> Option<UserProfile> {
                     private_key_hash: r.get(3)?,
                     created_at: r.get(5)?,
                     reset_token: r.get(4)?,
-                    trusted_apps: load_trusted_apps(user_id),
+                    trusted_apps: std::collections::HashMap::new(),
                 })
             },
         ) {
@@ -133,13 +133,12 @@ pub fn get_user(user_id: i64) -> Option<UserProfile> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
-    }) {
-        Ok(opt) => opt,
-        Err(e) => {
-            eprintln!("Error querying user: {}", e);
-            None
-        }
-    }
+    })?;
+    user.map(|mut user| {
+        user.trusted_apps = load_trusted_apps(user_id)?;
+        Ok(user)
+    })
+    .transpose()
 }
 
 pub fn get_users() -> Vec<UserProfile> {
@@ -177,7 +176,7 @@ pub fn get_users() -> Vec<UserProfile> {
         for row in rows {
             match row {
                 Ok(mut user) => {
-                    user.trusted_apps = load_trusted_apps(user.user_id);
+                    user.trusted_apps = load_trusted_apps(user.user_id)?;
                     out.push(user);
                 }
                 Err(e) => eprintln!("Failed to read user row: {}", e),
@@ -193,8 +192,10 @@ pub fn get_users() -> Vec<UserProfile> {
     }
 }
 
-fn load_trusted_apps(user_id: i64) -> std::collections::HashMap<String, String> {
-    match db::with_db(|conn| {
+fn load_trusted_apps(
+    user_id: i64,
+) -> Result<std::collections::HashMap<String, String>, crate::storage_error::StorageError> {
+    db::with_db(|conn| {
         let mut stmt =
             conn.prepare("SELECT app_id, app_secret FROM trusted_apps WHERE user_id = ?1")?;
         let rows = stmt.query_map(params![user_id], |r| {
@@ -203,18 +204,11 @@ fn load_trusted_apps(user_id: i64) -> std::collections::HashMap<String, String> 
 
         let mut map = std::collections::HashMap::new();
         for row in rows {
-            if let Ok((k, v)) = row {
-                map.insert(k, v);
-            }
+            let (key, value) = row?;
+            map.insert(key, value);
         }
         Ok(map)
-    }) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Failed to load trusted apps: {}", e);
-            std::collections::HashMap::new()
-        }
-    }
+    })
 }
 
 pub fn remove_user(user_id: i64) {
@@ -233,9 +227,11 @@ pub fn remove_user(user_id: i64) {
 /// Remove only local management authority. Hosted content is intentionally
 /// retained and is indexed as released for a later purge operation.
 pub fn release_user(user_id: i64) -> Result<(), crate::storage_error::StorageError> {
-    let username = get_user(user_id).map(|user| user.username).ok_or_else(|| {
-        crate::storage_error::StorageError::Other("managed user was not found".into())
-    })?;
+    let username = get_user(user_id)?
+        .map(|user| user.username)
+        .ok_or_else(|| {
+            crate::storage_error::StorageError::Other("managed user was not found".into())
+        })?;
     db::with_db(|conn| {
         let tx = conn.unchecked_transaction()?;
         tx.execute(
@@ -252,7 +248,7 @@ pub fn release_user(user_id: i64) -> Result<(), crate::storage_error::StorageErr
         tx.commit()?;
         Ok(())
     })?;
-    remove_user_credential(user_id)
+    remove_user_credential(user_id, Some(&username))
         .map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))
 }
 
@@ -312,6 +308,12 @@ pub fn purge_user_data(user_id: i64) -> Result<(), crate::storage_error::Storage
 /// Complete local erasure is idempotent and is the target for a durable
 /// Omega-hosted erasure request after account deletion.
 pub fn erase_user_locally(user_id: i64) -> Result<(), crate::storage_error::StorageError> {
+    let username = get_user(user_id)?.map(|user| user.username).or_else(|| {
+        get_residency()
+            .into_iter()
+            .find(|entry| entry.user_id == user_id)
+            .map(|entry| entry.username)
+    });
     purge_user_data(user_id)?;
     db::with_db(|conn| {
         conn.execute(
@@ -325,7 +327,7 @@ pub fn erase_user_locally(user_id: i64) -> Result<(), crate::storage_error::Stor
         )?;
         Ok(())
     })?;
-    remove_user_credential(user_id)
+    remove_user_credential(user_id, username.as_deref())
         .map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))
 }
 

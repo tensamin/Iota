@@ -291,30 +291,15 @@ mod tests {
             )
             .unwrap();
         let transaction = connection.unchecked_transaction().unwrap();
-        let message = super::record_event(
-            &transaction,
-            1,
-            EntityType::Message,
-            10,
-            Operation::Upsert,
-        )
-        .unwrap();
-        let setting = super::record_event(
-            &transaction,
-            1,
-            EntityType::Setting,
-            11,
-            Operation::Upsert,
-        )
-        .unwrap();
-        let contact = super::record_event(
-            &transaction,
-            1,
-            EntityType::Contact,
-            12,
-            Operation::Upsert,
-        )
-        .unwrap();
+        let message =
+            super::record_event(&transaction, 1, EntityType::Message, 10, Operation::Upsert)
+                .unwrap();
+        let setting =
+            super::record_event(&transaction, 1, EntityType::Setting, 11, Operation::Upsert)
+                .unwrap();
+        let contact =
+            super::record_event(&transaction, 1, EntityType::Contact, 12, Operation::Upsert)
+                .unwrap();
         transaction.commit().unwrap();
 
         assert_eq!((message, setting, contact), (1, 2, 3));

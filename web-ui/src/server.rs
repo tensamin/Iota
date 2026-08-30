@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 pub async fn start(port: u16, state: Arc<DaemonState>) -> bool {
     let (tx, rx) = oneshot::channel::<ServerHandle>();
 
-    let bind_addr = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let bind_addr = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1".to_string());
     let bind_ip: std::net::IpAddr = bind_addr.parse().expect("Invalid BIND_ADDRESS");
 
     let server_state = state.clone();

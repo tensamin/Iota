@@ -1,16 +1,19 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use iota_logger::{PrintType, log, log_cv, log_t};
+use iota_storage::users::pending_operations::{
+    self, PendingUserOperation, PendingUserOperationKind, PendingUserOperationPhase,
+};
 use iota_storage::users::user_manager::try_add_user;
 use iota_storage::users::user_profile::UserProfile;
 use iota_storage::util::config_util::CONFIG;
 use iota_util::crypto_helper::{self, hex_hash, public_key_bundle_to_base64};
-use iota_util::file_util::write_user_credential;
+use iota_util::file_util::{remove_user_credential, write_user_credential};
 use iota_util::mtp_compat::OptionalDataValueExt;
 use iota_util::tu::TuCredential;
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::{Ed25519Signer, MlDsaSigner, SignatureScheme};
 use rand_core::{OsRng, RngCore};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::OmikronClient;
 use crate::omega_discovery;
@@ -21,6 +24,7 @@ pub enum CreateUserError {
     Transport(crate::OmikronError),
     InvalidResponse,
     RemoteRejected,
+    LocalFinalizationPending { user_id: i64 },
     LocalPersistence(String),
 }
 
@@ -165,15 +169,6 @@ pub async fn attach_user_from_tu(
     let credential = TuCredential::parse(contents)
         .map_err(|error| LifecycleUserError::InvalidCredential(error.to_string()))?;
     let (username, public_key) = inspect_credential_account(connection, &credential).await?;
-    credential_proof(
-        connection,
-        &credential,
-        CommunicationType::AttachUserBegin,
-        CommunicationType::AttachUserChallenge,
-        CommunicationType::AttachUserComplete,
-        b"tensamin:user-attach:v1\0",
-    )
-    .await?;
     let profile = UserProfile::new(
         credential.user_id,
         username,
@@ -182,9 +177,39 @@ pub async fn attach_user_from_tu(
         hex_hash(contents),
         String::new(),
     );
-    write_user_credential(profile.user_id, &credential.to_canonical_string())
+    write_user_credential(&profile.username, &credential.to_canonical_string())
         .map_err(|error| LifecycleUserError::LocalPersistence(error.to_string()))?;
+    pending_operations::upsert(&PendingUserOperation {
+        user_id: profile.user_id,
+        operation: PendingUserOperationKind::Attach,
+        username: profile.username.clone(),
+        public_key: Some(profile.public_key.clone()),
+        private_key_hash: Some(profile.private_key_hash.clone()),
+        reset_token: Some(profile.reset_token.clone()),
+        registration_token: None,
+        phase: PendingUserOperationPhase::Prepared,
+        created_at: now_millis(),
+    })
+    .map_err(|error| LifecycleUserError::LocalPersistence(error.to_string()))?;
+    if let Err(error) = credential_proof(
+        connection,
+        &credential,
+        CommunicationType::AttachUserBegin,
+        CommunicationType::AttachUserChallenge,
+        CommunicationType::AttachUserComplete,
+        b"tensamin:user-attach:v1\0",
+    )
+    .await
+    {
+        if matches!(error, LifecycleUserError::RemoteRejected) {
+            let _ = pending_operations::remove(profile.user_id);
+            let _ = remove_user_credential(profile.user_id, Some(&profile.username));
+        }
+        return Err(error);
+    }
     try_add_user(profile.clone())
+        .map_err(|error| LifecycleUserError::LocalPersistence(error.to_string()))?;
+    pending_operations::remove(profile.user_id)
         .map_err(|error| LifecycleUserError::LocalPersistence(error.to_string()))?;
     Ok(profile)
 }
@@ -219,6 +244,83 @@ pub async fn reconcile_managed_users(connection: &dyn OmikronClient) {
     let Ok(local_iota_id) = configured_iota_id() else {
         return;
     };
+    let pending = match pending_operations::get_all() {
+        Ok(pending) => pending,
+        Err(error) => {
+            log!("Pending user operation reconciliation could not read storage: {error}");
+            return;
+        }
+    };
+    for operation in pending {
+        let request = CommunicationValue::new(CommunicationType::GetUserData).add_typed_default(
+            DataType::UserId,
+            DataValue::SignedNumber(operation.user_id.into()),
+        );
+        let response = connection
+            .await_response(&request, Duration::from_secs(10))
+            .await
+            .ok();
+        let remote_iota_id = response.as_ref().and_then(|response| {
+            response
+                .get_data(DataType::IotaId)
+                .as_signed_number()
+                .and_then(|value| i64::try_from(value).ok())
+        });
+        let remote_matches = response.as_ref().is_some_and(|response| {
+            response.is_type(CommunicationType::GetUserData)
+                && remote_iota_id == Some(local_iota_id)
+                && response.get_data(DataType::Username).as_str() == Some(&operation.username)
+                && response.get_data(DataType::PublicKey).as_str()
+                    == operation.public_key.as_deref()
+        });
+        let completion_retried = matches!(operation.operation, PendingUserOperationKind::Create)
+            && matches!(
+                operation.phase,
+                PendingUserOperationPhase::Prepared | PendingUserOperationPhase::CredentialWritten
+            )
+            && !remote_matches
+            && complete_pending_create(connection, &operation).await;
+        match operation.operation {
+            PendingUserOperationKind::Create | PendingUserOperationKind::Attach
+                if remote_matches || completion_retried =>
+            {
+                let credential_present = iota_util::file_util::read_user_credential_with_legacy(
+                    operation.user_id,
+                    &operation.username,
+                )
+                .ok()
+                .flatten()
+                .is_some();
+                if !credential_present {
+                    log!(
+                        "Pending user {} has no credential; leaving it unresolved",
+                        operation.user_id
+                    );
+                    continue;
+                }
+                let Some(public_key) = operation.public_key else {
+                    continue;
+                };
+                let profile = UserProfile::new(
+                    operation.user_id,
+                    operation.username,
+                    None,
+                    public_key,
+                    operation.private_key_hash.unwrap_or_default(),
+                    operation.reset_token.unwrap_or_default(),
+                );
+                if try_add_user(profile).is_ok() {
+                    let _ = pending_operations::remove(operation.user_id);
+                }
+            }
+            PendingUserOperationKind::Release if remote_iota_id != Some(local_iota_id) => {
+                if iota_storage::users::user_manager::release_user(operation.user_id).is_ok() {
+                    let _ = pending_operations::remove(operation.user_id);
+                }
+            }
+            _ => {}
+        }
+    }
     for user in iota_storage::users::user_manager::get_users() {
         let request = CommunicationValue::new(CommunicationType::GetUserData).add_typed_default(
             DataType::UserId,
@@ -240,11 +342,86 @@ pub async fn reconcile_managed_users(connection: &dyn OmikronClient) {
     }
 }
 
+/*
+ * Retry completion only while the locally persisted operation still owns a
+ * valid registration lease. Omega treats an exact repeat as idempotent, which
+ * repairs an interrupted request without allocating another user ID.
+ */
+async fn complete_pending_create(
+    connection: &dyn OmikronClient,
+    operation: &PendingUserOperation,
+) -> bool {
+    let Some(public_key) = operation.public_key.as_ref() else {
+        return false;
+    };
+    let Some(reset_token) = operation.reset_token.as_ref() else {
+        return false;
+    };
+    let Some(registration_token) = operation.registration_token.as_ref() else {
+        return false;
+    };
+    let request = CommunicationValue::new(CommunicationType::CompleteRegisterUser)
+        .add_typed_default(
+            DataType::UserId,
+            DataValue::SignedNumber(operation.user_id.into()),
+        )
+        .add_typed_default(
+            DataType::Username,
+            DataValue::Str(operation.username.clone()),
+        )
+        .add_typed_default(DataType::PublicKey, DataValue::Str(public_key.clone()))
+        .add_typed_default(DataType::ResetToken, DataValue::Str(reset_token.clone()))
+        .add_typed_default(
+            DataType::RegisterId,
+            DataValue::Str(registration_token.clone()),
+        );
+    match connection
+        .await_response(&request, Duration::from_secs(20))
+        .await
+    {
+        Ok(response) if response.is_type(CommunicationType::Success) => {
+            if let Err(error) = pending_operations::update_phase(
+                operation.user_id,
+                PendingUserOperationPhase::RemoteCommitted,
+            ) {
+                log!(
+                    "Pending user {} completed remotely but could not update its phase: {error}",
+                    operation.user_id
+                );
+            }
+            true
+        }
+        Ok(response) => {
+            log!(
+                "Pending user {} registration retry was rejected with {}",
+                operation.user_id,
+                response.get_type()
+            );
+            false
+        }
+        Err(error) => {
+            log!(
+                "Pending user {} registration retry failed: {error}",
+                operation.user_id
+            );
+            false
+        }
+    }
+}
+
 fn valid_username(username: &str) -> bool {
     !username.is_empty()
-        && username.chars().count() <= 15
-        && !username.chars().any(char::is_control)
-        && !username.contains(['/', '\\'])
+        && username.len() <= 15
+        && username
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 async fn request_user_id(connection: &dyn OmikronClient) -> Result<(i64, String), CreateUserError> {
@@ -318,6 +495,28 @@ pub async fn create_user(
         private_key_hash,
         reset_token.clone(),
     );
+    let credential = format!(
+        "{}@{}::{}",
+        user_id,
+        omega_discovery::omega_host(),
+        keyring_b64
+    );
+    pending_operations::upsert(&PendingUserOperation {
+        user_id,
+        operation: PendingUserOperationKind::Create,
+        username: user_profile.username.clone(),
+        public_key: Some(user_profile.public_key.clone()),
+        private_key_hash: Some(user_profile.private_key_hash.clone()),
+        reset_token: Some(user_profile.reset_token.clone()),
+        registration_token: Some(registration_token.clone()),
+        phase: PendingUserOperationPhase::Prepared,
+        created_at: now_millis(),
+    })
+    .map_err(|error| CreateUserError::LocalPersistence(error.to_string()))?;
+    write_user_credential(username, &credential)
+        .map_err(|error| CreateUserError::LocalPersistence(error.to_string()))?;
+    pending_operations::update_phase(user_id, PendingUserOperationPhase::CredentialWritten)
+        .map_err(|error| CreateUserError::LocalPersistence(error.to_string()))?;
 
     let communication_value = CommunicationValue::new(CommunicationType::CompleteRegisterUser)
         .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
@@ -337,6 +536,8 @@ pub async fn create_user(
         Ok(response) => {
             log_cv!(PrintType::Omega, response);
             if !response.is_type(CommunicationType::Success) {
+                let _ = pending_operations::remove(user_id);
+                let _ = remove_user_credential(user_id, Some(username));
                 return Err(CreateUserError::RemoteRejected);
             }
         }
@@ -355,20 +556,15 @@ pub async fn create_user(
             }
         }
     }
-    log!("Created User");
-    write_user_credential(
-        user_id,
-        &format!(
-            "{}@{}::{}",
-            user_id,
-            omega_discovery::omega_host(),
-            keyring_b64
-        ),
-    )
-    .map_err(|error| CreateUserError::LocalPersistence(error.to_string()))?;
-
+    pending_operations::update_phase(user_id, PendingUserOperationPhase::RemoteCommitted)
+        .map_err(|_| CreateUserError::LocalFinalizationPending { user_id })?;
     try_add_user(user_profile.clone())
-        .map_err(|error| CreateUserError::LocalPersistence(error.to_string()))?;
+        .map_err(|_| CreateUserError::LocalFinalizationPending { user_id })?;
+    pending_operations::update_phase(user_id, PendingUserOperationPhase::LocalCommitted)
+        .map_err(|_| CreateUserError::LocalFinalizationPending { user_id })?;
+    pending_operations::remove(user_id)
+        .map_err(|_| CreateUserError::LocalFinalizationPending { user_id })?;
+    log!("Created User");
     Ok(user_profile)
 }
 
@@ -416,10 +612,12 @@ mod tests {
     #[test]
     fn validates_usernames_before_remote_registration() {
         assert!(valid_username("alice"));
-        assert!(valid_username("fifteen_char_ok"));
+        assert!(valid_username("abc123def456ghi"));
         assert!(!valid_username(""));
         assert!(!valid_username("sixteen_chars_bad"));
         assert!(!valid_username("path/name"));
+        assert!(!valid_username("upperCase"));
+        assert!(!valid_username("underscore_name"));
         assert!(!valid_username("line\nbreak"));
     }
 

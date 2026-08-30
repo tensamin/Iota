@@ -8,6 +8,9 @@ iota-storage = { path = "../iota-storage" }
 iota-state = { path = "../iota-state" }
 iota-util = { path = "../iota-util" }
 iota-logger = { path = "../iota-logger" }
+iota-cli = { path = "../iota-cli" }
+iota-ipc = { path = "../iota-ipc" }
+iota-paths = { path = "../iota-paths" }
 
 actix-web = { version = "4", features = ["rustls-0_23"] }
 rustls = { version = "0.23.37", features = ["aws-lc-rs"] }
