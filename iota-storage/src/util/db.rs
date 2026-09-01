@@ -579,6 +579,137 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         conn.pragma_update(None, "user_version", 16)?;
     }
 
+    if current_version < 17 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS user_blobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                blob_id TEXT NOT NULL,
+                blob BLOB NOT NULL,
+                revision INTEGER NOT NULL,
+                deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+                updated_at INTEGER NOT NULL,
+                UNIQUE(user_id, blob_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_blobs_owner
+                ON user_blobs (user_id, deleted);
+            CREATE TABLE IF NOT EXISTS blocked_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                blocked_user_id INTEGER NOT NULL,
+                revision INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(user_id, blocked_user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_blocked_users_owner ON blocked_users (user_id);
+            CREATE TABLE IF NOT EXISTS user_receipt_policy (
+                user_id INTEGER PRIMARY KEY,
+                send_read_receipts INTEGER NOT NULL CHECK (send_read_receipts IN (0, 1)),
+                send_received_receipts INTEGER NOT NULL CHECK (send_received_receipts IN (0, 1)),
+                revision INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS user_message_storage_policy (
+                user_id INTEGER PRIMARY KEY,
+                history_mode TEXT NOT NULL CHECK (history_mode IN ('retain', 'delete_after_client_delivery')),
+                retention_mode TEXT NOT NULL CHECK (retention_mode IN ('forever', 'duration')),
+                retention_duration_ms INTEGER,
+                revision INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 17;
+            "#,
+        )?;
+    }
+
+    if current_version < 18 {
+        let messages_exist: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages')",
+            [],
+            |row| row.get(0),
+        )?;
+        if messages_exist {
+            add_column_if_missing(conn, "stored_at", "stored_at INTEGER")?;
+            add_column_if_missing(conn, "expires_at", "expires_at INTEGER")?;
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_messages_expiry ON messages (storage_owner, expires_at) WHERE expires_at IS NOT NULL;",
+            )?;
+        }
+        conn.pragma_update(None, "user_version", 18)?;
+    }
+
+    if current_version < 19 {
+        let messages_exist: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages')",
+            [],
+            |row| row.get(0),
+        )?;
+        if messages_exist {
+            conn.execute(
+                "UPDATE messages SET stored_at = COALESCE(destination_iota_received_at, origin_iota_received_at) WHERE stored_at IS NULL",
+                [],
+            )?;
+        }
+        conn.pragma_update(None, "user_version", 19)?;
+    }
+
+    if current_version < 20 {
+        let messages_exist: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages')",
+            [],
+            |row| row.get(0),
+        )?;
+        if messages_exist {
+            add_column_if_missing(
+                conn,
+                "history_deleted",
+                "history_deleted INTEGER NOT NULL DEFAULT 0 CHECK (history_deleted IN (0, 1))",
+            )?;
+            add_column_if_missing(conn, "history_deleted_at", "history_deleted_at INTEGER")?;
+        }
+        let pending_relays_exist: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pending_relays')",
+            [],
+            |row| row.get(0),
+        )?;
+        if pending_relays_exist {
+            add_table_column_if_missing(
+                conn,
+                "pending_relays",
+                "relay_signer_id",
+                "relay_signer_id INTEGER",
+            )?;
+            add_table_column_if_missing(
+                conn,
+                "pending_relays",
+                "relay_destination_user_id",
+                "relay_destination_user_id INTEGER",
+            )?;
+            add_table_column_if_missing(
+                conn,
+                "pending_relays",
+                "relay_message_id",
+                "relay_message_id TEXT",
+            )?;
+        }
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS client_message_deliveries (
+                user_id INTEGER NOT NULL,
+                session_id INTEGER NOT NULL,
+                sync_version INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, session_id, sync_version, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_client_message_deliveries_session
+                ON client_message_deliveries (user_id, session_id, sync_version);
+            PRAGMA user_version = 20;
+            "#,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -648,7 +779,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 16);
+        assert_eq!(version, 20);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -667,7 +798,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 16);
+        assert_eq!(version, 20);
         for table in [
             "sync_heads",
             "sync_events",
@@ -678,6 +809,10 @@ mod tests {
             "relay_inbox",
             "synced_settings",
             "pending_user_operations",
+            "user_blobs",
+            "blocked_users",
+            "user_receipt_policy",
+            "user_message_storage_policy",
         ] {
             let exists: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -702,7 +837,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 16);
+        assert_eq!(version, 20);
         for column in [
             "id",
             "user_id",

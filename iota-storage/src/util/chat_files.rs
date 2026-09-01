@@ -1,8 +1,9 @@
 use crate::storage_error::StorageError;
 use crate::util::db;
+use crate::util::message_storage_policy::{self, MessageRetention};
 use crate::util::sync::{self, EntityType, Operation};
 use iota_logger::log;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 
 pub const MAX_UNIQUE_REACTIONS_PER_MESSAGE: usize = 10;
 
@@ -149,7 +150,7 @@ fn update_message_content(
     db::with_db(|conn| {
         let msg = conn.query_row(
             r#"
-            SELECT id, content, sent_by_self
+            SELECT id, content, sent_by_self, history_deleted
             FROM messages
             WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
             ORDER BY id DESC LIMIT 1
@@ -160,11 +161,12 @@ fn update_message_content(
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             },
         )?;
 
-        let (msg_id, old_content, sent_by_self) = msg;
+        let (msg_id, old_content, sent_by_self, history_deleted) = msg;
         if require_sent_by_self && sent_by_self != 1 {
             return Err(StorageError::Other(
                 "Only the original sender can edit this message".into(),
@@ -176,6 +178,9 @@ fn update_message_content(
             ));
         }
 
+        if history_deleted != 0 {
+            return Ok(());
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -217,36 +222,131 @@ pub fn hard_delete_message(
     message_time: i64,
 ) -> Result<(), StorageError> {
     db::with_db(|conn| {
-        let msg_id: i64 = conn.query_row(
-            r#"
-            SELECT id FROM messages
+        let msg_id = conn
+            .query_row(
+                r#"
+            SELECT id, history_deleted FROM messages
             WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
             ORDER BY id DESC LIMIT 1
             "#,
-            params![storage_owner, external_user, message_time],
-            |row| row.get(0),
-        )?;
+                params![storage_owner, external_user, message_time],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(msg_id) = msg_id else {
+            return Ok(());
+        };
 
         let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM message_edits WHERE message_id = ?1",
-            params![msg_id],
-        )?;
-        tx.execute(
-            "DELETE FROM reactions WHERE message_id = ?1",
-            params![msg_id],
-        )?;
-        tx.execute("DELETE FROM messages WHERE id = ?1", params![msg_id])?;
-        sync::record_event(
-            &tx,
-            storage_owner,
-            EntityType::Message,
-            msg_id,
-            Operation::Delete,
-        )?;
+        purge_message_in_tx(&tx, storage_owner, msg_id)?;
         tx.commit()?;
         Ok(())
     })
+}
+
+pub fn purge_message(storage_owner: i64, message_id: i64) -> Result<(), StorageError> {
+    db::with_immediate_transaction(|tx| purge_message_in_tx(tx, storage_owner, message_id))
+}
+
+pub fn remove_message_history(storage_owner: i64, message_id: i64) -> Result<(), StorageError> {
+    db::with_immediate_transaction(|tx| remove_message_history_in_tx(tx, storage_owner, message_id))
+}
+
+/* Resolves the protocol identity retained in a tombstone before removing visible history. */
+pub fn remove_message_history_by_relay_identity(
+    storage_owner: i64,
+    relay_signer_id: i64,
+    relay_message_id: &str,
+) -> Result<(), StorageError> {
+    db::with_immediate_transaction(|tx| {
+        let message_id = tx.query_row(
+            "SELECT id FROM messages WHERE storage_owner = ?1 AND relay_signer_id = ?2 AND relay_message_id = ?3",
+            params![storage_owner, relay_signer_id, relay_message_id],
+            |row| row.get::<_, i64>(0),
+        ).optional()?;
+        if let Some(message_id) = message_id {
+            remove_message_history_in_tx(tx, storage_owner, message_id)?;
+        }
+        Ok(())
+    })
+}
+
+pub fn remove_message_history_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    message_id: i64,
+) -> Result<(), StorageError> {
+    let message: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT external_user, history_deleted FROM messages WHERE id = ?1 AND storage_owner = ?2",
+            params![message_id, storage_owner],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((external_user, history_deleted)) = message else {
+        return Ok(());
+    };
+    if history_deleted != 0 {
+        return Ok(());
+    }
+    tx.execute(
+        "DELETE FROM message_edits WHERE message_id = ?1",
+        [message_id],
+    )?;
+    tx.execute("DELETE FROM reactions WHERE message_id = ?1", [message_id])?;
+    tx.execute("DELETE FROM message_receipts WHERE storage_owner = ?1 AND EXISTS (SELECT 1 FROM messages WHERE id = ?2 AND relay_signer_id = message_receipts.target_signer_id AND relay_message_id = message_receipts.target_message_id)", params![storage_owner, message_id])?;
+    tx.execute("UPDATE messages SET content = '', history_deleted = 1, history_deleted_at = ?2, expires_at = NULL, client_received_at = NULL, client_received_recorded_at = NULL, read_at = NULL, read_recorded_at = NULL WHERE id = ?1", params![message_id, sync::now_millis()])?;
+    sync::record_event(
+        tx,
+        storage_owner,
+        EntityType::Message,
+        message_id,
+        Operation::Delete,
+    )?;
+    update_contact_last_message_in_tx(tx, storage_owner, external_user)?;
+    Ok(())
+}
+
+fn update_contact_last_message_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+) -> Result<(), StorageError> {
+    tx.execute("UPDATE contacts SET last_message_at = (SELECT MAX(COALESCE(destination_iota_received_at, origin_iota_received_at, authored_at, message_time)) FROM messages WHERE storage_owner = ?1 AND external_user = ?2 AND deleted_by_external = 0 AND history_deleted = 0) WHERE storage_owner = ?1 AND user_id = ?2", params![storage_owner, external_user])?;
+    Ok(())
+}
+
+pub fn purge_message_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    message_id: i64,
+) -> Result<(), StorageError> {
+    let (external_user, relay_signer_id, relay_message_id) = tx.query_row(
+        "SELECT external_user, relay_signer_id, relay_message_id FROM messages WHERE id = ?1 AND storage_owner = ?2",
+        params![message_id, storage_owner],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Option<String>>(2)?)),
+    )?;
+    if let (Some(relay_signer_id), Some(relay_message_id)) = (relay_signer_id, relay_message_id) {
+        tx.execute(
+            "DELETE FROM message_receipts WHERE storage_owner = ?1 AND target_signer_id = ?2 AND target_message_id = ?3",
+            params![storage_owner, relay_signer_id, relay_message_id],
+        )?;
+    }
+    tx.execute(
+        "DELETE FROM message_edits WHERE message_id = ?1",
+        [message_id],
+    )?;
+    tx.execute("DELETE FROM reactions WHERE message_id = ?1", [message_id])?;
+    tx.execute("DELETE FROM messages WHERE id = ?1", [message_id])?;
+    sync::record_event(
+        tx,
+        storage_owner,
+        EntityType::Message,
+        message_id,
+        Operation::Delete,
+    )?;
+    update_contact_last_message_in_tx(tx, storage_owner, external_user)?;
+    Ok(())
 }
 
 /* Deletes a message from the sender's local copy after checking ownership. */
@@ -255,8 +355,11 @@ pub fn delete_message(
     external_user: i64,
     message_time: i64,
 ) -> Result<(), StorageError> {
-    ensure_message_direction(storage_owner, external_user, message_time, true)?;
-    hard_delete_message(storage_owner, external_user, message_time)
+    match ensure_message_direction(storage_owner, external_user, message_time, true) {
+        Ok(()) => hard_delete_message(storage_owner, external_user, message_time),
+        Err(StorageError::Db(rusqlite::Error::QueryReturnedNoRows)) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /* Flags the recipient's local copy after validating its sender, preserving its history. */
@@ -271,8 +374,11 @@ pub fn apply_remote_delete(
             "Remote sender does not match chat partner".into(),
         ));
     }
-    ensure_message_direction(storage_owner, external_user, message_time, false)?;
-    flag_deleted_by_external(storage_owner, external_user, message_time)
+    match ensure_message_direction(storage_owner, external_user, message_time, false) {
+        Ok(()) => flag_deleted_by_external(storage_owner, external_user, message_time),
+        Err(StorageError::Db(rusqlite::Error::QueryReturnedNoRows)) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn ensure_message_direction(
@@ -330,6 +436,7 @@ pub fn flag_deleted_by_external(
             msg_id,
             Operation::Delete,
         )?;
+        update_contact_last_message_in_tx(&tx, storage_owner, external_user)?;
         tx.commit()?;
         Ok(())
     })
@@ -346,15 +453,18 @@ pub fn delete_edit_history(
     message_time: i64,
 ) -> Result<(), StorageError> {
     db::with_db(|conn| {
-        let msg_id: i64 = conn.query_row(
+        let (msg_id, history_deleted): (i64, i64) = conn.query_row(
             r#"
-            SELECT id FROM messages
+            SELECT id, history_deleted FROM messages
             WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
             ORDER BY id DESC LIMIT 1
             "#,
             params![storage_owner, external_user, message_time],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        if history_deleted != 0 {
+            return Ok(());
+        }
 
         let tx = conn.unchecked_transaction()?;
         tx.execute(
@@ -381,15 +491,18 @@ pub fn add_reaction(
     reaction: &str,
 ) -> Result<(), StorageError> {
     db::with_immediate_transaction(|tx| {
-        let msg_id: i64 = tx.query_row(
+        let (msg_id, history_deleted): (i64, i64) = tx.query_row(
             r#"
-            SELECT id FROM messages
+            SELECT id, history_deleted FROM messages
             WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
             ORDER BY id DESC LIMIT 1
             "#,
             params![storage_owner, external_user, message_time],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        if history_deleted != 0 {
+            return Ok(());
+        }
 
         let reaction_exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM reactions WHERE message_id = ?1 AND reaction = ?2)",
@@ -442,15 +555,18 @@ pub fn remove_reaction(
     reaction: &str,
 ) -> Result<(), StorageError> {
     db::with_db(|conn| {
-        let msg_id: i64 = conn.query_row(
+        let (msg_id, history_deleted): (i64, i64) = conn.query_row(
             r#"
-            SELECT id FROM messages
+            SELECT id, history_deleted FROM messages
             WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
             ORDER BY id DESC LIMIT 1
             "#,
             params![storage_owner, external_user, message_time],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        if history_deleted != 0 {
+            return Ok(());
+        }
 
         let tx = conn.unchecked_transaction()?;
         tx.execute(
@@ -485,6 +601,16 @@ pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
         destination_iota_received_at,
         initial_state,
     } = message;
+    let stored_at = sync::now_millis();
+    let policy = message_storage_policy::get(storage_owner)?;
+    let expires_at = match policy.retention {
+        MessageRetention::Forever => None,
+        MessageRetention::Duration { duration_ms } => Some(
+            stored_at
+                .checked_add(duration_ms)
+                .ok_or_else(|| StorageError::Other("message expiry overflow".into()))?,
+        ),
+    };
     db::with_db(|conn| {
         let tx = conn.unchecked_transaction()?;
         tx.execute(
@@ -492,8 +618,8 @@ pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
             INSERT INTO messages (
                 storage_owner, external_user, message_time, content, sent_by_self,
                 message_state, height, reply_to, relay_signer_id, relay_message_id,
-                authored_at, origin_iota_received_at, destination_iota_received_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                authored_at, origin_iota_received_at, destination_iota_received_at, stored_at, expires_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             "#,
             params![
                 storage_owner,
@@ -509,6 +635,8 @@ pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
                 authored_at,
                 origin_iota_received_at,
                 destination_iota_received_at,
+                stored_at,
+                expires_at,
             ],
         )?;
         let msg_id = tx.last_insert_rowid();
@@ -583,11 +711,11 @@ pub fn record_message_receipt(
     };
     db::with_db(|conn| {
         let tx = conn.unchecked_transaction()?;
-        let Some((message_id, external_user, authored_at)) = tx
+        let Some((message_id, external_user, authored_at, history_deleted)) = tx
             .query_row(
-                "SELECT id, external_user, authored_at FROM messages WHERE storage_owner = ?1 AND relay_signer_id = ?2 AND relay_message_id = ?3",
+                "SELECT id, external_user, authored_at, history_deleted FROM messages WHERE storage_owner = ?1 AND relay_signer_id = ?2 AND relay_message_id = ?3",
                 params![storage_owner, target_signer_id, target_message_id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?)),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, i64>(3)?)),
             )
             .optional()?
         else {
@@ -604,6 +732,9 @@ pub fn record_message_receipt(
             return Err(StorageError::Other(
                 "message receipt event time is outside the accepted clock range".into(),
             ));
+        }
+        if history_deleted != 0 {
+            return Ok(());
         }
         tx.execute(
             "INSERT OR IGNORE INTO message_receipts (storage_owner, target_signer_id, target_message_id, receipt_signer_id, receipt_message_id, receipt_type, event_at, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -832,7 +963,7 @@ pub fn get_messages(
                    read_recorded_at, delivery_failed_at, delivery_failure, content, sent_by_self, message_state, height,
                    reply_to, edited_count
             FROM messages
-            WHERE storage_owner = ?1 AND external_user = ?2 AND deleted_by_external = 0
+            WHERE storage_owner = ?1 AND external_user = ?2 AND deleted_by_external = 0 AND history_deleted = 0
             ORDER BY COALESCE(destination_iota_received_at, origin_iota_received_at, authored_at, id) DESC, id DESC
             LIMIT ?3 OFFSET ?4
             "#,
@@ -908,6 +1039,7 @@ pub fn get_message(
             WHERE storage_owner = ?1
               AND message_time = ?2
               AND deleted_by_external = 0
+              AND history_deleted = 0
               AND (?3 IS NULL OR external_user = ?3)
             ORDER BY id DESC
             "#,
@@ -977,6 +1109,7 @@ pub fn get_message_with_offset(
             WHERE storage_owner = ?1
               AND external_user = ?2
               AND deleted_by_external = 0
+              AND history_deleted = 0
               AND (
                    COALESCE(destination_iota_received_at, origin_iota_received_at, authored_at, id) >
                        COALESCE(?3, ?4)
@@ -1005,7 +1138,7 @@ pub fn get_messages_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<StoredMessage
     // A journal id uniquely identifies a row. Load all messages for this owner and retain only
     // those ids; this keeps reaction hydration identical to normal message loading.
     match db::with_db(|conn| {
-        let mut stmt = conn.prepare("SELECT id, relay_signer_id, relay_message_id, message_time, authored_at, origin_iota_received_at, destination_iota_received_at, client_received_at, client_received_recorded_at, read_at, read_recorded_at, delivery_failed_at, delivery_failure, content, sent_by_self, message_state, height, reply_to, edited_count, external_user FROM messages WHERE storage_owner = ?1 AND deleted_by_external = 0")?;
+        let mut stmt = conn.prepare("SELECT id, relay_signer_id, relay_message_id, message_time, authored_at, origin_iota_received_at, destination_iota_received_at, client_received_at, client_received_recorded_at, read_at, read_recorded_at, delivery_failed_at, delivery_failure, content, sent_by_self, message_state, height, reply_to, edited_count, external_user FROM messages WHERE storage_owner = ?1 AND deleted_by_external = 0 AND history_deleted = 0")?;
         let rows = stmt.query_map([storage_owner], |row| {
             let external_user: i64 = row.get(19)?;
             Ok(StoredMessage {
@@ -1056,7 +1189,7 @@ pub fn get_messages_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<StoredMessage
 pub fn get_all_messages(storage_owner: i64) -> Vec<StoredMessage> {
     let ids = match db::with_db(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id FROM messages WHERE storage_owner = ?1 AND deleted_by_external = 0",
+            "SELECT id FROM messages WHERE storage_owner = ?1 AND deleted_by_external = 0 AND history_deleted = 0",
         )?;
         Ok(stmt
             .query_map([storage_owner], |row| row.get::<_, i64>(0))?

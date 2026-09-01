@@ -10,6 +10,10 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("message has reached the unique reaction limit")]
     ReactionLimitReached,
+    #[error("revision conflict")]
+    RevisionConflict,
+    #[error("pending relay ownership is unknown")]
+    PendingRelayOwnershipUnknown,
     #[error("{0}")]
     Other(String),
 }

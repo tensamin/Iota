@@ -1,7 +1,7 @@
 use crate::storage_error::StorageError;
 use crate::util::db;
 use iota_util::route_target::RouteTarget;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, Transaction, params};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingRelay {
@@ -11,10 +11,43 @@ pub struct PendingRelay {
     pub created_at: i64,
     pub frame_id: u32,
     pub type_map_version: String,
+    pub relay_signer_id: Option<i64>,
+    pub relay_destination_user_id: Option<i64>,
+    pub relay_message_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayIdentity {
+    pub signer_id: i64,
+    pub destination_user_id: i64,
+    pub message_id: String,
 }
 
 pub fn enqueue(
     target: RouteTarget,
+    relay: &RelayIdentity,
+    frame: &[u8],
+    created_at: i64,
+    frame_id: u32,
+    type_map_version: &str,
+) -> Result<(), StorageError> {
+    db::with_immediate_transaction(|tx| {
+        enqueue_in_tx(
+            tx,
+            target,
+            relay,
+            frame,
+            created_at,
+            frame_id,
+            type_map_version,
+        )
+    })
+}
+
+pub fn enqueue_in_tx(
+    tx: &Transaction<'_>,
+    target: RouteTarget,
+    relay: &RelayIdentity,
     frame: &[u8],
     created_at: i64,
     frame_id: u32,
@@ -26,26 +59,27 @@ pub fn enqueue(
         RouteTarget::User(_) => 0_i64,
         RouteTarget::Iota(_) => 1_i64,
     };
-    db::with_db(|connection| {
-        connection.execute(
-            "INSERT OR IGNORE INTO pending_relays (destination_id, target_kind, frame, created_at, frame_id, type_map_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    tx.execute(
+            "INSERT OR IGNORE INTO pending_relays (destination_id, target_kind, relay_signer_id, relay_destination_user_id, relay_message_id, frame, created_at, frame_id, type_map_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 destination_id,
                 target_kind,
+                relay.signer_id,
+                relay.destination_user_id,
+                relay.message_id,
                 frame,
                 created_at,
                 i64::from(frame_id),
                 type_map_version
             ],
-        )?;
-        Ok(())
-    })
+    )?;
+    Ok(())
 }
 
 pub fn list(limit: i64) -> Result<Vec<PendingRelay>, StorageError> {
     db::with_db(|connection| {
         let mut statement = connection.prepare(
-            "SELECT id, destination_id, target_kind, frame, created_at, frame_id, type_map_version FROM pending_relays ORDER BY id LIMIT ?1",
+            "SELECT id, destination_id, target_kind, frame, created_at, frame_id, type_map_version, relay_signer_id, relay_destination_user_id, relay_message_id FROM pending_relays ORDER BY id LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit.clamp(1, 500)], |row| {
             let destination_id = row.get::<_, i64>(1)?;
@@ -81,9 +115,110 @@ pub fn list(limit: i64) -> Result<Vec<PendingRelay>, StorageError> {
                     )
                 })?,
                 type_map_version: row.get(6)?,
+                relay_signer_id: row.get(7)?,
+                relay_destination_user_id: row.get(8)?,
+                relay_message_id: row.get(9)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    })
+}
+
+pub fn list_without_relay_identity() -> Result<Vec<PendingRelay>, StorageError> {
+    list_without_relay_identity_after(0, i64::MAX)
+}
+
+pub fn list_without_relay_identity_after(
+    after_id: i64,
+    limit: i64,
+) -> Result<Vec<PendingRelay>, StorageError> {
+    db::with_db(|connection| {
+        let mut statement = connection.prepare("SELECT id, destination_id, target_kind, frame, created_at, frame_id, type_map_version, relay_signer_id, relay_destination_user_id, relay_message_id FROM pending_relays WHERE id > ?1 AND (relay_signer_id IS NULL OR relay_destination_user_id IS NULL OR relay_message_id IS NULL) ORDER BY id LIMIT ?2")?;
+        let rows = statement.query_map(
+            params![after_id, limit.clamp(1, 500)],
+            pending_relay_from_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    })
+}
+
+fn pending_relay_from_row(row: &rusqlite::Row<'_>) -> Result<PendingRelay, rusqlite::Error> {
+    let destination_id = u64::try_from(row.get::<_, i64>(1)?)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?;
+    let target = match row.get::<_, i64>(2)? {
+        0 => RouteTarget::User(destination_id),
+        1 => RouteTarget::Iota(destination_id),
+        _ => return Err(rusqlite::Error::IntegralValueOutOfRange(2, 0)),
+    };
+    Ok(PendingRelay {
+        id: row.get(0)?,
+        target,
+        frame: row.get(3)?,
+        created_at: row.get(4)?,
+        frame_id: u32::try_from(row.get::<_, i64>(5)?)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, 0))?,
+        type_map_version: row.get(6)?,
+        relay_signer_id: row.get(7)?,
+        relay_destination_user_id: row.get(8)?,
+        relay_message_id: row.get(9)?,
+    })
+}
+
+pub fn set_relay_identity(id: i64, relay: &RelayIdentity) -> Result<(), StorageError> {
+    db::with_db(|connection| {
+        connection.execute("UPDATE pending_relays SET relay_signer_id = ?2, relay_destination_user_id = ?3, relay_message_id = ?4 WHERE id = ?1", params![id, relay.signer_id, relay.destination_user_id, relay.message_id])?;
+        Ok(())
+    })
+}
+
+pub fn has_unclassified_relays() -> Result<bool, StorageError> {
+    db::with_db(|connection| {
+        connection
+            .query_row("SELECT EXISTS(SELECT 1 FROM pending_relays WHERE relay_signer_id IS NULL OR relay_destination_user_id IS NULL OR relay_message_id IS NULL)", [], |row| row.get(0))
+            .map_err(Into::into)
+    })
+}
+
+pub fn find_user_delivery_in_tx(
+    tx: &Transaction<'_>,
+    destination_id: i64,
+    frame_id: u32,
+) -> Result<Option<(i64, RelayIdentity)>, StorageError> {
+    tx.query_row(
+        "SELECT id, relay_signer_id, relay_destination_user_id, relay_message_id FROM pending_relays WHERE destination_id = ?1 AND target_kind = 0 AND frame_id = ?2",
+        params![destination_id, i64::from(frame_id)],
+        |row| {
+            let signer_id = row.get::<_, Option<i64>>(1)?;
+            let destination_user_id = row.get::<_, Option<i64>>(2)?;
+            let message_id = row.get::<_, Option<String>>(3)?;
+            match (signer_id, destination_user_id, message_id) {
+                (Some(signer_id), Some(destination_user_id), Some(message_id)) => Ok((row.get(0)?, RelayIdentity { signer_id, destination_user_id, message_id })),
+                _ => Err(rusqlite::Error::InvalidQuery),
+            }
+        },
+    ).optional().map_err(|error| match error {
+        rusqlite::Error::InvalidQuery => StorageError::PendingRelayOwnershipUnknown,
+        error => StorageError::Db(error),
+    })
+}
+
+pub fn acknowledge_in_tx(tx: &Transaction<'_>, id: i64) -> Result<(), StorageError> {
+    tx.execute("DELETE FROM pending_relays WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+pub fn reject_outgoing_relay(
+    destination_iota: u64,
+    frame_id: u32,
+    signer_id: i64,
+    relay_message_id: &str,
+) -> Result<(), StorageError> {
+    let destination_iota = i64::try_from(destination_iota)
+        .map_err(|_| StorageError::Other("relay destination ID exceeds SQLite range".into()))?;
+    db::with_immediate_transaction(|tx| {
+        tx.execute("DELETE FROM pending_relays WHERE destination_id = ?1 AND target_kind = 1 AND frame_id = ?2", params![destination_iota, i64::from(frame_id)])?;
+        tx.execute("UPDATE relay_inbox SET state = 'rejected', rejected_at = COALESCE(rejected_at, ?3) WHERE signer_id = ?1 AND message_id = ?2", params![signer_id, relay_message_id, crate::util::sync::now_millis()])?;
+        Ok(())
     })
 }
 

@@ -5,12 +5,21 @@ use iota_storage::util::communities_util::CommunitiesUtil;
 use iota_storage::util::e2ee_storage::{self, ChatSecretQuery};
 use iota_storage::util::settings;
 use iota_storage::util::synced_settings::{self, SettingScope, SyncedSetting};
+use iota_storage::util::user_blobs::{self, UserBlob};
+use iota_storage::util::{blocked_users, message_storage_policy, receipt_policy};
 use mtp::codec::{
     CommunicationType, CommunicationValue, DataType, DataValue, TypeMap, VerifiedRelayContent,
 };
 
 use crate::relay::VerifiedRelayContext;
 use iota_storage::storage_error::StorageError;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static NEXT_NOTIFICATION_ID: AtomicU32 = AtomicU32::new(1);
+
+fn next_notification_id() -> u32 {
+    NEXT_NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed).max(1)
+}
 
 #[derive(Debug)]
 pub struct MessageMutation {
@@ -21,6 +30,18 @@ pub struct MessageMutation {
 
 #[derive(Debug)]
 pub struct SettingMutation {
+    pub response: CommunicationValue,
+    pub changed: Option<CommunicationValue>,
+}
+
+#[derive(Debug)]
+pub struct BlobMutation {
+    pub response: CommunicationValue,
+    pub changed: Option<CommunicationValue>,
+}
+
+#[derive(Debug)]
+pub struct PolicyMutation {
     pub response: CommunicationValue,
     pub changed: Option<CommunicationValue>,
 }
@@ -174,6 +195,15 @@ pub fn apply_verified_relay_content(
                 .map(MessageState::from_str)
                 .filter(|state| matches!(state, MessageState::Received | MessageState::Read))
                 .ok_or_else(|| "Relay MessageState has an invalid state".to_string())?;
+            if sent_by_self {
+                return chat_files::change_message_state_by_relay_id(
+                    storage_owner,
+                    recipient_id,
+                    relay_message_id,
+                    state,
+                )
+                .map_err(|error| error.to_string());
+            }
             chat_files::record_message_receipt(
                 storage_owner,
                 recipient_id,
@@ -320,6 +350,32 @@ pub fn apply_verified_relay_content(
             .map_err(|error| format!("AddConversation persistence failed: {error}"))
         }
         _ => Ok(()),
+    }
+}
+
+/* Local receipt disclosure is checked before the relay enters durable state. */
+pub fn validate_outgoing_receipt_policy(
+    sender_id: i64,
+    context: &VerifiedRelayContext,
+    content: &VerifiedRelayContent,
+) -> Result<(), String> {
+    if content.message_type != "MessageState" {
+        return Ok(());
+    }
+    let state = relay_string(&content.content, DataType::MessageState, &context.type_map)
+        .map(MessageState::from_str)
+        .filter(|state| matches!(state, MessageState::Received | MessageState::Read))
+        .ok_or_else(|| "local MessageState has an invalid state".to_string())?;
+    let policy = receipt_policy::get(sender_id).map_err(|error| error.to_string())?;
+    let allowed = match state {
+        MessageState::Read => policy.send_read_receipts,
+        MessageState::Received => policy.send_received_receipts,
+        MessageState::Sent | MessageState::Sending => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err("local receipt disclosure is disabled by policy".into())
     }
 }
 
@@ -777,9 +833,11 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
         Err(_) => return sync_error(cv),
     };
     let known_session = sync::has_session(user_id, session_id).unwrap_or(false);
+    let acknowledged_version = sync::acknowledged_version(user_id, session_id).unwrap_or(None);
     let full = !cache_valid
         || reported_version == 0
         || !known_session
+        || acknowledged_version.is_some_and(|version| reported_version < version)
         || reported_version > head
         || schema != CACHE_SCHEMA_VERSION;
     let (contacts, messages, settings, deleted_messages, deleted_contacts, deleted_settings, mode) =
@@ -845,11 +903,59 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
         .iter()
         .map(|message| stored_message_value(message, user_id, message.external_user))
         .collect();
+    if iota_storage::util::client_message_delivery::record_sync_delivery(
+        user_id,
+        session_id,
+        head,
+        messages.iter().map(|message| message.id),
+    )
+    .is_err()
+    {
+        return sync_error(cv);
+    }
+    let (blobs, deleted_blobs) = if mode == "delta" {
+        match sync::delta(user_id, reported_version, head) {
+            Ok(delta) => {
+                let blobs = match user_blobs::list_by_ids(user_id, &delta.blob_upserts) {
+                    Ok(blobs) => blobs,
+                    Err(_) => return sync_error(cv),
+                };
+                let deleted =
+                    match user_blobs::list_deleted_by_ids(user_id, &delta.deleted_blob_ids) {
+                        Ok(blobs) => blobs,
+                        Err(_) => return sync_error(cv),
+                    };
+                (blobs, deleted)
+            }
+            Err(_) => return sync_error(cv),
+        }
+    } else {
+        match user_blobs::list(user_id) {
+            Ok(blobs) => (blobs, Vec::new()),
+            Err(_) => return sync_error(cv),
+        }
+    };
+    let blocked_users = match blocked_users::list(user_id) {
+        Ok(users) => users,
+        Err(_) => return sync_error(cv),
+    };
+    let receipt_policy = match receipt_policy::get(user_id) {
+        Ok(policy) => policy,
+        Err(_) => return sync_error(cv),
+    };
+    let message_storage_policy = match message_storage_policy::get(user_id) {
+        Ok(policy) => policy,
+        Err(_) => return sync_error(cv),
+    };
     let contact_ids = match current_contact_ids(user_id) {
         Ok(contact_ids) => contact_ids,
         Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
     };
-    CommunicationValue::new(CommunicationType::ClientStateSync)
+    let retention_duration = match message_storage_policy.retention {
+        message_storage_policy::MessageRetention::Forever => None,
+        message_storage_policy::MessageRetention::Duration { duration_ms } => Some(duration_ms),
+    };
+    let mut response = CommunicationValue::new(CommunicationType::ClientStateSync)
         .with_request_id(cv)
         .with_receiver(sender_wire_id(user_id))
         .add_typed_default(
@@ -878,6 +984,45 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
         .add_typed_default(
             DataType::Settings,
             DataValue::Array(settings.iter().map(synced_setting_value).collect()),
+        )
+        .add_typed_default(
+            DataType::Blobs,
+            DataValue::Array(blobs.iter().map(blob_value).collect()),
+        )
+        .add_typed_default(
+            DataType::DeletedBlobIds,
+            DataValue::Array(
+                deleted_blobs
+                    .iter()
+                    .map(|blob| DataValue::Str(blob.blob_id.clone()))
+                    .collect(),
+            ),
+        )
+        .add_typed_default(
+            DataType::BlockedUserIds,
+            DataValue::Array(
+                blocked_users
+                    .into_iter()
+                    .map(|id| DataValue::SignedNumber(id.into()))
+                    .collect(),
+            ),
+        )
+        .add_typed_default(
+            DataType::SendReadReceipts,
+            DataValue::Bool(receipt_policy.send_read_receipts),
+        )
+        .add_typed_default(
+            DataType::SendReceivedReceipts,
+            DataValue::Bool(receipt_policy.send_received_receipts),
+        )
+        .add_typed_default(
+            DataType::MessageHistoryMode,
+            DataValue::Str(match message_storage_policy.history_mode {
+                message_storage_policy::MessageHistoryMode::Retain => "retain".into(),
+                message_storage_policy::MessageHistoryMode::DeleteAfterClientDelivery => {
+                    "delete_after_client_delivery".into()
+                }
+            }),
         )
         .add_typed_default(
             DataType::Communities,
@@ -911,11 +1056,18 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
             ),
         )
         .add_typed_default(DataType::UserIds, contact_ids)
-        .add_typed_default(DataType::Calls, DataValue::Array(Vec::new()))
+        .add_typed_default(DataType::Calls, DataValue::Array(Vec::new()));
+    if let Some(duration_ms) = retention_duration {
+        response = response.add_typed_default(
+            DataType::MessageRetentionDuration,
+            DataValue::SignedNumber(duration_ms.into()),
+        );
+    }
+    response
 }
 
 pub fn handle_client_state_ack(cv: &CommunicationValue) -> CommunicationValue {
-    use iota_storage::util::sync::{self, CACHE_SCHEMA_VERSION};
+    use iota_storage::util::sync::CACHE_SCHEMA_VERSION;
     let user_id = match required_sender_id(cv) {
         Ok(id) if id > 0 => id,
         _ => return sync_error(cv),
@@ -928,7 +1080,14 @@ pub fn handle_client_state_ack(cv: &CommunicationValue) -> CommunicationValue {
         Some(version) if version >= 0 => version,
         _ => return sync_error(cv),
     };
-    if sync::acknowledge(user_id, session_id, version, CACHE_SCHEMA_VERSION).is_err() {
+    if iota_storage::util::client_message_delivery::acknowledge_client_state(
+        user_id,
+        session_id,
+        version,
+        CACHE_SCHEMA_VERSION,
+    )
+    .is_err()
+    {
         return sync_error(cv);
     }
     success_response(cv)
@@ -1483,6 +1642,66 @@ fn setting_response(
         )
 }
 
+fn blob_value(blob: &UserBlob) -> DataValue {
+    typed_container(vec![
+        (DataType::BlobId, DataValue::Str(blob.blob_id.clone())),
+        (DataType::Blob, DataValue::Bytes(blob.blob.clone())),
+        (
+            DataType::VersionNumber,
+            DataValue::SignedNumber(blob.revision.into()),
+        ),
+        (
+            DataType::UpdatedAt,
+            DataValue::SignedNumber(blob.updated_at.into()),
+        ),
+    ])
+}
+
+fn blob_response(
+    cv: &CommunicationValue,
+    ty: CommunicationType,
+    blob: &UserBlob,
+) -> CommunicationValue {
+    CommunicationValue::new(ty)
+        .with_request_id(cv)
+        .with_receiver(sender_wire_id(blob.user_id))
+        .add_typed_default(DataType::BlobId, DataValue::Str(blob.blob_id.clone()))
+        .add_typed_default(DataType::Blob, DataValue::Bytes(blob.blob.clone()))
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::SignedNumber(blob.revision.into()),
+        )
+        .add_typed_default(
+            DataType::UpdatedAt,
+            DataValue::SignedNumber(blob.updated_at.into()),
+        )
+}
+
+fn blob_changed(user_id: i64, blob_id: String, revision: i64, deleted: bool) -> CommunicationValue {
+    CommunicationValue::new(CommunicationType::UserBlobChanged)
+        .with_id(next_notification_id())
+        .with_receiver(sender_wire_id(user_id))
+        .add_typed_default(DataType::BlobId, DataValue::Str(blob_id))
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::SignedNumber(revision.into()),
+        )
+        .add_typed_default(DataType::Deleted, DataValue::Bool(deleted))
+}
+
+fn blob_request(cv: &CommunicationValue) -> Result<(i64, String), CommunicationValue> {
+    let user_id = required_sender_id(cv)?;
+    if user_id <= 0 {
+        return Err(error_response(cv, CommunicationType::ErrorInvalidData));
+    }
+    let id = cv
+        .get_data(DataType::BlobId)
+        .and_then(DataValue::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| error_response(cv, CommunicationType::ErrorInvalidData))?;
+    Ok((user_id, id.to_owned()))
+}
+
 fn setting_changed(setting: &SyncedSetting) -> CommunicationValue {
     CommunicationValue::new(CommunicationType::SyncedSettingChanged)
         .with_receiver(sender_wire_id(setting.user_id))
@@ -1699,6 +1918,410 @@ pub fn handle_synced_settings_list(cv: &CommunicationValue) -> CommunicationValu
                 DataType::Settings,
                 DataValue::Array(settings.iter().map(synced_setting_value).collect()),
             ),
+        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+    }
+}
+
+pub fn handle_user_blob_put(cv: &CommunicationValue) -> BlobMutation {
+    let Ok((user_id, blob_id)) = blob_request(cv) else {
+        return BlobMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        };
+    };
+    let Some(blob) = cv.get_data(DataType::Blob).and_then(DataValue::as_bytes) else {
+        return BlobMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        };
+    };
+    let expected_revision = data_i64(cv, DataType::ExpectedRevision);
+    match user_blobs::put(user_id, &blob_id, &blob, expected_revision) {
+        Ok(stored) => BlobMutation {
+            response: blob_response(cv, CommunicationType::UserBlobPut, &stored),
+            changed: Some(blob_changed(
+                user_id,
+                stored.blob_id.clone(),
+                stored.revision,
+                false,
+            )),
+        },
+        Err(iota_storage::storage_error::StorageError::RevisionConflict) => BlobMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        },
+        Err(_) => BlobMutation {
+            response: error_response(cv, CommunicationType::ErrorInternal),
+            changed: None,
+        },
+    }
+}
+
+pub fn handle_user_blob_get(cv: &CommunicationValue) -> CommunicationValue {
+    let Ok((user_id, blob_id)) = blob_request(cv) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    match user_blobs::get(user_id, &blob_id) {
+        Ok(Some(blob)) => blob_response(cv, CommunicationType::UserBlobGet, &blob),
+        Ok(None) => error_response(cv, CommunicationType::ErrorNotFound),
+        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+    }
+}
+
+pub fn handle_user_blob_delete(cv: &CommunicationValue) -> BlobMutation {
+    let Ok((user_id, blob_id)) = blob_request(cv) else {
+        return BlobMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        };
+    };
+    match user_blobs::delete(user_id, &blob_id, data_i64(cv, DataType::ExpectedRevision)) {
+        Ok(Some(deleted)) => BlobMutation {
+            response: CommunicationValue::new(CommunicationType::UserBlobDelete)
+                .with_request_id(cv)
+                .with_receiver(sender_wire_id(user_id))
+                .add_typed_default(DataType::BlobId, DataValue::Str(blob_id.clone()))
+                .add_typed_default(
+                    DataType::VersionNumber,
+                    DataValue::SignedNumber(deleted.revision.into()),
+                ),
+            changed: deleted
+                .changed
+                .then(|| blob_changed(user_id, blob_id, deleted.revision, true)),
+        },
+        Ok(None) => BlobMutation {
+            response: CommunicationValue::new(CommunicationType::UserBlobDelete)
+                .with_request_id(cv)
+                .with_receiver(sender_wire_id(user_id)),
+            changed: None,
+        },
+        Err(iota_storage::storage_error::StorageError::RevisionConflict) => BlobMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        },
+        Err(_) => BlobMutation {
+            response: error_response(cv, CommunicationType::ErrorInternal),
+            changed: None,
+        },
+    }
+}
+
+pub fn handle_user_blob_list(cv: &CommunicationValue) -> CommunicationValue {
+    let Ok(user_id) = required_sender_id(cv) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    if user_id <= 0 {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    }
+    match user_blobs::list(user_id) {
+        Ok(blobs) => CommunicationValue::new(CommunicationType::UserBlobList)
+            .with_request_id(cv)
+            .with_receiver(sender_wire_id(user_id))
+            .add_typed_default(
+                DataType::Blobs,
+                DataValue::Array(blobs.iter().map(blob_value).collect()),
+            ),
+        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+    }
+}
+
+fn authenticated_user(cv: &CommunicationValue) -> Result<i64, CommunicationValue> {
+    let user_id = required_sender_id(cv)?;
+    if user_id <= 0 {
+        return Err(error_response(cv, CommunicationType::ErrorInvalidData));
+    }
+    Ok(user_id)
+}
+
+pub fn handle_user_block(cv: &CommunicationValue) -> PolicyMutation {
+    let Ok(user_id) = authenticated_user(cv) else {
+        return PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        };
+    };
+    let Some(blocked_user_id) = data_i64(cv, DataType::BlockedUserId).filter(|id| *id > 0) else {
+        return PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        };
+    };
+    match blocked_users::block(user_id, blocked_user_id) {
+        Ok(record) => PolicyMutation {
+            response: CommunicationValue::new(CommunicationType::UserBlock)
+                .with_request_id(cv)
+                .with_receiver(sender_wire_id(user_id))
+                .add_typed_default(
+                    DataType::BlockedUserId,
+                    DataValue::SignedNumber(blocked_user_id.into()),
+                )
+                .add_typed_default(
+                    DataType::VersionNumber,
+                    DataValue::SignedNumber(record.revision.into()),
+                ),
+            changed: Some(
+                CommunicationValue::new(CommunicationType::BlockedUsersChanged)
+                    .with_id(next_notification_id())
+                    .with_receiver(sender_wire_id(user_id))
+                    .add_typed_default(
+                        DataType::BlockedUserId,
+                        DataValue::SignedNumber(blocked_user_id.into()),
+                    )
+                    .add_typed_default(
+                        DataType::VersionNumber,
+                        DataValue::SignedNumber(record.revision.into()),
+                    )
+                    .add_typed_default(DataType::Deleted, DataValue::Bool(record.deleted)),
+            ),
+        },
+        Err(_) => PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorInternal),
+            changed: None,
+        },
+    }
+}
+
+pub fn handle_user_unblock(cv: &CommunicationValue) -> PolicyMutation {
+    let Ok(user_id) = authenticated_user(cv) else {
+        return PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        };
+    };
+    let Some(blocked_user_id) = data_i64(cv, DataType::BlockedUserId).filter(|id| *id > 0) else {
+        return PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        };
+    };
+    match blocked_users::unblock(user_id, blocked_user_id) {
+        Ok(mutation) => PolicyMutation {
+            response: CommunicationValue::new(CommunicationType::UserUnblock)
+                .with_request_id(cv)
+                .with_receiver(sender_wire_id(user_id))
+                .add_typed_default(
+                    DataType::BlockedUserId,
+                    DataValue::SignedNumber(blocked_user_id.into()),
+                ),
+            changed: mutation.map(|mutation| {
+                CommunicationValue::new(CommunicationType::BlockedUsersChanged)
+                    .with_id(next_notification_id())
+                    .with_receiver(sender_wire_id(user_id))
+                    .add_typed_default(
+                        DataType::BlockedUserId,
+                        DataValue::SignedNumber(blocked_user_id.into()),
+                    )
+                    .add_typed_default(
+                        DataType::VersionNumber,
+                        DataValue::SignedNumber(mutation.revision.into()),
+                    )
+                    .add_typed_default(DataType::Deleted, DataValue::Bool(mutation.deleted))
+            }),
+        },
+        Err(_) => PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorInternal),
+            changed: None,
+        },
+    }
+}
+
+pub fn handle_blocked_users_get(cv: &CommunicationValue) -> CommunicationValue {
+    let Ok(user_id) = authenticated_user(cv) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    match blocked_users::list(user_id) {
+        Ok(users) => CommunicationValue::new(CommunicationType::BlockedUsersGet)
+            .with_request_id(cv)
+            .with_receiver(sender_wire_id(user_id))
+            .add_typed_default(
+                DataType::BlockedUserIds,
+                DataValue::Array(
+                    users
+                        .into_iter()
+                        .map(|id| DataValue::SignedNumber(id.into()))
+                        .collect(),
+                ),
+            ),
+        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+    }
+}
+
+fn receipt_response(
+    cv: &CommunicationValue,
+    ty: CommunicationType,
+    policy: receipt_policy::ReceiptPolicy,
+) -> CommunicationValue {
+    CommunicationValue::new(ty)
+        .with_request_id(cv)
+        .with_receiver(sender_wire_id(policy.user_id))
+        .add_typed_default(
+            DataType::SendReadReceipts,
+            DataValue::Bool(policy.send_read_receipts),
+        )
+        .add_typed_default(
+            DataType::SendReceivedReceipts,
+            DataValue::Bool(policy.send_received_receipts),
+        )
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::SignedNumber(policy.revision.into()),
+        )
+}
+pub fn handle_receipt_policy_get(cv: &CommunicationValue) -> CommunicationValue {
+    let Ok(user_id) = authenticated_user(cv) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    match receipt_policy::get(user_id) {
+        Ok(policy) => receipt_response(cv, CommunicationType::ReceiptPolicyGet, policy),
+        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+    }
+}
+pub fn handle_receipt_policy_set(cv: &CommunicationValue) -> PolicyMutation {
+    let Ok(user_id) = authenticated_user(cv) else {
+        return PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        };
+    };
+    let (Some(read), Some(received)) = (
+        cv.get_data(DataType::SendReadReceipts)
+            .and_then(DataValue::as_bool),
+        cv.get_data(DataType::SendReceivedReceipts)
+            .and_then(DataValue::as_bool),
+    ) else {
+        return PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        };
+    };
+    match receipt_policy::set(user_id, read, received) {
+        Ok(policy) => {
+            let response = receipt_response(cv, CommunicationType::ReceiptPolicySet, policy);
+            let changed = receipt_response(cv, CommunicationType::ReceiptPolicyChanged, policy)
+                .with_id(next_notification_id());
+            PolicyMutation {
+                response,
+                changed: Some(changed),
+            }
+        }
+        Err(_) => PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorInternal),
+            changed: None,
+        },
+    }
+}
+
+fn storage_policy_response(
+    cv: &CommunicationValue,
+    ty: CommunicationType,
+    policy: message_storage_policy::MessageStoragePolicy,
+) -> CommunicationValue {
+    let (history_mode, duration) = match policy.history_mode {
+        message_storage_policy::MessageHistoryMode::Retain => ("retain", None),
+        message_storage_policy::MessageHistoryMode::DeleteAfterClientDelivery => {
+            ("delete_after_client_delivery", None)
+        }
+    };
+    let retention_duration = match policy.retention {
+        message_storage_policy::MessageRetention::Forever => None,
+        message_storage_policy::MessageRetention::Duration { duration_ms } => Some(duration_ms),
+    };
+    let mut response = CommunicationValue::new(ty)
+        .with_request_id(cv)
+        .with_receiver(sender_wire_id(policy.user_id))
+        .add_typed_default(
+            DataType::MessageHistoryMode,
+            DataValue::Str(history_mode.into()),
+        )
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::SignedNumber(policy.revision.into()),
+        );
+    if let Some(duration_ms) = retention_duration.or(duration) {
+        response = response.add_typed_default(
+            DataType::MessageRetentionDuration,
+            DataValue::SignedNumber(duration_ms.into()),
+        );
+    }
+    response
+}
+
+pub fn handle_message_storage_policy_get(cv: &CommunicationValue) -> CommunicationValue {
+    let Ok(user_id) = authenticated_user(cv) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    match message_storage_policy::get(user_id) {
+        Ok(policy) => {
+            storage_policy_response(cv, CommunicationType::MessageStoragePolicyGet, policy)
+        }
+        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+    }
+}
+
+pub fn handle_message_storage_policy_set(cv: &CommunicationValue) -> PolicyMutation {
+    let Ok(user_id) = authenticated_user(cv) else {
+        return PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        };
+    };
+    let Some(history_mode) = cv
+        .get_data(DataType::MessageHistoryMode)
+        .and_then(DataValue::as_str)
+    else {
+        return PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        };
+    };
+    let history_mode = match history_mode {
+        "retain" => message_storage_policy::MessageHistoryMode::Retain,
+        "delete_after_client_delivery" => {
+            message_storage_policy::MessageHistoryMode::DeleteAfterClientDelivery
+        }
+        _ => {
+            return PolicyMutation {
+                response: error_response(cv, CommunicationType::ErrorInvalidData),
+                changed: None,
+            };
+        }
+    };
+    let retention = match data_i64(cv, DataType::MessageRetentionDuration) {
+        Some(duration_ms) => message_storage_policy::MessageRetention::Duration { duration_ms },
+        None => message_storage_policy::MessageRetention::Forever,
+    };
+    match message_storage_policy::set(user_id, history_mode, retention) {
+        Ok(policy) => {
+            let response =
+                storage_policy_response(cv, CommunicationType::MessageStoragePolicySet, policy);
+            let changed =
+                storage_policy_response(cv, CommunicationType::MessageStoragePolicyChanged, policy)
+                    .with_id(next_notification_id());
+            PolicyMutation {
+                response,
+                changed: Some(changed),
+            }
+        }
+        Err(_) => PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        },
+    }
+}
+
+/* This request is issued over Omikron's trusted Iota connection. Clients have
+ * no route to it, preventing arbitrary block-relationship disclosure. */
+pub fn handle_user_block_check(cv: &CommunicationValue) -> CommunicationValue {
+    let Some(sender_id) = data_i64(cv, DataType::SenderId).filter(|id| *id > 0) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let Some(receiver_id) = data_i64(cv, DataType::ReceiverId).filter(|id| *id > 0) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    match blocked_users::is_blocked(receiver_id, sender_id) {
+        Ok(blocked) => CommunicationValue::new(CommunicationType::UserBlockCheck)
+            .with_request_id(cv)
+            .add_typed_default(DataType::IsBlocked, DataValue::Bool(blocked)),
         Err(_) => error_response(cv, CommunicationType::ErrorInternal),
     }
 }

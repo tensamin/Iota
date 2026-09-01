@@ -1,6 +1,13 @@
 use crate::storage_error::StorageError;
 use crate::util::db;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveredRelay {
+    pub signer_id: i64,
+    pub message_id: String,
+    pub destination_id: i64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayReservation {
@@ -65,20 +72,50 @@ pub fn reserve(
     })
 }
 
-pub fn mark_delivered_for_frame(destination_id: u64, frame_id: u32) -> Result<(), StorageError> {
+pub fn mark_delivered_for_frame(
+    destination_id: u64,
+    frame_id: u32,
+) -> Result<Option<DeliveredRelay>, StorageError> {
     let destination_id = i64::try_from(destination_id)
         .map_err(|_| StorageError::Other("relay destination ID exceeds SQLite range".into()))?;
-    db::with_db(|connection| {
+    db::with_immediate_transaction(|tx| {
         let delivered_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        connection.execute(
+        let relay = tx
+            .query_row(
+                "SELECT signer_id, message_id, destination_id FROM relay_inbox WHERE destination_id = ?1 AND frame_id = ?2",
+                params![destination_id, i64::from(frame_id)],
+                |row| Ok(DeliveredRelay { signer_id: row.get(0)?, message_id: row.get(1)?, destination_id: row.get(2)? }),
+            )
+            .optional()?;
+        if relay.is_none() {
+            return Ok(None);
+        }
+        tx.execute(
             "UPDATE relay_inbox SET state = 'delivered', downstream_acked_at = COALESCE(downstream_acked_at, ?3) WHERE destination_id = ?1 AND frame_id = ?2",
             params![destination_id, i64::from(frame_id), delivered_at],
         )?;
-        Ok(())
+        Ok(relay)
     })
+}
+
+pub fn mark_delivered_for_frame_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    destination_id: i64,
+    frame_id: u32,
+) -> Result<(), StorageError> {
+    let changed = tx.execute(
+        "UPDATE relay_inbox SET state = 'delivered', downstream_acked_at = COALESCE(downstream_acked_at, ?3) WHERE destination_id = ?1 AND frame_id = ?2",
+        params![destination_id, i64::from(frame_id), crate::util::sync::now_millis()],
+    )?;
+    if changed == 0 {
+        return Err(StorageError::Other(
+            "pending relay has no relay inbox record".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn mark_transition(
@@ -108,6 +145,18 @@ pub fn mark_applied(signer_id: u64, message_id: &str) -> Result<(), StorageError
 
 pub fn mark_queued(signer_id: u64, message_id: &str) -> Result<(), StorageError> {
     mark_transition(signer_id, message_id, "queued", "queued_at")
+}
+
+pub fn mark_queued_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    signer_id: i64,
+    message_id: &str,
+) -> Result<(), StorageError> {
+    tx.execute(
+        "UPDATE relay_inbox SET state = 'queued', queued_at = COALESCE(queued_at, ?3) WHERE signer_id = ?1 AND message_id = ?2",
+        params![signer_id, message_id, crate::util::sync::now_millis()],
+    )?;
+    Ok(())
 }
 
 pub fn mark_downstream_acked(signer_id: u64, message_id: &str) -> Result<(), StorageError> {

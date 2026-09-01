@@ -255,8 +255,15 @@ pub fn release_user(user_id: i64) -> Result<(), crate::storage_error::StorageErr
 /// Authoritative hosted-data erasure used by local purge and future Omega
 /// erasure delivery. Management metadata and credentials are left intact.
 pub fn purge_user_data(user_id: i64) -> Result<(), crate::storage_error::StorageError> {
+    if crate::util::relay_queue::has_unclassified_relays()? {
+        return Err(crate::storage_error::StorageError::PendingRelayOwnershipUnknown);
+    }
     db::with_db(|conn| {
         let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM message_receipts WHERE storage_owner = ?1",
+            params![user_id],
+        )?;
         tx.execute("DELETE FROM message_edits WHERE message_id IN (SELECT id FROM messages WHERE storage_owner = ?1)", params![user_id])?;
         tx.execute("DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE storage_owner = ?1)", params![user_id])?;
         tx.execute(
@@ -277,6 +284,22 @@ pub fn purge_user_data(user_id: i64) -> Result<(), crate::storage_error::Storage
             params![user_id],
         )?;
         tx.execute(
+            "DELETE FROM user_blobs WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM blocked_users WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM user_receipt_policy WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM user_message_storage_policy WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
             "DELETE FROM sync_events WHERE user_id = ?1",
             params![user_id],
         )?;
@@ -289,7 +312,23 @@ pub fn purge_user_data(user_id: i64) -> Result<(), crate::storage_error::Storage
             params![user_id],
         )?;
         tx.execute(
+            "DELETE FROM client_message_deliveries WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
             "DELETE FROM trusted_apps WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM pending_relays WHERE relay_signer_id = ?1 OR relay_destination_user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM relay_replay WHERE EXISTS (SELECT 1 FROM relay_inbox WHERE relay_inbox.signer_id = relay_replay.signer_id AND relay_inbox.message_id = relay_replay.message_id AND (relay_inbox.signer_id = ?1 OR relay_inbox.destination_id = ?1))",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM relay_inbox WHERE signer_id = ?1 OR destination_id = ?1",
             params![user_id],
         )?;
         tx.execute(

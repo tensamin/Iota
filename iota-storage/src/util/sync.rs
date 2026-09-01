@@ -1,16 +1,21 @@
 /* Durable per-user state journal used by device cache synchronization. */
 use crate::storage_error::StorageError;
 use crate::util::db;
-use rusqlite::{Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
 
-pub const CACHE_SCHEMA_VERSION: i64 = 3;
+pub const CACHE_SCHEMA_VERSION: i64 = 4;
+pub const STALE_CLIENT_SYNC_STATE_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityType {
     Message,
     Contact,
     Setting,
+    UserBlob,
+    BlockedUser,
+    ReceiptPolicy,
+    MessageStoragePolicy,
 }
 impl EntityType {
     fn as_str(self) -> &'static str {
@@ -18,6 +23,10 @@ impl EntityType {
             Self::Message => "message",
             Self::Contact => "contact",
             Self::Setting => "setting",
+            Self::UserBlob => "user_blob",
+            Self::BlockedUser => "blocked_user",
+            Self::ReceiptPolicy => "receipt_policy",
+            Self::MessageStoragePolicy => "message_storage_policy",
         }
     }
 }
@@ -44,6 +53,19 @@ pub struct Delta {
     pub deleted_contact_ids: Vec<i64>,
     pub setting_upserts: Vec<i64>,
     pub deleted_setting_ids: Vec<i64>,
+    pub blob_upserts: Vec<i64>,
+    pub deleted_blob_ids: Vec<i64>,
+    pub blocked_user_upserts: Vec<i64>,
+    pub deleted_blocked_user_ids: Vec<i64>,
+    pub receipt_policy_changed: bool,
+    pub message_storage_policy_changed: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SyncCompactionResult {
+    pub removed_stale_clients: usize,
+    pub removed_events: usize,
+    pub removed_blob_tombstones: usize,
 }
 
 pub fn now_millis() -> i64 {
@@ -104,6 +126,18 @@ pub fn has_session(user_id: i64, session_id: i64) -> Result<bool, StorageError> 
     })
 }
 
+pub fn acknowledged_version(user_id: i64, session_id: i64) -> Result<Option<i64>, StorageError> {
+    db::with_db(|conn| {
+        conn.query_row(
+            "SELECT acknowledged_version FROM client_sync_state WHERE user_id = ?1 AND session_id = ?2",
+            params![user_id, session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StorageError::from)
+    })
+}
+
 pub fn acknowledge(
     user_id: i64,
     session_id: i64,
@@ -129,6 +163,70 @@ pub fn acknowledge(
         conn.execute("INSERT INTO client_sync_state (user_id, session_id, acknowledged_version, cache_schema_version, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(user_id, session_id) DO UPDATE SET acknowledged_version = MAX(acknowledged_version, excluded.acknowledged_version), cache_schema_version = excluded.cache_schema_version, updated_at = excluded.updated_at", params![user_id, session_id, version, cache_schema_version, now_millis()])?;
         Ok(())
     })
+}
+
+/* Retain deltas until every non-stale client has acknowledged them. */
+pub fn compact_user_sync_state(user_id: i64) -> Result<SyncCompactionResult, StorageError> {
+    if user_id <= 0 {
+        return Err(StorageError::Other("invalid sync owner".into()));
+    }
+    let stale_before = now_millis().saturating_sub(STALE_CLIENT_SYNC_STATE_MS);
+    db::with_immediate_transaction(|tx| {
+        tx.execute(
+            "DELETE FROM client_message_deliveries WHERE user_id = ?1 AND session_id IN (SELECT session_id FROM client_sync_state WHERE user_id = ?1 AND updated_at < ?2)",
+            params![user_id, stale_before],
+        )?;
+        let removed_stale_clients = tx.execute(
+            "DELETE FROM client_sync_state WHERE user_id = ?1 AND updated_at < ?2",
+            params![user_id, stale_before],
+        )?;
+        let minimum_acknowledged: Option<i64> = tx.query_row(
+            "SELECT MIN(acknowledged_version) FROM client_sync_state WHERE user_id = ?1",
+            [user_id],
+            |row| row.get(0),
+        )?;
+        let revision = match minimum_acknowledged {
+            Some(revision) => revision,
+            None => tx
+                .query_row(
+                    "SELECT version FROM sync_heads WHERE user_id = ?1",
+                    [user_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0),
+        };
+        let removed_events = tx.execute(
+            "DELETE FROM sync_events WHERE user_id = ?1 AND version <= ?2",
+            params![user_id, revision],
+        )?;
+        let removed_blob_tombstones = tx.execute(
+            "DELETE FROM user_blobs WHERE user_id = ?1 AND deleted = 1 AND revision <= ?2",
+            params![user_id, revision],
+        )?;
+        Ok(SyncCompactionResult {
+            removed_stale_clients,
+            removed_events,
+            removed_blob_tombstones,
+        })
+    })
+}
+
+pub fn compact_all_sync_state() -> Result<SyncCompactionResult, StorageError> {
+    let users = db::with_db(|conn| {
+        let mut statement = conn.prepare("SELECT user_id FROM sync_heads")?;
+        statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    })?;
+    let mut total = SyncCompactionResult::default();
+    for user_id in users {
+        let result = compact_user_sync_state(user_id)?;
+        total.removed_stale_clients += result.removed_stale_clients;
+        total.removed_events += result.removed_events;
+        total.removed_blob_tombstones += result.removed_blob_tombstones;
+    }
+    Ok(total)
 }
 
 /// Returns the final operation for each entity after `from_version`.
@@ -163,6 +261,12 @@ fn reduce_events(events: BTreeMap<(String, i64), String>) -> Delta {
             ("contact", _) => out.contact_upserts.push(id),
             ("setting", "delete") => out.deleted_setting_ids.push(id),
             ("setting", _) => out.setting_upserts.push(id),
+            ("user_blob", "delete") => out.deleted_blob_ids.push(id),
+            ("user_blob", _) => out.blob_upserts.push(id),
+            ("blocked_user", "delete") => out.deleted_blocked_user_ids.push(id),
+            ("blocked_user", _) => out.blocked_user_upserts.push(id),
+            ("receipt_policy", _) => out.receipt_policy_changed = true,
+            ("message_storage_policy", _) => out.message_storage_policy_changed = true,
             _ => {}
         }
     }
@@ -213,6 +317,20 @@ mod tests {
 
         assert_eq!(delta.deleted_setting_ids, vec![7]);
         assert!(delta.setting_upserts.is_empty());
+    }
+
+    #[test]
+    fn blob_delete_is_included_in_delta() {
+        let mut events = BTreeMap::new();
+        events.insert(
+            (EntityType::UserBlob.as_str().to_string(), 7),
+            Operation::Delete.as_str().to_string(),
+        );
+
+        let delta = reduce_events(events);
+
+        assert_eq!(delta.deleted_blob_ids, vec![7]);
+        assert!(delta.blob_upserts.is_empty());
     }
 
     #[test]

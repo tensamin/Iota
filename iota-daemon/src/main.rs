@@ -9,6 +9,9 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
+
+const MESSAGE_RETENTION_INTERVAL: Duration = Duration::from_secs(60);
+const SYNC_COMPACTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     let scope = match std::env::var("IOTA_DEPLOYMENT_MODE").ok().as_deref() {
@@ -356,6 +359,65 @@ async fn main() -> ExitCode {
 
     runtime.set_startup_phase(StartupPhase::Ready);
     log!("iota-daemon started (phase: Ready)");
+
+    let retention_runtime = runtime.clone();
+    runtime
+        .tasks
+        .spawn_tracked("message-retention", async move {
+            loop {
+                let purge = tokio::task::spawn_blocking(|| {
+                    iota_storage::util::message_retention::purge_expired_messages(
+                        iota_storage::util::sync::now_millis(),
+                    )
+                })
+                .await;
+                match purge {
+                    Ok(Ok(result)) if result.deleted_messages > 0 => {
+                        log!("purged {} expired messages", result.deleted_messages);
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => log!("message retention cleanup failed: {}", error),
+                    Err(error) => log!("message retention task failed: {}", error),
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(MESSAGE_RETENTION_INTERVAL) => {},
+                    _ = retention_runtime.cancellation.cancelled() => break,
+                }
+            }
+            Ok(())
+        })
+        .await;
+
+    let compaction_runtime = runtime.clone();
+    runtime
+        .tasks
+        .spawn_tracked("sync-compaction", async move {
+            loop {
+                let compact =
+                    tokio::task::spawn_blocking(iota_storage::util::sync::compact_all_sync_state)
+                        .await;
+                match compact {
+                    Ok(Ok(result))
+                        if result.removed_events > 0 || result.removed_blob_tombstones > 0 =>
+                    {
+                        log!(
+                            "compacted {} sync events and {} blob tombstones",
+                            result.removed_events,
+                            result.removed_blob_tombstones
+                        );
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => log!("sync compaction failed: {}", error),
+                    Err(error) => log!("sync compaction task failed: {}", error),
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(SYNC_COMPACTION_INTERVAL) => {},
+                    _ = compaction_runtime.cancellation.cancelled() => break,
+                }
+            }
+            Ok(())
+        })
+        .await;
 
     // --- Main lifecycle loop ---
     let signal = async {

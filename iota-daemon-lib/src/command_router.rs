@@ -238,6 +238,12 @@ impl CommandRouter {
             LocalRequest::PurgeUserData { user_id } => match user_manager::purge_user_data(user_id)
             {
                 Ok(()) => ResponseResult::Ok(ResponsePayload::UserDataPurged { user_id }),
+                Err(iota_storage::storage_error::StorageError::PendingRelayOwnershipUnknown) => {
+                    log!(
+                        "User data purge is waiting for pending relay ownership classification for {user_id}"
+                    );
+                    ResponseResult::Error(IpcErrorCode::StorageFailure)
+                }
                 Err(error) => {
                     log!("User data purge failed for {user_id}: {error}");
                     ResponseResult::Error(IpcErrorCode::StorageFailure)

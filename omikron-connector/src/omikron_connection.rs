@@ -1,9 +1,9 @@
 use dashmap::{DashMap, DashSet};
 use iota_logger::{log, log_cv_in, log_cv_out, log_t};
 use iota_state::AppState;
-use iota_storage::util::chat_files;
 use iota_storage::util::config_util::{CONFIG, modify_config};
-use iota_storage::util::{relay_queue, relay_replay};
+use iota_storage::util::relay_replay;
+use iota_storage::util::{chat_files, client_relay_delivery, outgoing_relay, relay_queue};
 use iota_util::crypto_helper::{self, keyring_from_base64};
 use iota_util::crypto_util::{self};
 use mtp::client::{Client, ClientConfig, MTPConnection, Policy, SendMode, Sender};
@@ -510,6 +510,9 @@ impl OmikronConnection {
 
         log_t!("omikron_authenticated");
 
+        self.classify_legacy_pending_relays().await;
+        self.flush_pending_relays().await;
+
         let maintenance_self = self.clone();
         let maintenance_handle = tokio::spawn(async move {
             maintenance_self.maintenance_loop(connection).await;
@@ -753,6 +756,7 @@ impl OmikronConnection {
                 self.app.lock().unwrap().push_ping_val(ping_ms as f64);
             }
 
+            self.classify_legacy_pending_relays().await;
             self.flush_pending_relays().await;
             if let Err(error) = relay_replay::prune_completed(
                 now_millis_i64().saturating_sub(RELAY_RETENTION_MILLIS),
@@ -980,6 +984,74 @@ impl OmikronConnection {
             return;
         }
 
+        /* Evaluate recipient policy before reserving relay replay state or
+         * persisting the frame, so blocked traffic leaves no durable trace. */
+        if recipient_is_local {
+            match iota_storage::util::blocked_users::is_blocked(recipient_id, signer_id) {
+                Ok(true) => {
+                    log!(
+                        "Rejecting Relay from blocked signer {} to recipient {}",
+                        signer_id,
+                        recipient_id
+                    );
+                    self.send_relay_response(
+                        Some(incoming_frame_id),
+                        CommunicationType::ErrorNotAuthenticated,
+                    )
+                    .await;
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    log!(
+                        "Relay block policy lookup failed for recipient {}: {}",
+                        recipient_id,
+                        error
+                    );
+                    self.send_relay_response(
+                        Some(incoming_frame_id),
+                        CommunicationType::ErrorInternal,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
+        /* An origin Iota is authoritative for receipt disclosure. Inspect
+         * local-origin relay content before reserving or queuing the frame. */
+        if signer_is_local {
+            let content = match open_verified_relay_content(
+                &verified,
+                &[&keyring],
+                verified.context.signer_id,
+            ) {
+                Ok(content) => content,
+                Err(error) => {
+                    log!("Relay origin content verification failed: {}", error);
+                    self.send_relay_response(
+                        Some(incoming_frame_id),
+                        CommunicationType::ErrorInvalidData,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if let Err(error) = message_handlers::validate_outgoing_receipt_policy(
+                signer_id,
+                &verified.context,
+                &content,
+            ) {
+                log!("Rejecting local receipt relay: {}", error);
+                self.send_relay_response(
+                    Some(incoming_frame_id),
+                    CommunicationType::ErrorInvalidData,
+                )
+                .await;
+                return;
+            }
+        }
+
         let frame_bytes = match frame.clone().without_id().to_bytes() {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -1189,13 +1261,32 @@ impl OmikronConnection {
                     return;
                 }
             };
-            if let Err(error) = relay_queue::enqueue(
-                RouteTarget::Iota(router),
-                &bytes,
-                now_millis_i64(),
-                frame_id,
-                &type_map_version,
+            let relay_identity = match (
+                i64::try_from(verified.context.signer_id),
+                i64::try_from(verified.context.final_recipient_id),
             ) {
+                (Ok(signer_id), Ok(destination_user_id)) => relay_queue::RelayIdentity {
+                    signer_id,
+                    destination_user_id,
+                    message_id: verified.context.message_id.clone(),
+                },
+                _ => {
+                    log!("Relay identity exceeds the storage range");
+                    self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                        .await;
+                    return;
+                }
+            };
+            if let Err(error) =
+                outgoing_relay::commit_outgoing_relay(outgoing_relay::OutgoingRelay {
+                    target: RouteTarget::Iota(router),
+                    identity: &relay_identity,
+                    frame: &bytes,
+                    created_at: now_millis_i64(),
+                    frame_id,
+                    type_map_version: &type_map_version,
+                })
+            {
                 log!("Relay origin retry queue failed: {}", error);
                 record_origin_delivery_failure(
                     verified.context.signer_id,
@@ -1206,13 +1297,8 @@ impl OmikronConnection {
                     .await;
                 return;
             }
-            if let Err(error) =
-                relay_replay::mark_queued(verified.context.signer_id, &verified.context.message_id)
-            {
-                log!("Relay origin state update failed: {}", error);
-            }
             match self
-                .await_response(&forwarded, Some(Duration::from_secs(20)))
+                .await_relay_response(&forwarded, Duration::from_secs(20))
                 .await
             {
                 Ok(response) if response.is_type(CommunicationType::Success) => {
@@ -1233,33 +1319,27 @@ impl OmikronConnection {
                             .await;
                         return;
                     };
-                    if let (Ok(owner), Ok(signer)) = (
-                        i64::try_from(verified.context.signer_id),
-                        i64::try_from(verified.context.signer_id),
-                    ) {
-                        if let Err(error) = chat_files::record_destination_iota_received(
-                            owner,
-                            signer,
+                    let Ok(signer_id) = i64::try_from(verified.context.signer_id) else {
+                        self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                            .await;
+                        return;
+                    };
+                    if let Err(error) =
+                        iota_storage::util::downstream_relay::acknowledge_iota_delivery(
+                            router,
+                            frame_id,
+                            signer_id,
                             &verified.context.message_id,
                             destination_accepted_at,
-                        ) {
-                            log!(
-                                "Relay destination acknowledgement storage failed: {}",
-                                error
-                            );
-                        }
-                    }
-                    if let Err(error) = relay_queue::acknowledge_iota(router, frame_id) {
+                        )
+                    {
                         log!(
-                            "Relay origin acknowledgement could not clear the queue: {}",
+                            "Relay destination acknowledgement storage failed: {}",
                             error
                         );
-                    }
-                    if let Err(error) = relay_replay::mark_downstream_acked(
-                        verified.context.signer_id,
-                        &verified.context.message_id,
-                    ) {
-                        log!("Relay origin delivery state update failed: {}", error);
+                        self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
+                            .await;
+                        return;
                     }
                     let response = response
                         .add_typed_default(
@@ -1277,11 +1357,30 @@ impl OmikronConnection {
                 }
                 Ok(response) => {
                     log!("Relay origin route returned {}", response.get_type());
-                    record_origin_delivery_failure(
-                        verified.context.signer_id,
-                        &verified.context.message_id,
-                        "destination_rejected",
-                    );
+                    if response.is_type(CommunicationType::ErrorInternal) {
+                        record_origin_delivery_failure(
+                            verified.context.signer_id,
+                            &verified.context.message_id,
+                            "destination_internal_error",
+                        );
+                    } else if let Ok(signer_id) = i64::try_from(verified.context.signer_id) {
+                        if let Err(error) =
+                            iota_storage::util::downstream_relay::reject_iota_delivery(
+                                router,
+                                frame_id,
+                                signer_id,
+                                &verified.context.message_id,
+                                "destination_rejected",
+                            )
+                        {
+                            log!("Relay rejection cleanup failed: {}", error);
+                        }
+                        record_origin_delivery_failure(
+                            verified.context.signer_id,
+                            &verified.context.message_id,
+                            "destination_rejected",
+                        );
+                    }
                     self.send_relay_response(
                         frame.id(),
                         response
@@ -1326,8 +1425,25 @@ impl OmikronConnection {
                 return;
             }
         };
+        let relay_identity = match (
+            i64::try_from(verified.context.signer_id),
+            i64::try_from(verified.context.final_recipient_id),
+        ) {
+            (Ok(signer_id), Ok(destination_user_id)) => relay_queue::RelayIdentity {
+                signer_id,
+                destination_user_id,
+                message_id: verified.context.message_id.clone(),
+            },
+            _ => {
+                log!("Relay identity exceeds the storage range");
+                self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                    .await;
+                return;
+            }
+        };
         if let Err(error) = relay_queue::enqueue(
             RouteTarget::User(destination),
+            &relay_identity,
             &bytes,
             now_millis_i64(),
             frame_id,
@@ -1404,6 +1520,24 @@ impl OmikronConnection {
             }
         }
 
+        if signer_is_local && recipient_is_local {
+            let Ok(owner) = i64::try_from(verified.context.signer_id) else {
+                self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
+                    .await;
+                return;
+            };
+            if let Err(error) = outgoing_relay::apply_outgoing_history_policy(
+                owner,
+                owner,
+                &verified.context.message_id,
+            ) {
+                log!("Shared-Iota outgoing history policy failed: {}", error);
+                self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
+                    .await;
+                return;
+            }
+        }
+
         if let Err(error) =
             relay_replay::mark_queued(verified.context.signer_id, &verified.context.message_id)
         {
@@ -1422,11 +1556,117 @@ impl OmikronConnection {
         }
     }
 
+    async fn classify_legacy_pending_relays(&self) {
+        let mut after_id = 0;
+        loop {
+            let records = match relay_queue::list_without_relay_identity_after(after_id, 100) {
+                Ok(records) => records,
+                Err(error) => {
+                    log!("Pending relay ownership query failed: {}", error);
+                    return;
+                }
+            };
+            if records.is_empty() {
+                return;
+            }
+            for record in records {
+                after_id = record.id;
+                let Some(version) = mtp::type_map::Version::parse(&record.type_map_version) else {
+                    log!(
+                        "Deleting pending Relay {} with invalid type-map version",
+                        record.id
+                    );
+                    let _ = relay_queue::delete(record.id);
+                    continue;
+                };
+                let type_map = mtp::codec::TypeMap::new(version);
+                let Ok(frame) = CommunicationValue::from_bytes_with(&record.frame, &type_map)
+                else {
+                    log!("Deleting pending Relay {} with invalid frame", record.id);
+                    let _ = relay_queue::delete(record.id);
+                    continue;
+                };
+                let Some(local_iota_id) = CONFIG.load().iota_id else {
+                    return;
+                };
+                let Some(keyring) = self.keyring.read().await.as_ref().cloned() else {
+                    return;
+                };
+                let verified = verify_relay_metadata(
+                    &frame,
+                    local_iota_id,
+                    &keyring,
+                    |signer_id| async move { self.resolve_relay_signing_keys(signer_id).await },
+                )
+                .await;
+                let verified = match verified {
+                    Ok(verified) => verified,
+                    Err(RelayValidationError::KeyLookup(error)) => {
+                        log!(
+                            "Deferring pending Relay {} ownership lookup: {}",
+                            record.id,
+                            error
+                        );
+                        continue;
+                    }
+                    Err(RelayValidationError::MissingSigningKeys(signer_id)) => {
+                        log!(
+                            "Deferring pending Relay {} until signer {} keys are available",
+                            record.id,
+                            signer_id
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        log!(
+                            "Deleting structurally invalid pending Relay {}: {}",
+                            record.id,
+                            error
+                        );
+                        let _ = relay_queue::delete(record.id);
+                        continue;
+                    }
+                };
+                let identity = match (
+                    i64::try_from(verified.context.signer_id),
+                    i64::try_from(verified.context.final_recipient_id),
+                ) {
+                    (Ok(signer_id), Ok(destination_user_id)) => relay_queue::RelayIdentity {
+                        signer_id,
+                        destination_user_id,
+                        message_id: verified.context.message_id,
+                    },
+                    _ => {
+                        let _ = relay_queue::delete(record.id);
+                        continue;
+                    }
+                };
+                if let Err(error) = relay_queue::set_relay_identity(record.id, &identity) {
+                    log!(
+                        "Pending Relay {} ownership backfill failed: {}",
+                        record.id,
+                        error
+                    );
+                }
+            }
+        }
+    }
+
     async fn flush_pending_relays(&self) {
         let Ok(records) = relay_queue::list(100) else {
             return;
         };
         for record in records {
+            if record.relay_signer_id.is_none()
+                || record.relay_destination_user_id.is_none()
+                || record.relay_message_id.is_none()
+            {
+                log!(
+                    "Skipping pending Relay {} until ownership is classified",
+                    record.id
+                );
+                continue;
+            }
             let Some(version) = mtp::type_map::Version::parse(&record.type_map_version) else {
                 log!(
                     "Retaining pending Relay {} with invalid type-map version {}",
@@ -1440,6 +1680,72 @@ impl OmikronConnection {
                 log!("Retaining pending Relay {} with invalid frame", record.id);
                 continue;
             };
+            if record.relay_signer_id.is_none()
+                || record.relay_destination_user_id.is_none()
+                || record.relay_message_id.is_none()
+            {
+                let Some(local_iota_id) = CONFIG.load().iota_id else {
+                    log!(
+                        "Retaining pending Relay {} until the Iota identity is available",
+                        record.id
+                    );
+                    continue;
+                };
+                let Some(keyring) = self.keyring.read().await.as_ref().cloned() else {
+                    log!(
+                        "Retaining pending Relay {} until the Iota keyring is available",
+                        record.id
+                    );
+                    continue;
+                };
+                let resolver_connection = self;
+                let verified = verify_relay_metadata(
+                    &frame,
+                    local_iota_id,
+                    &keyring,
+                    move |signer_id| async move {
+                        resolver_connection
+                            .resolve_relay_signing_keys(signer_id)
+                            .await
+                    },
+                )
+                .await;
+                let Ok(verified) = verified else {
+                    log!("Deleting unverifiable pending Relay {}", record.id);
+                    if let Err(error) = relay_queue::delete(record.id) {
+                        log!("Pending Relay {} cleanup failed: {}", record.id, error);
+                    }
+                    continue;
+                };
+                let relay_identity = match (
+                    i64::try_from(verified.context.signer_id),
+                    i64::try_from(verified.context.final_recipient_id),
+                ) {
+                    (Ok(signer_id), Ok(destination_user_id)) => relay_queue::RelayIdentity {
+                        signer_id,
+                        destination_user_id,
+                        message_id: verified.context.message_id,
+                    },
+                    _ => {
+                        log!(
+                            "Deleting pending Relay {} with an out-of-range identity",
+                            record.id
+                        );
+                        if let Err(error) = relay_queue::delete(record.id) {
+                            log!("Pending Relay {} cleanup failed: {}", record.id, error);
+                        }
+                        continue;
+                    }
+                };
+                if let Err(error) = relay_queue::set_relay_identity(record.id, &relay_identity) {
+                    log!(
+                        "Pending Relay {} ownership backfill failed: {}",
+                        record.id,
+                        error
+                    );
+                    continue;
+                }
+            }
             let Ok(forwarded) = forward_verified_relay(&frame, record.target) else {
                 log!(
                     "Retaining pending Relay {} with invalid route target",
@@ -1450,22 +1756,63 @@ impl OmikronConnection {
             match record.target {
                 RouteTarget::Iota(destination_iota) => {
                     match self
-                        .await_response(&forwarded, Some(Duration::from_secs(20)))
+                        .await_relay_response(&forwarded, Duration::from_secs(20))
                         .await
                     {
                         Ok(response) if response.is_type(CommunicationType::Success) => {
-                            if let Err(error) =
-                                relay_queue::acknowledge_iota(destination_iota, record.frame_id)
+                            let accepted_at = response
+                                .get_data(DataType::RelayAcceptedAt)
+                                .as_number()
+                                .and_then(|value| i64::try_from(value).ok());
+                            let relay_id = response.get_data(DataType::RelayMessageId).as_str();
+                            if let (Some(accepted_at), Some(message_id), Some(signer_id)) = (
+                                accepted_at,
+                                record.relay_message_id.as_deref(),
+                                record.relay_signer_id,
+                            ) && relay_id == Some(message_id)
                             {
-                                log!(
-                                    "Pending Relay {} acknowledgement could not clear the queue: {}",
-                                    record.id,
-                                    error
-                                );
+                                if let Err(error) =
+                                    iota_storage::util::downstream_relay::acknowledge_iota_delivery(
+                                        destination_iota,
+                                        record.frame_id,
+                                        signer_id,
+                                        message_id,
+                                        accepted_at,
+                                    )
+                                {
+                                    log!(
+                                        "Pending Relay {} acknowledgement failed: {}",
+                                        record.id,
+                                        error
+                                    );
+                                }
+                            } else {
+                                log!("Pending Relay {} returned malformed Success", record.id);
+                            }
+                        }
+                        Ok(response) if !response.is_type(CommunicationType::ErrorInternal) => {
+                            if let (Some(message_id), Some(signer_id)) =
+                                (record.relay_message_id.as_deref(), record.relay_signer_id)
+                            {
+                                if let Err(error) =
+                                    iota_storage::util::downstream_relay::reject_iota_delivery(
+                                        destination_iota,
+                                        record.frame_id,
+                                        signer_id,
+                                        message_id,
+                                        "destination_rejected",
+                                    )
+                                {
+                                    log!(
+                                        "Pending Relay {} rejection cleanup failed: {}",
+                                        record.id,
+                                        error
+                                    );
+                                }
                             }
                         }
                         Ok(response) => log!(
-                            "Pending Relay {} route returned {}",
+                            "Pending Relay {} route returned retryable {}",
                             record.id,
                             response.get_type()
                         ),
@@ -1497,16 +1844,15 @@ impl OmikronConnection {
                 .as_number()
                 .and_then(|value| u64::try_from(value).ok())
         {
-            match relay_queue::acknowledge(destination_id, frame_id) {
-                Ok(true) => {
-                    if let Err(error) =
-                        relay_replay::mark_delivered_for_frame(destination_id, frame_id)
-                    {
-                        log!("Relay delivery state update failed: {}", error);
-                    }
+            let Ok(destination_id) = i64::try_from(destination_id) else {
+                log!("Relay destination ID exceeds storage range");
+                return;
+            };
+            match client_relay_delivery::acknowledge_client_delivery(destination_id, frame_id) {
+                Ok(client_relay_delivery::ClientRelayDeliveryResult::Acknowledged) => {
                     return;
                 }
-                Ok(false) => {}
+                Ok(client_relay_delivery::ClientRelayDeliveryResult::NotFound) => {}
                 Err(error) => log!("Relay delivery acknowledgement failed: {}", error),
             }
         }
@@ -1587,6 +1933,18 @@ impl OmikronConnection {
         dispatch!(SyncedSettingGet, handle_synced_setting_get);
         dispatch!(SyncedSettingDelete, handle_synced_setting_delete);
         dispatch!(SyncedSettingsList, handle_synced_settings_list);
+        dispatch!(UserBlobPut, handle_user_blob_put);
+        dispatch!(UserBlobGet, handle_user_blob_get);
+        dispatch!(UserBlobDelete, handle_user_blob_delete);
+        dispatch!(UserBlobList, handle_user_blob_list);
+        dispatch!(UserBlock, handle_user_block);
+        dispatch!(UserUnblock, handle_user_unblock);
+        dispatch!(BlockedUsersGet, handle_blocked_users_get);
+        dispatch!(ReceiptPolicyGet, handle_receipt_policy_get);
+        dispatch!(ReceiptPolicySet, handle_receipt_policy_set);
+        dispatch!(MessageStoragePolicyGet, handle_message_storage_policy_get);
+        dispatch!(MessageStoragePolicySet, handle_message_storage_policy_set);
+        dispatch!(UserBlockCheck, handle_user_block_check);
         dispatch!(EraseHostedUserData, handle_erase_hosted_user_data);
     }
 
@@ -2232,6 +2590,90 @@ impl OmikronConnection {
             .await;
     }
 
+    async fn handle_user_blob_put(self: Arc<Self>, cv: &CommunicationValue) {
+        let mutation = message_handlers::handle_user_blob_put(cv);
+        let _ = self.send_message(&mutation.response).await;
+        if let Some(changed) = mutation.changed {
+            let _ = self.send_message(&changed).await;
+        }
+    }
+
+    async fn handle_user_blob_get(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_user_blob_get(cv))
+            .await;
+    }
+
+    async fn handle_user_blob_delete(self: Arc<Self>, cv: &CommunicationValue) {
+        let mutation = message_handlers::handle_user_blob_delete(cv);
+        let _ = self.send_message(&mutation.response).await;
+        if let Some(changed) = mutation.changed {
+            let _ = self.send_message(&changed).await;
+        }
+    }
+
+    async fn handle_user_blob_list(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_user_blob_list(cv))
+            .await;
+    }
+
+    async fn handle_user_block(self: Arc<Self>, cv: &CommunicationValue) {
+        let mutation = message_handlers::handle_user_block(cv);
+        let _ = self.send_message(&mutation.response).await;
+        if let Some(changed) = mutation.changed {
+            let _ = self.send_message(&changed).await;
+        }
+    }
+
+    async fn handle_user_unblock(self: Arc<Self>, cv: &CommunicationValue) {
+        let mutation = message_handlers::handle_user_unblock(cv);
+        let _ = self.send_message(&mutation.response).await;
+        if let Some(changed) = mutation.changed {
+            let _ = self.send_message(&changed).await;
+        }
+    }
+
+    async fn handle_blocked_users_get(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_blocked_users_get(cv))
+            .await;
+    }
+
+    async fn handle_receipt_policy_get(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_receipt_policy_get(cv))
+            .await;
+    }
+
+    async fn handle_receipt_policy_set(self: Arc<Self>, cv: &CommunicationValue) {
+        let mutation = message_handlers::handle_receipt_policy_set(cv);
+        let _ = self.send_message(&mutation.response).await;
+        if let Some(changed) = mutation.changed {
+            let _ = self.send_message(&changed).await;
+        }
+    }
+
+    async fn handle_message_storage_policy_get(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_message_storage_policy_get(cv))
+            .await;
+    }
+
+    async fn handle_message_storage_policy_set(self: Arc<Self>, cv: &CommunicationValue) {
+        let mutation = message_handlers::handle_message_storage_policy_set(cv);
+        let _ = self.send_message(&mutation.response).await;
+        if let Some(changed) = mutation.changed {
+            let _ = self.send_message(&changed).await;
+        }
+    }
+
+    async fn handle_user_block_check(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_user_block_check(cv))
+            .await;
+    }
+
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
@@ -2361,6 +2803,40 @@ impl OmikronConnection {
                     self.is_connected().await,
                     waiting_tasks_len
                 ))
+            }
+        }
+    }
+
+    async fn await_relay_response(
+        &self,
+        cv: &CommunicationValue,
+        timeout: Duration,
+    ) -> Result<CommunicationValue, String> {
+        let (tx, rx) = oneshot::channel();
+        let msg_id = cv.require_id().map_err(|error| error.to_string())?;
+        WAITING_TASKS.insert(
+            msg_id,
+            WaitingTask {
+                task: Box::new(move |response| {
+                    let _ = tx.send(response);
+                    true
+                }),
+                inserted_at: Instant::now(),
+            },
+        );
+        if let Err(error) = self.send_message(cv).await {
+            WAITING_TASKS.remove(&msg_id);
+            return Err(format!("Relay send failed: {error}"));
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => {
+                WAITING_TASKS.remove(&msg_id);
+                Err("Relay response channel closed".into())
+            }
+            Err(_) => {
+                WAITING_TASKS.remove(&msg_id);
+                Err("Relay response timed out".into())
             }
         }
     }
