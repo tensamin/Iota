@@ -48,8 +48,33 @@ pub enum LocalRequest {
     CreateUser {
         username: String,
     },
+    InspectTuCredential {
+        credential: SecretString,
+    },
     AttachUserFromTu {
         credential: SecretString,
+    },
+    ReconcileUser {
+        user_id: i64,
+    },
+    ForceDetachUser {
+        user_id: i64,
+    },
+    ForgetReleasedUser {
+        user_id: i64,
+    },
+    GetUserDiagnostics {
+        user_id: i64,
+    },
+    RevokeTrustedApp {
+        user_id: i64,
+        app_id: String,
+    },
+    RevokeAllTrustedApps {
+        user_id: i64,
+    },
+    ExportUserCredential {
+        user_id: i64,
     },
     PurgeUserData {
         user_id: i64,
@@ -127,6 +152,7 @@ impl LocalRequest {
             | Self::GetOmikronStatus
             | Self::ListComponents
             | Self::GetUser { .. }
+            | Self::GetUserDiagnostics { .. }
             | Self::GetLogs { .. }
             | Self::CheckUpdate
             | Self::ListCommunities => IpcRole::Read,
@@ -134,7 +160,14 @@ impl LocalRequest {
             Self::ReconnectOmikron | Self::ReloadConfig => IpcRole::Operate,
 
             Self::CreateUser { .. }
+            | Self::InspectTuCredential { .. }
             | Self::AttachUserFromTu { .. }
+            | Self::ReconcileUser { .. }
+            | Self::ForceDetachUser { .. }
+            | Self::ForgetReleasedUser { .. }
+            | Self::RevokeTrustedApp { .. }
+            | Self::RevokeAllTrustedApps { .. }
+            | Self::ExportUserCredential { .. }
             | Self::PurgeUserData { .. }
             | Self::ReleaseUser { .. }
             | Self::CompleteDeleteUser { .. }
@@ -220,6 +253,14 @@ pub enum ResponsePayload {
         user_id: i64,
         username: String,
     },
+    TuCredentialPreview(TuCredentialPreview),
+    UserReconciled(UserReconcileResult),
+    UserDiagnostics(UserDiagnostics),
+    UserCredentialExport {
+        user_id: i64,
+        username: String,
+        credential: SecretString,
+    },
     /// Retained only for wire compatibility. New lifecycle code never emits it.
     UserRemoved {
         user_id: i64,
@@ -267,7 +308,7 @@ pub struct UserDetailResponse {
     pub trusted_apps: Vec<String>,
     pub state: LocalUserState,
     pub data_present: bool,
-    pub credential_present: bool,
+    pub credential_status: CredentialStatus,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -304,7 +345,66 @@ pub struct UserSummary {
     pub username: String,
     pub state: LocalUserState,
     pub data_present: bool,
-    pub credential_present: bool,
+    pub credential_status: CredentialStatus,
+    #[serde(default)]
+    pub pending_operation: Option<UserOperationSummary>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UserOperationKind {
+    Create,
+    Attach,
+    Release,
+    Purge,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UserOperationSummary {
+    pub operation: UserOperationKind,
+    pub phase: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStatus {
+    LocalPresent,
+    External,
+    Missing,
+    None,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TuCredentialPreview {
+    pub user_id: i64,
+    pub username: String,
+    pub assigned_iota_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UserReconcileResult {
+    pub user_id: i64,
+    pub local_state: LocalUserState,
+    pub omega_iota_id: Option<i64>,
+    pub action: ReconcileAction,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileAction {
+    None,
+    ReleasedLocally,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UserDiagnostics {
+    pub user_id: i64,
+    pub username: String,
+    pub local_state: LocalUserState,
+    pub data_present: bool,
+    pub credential_status: CredentialStatus,
+    pub trusted_app_count: usize,
+    pub pending_operation: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -359,6 +459,11 @@ impl std::fmt::Display for IpcErrorCode {
 
 #[cfg(test)]
 mod error_tests {
+    use super::{
+        CredentialStatus, LocalUserState, ResponsePayload, SecretString, UserOperationKind,
+        UserOperationSummary, UserSummary,
+    };
+
     use super::IpcErrorCode;
 
     #[test]
@@ -377,6 +482,50 @@ mod error_tests {
                 .to_string()
                 .contains("required role")
         );
+    }
+
+    #[test]
+    fn credential_export_debug_output_is_redacted() {
+        let payload = ResponsePayload::UserCredentialExport {
+            user_id: 42,
+            username: "alice".into(),
+            credential: SecretString("private-tu-contents".into()),
+        };
+        let output = format!("{payload:?}");
+
+        assert!(!output.contains("private-tu-contents"));
+        assert!(output.contains("<redacted>"));
+    }
+
+    #[test]
+    fn user_summary_serializes_pending_operation_without_lifecycle_secrets() {
+        let summary = UserSummary {
+            user_id: 42,
+            username: "alice".into(),
+            state: LocalUserState::Managed,
+            data_present: true,
+            credential_status: CredentialStatus::LocalPresent,
+            pending_operation: Some(UserOperationSummary {
+                operation: UserOperationKind::Purge,
+                phase: "database_purged".into(),
+            }),
+        };
+        let encoded = serde_json::to_string(&summary).unwrap();
+
+        assert!(encoded.contains("purge"));
+        assert!(encoded.contains("database_purged"));
+        assert!(!encoded.contains("private_key"));
+        assert!(!encoded.contains("reset_token"));
+    }
+
+    #[test]
+    fn user_summary_accepts_older_payload_without_pending_operation() {
+        let summary: UserSummary = serde_json::from_str(
+            r#"{"user_id":42,"username":"alice","state":"managed","data_present":true,"credential_status":"local_present"}"#,
+        )
+        .unwrap();
+
+        assert!(summary.pending_operation.is_none());
     }
 }
 

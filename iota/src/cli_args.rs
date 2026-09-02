@@ -117,25 +117,96 @@ enum UsersAction {
         user_id: i64,
     },
     Add {
-        username: Option<String>,
-        #[arg(long, value_name = "PATH")]
-        tu: Option<PathBuf>,
+        #[command(subcommand)]
+        action: UserAddAction,
     },
-    Release {
-        user_id: i64,
-        #[arg(long)]
-        yes: bool,
+    Hosting {
+        #[command(subcommand)]
+        action: UserHostingAction,
     },
     Data {
         #[command(subcommand)]
         action: UserDataAction,
     },
-    CompleteDelete {
+    Account {
+        #[command(subcommand)]
+        action: UserAccountAction,
+    },
+    Repair {
+        #[command(subcommand)]
+        action: UserRepairAction,
+    },
+    Forget {
+        user_id: i64,
+        #[arg(long)]
+        yes: bool,
+    },
+    Apps {
+        #[command(subcommand)]
+        action: UserAppsAction,
+    },
+    Credential {
+        #[command(subcommand)]
+        action: UserCredentialAction,
+    },
+}
+#[derive(Subcommand, Debug)]
+enum UserAddAction {
+    Create { username: String },
+    Tu { path: PathBuf },
+}
+#[derive(Subcommand, Debug)]
+enum UserHostingAction {
+    Release {
+        user_id: i64,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+#[derive(Subcommand, Debug)]
+enum UserAccountAction {
+    Delete {
         user_id: i64,
         #[arg(long, value_name = "PATH")]
         tu: Option<PathBuf>,
         #[arg(long)]
         yes: bool,
+    },
+}
+#[derive(Subcommand, Debug)]
+enum UserRepairAction {
+    Reconcile {
+        user_id: i64,
+    },
+    Diagnostics {
+        user_id: i64,
+    },
+    ForceDetach {
+        user_id: i64,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+#[derive(Subcommand, Debug)]
+enum UserAppsAction {
+    Revoke {
+        user_id: i64,
+        app_id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    RevokeAll {
+        user_id: i64,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+#[derive(Subcommand, Debug)]
+enum UserCredentialAction {
+    Export {
+        user_id: i64,
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
     },
 }
 #[derive(Subcommand, Debug)]
@@ -310,6 +381,33 @@ pub enum Command {
         tu: Option<PathBuf>,
         confirmed: bool,
     },
+    UsersReconcile {
+        user_id: i64,
+    },
+    UsersDiagnostics {
+        user_id: i64,
+    },
+    UsersForceDetach {
+        user_id: i64,
+        confirmed: bool,
+    },
+    UsersForget {
+        user_id: i64,
+        confirmed: bool,
+    },
+    UsersRevokeApp {
+        user_id: i64,
+        app_id: String,
+        confirmed: bool,
+    },
+    UsersRevokeAllApps {
+        user_id: i64,
+        confirmed: bool,
+    },
+    UsersExportCredential {
+        user_id: i64,
+        output: PathBuf,
+    },
     OmikronReconnect,
     IdentityRotate {
         confirmed: bool,
@@ -406,15 +504,21 @@ impl CliInvocation {
             Some(CliCommand::Users(users)) => match users.action {
                 UsersAction::List => Command::UsersList,
                 UsersAction::Show { user_id } => Command::UsersShow { user_id },
-                UsersAction::Add { username, tu } => {
-                    if username.is_some() == tu.is_some() {
-                        return Err(
-                            "users add requires exactly one of <username> or --tu <PATH>".into(),
-                        );
-                    }
-                    Command::UsersAdd { username, tu }
-                }
-                UsersAction::Release { user_id, yes } => Command::UsersRelease {
+                UsersAction::Add {
+                    action: UserAddAction::Create { username },
+                } => Command::UsersAdd {
+                    username: Some(username),
+                    tu: None,
+                },
+                UsersAction::Add {
+                    action: UserAddAction::Tu { path },
+                } => Command::UsersAdd {
+                    username: None,
+                    tu: Some(path),
+                },
+                UsersAction::Hosting {
+                    action: UserHostingAction::Release { user_id, yes },
+                } => Command::UsersRelease {
                     user_id,
                     confirmed: resolve_confirmed(yes),
                 },
@@ -424,11 +528,50 @@ impl CliInvocation {
                     user_id,
                     confirmed: resolve_confirmed(yes),
                 },
-                UsersAction::CompleteDelete { user_id, tu, yes } => Command::UsersCompleteDelete {
+                UsersAction::Account {
+                    action: UserAccountAction::Delete { user_id, tu, yes },
+                } => Command::UsersCompleteDelete {
                     user_id,
                     tu,
                     confirmed: resolve_confirmed(yes),
                 },
+                UsersAction::Repair {
+                    action: UserRepairAction::Reconcile { user_id },
+                } => Command::UsersReconcile { user_id },
+                UsersAction::Repair {
+                    action: UserRepairAction::Diagnostics { user_id },
+                } => Command::UsersDiagnostics { user_id },
+                UsersAction::Repair {
+                    action: UserRepairAction::ForceDetach { user_id, yes },
+                } => Command::UsersForceDetach {
+                    user_id,
+                    confirmed: resolve_confirmed(yes),
+                },
+                UsersAction::Forget { user_id, yes } => Command::UsersForget {
+                    user_id,
+                    confirmed: resolve_confirmed(yes),
+                },
+                UsersAction::Apps {
+                    action:
+                        UserAppsAction::Revoke {
+                            user_id,
+                            app_id,
+                            yes,
+                        },
+                } => Command::UsersRevokeApp {
+                    user_id,
+                    app_id,
+                    confirmed: resolve_confirmed(yes),
+                },
+                UsersAction::Apps {
+                    action: UserAppsAction::RevokeAll { user_id, yes },
+                } => Command::UsersRevokeAllApps {
+                    user_id,
+                    confirmed: resolve_confirmed(yes),
+                },
+                UsersAction::Credential {
+                    action: UserCredentialAction::Export { user_id, output },
+                } => Command::UsersExportCredential { user_id, output },
             },
             Some(CliCommand::Omikron(omikron)) => match omikron.action {
                 OmikronAction::Reconnect => Command::OmikronReconnect,
@@ -594,7 +737,8 @@ mod tests {
     #[test]
     fn command_schema_drives_help_and_completion_paths() {
         let paths = CliInvocation::command_paths();
-        assert!(paths.contains(&"users release".to_owned()));
+        assert!(paths.contains(&"users hosting release".to_owned()));
+        assert!(paths.contains(&"users add create".to_owned()));
         assert!(paths.contains(&"daemon install".to_owned()));
         let help = CliInvocation::help_text();
         assert!(help.contains("users"));
@@ -649,8 +793,13 @@ mod tests {
 
     #[test]
     fn parses_users_add() {
-        let invocation =
-            CliInvocation::parse(["users".into(), "add".into(), "alice".into()]).unwrap();
+        let invocation = CliInvocation::parse([
+            "users".into(),
+            "add".into(),
+            "create".into(),
+            "alice".into(),
+        ])
+        .unwrap();
         assert_eq!(
             invocation.command,
             Command::UsersAdd {
@@ -689,6 +838,7 @@ mod tests {
     fn parses_users_release_with_confirmation() {
         let invocation = CliInvocation::parse([
             "users".into(),
+            "hosting".into(),
             "release".into(),
             "42".into(),
             "--yes".into(),
@@ -700,6 +850,39 @@ mod tests {
                 user_id: 42,
                 confirmed: true,
             }
+        );
+    }
+
+    #[test]
+    fn parses_credential_export_with_required_destination() {
+        let invocation = CliInvocation::parse([
+            "users".into(),
+            "credential".into(),
+            "export".into(),
+            "42".into(),
+            "--output".into(),
+            "alice.tu".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            invocation.command,
+            Command::UsersExportCredential {
+                user_id: 42,
+                output: PathBuf::from("alice.tu"),
+            }
+        );
+    }
+
+    #[test]
+    fn credential_export_rejects_a_missing_destination() {
+        assert!(
+            CliInvocation::parse([
+                "users".into(),
+                "credential".into(),
+                "export".into(),
+                "42".into(),
+            ])
+            .is_err()
         );
     }
 

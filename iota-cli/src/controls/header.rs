@@ -11,6 +11,36 @@ use ratatui::{
     widgets::Paragraph,
 };
 
+#[derive(Debug, Clone, Copy)]
+pub struct HeaderItem {
+    pub label: &'static str,
+    pub intent: ButtonIntent,
+    pub action: AppAction,
+}
+
+pub const HEADER_ITEMS: &[HeaderItem] = &[
+    HeaderItem {
+        label: "Overview",
+        intent: ButtonIntent::Primary,
+        action: AppAction::OpenOverview,
+    },
+    HeaderItem {
+        label: "Users",
+        intent: ButtonIntent::Neutral,
+        action: AppAction::OpenUsers,
+    },
+    HeaderItem {
+        label: "Settings",
+        intent: ButtonIntent::Neutral,
+        action: AppAction::OpenSettings,
+    },
+    HeaderItem {
+        label: "Quit",
+        intent: ButtonIntent::Destructive,
+        action: AppAction::Quit,
+    },
+];
+
 fn connection_badge(
     state: &IpcConnectionState,
     theme: &ResolvedTheme,
@@ -59,22 +89,14 @@ pub fn render_header(
 
     let rows =
         Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
-    let cells = Layout::horizontal([
-        Constraint::Min(28),
-        Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Length(8),
-    ])
-    .split(rows[0]);
-    let cells2 = Layout::horizontal([
-        Constraint::Min(28),
-        Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Length(8),
-    ])
-    .split(rows[1]);
+    let constraints = std::iter::once(Constraint::Min(28))
+        .chain(
+            HEADER_ITEMS
+                .iter()
+                .map(|item| Constraint::Length(if item.label == "Quit" { 8 } else { 12 })),
+        )
+        .collect::<Vec<_>>();
+    let cells = Layout::horizontal(constraints.clone()).split(rows[0]);
 
     let (ipc_label, ipc_style) = connection_badge(connection, theme);
     let (omikron_text, omikron_style) = omikron_badge(daemon, theme);
@@ -99,46 +121,15 @@ pub fn render_header(
     );
     hits.register(brand_area, AppAction::OpenMain);
 
-    for (index, (top, _bottom, label, intent, action)) in [
-        (
-            cells[1],
-            cells2[1],
-            "Overview",
-            ButtonIntent::Primary,
-            AppAction::OpenOverview,
-        ),
-        (
-            cells[2],
-            cells2[2],
-            "Users",
-            ButtonIntent::Neutral,
-            AppAction::OpenUsers,
-        ),
-        (
-            cells[3],
-            cells2[3],
-            "Settings",
-            ButtonIntent::Neutral,
-            AppAction::OpenSettings,
-        ),
-        (
-            cells[4],
-            cells2[4],
-            "Quit",
-            ButtonIntent::Destructive,
-            AppAction::Quit,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    for (index, item) in HEADER_ITEMS.iter().enumerate() {
+        let top = cells[index + 1];
         let button_area = Rect {
             x: top.x,
             y: top.y,
             width: top.width,
             height: area.height,
         };
-        let style = match (intent, focused_action == Some(index)) {
+        let style = match (item.intent, focused_action == Some(index)) {
             (ButtonIntent::Primary, true) => theme.buttons.primary_focused,
             (ButtonIntent::Primary, false) => theme.buttons.primary,
             (ButtonIntent::Neutral, true) => theme.buttons.neutral_focused,
@@ -148,9 +139,9 @@ pub fn render_header(
             (ButtonIntent::Destructive, _) => theme.buttons.destructive,
         };
         let display_label = if focused_action == Some(index) {
-            format!("› {label}")
+            format!("› {}", item.label)
         } else {
-            label.to_owned()
+            item.label.to_owned()
         };
         frame.render_widget(
             Paragraph::new(vec![
@@ -159,6 +150,6 @@ pub fn render_header(
             ]),
             button_area,
         );
-        hits.register(button_area, action);
+        hits.register(button_area, item.action);
     }
 }

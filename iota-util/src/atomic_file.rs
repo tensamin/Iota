@@ -16,6 +16,39 @@ pub fn replace_private(path: &Path, contents: &[u8], backup_limit: usize) -> io:
     replace_with_mode(path, contents, backup_limit, true)
 }
 
+/* Create exported secret material without replacing an existing destination.
+ * Operators must choose another path explicitly if a file already exists. */
+pub fn create_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "export file has no parent directory",
+        )
+    })?;
+    if !parent.as_os_str().is_empty() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    if let Err(error) = set_private_permissions(path, true) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    let write_result = (|| {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        if !parent.as_os_str().is_empty() {
+            sync_directory(parent)?;
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+    }
+    write_result
+}
+
 fn replace_with_mode(
     path: &Path,
     contents: &[u8],
@@ -133,7 +166,7 @@ fn sync_directory(_path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::replace;
+    use super::{create_private, replace};
 
     #[test]
     fn replace_preserves_a_previous_version_as_a_backup() {
@@ -154,5 +187,33 @@ mod tests {
             })
             .count();
         assert_eq!(backups, 1);
+    }
+
+    #[test]
+    fn create_private_refuses_to_replace_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("alice.tu");
+        create_private(&path, b"first").unwrap();
+
+        assert_eq!(
+            create_private(&path, b"second").unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"first");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_private_uses_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("alice.tu");
+        create_private(&path, b"secret").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

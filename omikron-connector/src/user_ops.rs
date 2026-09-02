@@ -37,6 +37,13 @@ pub enum LifecycleUserError {
     LocalPersistence(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectedTuCredential {
+    pub user_id: i64,
+    pub username: String,
+    pub assigned_iota_id: Option<i64>,
+}
+
 impl From<crate::OmikronError> for LifecycleUserError {
     fn from(value: crate::OmikronError) -> Self {
         Self::Transport(value)
@@ -120,6 +127,58 @@ async fn inspect_credential_account(
     Ok((username, public_key, created_at))
 }
 
+/*
+ * Inspection verifies the credential against Omega but deliberately stops
+ * before proof, assignment, pending-operation, credential, or profile writes.
+ */
+pub async fn inspect_tu_credential(
+    connection: &dyn OmikronClient,
+    contents: &str,
+) -> Result<InspectedTuCredential, LifecycleUserError> {
+    let credential = TuCredential::parse(contents)
+        .map_err(|error| LifecycleUserError::InvalidCredential(error.to_string()))?;
+    let (username, _, _) = inspect_credential_account(connection, &credential).await?;
+    let request = CommunicationValue::new(CommunicationType::GetUserData).add_typed_default(
+        DataType::UserId,
+        DataValue::SignedNumber(credential.user_id.into()),
+    );
+    let response = connection
+        .await_response(&request, Duration::from_secs(20))
+        .await?;
+    if !response.is_type(CommunicationType::GetUserData) {
+        return Err(LifecycleUserError::RemoteRejected);
+    }
+    let assigned_iota_id = response
+        .get_data(DataType::IotaId)
+        .as_signed_number()
+        .and_then(|value| i64::try_from(value).ok())
+        .filter(|value| *value > 0);
+    Ok(InspectedTuCredential {
+        user_id: credential.user_id,
+        username,
+        assigned_iota_id,
+    })
+}
+
+pub async fn get_remote_user_assignment(
+    connection: &dyn OmikronClient,
+    user_id: i64,
+) -> Result<Option<i64>, LifecycleUserError> {
+    let request = CommunicationValue::new(CommunicationType::GetUserData)
+        .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
+    let response = connection
+        .await_response(&request, Duration::from_secs(20))
+        .await?;
+    if !response.is_type(CommunicationType::GetUserData) {
+        return Err(LifecycleUserError::RemoteRejected);
+    }
+    Ok(response
+        .get_data(DataType::IotaId)
+        .as_signed_number()
+        .and_then(|value| i64::try_from(value).ok())
+        .filter(|value| *value > 0))
+}
+
 async fn credential_proof(
     connection: &dyn OmikronClient,
     credential: &TuCredential,
@@ -181,8 +240,8 @@ pub async fn attach_user_from_tu(
         username,
         None,
         public_key,
-        hex_hash(contents),
-        String::new(),
+        Some(hex_hash(contents)),
+        Some(String::new()),
         created_at,
     );
     pending_operations::upsert(&PendingUserOperation {
@@ -190,8 +249,8 @@ pub async fn attach_user_from_tu(
         operation: PendingUserOperationKind::Attach,
         username: profile.username.clone(),
         public_key: Some(profile.public_key.clone()),
-        private_key_hash: Some(profile.private_key_hash.clone()),
-        reset_token: Some(profile.reset_token.clone()),
+        private_key_hash: profile.private_key_hash.clone(),
+        reset_token: profile.reset_token.clone(),
         registration_token: None,
         phase: PendingUserOperationPhase::Prepared,
         created_at: now_millis(),
@@ -254,15 +313,16 @@ pub async fn complete_delete_user_with_tu(
 /// Repair local management state after a release or migration committed in
 /// Omega but local cleanup was interrupted. Hosted data is retained.
 pub async fn reconcile_managed_users(connection: &dyn OmikronClient) {
-    let Ok(local_iota_id) = configured_iota_id() else {
-        return;
-    };
-    let pending = match pending_operations::get_all() {
+    let mut pending = match pending_operations::get_all() {
         Ok(pending) => pending,
         Err(error) => {
             log!("Pending user operation reconciliation could not read storage: {error}");
             return;
         }
+    };
+    pending.retain(|operation| operation.operation != PendingUserOperationKind::Purge);
+    let Ok(local_iota_id) = configured_iota_id() else {
+        return;
     };
     for operation in pending {
         let request = CommunicationValue::new(CommunicationType::GetUserData).add_typed_default(
@@ -319,15 +379,20 @@ pub async fn reconcile_managed_users(connection: &dyn OmikronClient) {
                     operation.username,
                     None,
                     public_key,
-                    operation.private_key_hash.unwrap_or_default(),
-                    operation.reset_token.unwrap_or_default(),
+                    operation.private_key_hash,
+                    operation.reset_token,
                 );
                 if try_add_user(profile).is_ok() {
                     let _ = pending_operations::remove(operation.user_id);
                 }
             }
             PendingUserOperationKind::Release if remote_iota_id != Some(local_iota_id) => {
-                if iota_storage::users::user_manager::release_user(operation.user_id).is_ok() {
+                if iota_storage::users::user_manager::finalize_local_release(
+                    operation.user_id,
+                    Some(&operation.username),
+                )
+                .is_ok()
+                {
                     let _ = pending_operations::remove(operation.user_id);
                 }
             }
@@ -339,19 +404,47 @@ pub async fn reconcile_managed_users(connection: &dyn OmikronClient) {
             DataType::UserId,
             DataValue::SignedNumber(user.user_id.into()),
         );
-        let Ok(response) = connection
+        let response = connection
             .await_response(&request, Duration::from_secs(10))
-            .await
-        else {
-            continue;
+            .await;
+        let should_release = match should_release_reconciled_user(response, local_iota_id) {
+            Ok(should_release) => should_release,
+            Err(error) => {
+                log!(
+                    "Could not reconcile local user {} with Omega: {}",
+                    user.user_id,
+                    error
+                );
+                continue;
+            }
         };
-        let remote_iota_id = response
+        if should_release {
+            if let Err(error) = iota_storage::users::user_manager::finalize_local_release(
+                user.user_id,
+                Some(&user.username),
+            ) {
+                log!(
+                    "Could not release local user {} after Omega reconciliation: {}",
+                    user.user_id,
+                    error
+                );
+            }
+        }
+    }
+}
+
+fn should_release_reconciled_user(
+    response: Result<CommunicationValue, crate::OmikronError>,
+    local_iota_id: i64,
+) -> Result<bool, crate::OmikronError> {
+    match response {
+        Ok(response) => Ok(response
             .get_data(DataType::IotaId)
             .as_signed_number()
-            .and_then(|value| i64::try_from(value).ok());
-        if remote_iota_id != Some(local_iota_id) {
-            let _ = iota_storage::users::user_manager::release_user(user.user_id);
-        }
+            .and_then(|value| i64::try_from(value).ok())
+            != Some(local_iota_id)),
+        Err(crate::OmikronError::Rejected(CommunicationType::ErrorNotFound, _)) => Ok(true),
+        Err(error) => Err(error),
     }
 }
 
@@ -505,8 +598,8 @@ pub async fn create_user(
         username.to_string(),
         None,
         public_key_bundle_to_base64(&pub_key_bundle),
-        private_key_hash,
-        reset_token.clone(),
+        Some(private_key_hash),
+        Some(reset_token.clone()),
     );
     let credential = format!(
         "{}@{}::{}",
@@ -519,8 +612,8 @@ pub async fn create_user(
         operation: PendingUserOperationKind::Create,
         username: user_profile.username.clone(),
         public_key: Some(user_profile.public_key.clone()),
-        private_key_hash: Some(user_profile.private_key_hash.clone()),
-        reset_token: Some(user_profile.reset_token.clone()),
+        private_key_hash: user_profile.private_key_hash.clone(),
+        reset_token: user_profile.reset_token.clone(),
         registration_token: Some(registration_token.clone()),
         phase: PendingUserOperationPhase::Prepared,
         created_at: now_millis(),
@@ -563,7 +656,9 @@ pub async fn create_user(
             } else {
                 log_t!("User creation: {}", error.to_string());
                 return Err(match error {
-                    crate::OmikronError::Internal(_) => CreateUserError::RemoteRejected,
+                    crate::OmikronError::Rejected(_, _) | crate::OmikronError::Internal(_) => {
+                        CreateUserError::RemoteRejected
+                    }
                     error => CreateUserError::Transport(error),
                 });
             }
@@ -583,15 +678,48 @@ pub async fn create_user(
 
 #[cfg(test)]
 mod tests {
-    use super::{CreateUserError, request_user_id, valid_username};
+    use super::{
+        CreateUserError, LifecycleUserError, inspect_tu_credential, request_user_id,
+        should_release_reconciled_user, valid_username,
+    };
     use crate::{OmikronClient, OmikronError};
     use async_trait::async_trait;
     use iota_connection::message_common::CommunicationResponseExt;
+    use iota_util::crypto_helper::{generate_keyring, public_key_bundle_to_base64};
+    use iota_util::tu::TuCredential;
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
     use std::time::Duration;
 
     struct RegistrationClient {
         response: CommunicationValue,
+    }
+
+    struct InspectionClient {
+        response: CommunicationValue,
+    }
+
+    #[async_trait]
+    impl OmikronClient for InspectionClient {
+        async fn send_message(&self, _: &CommunicationValue) -> Result<(), OmikronError> {
+            unreachable!()
+        }
+        async fn await_response(
+            &self,
+            request: &CommunicationValue,
+            _: Duration,
+        ) -> Result<CommunicationValue, OmikronError> {
+            assert!(request.is_type(CommunicationType::GetUserData));
+            Ok(self.response.clone().with_request_id(request))
+        }
+        async fn reconnect(&self) -> Result<(), OmikronError> {
+            unreachable!()
+        }
+        async fn rotate_identity(&self) -> Result<(), OmikronError> {
+            unreachable!()
+        }
+        async fn is_connected(&self) -> bool {
+            true
+        }
     }
 
     #[async_trait]
@@ -635,6 +763,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inspection_returns_verified_identity_without_lifecycle_requests() {
+        let credential = TuCredential {
+            user_id: 42,
+            omega_host: crate::omega_discovery::omega_host(),
+            keyring: generate_keyring(),
+        };
+        let client = InspectionClient {
+            response: CommunicationValue::new(CommunicationType::GetUserData)
+                .add_typed_default(DataType::Username, DataValue::Str("alice".into()))
+                .add_typed_default(
+                    DataType::PublicKey,
+                    DataValue::Str(public_key_bundle_to_base64(&credential.public_key_bundle())),
+                )
+                .add_typed_default(DataType::CreatedAt, DataValue::SignedNumber(1))
+                .add_typed_default(DataType::IotaId, DataValue::SignedNumber(7)),
+        };
+        let preview = inspect_tu_credential(&client, &credential.to_canonical_string())
+            .await
+            .unwrap();
+        assert_eq!(preview.user_id, 42);
+        assert_eq!(preview.username, "alice");
+        assert_eq!(preview.assigned_iota_id, Some(7));
+    }
+
+    #[tokio::test]
+    async fn inspection_rejects_malformed_credentials_before_remote_access() {
+        let client = InspectionClient {
+            response: CommunicationValue::new(CommunicationType::GetUserData),
+        };
+        assert!(matches!(
+            inspect_tu_credential(&client, "malformed").await,
+            Err(LifecycleUserError::InvalidCredential(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn uses_user_id_allocated_by_omega() {
         let client = RegistrationClient {
             response: CommunicationValue::new(CommunicationType::GetRegister)
@@ -661,6 +825,26 @@ mod tests {
         assert!(matches!(
             request_user_id(&client).await,
             Err(CreateUserError::InvalidResponse)
+        ));
+    }
+
+    #[test]
+    fn releases_a_user_that_omega_no_longer_has() {
+        let response = Err(OmikronError::Rejected(
+            CommunicationType::ErrorNotFound,
+            "user does not exist".into(),
+        ));
+
+        assert_eq!(should_release_reconciled_user(response, 7), Ok(true));
+    }
+
+    #[test]
+    fn retains_a_user_when_omega_cannot_be_reached() {
+        let response = Err(OmikronError::Timeout("timed out".into()));
+
+        assert!(matches!(
+            should_release_reconciled_user(response, 7),
+            Err(OmikronError::Timeout(_))
         ));
     }
 }

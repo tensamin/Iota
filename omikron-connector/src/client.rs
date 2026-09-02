@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use mtp::codec::CommunicationValue;
+use mtp::codec::{CommunicationType, CommunicationValue};
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7,6 +7,7 @@ pub enum OmikronError {
     Disconnected(String),
     Timeout(String),
     Authentication(String),
+    Rejected(CommunicationType, String),
     Internal(String),
 }
 
@@ -16,6 +17,7 @@ impl std::fmt::Display for OmikronError {
             Self::Disconnected(v)
             | Self::Timeout(v)
             | Self::Authentication(v)
+            | Self::Rejected(_, v)
             | Self::Internal(v) => f.write_str(v),
         }
     }

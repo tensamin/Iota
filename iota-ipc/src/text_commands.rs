@@ -5,9 +5,16 @@ pub const COMMANDS: &[&str] = &[
     "tasks",
     "users list",
     "users show ",
-    "users add ",
-    "users remove ",
-    "users import ",
+    "users add create ",
+    "users hosting release ",
+    "users data purge ",
+    "users account delete ",
+    "users repair reconcile ",
+    "users repair diagnostics ",
+    "users repair force-detach ",
+    "users forget ",
+    "users apps revoke ",
+    "users apps revoke-all ",
     "omikron status",
     "reconnect",
     "identity rotate",
@@ -59,16 +66,47 @@ pub fn parse(line: &str) -> Option<LocalRequest> {
             let user_id = id_str.parse::<i64>().ok()?;
             Some(LocalRequest::GetUser { user_id })
         }
-        ["user" | "users", "add", username] => Some(LocalRequest::CreateUser {
+        ["user" | "users", "add", "create", username] => Some(LocalRequest::CreateUser {
             username: username.to_string(),
         }),
-        ["user" | "users", "remove", id_str] => {
+        ["user" | "users", "hosting", "release", id_str] => {
             let user_id = id_str.parse::<i64>().ok()?;
-            Some(LocalRequest::RemoveUser { user_id })
+            Some(LocalRequest::ReleaseUser { user_id })
         }
-        ["user" | "users", "import", username] => Some(LocalRequest::ImportUser {
-            username: username.to_string(),
+        ["user" | "users", "data", "purge", id_str] => Some(LocalRequest::PurgeUserData {
+            user_id: id_str.parse::<i64>().ok()?,
         }),
+        ["user" | "users", "account", "delete", id_str] => Some(LocalRequest::CompleteDeleteUser {
+            user_id: id_str.parse::<i64>().ok()?,
+            credential: None,
+        }),
+        ["user" | "users", "repair", "reconcile", id_str] => Some(LocalRequest::ReconcileUser {
+            user_id: id_str.parse::<i64>().ok()?,
+        }),
+        ["user" | "users", "repair", "diagnostics", id_str] => {
+            Some(LocalRequest::GetUserDiagnostics {
+                user_id: id_str.parse::<i64>().ok()?,
+            })
+        }
+        ["user" | "users", "repair", "force-detach", id_str] => {
+            Some(LocalRequest::ForceDetachUser {
+                user_id: id_str.parse::<i64>().ok()?,
+            })
+        }
+        ["user" | "users", "forget", id_str] => Some(LocalRequest::ForgetReleasedUser {
+            user_id: id_str.parse::<i64>().ok()?,
+        }),
+        ["user" | "users", "apps", "revoke", id_str, app_id] => {
+            Some(LocalRequest::RevokeTrustedApp {
+                user_id: id_str.parse::<i64>().ok()?,
+                app_id: app_id.to_string(),
+            })
+        }
+        ["user" | "users", "apps", "revoke-all", id_str] => {
+            Some(LocalRequest::RevokeAllTrustedApps {
+                user_id: id_str.parse::<i64>().ok()?,
+            })
+        }
         ["reconnect"] => Some(LocalRequest::ReconnectOmikron),
         ["regenerate", "keys"] | ["identity", "rotate"] => Some(LocalRequest::RotateIotaIdentity),
         ["reload"] | ["restart"] => Some(LocalRequest::RequestProcessExit {
@@ -116,7 +154,7 @@ mod tests {
 
     #[test]
     fn parses_user_add() {
-        let req = parse("user add alice").unwrap();
+        let req = parse("user add create alice").unwrap();
         match req {
             LocalRequest::CreateUser { username } => assert_eq!(username, "alice"),
             _ => panic!("expected CreateUser"),
@@ -127,12 +165,20 @@ mod tests {
     fn accepts_the_headless_cli_user_vocabulary() {
         assert!(matches!(parse("users list"), Some(LocalRequest::ListUsers)));
         assert!(matches!(
-            parse("users add alice"),
+            parse("users add create alice"),
             Some(LocalRequest::CreateUser { .. })
         ));
         assert!(matches!(
-            parse("users remove 42"),
-            Some(LocalRequest::RemoveUser { user_id: 42 })
+            parse("users hosting release 42"),
+            Some(LocalRequest::ReleaseUser { user_id: 42 })
+        ));
+        assert!(matches!(
+            parse("users apps revoke 42 desktop"),
+            Some(LocalRequest::RevokeTrustedApp { user_id: 42, .. })
+        ));
+        assert!(matches!(
+            parse("users apps revoke-all 42"),
+            Some(LocalRequest::RevokeAllTrustedApps { user_id: 42 })
         ));
         assert!(matches!(
             parse("identity rotate"),
@@ -141,17 +187,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_user_remove_by_id() {
-        let req = parse("user remove 42").unwrap();
+    fn parses_user_release_by_id() {
+        let req = parse("user hosting release 42").unwrap();
         match req {
-            LocalRequest::RemoveUser { user_id } => assert_eq!(user_id, 42),
-            _ => panic!("expected RemoveUser"),
+            LocalRequest::ReleaseUser { user_id } => assert_eq!(user_id, 42),
+            _ => panic!("expected ReleaseUser"),
         }
     }
 
     #[test]
-    fn user_remove_requires_numeric_id() {
-        assert!(parse("user remove alice").is_none());
+    fn generic_remove_is_not_routed() {
+        assert!(parse("user remove 42").is_none());
+        assert!(parse("users remove alice").is_none());
     }
 
     #[test]
@@ -295,12 +342,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_users_import() {
-        let req = parse("users import alice").unwrap();
-        match req {
-            LocalRequest::ImportUser { username } => assert_eq!(username, "alice"),
-            _ => panic!("expected ImportUser"),
-        }
+    fn deprecated_import_is_not_routed() {
+        assert!(parse("users import alice").is_none());
     }
 
     #[test]
@@ -317,7 +360,15 @@ mod tests {
     #[test]
     fn completion_is_prefix_based_and_deterministic() {
         assert_eq!(completions("identity r"), vec!["identity rotate"]);
-        assert_eq!(completions("/users a"), vec!["users add "]);
+        assert_eq!(
+            completions("/users a"),
+            vec![
+                "users add create ",
+                "users account delete ",
+                "users apps revoke ",
+                "users apps revoke-all ",
+            ]
+        );
         assert!(completions("definitely-unknown").is_empty());
     }
 

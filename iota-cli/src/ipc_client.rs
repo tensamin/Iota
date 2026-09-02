@@ -6,7 +6,7 @@ use iota_state::{ClientState, UiLogEntry};
 use std::collections::HashMap;
 use std::io::Result;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -44,6 +44,7 @@ pub struct DaemonStatus {
     pub health: iota_ipc::HealthStatus,
     pub deployment_mode: Option<iota_ipc::DeploymentMode>,
     pub supervisor: Option<iota_ipc::SupervisorKind>,
+    pub capabilities: Vec<String>,
     pub components: std::collections::BTreeMap<iota_ipc::ComponentId, iota_ipc::ComponentHealth>,
 }
 
@@ -71,6 +72,7 @@ pub struct IpcClient {
     writer: Mutex<Option<ActiveWriter>>,
     next_generation: AtomicU64,
     next_request_id: AtomicU64,
+    protocol_version: AtomicU16,
     pending: Mutex<HashMap<u64, PendingRequest>>,
     connection_state: watch::Sender<IpcConnectionState>,
     daemon_status: watch::Sender<DaemonStatus>,
@@ -103,6 +105,7 @@ impl IpcClient {
             health: negotiated.ack.health,
             deployment_mode: Some(negotiated.ack.deployment_mode),
             supervisor: Some(negotiated.ack.supervisor),
+            capabilities: negotiated.ack.capabilities.clone(),
             components: std::collections::BTreeMap::new(),
         };
         let (conn_state_tx, _) = watch::channel(IpcConnectionState::Connected);
@@ -115,6 +118,7 @@ impl IpcClient {
             })),
             next_generation: AtomicU64::new(2),
             next_request_id: AtomicU64::new(1),
+            protocol_version: AtomicU16::new(negotiated.ack.protocol_version),
             pending: Mutex::new(HashMap::new()),
             connection_state: conn_state_tx,
             daemon_status: daemon_status_tx,
@@ -180,7 +184,7 @@ impl IpcClient {
             write_msg(
                 &mut writer,
                 &ClientMessage::Hello {
-                    supported_versions: vec![MIN_PROTOCOL_VERSION, PROTOCOL_VERSION],
+                    supported_versions: (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).collect(),
                 },
             ),
         )
@@ -432,6 +436,8 @@ impl IpcClient {
     }
 
     fn update_hello_ack(&self, ack: HelloAck) {
+        self.protocol_version
+            .store(ack.protocol_version, Ordering::Release);
         self.daemon_status.send_modify(|status| {
             status.version = ack.daemon_version;
             status.instance_id = ack.instance_id;
@@ -440,6 +446,7 @@ impl IpcClient {
             status.health = ack.health;
             status.deployment_mode = Some(ack.deployment_mode);
             status.supervisor = Some(ack.supervisor);
+            status.capabilities = ack.capabilities;
         });
     }
 
@@ -479,6 +486,23 @@ impl IpcClient {
             }
             ResponsePayload::UserCreated { user_id, username } => {
                 format!("Created user {} ({})", username, user_id)
+            }
+            ResponsePayload::TuCredentialPreview(preview) => {
+                format!("Inspected {} ({})", preview.username, preview.user_id)
+            }
+            ResponsePayload::UserReconciled(result) => {
+                format!("Reconciled user {}: {:?}", result.user_id, result.action)
+            }
+            ResponsePayload::UserDiagnostics(diagnostics) => format!(
+                "User {}: state={:?}, data={}, credential={:?}, trusted_apps={}",
+                diagnostics.user_id,
+                diagnostics.local_state,
+                diagnostics.data_present,
+                diagnostics.credential_status,
+                diagnostics.trusted_app_count,
+            ),
+            ResponsePayload::UserCredentialExport { .. } => {
+                "Credential export payload withheld.".into()
             }
             ResponsePayload::UserRemoved { user_id } => {
                 format!("Removed user {}", user_id)
@@ -589,7 +613,7 @@ impl IpcClient {
 
         let envelope = RequestEnvelope {
             request_id,
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: self.protocol_version.load(Ordering::Acquire),
             request,
         };
         if let Err(error) = self.send(ClientMessage::Request(envelope)).await {

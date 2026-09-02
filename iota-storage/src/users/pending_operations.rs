@@ -7,6 +7,7 @@ pub enum PendingUserOperationKind {
     Create,
     Attach,
     Release,
+    Purge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,15 +16,21 @@ pub enum PendingUserOperationPhase {
     CredentialWritten,
     RemoteCommitted,
     LocalCommitted,
+    DatabasePurged,
+    E2eePurged,
+    FilesystemPurged,
 }
 
 impl PendingUserOperationPhase {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Prepared => "prepared",
             Self::CredentialWritten => "credential_written",
             Self::RemoteCommitted => "remote_committed",
             Self::LocalCommitted => "local_committed",
+            Self::DatabasePurged => "database_purged",
+            Self::E2eePurged => "e2ee_purged",
+            Self::FilesystemPurged => "filesystem_purged",
         }
     }
 
@@ -33,6 +40,9 @@ impl PendingUserOperationPhase {
             "credential_written" => Ok(Self::CredentialWritten),
             "remote_committed" => Ok(Self::RemoteCommitted),
             "local_committed" => Ok(Self::LocalCommitted),
+            "database_purged" => Ok(Self::DatabasePurged),
+            "e2ee_purged" => Ok(Self::E2eePurged),
+            "filesystem_purged" => Ok(Self::FilesystemPurged),
             _ => Err(StorageError::Other(
                 "unknown pending user operation phase".into(),
             )),
@@ -41,11 +51,12 @@ impl PendingUserOperationPhase {
 }
 
 impl PendingUserOperationKind {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Create => "create",
             Self::Attach => "attach",
             Self::Release => "release",
+            Self::Purge => "purge",
         }
     }
 
@@ -54,6 +65,7 @@ impl PendingUserOperationKind {
             "create" => Ok(Self::Create),
             "attach" => Ok(Self::Attach),
             "release" => Ok(Self::Release),
+            "purge" => Ok(Self::Purge),
             _ => Err(StorageError::Other("unknown pending user operation".into())),
         }
     }
@@ -166,6 +178,23 @@ pub fn remove(user_id: i64) -> Result<(), StorageError> {
     db::with_immediate_transaction(|tx| {
         tx.execute(
             "DELETE FROM pending_user_operations WHERE user_id = ?1",
+            [user_id],
+        )?;
+        Ok(())
+    })
+}
+
+pub fn complete_purge(user_id: i64, updated_at: i64) -> Result<(), StorageError> {
+    db::with_immediate_transaction(|tx| {
+        let changed = tx.execute(
+            "UPDATE user_residency SET data_state = 'empty', updated_at = ?2 WHERE user_id = ?1",
+            params![user_id, updated_at],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Other("user residency was not found".into()));
+        }
+        tx.execute(
+            "DELETE FROM pending_user_operations WHERE user_id = ?1 AND operation = 'purge'",
             [user_id],
         )?;
         Ok(())

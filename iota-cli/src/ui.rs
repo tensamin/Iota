@@ -1,5 +1,5 @@
 use crate::{
-    controls::header::render_header,
+    controls::header::{HEADER_ITEMS, render_header},
     help_overlay::HelpOverlay,
     input_handler::setup_input_handler,
     interaction_result::InteractionResult,
@@ -432,19 +432,16 @@ impl UI {
             if header_is_focused {
                 let mut action = None;
                 if let Ok(mut focus) = self.header_focus.lock() {
-                    let index = focus.unwrap_or(0);
+                    let index = focus.unwrap_or(0).min(HEADER_ITEMS.len().saturating_sub(1));
                     match key.code {
-                        KeyCode::Left | KeyCode::BackTab => *focus = Some((index + 3) % 4),
-                        KeyCode::Right | KeyCode::Tab => *focus = Some((index + 1) % 4),
+                        KeyCode::Left | KeyCode::BackTab => {
+                            *focus = Some((index + HEADER_ITEMS.len() - 1) % HEADER_ITEMS.len())
+                        }
+                        KeyCode::Right | KeyCode::Tab => {
+                            *focus = Some((index + 1) % HEADER_ITEMS.len())
+                        }
                         KeyCode::Enter | KeyCode::Char(' ') => {
-                            action = Some(
-                                [
-                                    AppAction::OpenOverview,
-                                    AppAction::OpenUsers,
-                                    AppAction::OpenSettings,
-                                    AppAction::Quit,
-                                ][index],
-                            );
+                            action = HEADER_ITEMS.get(index).map(|item| item.action);
                             *focus = None;
                         }
                         KeyCode::Esc => *focus = None,
@@ -607,7 +604,8 @@ impl UI {
                                 username: u.username,
                                 state: u.state,
                                 data_present: u.data_present,
-                                credential_present: u.credential_present,
+                                credential_status: u.credential_status,
+                                pending_operation: u.pending_operation,
                             })
                             .collect())
                     }

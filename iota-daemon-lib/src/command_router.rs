@@ -3,8 +3,9 @@ use crate::{DaemonRuntime, DaemonServices};
 use iota_ipc::{
     CommunitySummary, ComponentStatusResponse, ConfigResponse, DaemonMessage, ExitIntent,
     IpcErrorCode, LocalRequest, LogEntriesResponse, LogEntry, MAX_MESSAGE_SIZE,
-    OmikronStatusResponse, ResponseEnvelope, ResponsePayload, ResponseResult, StatusResponse,
-    TaskSummary, UpdateStatusResponse, UserDetailResponse, UserSummary,
+    OmikronStatusResponse, ReconcileAction, ResponseEnvelope, ResponsePayload, ResponseResult,
+    StatusResponse, TaskSummary, UpdateStatusResponse, UserDetailResponse, UserDiagnostics,
+    UserOperationKind, UserOperationSummary, UserReconcileResult, UserSummary,
 };
 use iota_logger::{log, log_command};
 use iota_storage::users::pending_operations::{
@@ -28,6 +29,30 @@ pub struct PeerContext {
 }
 
 const MAX_LOG_ENTRIES_PER_RESPONSE: usize = 512;
+
+fn credential_status(
+    residency: &user_manager::UserResidency,
+    profile: Option<&iota_storage::users::user_profile::UserProfile>,
+) -> iota_ipc::CredentialStatus {
+    match (residency.state, residency.credential_origin) {
+        (user_manager::LocalUserState::Released, _) => iota_ipc::CredentialStatus::None,
+        (_, user_manager::CredentialOrigin::External) => iota_ipc::CredentialStatus::External,
+        (_, user_manager::CredentialOrigin::Local)
+            if profile.is_some_and(|profile| {
+                iota_util::file_util::read_user_credential_with_legacy(
+                    residency.user_id,
+                    &profile.username,
+                )
+                .ok()
+                .flatten()
+                .is_some()
+            }) =>
+        {
+            iota_ipc::CredentialStatus::LocalPresent
+        }
+        _ => iota_ipc::CredentialStatus::Missing,
+    }
+}
 
 fn now_millis() -> i64 {
     SystemTime::now()
@@ -119,7 +144,9 @@ impl CommandRouter {
         let needs_omikron = matches!(
             request,
             LocalRequest::CreateUser { .. }
+                | LocalRequest::InspectTuCredential { .. }
                 | LocalRequest::AttachUserFromTu { .. }
+                | LocalRequest::ReconcileUser { .. }
                 | LocalRequest::ReleaseUser { .. }
                 | LocalRequest::CompleteDeleteUser { .. }
         );
@@ -162,22 +189,35 @@ impl CommandRouter {
                 ResponseResult::Ok(ResponsePayload::Tasks(tasks))
             }
             LocalRequest::ListUsers => {
+                let pending = match pending_operations::get_all() {
+                    Ok(operations) => operations
+                        .into_iter()
+                        .map(|operation| {
+                            let kind = match operation.operation {
+                                PendingUserOperationKind::Create => UserOperationKind::Create,
+                                PendingUserOperationKind::Attach => UserOperationKind::Attach,
+                                PendingUserOperationKind::Release => UserOperationKind::Release,
+                                PendingUserOperationKind::Purge => UserOperationKind::Purge,
+                            };
+                            (
+                                operation.user_id,
+                                UserOperationSummary {
+                                    operation: kind,
+                                    phase: operation.phase.as_str().into(),
+                                },
+                            )
+                        })
+                        .collect::<std::collections::HashMap<_, _>>(),
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
                 let users = user_manager::get_residency()
                     .into_iter()
                     .map(|user| {
+                        let user_id = user.user_id;
                         let profile = user_manager::get_user(user.user_id)?;
                         Ok(UserSummary {
-                            credential_present: user.state == user_manager::LocalUserState::Managed
-                                && profile.is_some_and(|profile| {
-                                    iota_util::file_util::read_user_credential_with_legacy(
-                                        user.user_id,
-                                        &profile.username,
-                                    )
-                                    .ok()
-                                    .flatten()
-                                    .is_some()
-                                }),
-                            user_id: user.user_id,
+                            credential_status: credential_status(&user, profile.as_ref()),
+                            user_id,
                             username: user.username,
                             state: match user.state {
                                 user_manager::LocalUserState::Managed => {
@@ -188,6 +228,7 @@ impl CommandRouter {
                                 }
                             },
                             data_present: user.data_present,
+                            pending_operation: pending.get(&user_id).cloned(),
                         })
                     })
                     .collect::<Result<Vec<_>, iota_storage::storage_error::StorageError>>();
@@ -262,6 +303,163 @@ impl CommandRouter {
                     Err(error) => {
                         log!("Credential attach failed: {error:?}");
                         ResponseResult::Error(IpcErrorCode::Unauthorized)
+                    }
+                }
+            }
+            LocalRequest::InspectTuCredential { credential } => {
+                match omikron_connector::user_ops::inspect_tu_credential(
+                    self.services.omikron.as_ref(),
+                    &credential.0,
+                )
+                .await
+                {
+                    Ok(preview) => ResponseResult::Ok(ResponsePayload::TuCredentialPreview(
+                        iota_ipc::TuCredentialPreview {
+                            user_id: preview.user_id,
+                            username: preview.username,
+                            assigned_iota_id: preview.assigned_iota_id,
+                        },
+                    )),
+                    Err(error) => {
+                        log!("Credential inspection failed: {error:?}");
+                        ResponseResult::Error(IpcErrorCode::Unauthorized)
+                    }
+                }
+            }
+            LocalRequest::ReconcileUser { user_id } => {
+                let residency = match user_manager::get_residency_by_id(user_id) {
+                    Ok(Some(residency)) => residency,
+                    Ok(None) => return ResponseResult::Error(IpcErrorCode::NotFound),
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                let omega_iota_id = match omikron_connector::user_ops::get_remote_user_assignment(
+                    self.services.omikron.as_ref(),
+                    user_id,
+                )
+                .await
+                {
+                    Ok(assignment) => assignment,
+                    Err(error) => {
+                        log!("User reconciliation failed for {user_id}: {error:?}");
+                        return ResponseResult::Error(IpcErrorCode::OmikronUnavailable);
+                    }
+                };
+                let local_iota_id = config_util::CONFIG
+                    .load()
+                    .iota_id
+                    .and_then(|id| i64::try_from(id).ok());
+                let action = if residency.state == user_manager::LocalUserState::Managed
+                    && omega_iota_id != local_iota_id
+                {
+                    match user_manager::finalize_local_release(user_id, Some(&residency.username)) {
+                        Ok(()) => ReconcileAction::ReleasedLocally,
+                        Err(error) => {
+                            log!("User reconciliation cleanup failed for {user_id}: {error}");
+                            return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                        }
+                    }
+                } else {
+                    ReconcileAction::None
+                };
+                ResponseResult::Ok(ResponsePayload::UserReconciled(UserReconcileResult {
+                    user_id,
+                    local_state: match residency.state {
+                        user_manager::LocalUserState::Managed => iota_ipc::LocalUserState::Managed,
+                        user_manager::LocalUserState::Released => {
+                            iota_ipc::LocalUserState::Released
+                        }
+                    },
+                    omega_iota_id,
+                    action,
+                }))
+            }
+            LocalRequest::ForceDetachUser { user_id } => {
+                match user_manager::force_local_detach(user_id) {
+                    Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: format!(
+                            "Force-detached user {user_id} locally; Omega was not changed"
+                        ),
+                    }),
+                    Err(error) => {
+                        log!("Force local detach failed for {user_id}: {error}");
+                        ResponseResult::Error(IpcErrorCode::StorageFailure)
+                    }
+                }
+            }
+            LocalRequest::ForgetReleasedUser { user_id } => {
+                match user_manager::forget_released_user(user_id) {
+                    Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: format!("Forgot released user residency {user_id}"),
+                    }),
+                    Err(error) => {
+                        log!("Forget residency failed for {user_id}: {error}");
+                        ResponseResult::Error(IpcErrorCode::Conflict)
+                    }
+                }
+            }
+            LocalRequest::GetUserDiagnostics { user_id } => {
+                let residency = match user_manager::get_residency_by_id(user_id) {
+                    Ok(Some(residency)) => residency,
+                    Ok(None) => return ResponseResult::Error(IpcErrorCode::NotFound),
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                let profile = match user_manager::get_user(user_id) {
+                    Ok(profile) => profile,
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                let pending_operation = match pending_operations::get_all() {
+                    Ok(operations) => operations
+                        .into_iter()
+                        .find(|operation| operation.user_id == user_id)
+                        .map(|operation| {
+                            format!(
+                                "{}/{}",
+                                operation.operation.as_str(),
+                                operation.phase.as_str()
+                            )
+                        }),
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                let credential_status = credential_status(&residency, profile.as_ref());
+                ResponseResult::Ok(ResponsePayload::UserDiagnostics(UserDiagnostics {
+                    user_id,
+                    username: residency.username,
+                    local_state: match residency.state {
+                        user_manager::LocalUserState::Managed => iota_ipc::LocalUserState::Managed,
+                        user_manager::LocalUserState::Released => {
+                            iota_ipc::LocalUserState::Released
+                        }
+                    },
+                    data_present: residency.data_present,
+                    credential_status,
+                    trusted_app_count: profile
+                        .as_ref()
+                        .map_or(0, |profile| profile.trusted_apps.len()),
+                    pending_operation,
+                }))
+            }
+            LocalRequest::RevokeTrustedApp { user_id, app_id } => {
+                match user_manager::revoke_trusted_app(user_id, &app_id) {
+                    Ok(true) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: format!("Revoked trusted application {app_id} for user {user_id}"),
+                    }),
+                    Ok(false) => ResponseResult::Error(IpcErrorCode::NotFound),
+                    Err(error) => {
+                        log!("Trusted application revocation failed for {user_id}: {error}");
+                        ResponseResult::Error(IpcErrorCode::StorageFailure)
+                    }
+                }
+            }
+            LocalRequest::RevokeAllTrustedApps { user_id } => {
+                match user_manager::revoke_all_trusted_apps(user_id) {
+                    Ok(removed) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: format!(
+                            "Revoked {removed} trusted applications for user {user_id}"
+                        ),
+                    }),
+                    Err(error) => {
+                        log!("Trusted application revocation failed for {user_id}: {error}");
+                        ResponseResult::Error(IpcErrorCode::StorageFailure)
                     }
                 }
             }
@@ -457,33 +655,71 @@ impl CommandRouter {
                     .collect();
                 ResponseResult::Ok(ResponsePayload::Components(components))
             }
-            LocalRequest::GetUser { user_id } => match user_manager::get_user(user_id) {
-                Ok(Some(user)) => {
-                    let credential_present =
-                        iota_util::file_util::read_user_credential_with_legacy(
-                            user_id,
-                            &user.username,
-                        )
-                        .ok()
-                        .flatten()
-                        .is_some();
-                    ResponseResult::Ok(ResponsePayload::UserDetail(UserDetailResponse {
-                        user_id: user.user_id,
-                        username: user.username,
-                        display_name: user.display_name,
-                        created_at: user.created_at,
-                        trusted_apps: user.trusted_apps.keys().cloned().collect(),
-                        state: iota_ipc::LocalUserState::Managed,
-                        data_present: user_manager::get_residency()
-                            .iter()
-                            .find(|entry| entry.user_id == user_id)
-                            .is_none_or(|entry| entry.data_present),
-                        credential_present,
-                    }))
+            LocalRequest::GetUser { user_id } => {
+                let residency = match user_manager::get_residency_by_id(user_id) {
+                    Ok(Some(residency)) => residency,
+                    Ok(None) => return ResponseResult::Error(IpcErrorCode::NotFound),
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                match user_manager::get_user(user_id) {
+                    Ok(Some(user)) => {
+                        let credential_status = credential_status(&residency, Some(&user));
+                        ResponseResult::Ok(ResponsePayload::UserDetail(UserDetailResponse {
+                            user_id: user.user_id,
+                            username: user.username,
+                            display_name: user.display_name,
+                            created_at: user.created_at,
+                            trusted_apps: user.trusted_apps.keys().cloned().collect(),
+                            state: iota_ipc::LocalUserState::Managed,
+                            data_present: residency.data_present,
+                            credential_status,
+                        }))
+                    }
+                    Ok(None) if residency.state == user_manager::LocalUserState::Released => {
+                        ResponseResult::Ok(ResponsePayload::UserDetail(UserDetailResponse {
+                            user_id: residency.user_id,
+                            username: residency.username,
+                            display_name: None,
+                            created_at: 0,
+                            trusted_apps: Vec::new(),
+                            state: iota_ipc::LocalUserState::Released,
+                            data_present: residency.data_present,
+                            credential_status: iota_ipc::CredentialStatus::None,
+                        }))
+                    }
+                    Ok(None) => ResponseResult::Error(IpcErrorCode::StorageFailure),
+                    Err(_) => ResponseResult::Error(IpcErrorCode::StorageFailure),
                 }
-                Ok(None) => ResponseResult::Error(IpcErrorCode::NotFound),
-                Err(_) => ResponseResult::Error(IpcErrorCode::StorageFailure),
-            },
+            }
+            LocalRequest::ExportUserCredential { user_id } => {
+                let residency = match user_manager::get_residency_by_id(user_id) {
+                    Ok(Some(residency)) => residency,
+                    Ok(None) => return ResponseResult::Error(IpcErrorCode::NotFound),
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                if residency.state != user_manager::LocalUserState::Managed
+                    || residency.credential_origin != user_manager::CredentialOrigin::Local
+                {
+                    return ResponseResult::Error(IpcErrorCode::Conflict);
+                }
+                let credential = match iota_util::file_util::read_user_credential_with_legacy(
+                    user_id,
+                    &residency.username,
+                ) {
+                    Ok(Some(credential)) => credential,
+                    Ok(None) => return ResponseResult::Error(IpcErrorCode::NotFound),
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                let parsed = match iota_util::tu::TuCredential::parse(&credential) {
+                    Ok(parsed) if parsed.user_id == user_id => parsed,
+                    Ok(_) | Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                ResponseResult::Ok(ResponsePayload::UserCredentialExport {
+                    user_id,
+                    username: residency.username,
+                    credential: iota_ipc::SecretString(parsed.to_canonical_string()),
+                })
+            }
             LocalRequest::ImportUser { .. } => ResponseResult::Error(IpcErrorCode::InvalidRequest),
             LocalRequest::GetLogs { limit } => {
                 let entries = if let Ok(buf) = self.log_buffer.lock() {
@@ -538,6 +774,19 @@ mod tests {
             LocalRequest::AttachUserFromTu {
                 credential: SecretString("credential".into()),
             },
+            LocalRequest::InspectTuCredential {
+                credential: SecretString("credential".into()),
+            },
+            LocalRequest::ReconcileUser { user_id: 1 },
+            LocalRequest::ForceDetachUser { user_id: 1 },
+            LocalRequest::ForgetReleasedUser { user_id: 1 },
+            LocalRequest::GetUserDiagnostics { user_id: 1 },
+            LocalRequest::RevokeTrustedApp {
+                user_id: 1,
+                app_id: "desktop".into(),
+            },
+            LocalRequest::RevokeAllTrustedApps { user_id: 1 },
+            LocalRequest::ExportUserCredential { user_id: 1 },
             LocalRequest::PurgeUserData { user_id: 1 },
             LocalRequest::ReleaseUser { user_id: 1 },
             LocalRequest::CompleteDeleteUser {
@@ -570,7 +819,7 @@ mod tests {
             LocalRequest::ListCommunities,
         ];
 
-        assert_eq!(requests.len(), 25);
+        assert_eq!(requests.len(), 33);
         for request in requests {
             let required = request.required_role();
             assert!(IpcRole::Admin.allows(required));

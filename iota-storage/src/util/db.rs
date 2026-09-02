@@ -710,6 +710,110 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    if current_version < 21 {
+        let users_exist: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users')",
+            [],
+            |row| row.get(0),
+        )?;
+        if users_exist {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE users RENAME TO users_before_credential_origin;
+                CREATE TABLE users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    public_key TEXT NOT NULL,
+                    private_key_hash TEXT,
+                    reset_token TEXT,
+                    created_at INTEGER NOT NULL,
+                    display_name TEXT
+                );
+                INSERT INTO users (user_id, username, public_key, private_key_hash, reset_token, created_at, display_name)
+                    SELECT user_id, username, public_key, private_key_hash, reset_token, created_at, display_name
+                    FROM users_before_credential_origin;
+                DROP TABLE users_before_credential_origin;
+                "#,
+            )?;
+        }
+        let residency_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user_residency')",
+            [],
+            |row| row.get(0),
+        )?;
+        if residency_exists {
+            add_table_column_if_missing(
+                conn,
+                "user_residency",
+                "credential_origin",
+                "credential_origin TEXT NOT NULL DEFAULT 'local' CHECK (credential_origin IN ('local', 'external'))",
+            )?;
+        }
+        conn.pragma_update(None, "user_version", 21)?;
+    }
+
+    if current_version < 22 {
+        let pending_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pending_user_operations')",
+            [],
+            |row| row.get(0),
+        )?;
+        if pending_exists {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE pending_user_operations RENAME TO pending_user_operations_before_purge;
+                CREATE TABLE pending_user_operations (
+                    user_id INTEGER PRIMARY KEY,
+                    operation TEXT NOT NULL
+                        CHECK (operation IN ('create', 'attach', 'release', 'purge')),
+                    username TEXT NOT NULL,
+                    public_key TEXT,
+                    private_key_hash TEXT,
+                    reset_token TEXT,
+                    registration_token TEXT,
+                    phase TEXT NOT NULL DEFAULT 'prepared'
+                        CHECK (phase IN (
+                            'prepared', 'credential_written', 'remote_committed', 'local_committed',
+                            'database_purged', 'e2ee_purged', 'filesystem_purged'
+                        )),
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO pending_user_operations (
+                    user_id, operation, username, public_key, private_key_hash,
+                    reset_token, registration_token, phase, created_at
+                )
+                SELECT user_id, operation, username, public_key, private_key_hash,
+                       reset_token, registration_token, phase, created_at
+                FROM pending_user_operations_before_purge;
+                DROP TABLE pending_user_operations_before_purge;
+                CREATE INDEX idx_pending_user_operations_operation
+                    ON pending_user_operations (operation, created_at);
+                "#,
+            )?;
+        }
+        conn.pragma_update(None, "user_version", 22)?;
+    }
+
+    if current_version < 23 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS user_invitations (
+                invitation_id TEXT PRIMARY KEY,
+                token_hash BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                state TEXT NOT NULL CHECK (state IN ('pending', 'redeemed', 'revoked', 'expired')),
+                redeemed_user_id INTEGER,
+                redeemed_at INTEGER,
+                revoked_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_invitations_state_created
+                ON user_invitations (state, created_at);
+            PRAGMA user_version = 23;
+            "#,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -779,7 +883,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 20);
+        assert_eq!(version, 23);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -798,7 +902,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 20);
+        assert_eq!(version, 23);
         for table in [
             "sync_heads",
             "sync_events",
@@ -813,6 +917,7 @@ mod tests {
             "blocked_users",
             "user_receipt_policy",
             "user_message_storage_policy",
+            "user_invitations",
         ] {
             let exists: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -837,7 +942,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 20);
+        assert_eq!(version, 23);
         for column in [
             "id",
             "user_id",
@@ -853,6 +958,86 @@ mod tests {
             assert!(statement.exists([column])?);
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn credential_origin_migration_allows_external_profiles() -> Result<(), StorageError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                public_key TEXT NOT NULL,
+                private_key_hash TEXT NOT NULL,
+                reset_token TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                display_name TEXT
+            );
+            CREATE TABLE user_residency (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT NOT NULL,
+                lifecycle_state TEXT NOT NULL,
+                data_state TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 20;
+            "#,
+        )?;
+        run_migrations_on_connection(&conn)?;
+        conn.execute(
+            "INSERT INTO users (user_id, username, public_key, private_key_hash, reset_token, created_at) VALUES (1, 'alice', 'key', NULL, NULL, 1)",
+            [],
+        )?;
+        let origin_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('user_residency') WHERE name = 'credential_origin'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(origin_exists, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_purge_migration_preserves_lifecycle_operations() -> Result<(), StorageError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE pending_user_operations (
+                user_id INTEGER PRIMARY KEY,
+                operation TEXT NOT NULL
+                    CHECK (operation IN ('create', 'attach', 'release')),
+                username TEXT NOT NULL,
+                public_key TEXT,
+                private_key_hash TEXT,
+                reset_token TEXT,
+                registration_token TEXT,
+                phase TEXT NOT NULL DEFAULT 'prepared'
+                    CHECK (phase IN ('prepared', 'credential_written', 'remote_committed', 'local_committed')),
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO pending_user_operations (
+                user_id, operation, username, phase, created_at
+            ) VALUES (1, 'release', 'alice', 'remote_committed', 1);
+            PRAGMA user_version = 21;
+            "#,
+        )?;
+
+        run_migrations_on_connection(&conn)?;
+        conn.execute(
+            "INSERT INTO pending_user_operations (user_id, operation, username, phase, created_at) VALUES (2, 'purge', 'bob', 'filesystem_purged', 2)",
+            [],
+        )?;
+
+        let preserved: String = conn.query_row(
+            "SELECT phase FROM pending_user_operations WHERE user_id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(preserved, "remote_committed");
+        assert_eq!(version, 23);
         Ok(())
     }
 }

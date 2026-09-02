@@ -38,7 +38,7 @@ use iota_util::route_target::RouteTarget;
 
 const IOTA_KEYRING_PATH: &str = "iota.mk";
 static IDENTITY_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-static OMIKRON_PUBLIC_KEY_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static OMIKRON_TRUST_DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 fn record_origin_delivery_failure(signer_id: u64, relay_message_id: &str, failure: &str) {
     let Ok(storage_owner) = i64::try_from(signer_id) else {
@@ -60,10 +60,10 @@ fn record_origin_delivery_failure(signer_id: u64, relay_message_id: &str, failur
  * working directory, so restarts use the same trusted material.
  */
 pub fn configure_identity_path(path: PathBuf) {
-    let key_path = path.parent().map(|parent| parent.join("omikron.mpkb"));
+    let trust_directory = path.parent().map(|parent| parent.join("omikrons"));
     let _ = IDENTITY_PATH.set(path);
-    if let Some(key_path) = key_path {
-        let _ = OMIKRON_PUBLIC_KEY_PATH.set(key_path);
+    if let Some(trust_directory) = trust_directory {
+        let _ = OMIKRON_TRUST_DIRECTORY.set(trust_directory);
     }
 }
 fn identity_path() -> &'static Path {
@@ -72,11 +72,22 @@ fn identity_path() -> &'static Path {
         .map(PathBuf::as_path)
         .unwrap_or_else(|| Path::new(IOTA_KEYRING_PATH))
 }
-fn omikron_public_key_path() -> &'static Path {
-    OMIKRON_PUBLIC_KEY_PATH
+fn omikron_trust_directory() -> &'static Path {
+    OMIKRON_TRUST_DIRECTORY
         .get()
         .map(PathBuf::as_path)
-        .unwrap_or_else(|| Path::new("omikron.mpkb"))
+        .unwrap_or_else(|| Path::new("omikrons"))
+}
+
+fn omikron_public_key_path(id: i64) -> PathBuf {
+    omikron_trust_directory().join(format!("{id}.mpkb"))
+}
+
+fn legacy_omikron_public_key_path() -> PathBuf {
+    identity_path()
+        .parent()
+        .map(|parent| parent.join("omikron.mpkb"))
+        .unwrap_or_else(|| PathBuf::from("omikron.mpkb"))
 }
 
 fn save_omikron_public_key(key: &PublicKeyBundle, path: &Path) -> Result<(), String> {
@@ -107,12 +118,19 @@ fn serialization_path(path: &Path) -> Result<PathBuf, String> {
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(45);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 const TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const TASK_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_HANDLERS: usize = 20;
 const RELAY_RETENTION_MILLIS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+struct ResolvedOmikronEndpoint {
+    id: Option<i64>,
+    host: String,
+    port: u16,
+    public_key: PublicKeyBundle,
+}
 
 #[derive(Debug)]
 pub enum IdentityError {
@@ -157,6 +175,18 @@ fn jittered_reconnect_delay(delay: Duration) -> Duration {
     let offset = (rng.next_u64() % range) as i128 - jitter_span as i128;
     let jittered = (base_ms as i128 + offset).clamp(0, i128::from(ceiling_ms));
     Duration::from_millis(u64::try_from(jittered).expect("bounded jitter must be non-negative"))
+}
+
+fn map_await_response_error(error: String) -> OmikronError {
+    if error.contains("timed out") {
+        OmikronError::Timeout(error)
+    } else if error.contains("kind=not_found") {
+        OmikronError::Rejected(CommunicationType::ErrorNotFound, error)
+    } else if error.starts_with("Request rejected") {
+        OmikronError::Rejected(CommunicationType::Error, error)
+    } else {
+        OmikronError::Disconnected(error)
+    }
 }
 
 fn wire_user_id(user_id: i64) -> u64 {
@@ -443,10 +473,9 @@ impl OmikronConnection {
 
         let existing_iota_id = CONFIG.load().iota_id;
 
-        let (host, port, omikron_public_key) =
-            self.resolve_omikron_endpoint(existing_iota_id).await?;
+        let endpoint = self.resolve_omikron_endpoint(existing_iota_id).await?;
 
-        let addr_str = format!("https://{}:{}", host, port);
+        let addr_str = format!("https://{}:{}", endpoint.host, endpoint.port);
 
         log!("Connecting to Omikron at {}", addr_str);
 
@@ -470,25 +499,23 @@ impl OmikronConnection {
             client_config,
             existing_iota_id,
             &keyring,
-            &omikron_public_key,
+            &endpoint.public_key,
         )
         .await
         {
             Ok(connection) => connection,
             Err(mtp::common::CommunicationError::AuthenticationFailed(reason)) => {
-                let reason = format!(
-                    "Authentication failed: {}. Your Iota keys may be invalid or the private key has changed on the server.",
-                    reason
-                );
-                *self.reconnect_on_close.write().await = false;
-                *self.auth_failure.write().await = Some(reason.clone());
-                self.set_state(ConnectionState::Disconnected).await;
-                return Err(reason);
+                /* MTP currently combines invalid proofs with timeouts and backend
+                 * failures in this variant. Retrying is safe; stopping here can
+                 * strand an Iota during a temporary Omega outage. */
+                return Err(format!("Authentication attempt failed: {reason}"));
             }
             Err(e) => return Err(format!("Connection failed: {}", e)),
         };
 
         log_t!("omikron_connection_success");
+
+        self.persist_authenticated_omikron(&endpoint)?;
 
         if existing_iota_id.is_none() {
             modify_config(|cfg| cfg.iota_id = Some(connection.client_id));
@@ -564,22 +591,20 @@ impl OmikronConnection {
      * override for local dev/testing against a hand-run Omikron without a
      * live Omega.
      *
-     * The fetched Omikron public key is pinned to `omikron.mpkb` (trust on
-     * first use): if a cached key exists and a fresh discovery response
-     * disagrees with it, the mismatch is logged loudly and the cached key is
-     * kept rather than silently trusting whatever Omega's HTTP API returned
-     * this time - the same trust boundary the previous manual-file-drop
-     * model had, just automated for the common case.
+     * Keys are pinned per Omikron ID. A different relay can therefore be used
+     * after failover, while an unexpected key change for one relay remains a
+     * security error. Discovery data becomes durable only after MTP
+     * authentication has completed.
      */
     async fn resolve_omikron_endpoint(
         &self,
         existing_iota_id: Option<u64>,
-    ) -> Result<(String, u16, PublicKeyBundle), String> {
+    ) -> Result<ResolvedOmikronEndpoint, String> {
         if let (Ok(host), Ok(port_str)) = (env::var("OMIKRON_HOST"), env::var("OMIKRON_PORT")) {
             let port: u16 = port_str
                 .parse()
                 .map_err(|_| format!("Invalid OMIKRON_PORT: {}", port_str))?;
-            let key_path = omikron_public_key_path();
+            let key_path = Path::new("omikron.mpkb");
             let public_key = mtp::files::load_public_key_bundle(key_path)
                 .map_err(|e| {
                     format!(
@@ -587,20 +612,40 @@ impl OmikronConnection {
                         key_path.display(), e, key_path.display()
                     )
                 })?;
-            return Ok((host, port, public_key));
+            return Ok(ResolvedOmikronEndpoint {
+                id: None,
+                host,
+                port,
+                public_key,
+            });
         }
 
-        let key_path = omikron_public_key_path();
-        let cached_key = mtp::files::load_public_key_bundle(key_path).ok();
-        let cached_host_port = {
+        let cached_endpoint = {
             let conf = CONFIG.load();
-            match (&conf.omikron_host, conf.omikron_port) {
-                (Some(host), Some(port)) if !host.trim().is_empty() && port != 0 => {
-                    Some((host.clone(), port))
+            match (&conf.omikron_id, &conf.omikron_host, conf.omikron_port) {
+                (Some(id), Some(host), Some(port)) if !host.trim().is_empty() && port != 0 => {
+                    mtp::files::load_public_key_bundle(&omikron_public_key_path(*id))
+                        .ok()
+                        .map(|public_key| ResolvedOmikronEndpoint {
+                            id: Some(*id),
+                            host: host.clone(),
+                            port,
+                            public_key,
+                        })
                 }
-                (Some(_), Some(_)) => {
+                (Some(_), Some(_), Some(_)) => {
                     log!("Ignoring invalid cached Omikron endpoint in Iota configuration");
                     None
+                }
+                (None, Some(host), Some(port)) if !host.trim().is_empty() && port != 0 => {
+                    mtp::files::load_public_key_bundle(legacy_omikron_public_key_path())
+                        .ok()
+                        .map(|public_key| ResolvedOmikronEndpoint {
+                            id: None,
+                            host: host.clone(),
+                            port,
+                            public_key,
+                        })
                 }
                 _ => None,
             }
@@ -620,8 +665,9 @@ impl OmikronConnection {
             None => omega_discovery::discover_random().await.ok(),
         };
 
-        let (host, port, public_key) = if let Some(endpoint) = discovered {
-            match &cached_key {
+        let endpoint = if let Some(endpoint) = discovered {
+            let key_path = omikron_public_key_path(endpoint.id);
+            match mtp::files::load_public_key_bundle(&key_path).ok() {
                 Some(cached) => {
                     let keys_match =
                         match (cached.try_as_bytes(), endpoint.public_key.try_as_bytes()) {
@@ -632,49 +678,63 @@ impl OmikronConnection {
                         };
                     if !keys_match {
                         log!(
-                            "Fetched Omikron public key differs from the cached {} - keeping the \
-                             cached key. Delete {} manually if this is an expected key rotation.",
+                            "Fetched Omikron public key differs from the trusted {}. \
+                             Omikron key rotation requires an explicit trust refresh.",
                             key_path.display(),
-                            key_path.display()
                         );
-                        if let Some((cached_host, cached_port)) = &cached_host_port {
-                            (cached_host.clone(), *cached_port, cached.clone())
-                        } else {
-                            return Err(format!(
-                                "Omega returned an Omikron key that differs from {} and no validated cached endpoint is available",
-                                key_path.display()
-                            ));
-                        }
+                        return Err(format!(
+                            "Omega returned a changed public key for Omikron {}",
+                            endpoint.id
+                        ));
                     } else {
-                        (endpoint.host, endpoint.port, cached.clone())
+                        ResolvedOmikronEndpoint {
+                            id: Some(endpoint.id),
+                            host: endpoint.host,
+                            port: endpoint.port,
+                            public_key: cached,
+                        }
                     }
                 }
-                None => {
-                    if let Err(e) = save_omikron_public_key(&endpoint.public_key, key_path) {
-                        log!("Failed to cache Omikron public key: {}", e);
-                    }
-                    (endpoint.host, endpoint.port, endpoint.public_key)
-                }
+                None => ResolvedOmikronEndpoint {
+                    id: Some(endpoint.id),
+                    host: endpoint.host,
+                    port: endpoint.port,
+                    public_key: endpoint.public_key,
+                },
             }
-        } else if let (Some(cached), Some((host, port))) = (&cached_key, &cached_host_port) {
+        } else if let Some(cached) = cached_endpoint {
             log!(
                 "Omega discovery unreachable, falling back to last-known Omikron {}:{}",
-                host,
-                port
+                cached.host,
+                cached.port
             );
-            (host.clone(), *port, cached.clone())
+            cached
         } else {
             return Err(
                 "Omega discovery failed and no cached Omikron address/key is available".to_string(),
             );
         };
 
-        modify_config(|cfg| {
-            cfg.omikron_host = Some(host.clone());
-            cfg.omikron_port = Some(port);
-        });
+        Ok(endpoint)
+    }
 
-        Ok((host, port, public_key))
+    fn persist_authenticated_omikron(
+        &self,
+        endpoint: &ResolvedOmikronEndpoint,
+    ) -> Result<(), String> {
+        let Some(id) = endpoint.id else {
+            return Ok(());
+        };
+        let key_path = omikron_public_key_path(id);
+        std::fs::create_dir_all(omikron_trust_directory())
+            .map_err(|error| format!("create Omikron trust directory: {error}"))?;
+        save_omikron_public_key(&endpoint.public_key, &key_path)?;
+        modify_config(|cfg| {
+            cfg.omikron_id = Some(id);
+            cfg.omikron_host = Some(endpoint.host.clone());
+            cfg.omikron_port = Some(endpoint.port);
+        });
+        Ok(())
     }
 
     // -------------------------------------------------------------------------
@@ -1946,6 +2006,7 @@ impl OmikronConnection {
         dispatch!(MessageStoragePolicySet, handle_message_storage_policy_set);
         dispatch!(UserBlockCheck, handle_user_block_check);
         dispatch!(EraseHostedUserData, handle_erase_hosted_user_data);
+        dispatch!(ProvisionIotaUser, handle_iota_user_provisioning);
     }
 
     // -------------------------------------------------------------------------
@@ -1977,6 +2038,54 @@ impl OmikronConnection {
         let acknowledgement = CommunicationValue::new(CommunicationType::EraseHostedUserDataAck)
             .with_request_id(cv)
             .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
+        let _ = self.send_message(&acknowledgement).await;
+    }
+
+    /* Omega sends only public account metadata here. The locally created
+     * profile records an external credential origin and never receives a TU. */
+    async fn handle_iota_user_provisioning(self: Arc<Self>, cv: &CommunicationValue) {
+        let user_id = cv
+            .get_data(DataType::UserId)
+            .as_signed_number()
+            .and_then(|id| i64::try_from(id).ok())
+            .filter(|id| *id > 0);
+        let username = cv.get_data(DataType::Username).as_str().map(str::to_owned);
+        let public_key = cv.get_data(DataType::PublicKey).as_str().map(str::to_owned);
+        let invitation_id = cv
+            .get_data(DataType::InvitationId)
+            .as_str()
+            .filter(|value| uuid::Uuid::parse_str(value).is_ok())
+            .map(str::to_owned);
+        let Some((user_id, username, public_key, invitation_id)) = user_id
+            .zip(username)
+            .zip(public_key)
+            .zip(invitation_id)
+            .map(|(((id, username), key), invitation_id)| (id, username, key, invitation_id))
+        else {
+            let _ = self
+                .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
+                .await;
+            return;
+        };
+        let profile = iota_storage::users::user_profile::UserProfile::new(
+            user_id, username, None, public_key, None, None,
+        );
+        if iota_storage::users::user_manager::try_add_user_with_credential_origin(
+            profile,
+            iota_storage::users::user_manager::CredentialOrigin::External,
+        )
+        .is_err()
+        {
+            let _ = self
+                .send_message(&error_response(cv, CommunicationType::ErrorInternal))
+                .await;
+            return;
+        }
+        let acknowledgement =
+            CommunicationValue::new(CommunicationType::AcknowledgeIotaUserProvision)
+                .with_request_id(cv)
+                .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
+                .add_typed_default(DataType::InvitationId, DataValue::Str(invitation_id));
         let _ = self.send_message(&acknowledgement).await;
     }
 
@@ -2781,9 +2890,13 @@ impl OmikronConnection {
                         .or_else(|| response_cv.get_data(DataType::ErrorType).as_str())
                         .unwrap_or("connection error")
                         .to_string();
+                    let rejection_kind = if response_cv.is_type(CommunicationType::ErrorNotFound) {
+                        "not_found"
+                    } else {
+                        "other"
+                    };
                     Err(format!(
-                        "Request rejected (msg_id={}, reason={})",
-                        msg_id, reason
+                        "Request rejected (kind={rejection_kind}, msg_id={msg_id}, reason={reason})"
                     ))
                 } else {
                     Ok(response_cv)
@@ -3029,15 +3142,7 @@ impl OmikronClient for OmikronConnection {
     ) -> Result<CommunicationValue, OmikronError> {
         Self::await_response(self, value, Some(timeout))
             .await
-            .map_err(|error| {
-                if error.contains("timed out") {
-                    OmikronError::Timeout(error)
-                } else if error.starts_with("Request rejected") {
-                    OmikronError::Internal(error)
-                } else {
-                    OmikronError::Disconnected(error)
-                }
-            })
+            .map_err(map_await_response_error)
     }
 
     async fn reconnect(&self) -> Result<(), OmikronError> {
@@ -3164,5 +3269,22 @@ mod tests {
         }
 
         assert!(jittered_reconnect_delay(Duration::from_secs(600)) <= MAX_RECONNECT_DELAY);
+    }
+
+    #[test]
+    fn per_omikron_trust_paths_do_not_collide() {
+        assert_ne!(omikron_public_key_path(1), omikron_public_key_path(2));
+    }
+
+    #[test]
+    fn not_found_response_is_preserved_for_callers() {
+        let error = map_await_response_error(
+            "Request rejected (kind=not_found, msg_id=1, reason=connection error)".into(),
+        );
+
+        assert!(matches!(
+            error,
+            OmikronError::Rejected(CommunicationType::ErrorNotFound, _)
+        ));
     }
 }

@@ -400,10 +400,18 @@ fn print_help() {
     println!("  tasks                  List active tasks");
     println!("  users list             List all users");
     println!("  users show <ID>        Show user details");
-    println!("  users add <NAME>       Create a new user");
-    println!("  users add --tu <PATH>  Add an existing account credential");
+    println!("  users add create <NAME> Create a new user");
+    println!("  users add tu <PATH>    Attach an existing account credential");
     println!("  users data purge <ID>  Purge hosted data (requires --yes)");
-    println!("  users release <ID>     Release this Iota (requires --yes)");
+    println!("  users hosting release <ID> Release from this Iota (requires --yes)");
+    println!("  users account delete <ID> Delete the Tensamin account (requires --yes)");
+    println!("  users repair reconcile <ID> Compare local state with Omega");
+    println!("  users repair diagnostics <ID> Show local lifecycle diagnostics");
+    println!("  users repair force-detach <ID> Remove local management (requires --yes)");
+    println!("  users forget <ID>      Forget an empty released residency (requires --yes)");
+    println!("  users apps revoke <ID> <APP> Revoke a trusted app (requires --yes)");
+    println!("  users apps revoke-all <ID> Revoke all trusted apps (requires --yes)");
+    println!("  users credential export <ID> --output <PATH> Export the local TU");
     println!("  omikron status         Show Omikron connection status");
     println!("  omikron reconnect      Reconnect to Omikron");
     println!("  identity rotate        Rotate identity keys (requires --yes)");
@@ -549,6 +557,7 @@ async fn run_command(
     output: OutputFormat,
 ) -> Result<(), StartupError> {
     let color = ColorConfig::new();
+    let mut credential_output = None;
     let request = match command {
         Command::Status => LocalRequest::GetStatus,
         Command::Tasks => LocalRequest::ListTasks,
@@ -622,6 +631,40 @@ async fn run_command(
                 credential,
             }
         }
+        Command::UsersReconcile { user_id } => LocalRequest::ReconcileUser { user_id },
+        Command::UsersDiagnostics { user_id } => LocalRequest::GetUserDiagnostics { user_id },
+        Command::UsersForceDetach {
+            user_id,
+            confirmed: true,
+        } => LocalRequest::ForceDetachUser { user_id },
+        Command::UsersForget {
+            user_id,
+            confirmed: true,
+        } => LocalRequest::ForgetReleasedUser { user_id },
+        Command::UsersRevokeApp {
+            user_id,
+            app_id,
+            confirmed: true,
+        } => LocalRequest::RevokeTrustedApp { user_id, app_id },
+        Command::UsersRevokeAllApps {
+            user_id,
+            confirmed: true,
+        } => LocalRequest::RevokeAllTrustedApps { user_id },
+        Command::UsersExportCredential { user_id, output } => {
+            let daemon_status = ipc.daemon_status();
+            if !daemon_status
+                .borrow()
+                .capabilities
+                .iter()
+                .any(|capability| capability == "credential_export_v1")
+            {
+                return Err(StartupError::InvalidCommand(
+                    "The connected daemon does not support credential export.".into(),
+                ));
+            }
+            credential_output = Some(output);
+            LocalRequest::ExportUserCredential { user_id }
+        }
         Command::OmikronReconnect => LocalRequest::ReconnectOmikron,
         Command::IdentityRotate { confirmed: true } => LocalRequest::RotateIotaIdentity,
         Command::RegenerateKeys { confirmed: true } => LocalRequest::RotateIotaIdentity,
@@ -648,6 +691,18 @@ async fn run_command(
             confirmed: false, ..
         }
         | Command::UsersCompleteDelete {
+            confirmed: false, ..
+        }
+        | Command::UsersForceDetach {
+            confirmed: false, ..
+        }
+        | Command::UsersForget {
+            confirmed: false, ..
+        }
+        | Command::UsersRevokeApp {
+            confirmed: false, ..
+        }
+        | Command::UsersRevokeAllApps {
             confirmed: false, ..
         }
         | Command::IdentityRotate { confirmed: false }
@@ -685,6 +740,38 @@ async fn run_command(
         .map_err(|e| StartupError::Other(e.to_string()))?
     {
         ResponseResult::Ok(payload) => {
+            if let ResponsePayload::UserCredentialExport {
+                user_id,
+                username,
+                credential,
+            } = &payload
+            {
+                let path = credential_output.as_deref().ok_or_else(|| {
+                    StartupError::Other(
+                        "Refusing to render a credential without an export destination.".into(),
+                    )
+                })?;
+                iota_util::atomic_file::create_private(path, credential.0.as_bytes()).map_err(
+                    |error| {
+                        StartupError::Other(format!(
+                            "Cannot export credential to {}: {error}",
+                            path.display()
+                        ))
+                    },
+                )?;
+                println!(
+                    "Exported credential for {} ({}) to {}.",
+                    username,
+                    user_id,
+                    path.display()
+                );
+                return Ok(());
+            }
+            if credential_output.is_some() {
+                return Err(StartupError::Other(
+                    "The daemon returned an unexpected credential export response.".into(),
+                ));
+            }
             if !matches!(output, OutputFormat::Text) {
                 return render_structured(&payload, output);
             }
@@ -725,11 +812,34 @@ async fn run_command(
                     if users.is_empty() {
                         println!("{}", cli_color::muted(&color, "No users."));
                     } else {
+                        println!(
+                            "{:<12} {:<18} {:<10} {:<9} {:<12} PENDING",
+                            "ID", "USERNAME", "STATE", "DATA", "CREDENTIAL"
+                        );
                         for user in &users {
                             println!(
-                                "{} ({})",
+                                "{:<12} {:<18} {:<10} {:<9} {:<12} {}",
+                                user.user_id,
                                 cli_color::heading(&color, &user.username),
-                                user.user_id
+                                match user.state {
+                                    iota_ipc::LocalUserState::Managed => "managed",
+                                    iota_ipc::LocalUserState::Released => "released",
+                                },
+                                if user.data_present {
+                                    "present"
+                                } else {
+                                    "empty"
+                                },
+                                match user.credential_status {
+                                    iota_ipc::CredentialStatus::LocalPresent => "local",
+                                    iota_ipc::CredentialStatus::External => "external",
+                                    iota_ipc::CredentialStatus::Missing => "missing",
+                                    iota_ipc::CredentialStatus::None => "none",
+                                },
+                                user.pending_operation
+                                    .as_ref()
+                                    .map(format_pending_operation)
+                                    .unwrap_or_else(|| "-".into())
                             );
                         }
                     }
@@ -815,6 +925,34 @@ async fn run_command(
                         println!("Trusted Apps: {}", user.trusted_apps.join(", "));
                     }
                 }
+                ResponsePayload::TuCredentialPreview(preview) => {
+                    println!("User: {} ({})", preview.username, preview.user_id);
+                    println!(
+                        "Current Iota: {}",
+                        preview
+                            .assigned_iota_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "Unassigned".into())
+                    );
+                }
+                ResponsePayload::UserReconciled(result) => {
+                    println!("Reconciled user {}: {:?}", result.user_id, result.action);
+                }
+                ResponsePayload::UserDiagnostics(diagnostics) => {
+                    println!("User: {} ({})", diagnostics.username, diagnostics.user_id);
+                    println!("Local state: {:?}", diagnostics.local_state);
+                    println!("Hosted data: {}", diagnostics.data_present);
+                    println!("Credential: {:?}", diagnostics.credential_status);
+                    println!("Trusted applications: {}", diagnostics.trusted_app_count);
+                    if let Some(operation) = &diagnostics.pending_operation {
+                        println!("Pending operation: {operation}");
+                    }
+                }
+                ResponsePayload::UserCredentialExport { .. } => {
+                    return Err(StartupError::Other(
+                        "Refusing to display credential material.".into(),
+                    ));
+                }
                 ResponsePayload::LogEntries(logs) => {
                     for entry in &logs.entries {
                         let ts = entry.timestamp_ms;
@@ -860,6 +998,11 @@ async fn run_command(
 /// Text remains an operator-oriented presentation; JSON and YAML must never
 /// require consumers to parse it.
 fn render_structured(payload: &ResponsePayload, output: OutputFormat) -> Result<(), StartupError> {
+    if matches!(payload, ResponsePayload::UserCredentialExport { .. }) {
+        return Err(StartupError::Other(
+            "Refusing to encode credential material as ordinary output.".into(),
+        ));
+    }
     match output {
         OutputFormat::Json => println!(
             "{}",
@@ -886,10 +1029,35 @@ fn render_table(payload: &ResponsePayload) {
                 println!("No users.");
                 return;
             }
-            println!("{:<8} {}", "ID", "USERNAME");
-            println!("{:<8} {}", "--------", "--------");
+            println!(
+                "{:<12} {:<18} {:<10} {:<9} {:<12} PENDING",
+                "ID", "USERNAME", "STATE", "DATA", "CREDENTIAL"
+            );
             for user in users {
-                println!("{:<8} {}", user.user_id, user.username);
+                println!(
+                    "{:<12} {:<18} {:<10} {:<9} {:<12} {}",
+                    user.user_id,
+                    user.username,
+                    match user.state {
+                        iota_ipc::LocalUserState::Managed => "managed",
+                        iota_ipc::LocalUserState::Released => "released",
+                    },
+                    if user.data_present {
+                        "present"
+                    } else {
+                        "empty"
+                    },
+                    match user.credential_status {
+                        iota_ipc::CredentialStatus::LocalPresent => "local",
+                        iota_ipc::CredentialStatus::External => "external",
+                        iota_ipc::CredentialStatus::Missing => "missing",
+                        iota_ipc::CredentialStatus::None => "none",
+                    },
+                    user.pending_operation
+                        .as_ref()
+                        .map(format_pending_operation)
+                        .unwrap_or_else(|| "-".into())
+                );
             }
         }
         ResponsePayload::Tasks(tasks) => {
@@ -990,6 +1158,33 @@ fn render_table(payload: &ResponsePayload) {
         ResponsePayload::UserCreated { user_id, username } => {
             println!("Created user {} ({})", username, user_id);
         }
+        ResponsePayload::TuCredentialPreview(preview) => {
+            println!("{:<15} {}", "Username", preview.username);
+            println!("{:<15} {}", "User ID", preview.user_id);
+            println!(
+                "{:<15} {}",
+                "Current Iota",
+                preview
+                    .assigned_iota_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "Unassigned".into())
+            );
+        }
+        ResponsePayload::UserReconciled(result) => {
+            println!("{:<15} {}", "User ID", result.user_id);
+            println!("{:<15} {:?}", "Action", result.action);
+        }
+        ResponsePayload::UserDiagnostics(diagnostics) => {
+            println!("{:<15} {}", "Username", diagnostics.username);
+            println!("{:<15} {}", "User ID", diagnostics.user_id);
+            println!("{:<15} {:?}", "Local state", diagnostics.local_state);
+            println!("{:<15} {}", "Hosted data", diagnostics.data_present);
+            println!("{:<15} {:?}", "Credential", diagnostics.credential_status);
+            println!("{:<15} {}", "Trusted apps", diagnostics.trusted_app_count);
+        }
+        ResponsePayload::UserCredentialExport { .. } => {
+            println!("Credential export payload withheld.");
+        }
         ResponsePayload::UserRemoved { user_id } => {
             println!("Removed user {}", user_id);
         }
@@ -1013,4 +1208,14 @@ fn render_table(payload: &ResponsePayload) {
             }
         }
     }
+}
+
+fn format_pending_operation(operation: &iota_ipc::UserOperationSummary) -> String {
+    let kind = match operation.operation {
+        iota_ipc::UserOperationKind::Create => "create",
+        iota_ipc::UserOperationKind::Attach => "attach",
+        iota_ipc::UserOperationKind::Release => "release",
+        iota_ipc::UserOperationKind::Purge => "purge",
+    };
+    format!("{kind}/{}", operation.phase)
 }

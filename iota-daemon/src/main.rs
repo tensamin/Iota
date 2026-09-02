@@ -149,8 +149,7 @@ async fn main() -> ExitCode {
         Err(omikron_connector::OmikronStartupError::Authentication { connection }) => {
             runtime.set_component_failed(
                 iota_ipc::ComponentId::Omikron,
-                "Omikron authentication failed; regenerate the Iota identity to register again"
-                    .into(),
+                "Omikron authentication failed; inspect the authenticated relay and Omega status before rotating the Iota identity".into(),
             );
             // Keep IPC alive: identity rotation is the supported recovery
             // action and must remain available after authentication fails.
@@ -221,6 +220,23 @@ async fn main() -> ExitCode {
         .spawn_tracked("user-lifecycle-reconciliation", async move {
             let mut states = omikron_reconcile.connection_state();
             loop {
+                match iota_storage::users::pending_operations::get_all() {
+                    Ok(operations) => {
+                        for operation in operations.into_iter().filter(|operation| {
+                            operation.operation
+                                == iota_storage::users::pending_operations::PendingUserOperationKind::Purge
+                        }) {
+                            if let Err(error) = user_manager::purge_user_data(operation.user_id) {
+                                log!(
+                                    "Pending purge reconciliation failed for {}: {}",
+                                    operation.user_id,
+                                    error
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => log!("Pending purge reconciliation could not read storage: {error}"),
+                }
                 if matches!(
                     *states.borrow(),
                     omikron_connector::omikron_connection::ConnectionState::Connected { .. }

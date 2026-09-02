@@ -21,6 +21,8 @@ pub struct IotaConfig {
     pub omikron_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub omikron_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub omikron_id: Option<i64>,
     #[serde(skip_serializing)]
     pub keyring: Option<String>,
     #[serde(skip_serializing)]
@@ -101,6 +103,7 @@ impl Default for IotaConfig {
             web: WebSettings::default(),
             omikron_host: None,
             omikron_port: None,
+            omikron_id: None,
             keyring: None,
             public_key: None,
             private_key: None,

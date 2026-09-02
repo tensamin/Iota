@@ -12,8 +12,8 @@ pub struct UserProfile {
     pub user_id: i64,
     pub username: String,
     pub public_key: String,
-    pub private_key_hash: String,
-    pub reset_token: String,
+    pub private_key_hash: Option<String>,
+    pub reset_token: Option<String>,
     pub created_at: i64,
     pub display_name: Option<String>,
     pub trusted_apps: std::collections::HashMap<String, String>,
@@ -25,8 +25,8 @@ impl UserProfile {
         username: String,
         display_name: Option<String>,
         public_key: String,
-        private_key_hash: String,
-        reset_token: String,
+        private_key_hash: Option<String>,
+        reset_token: Option<String>,
     ) -> Self {
         Self::new_with_created_at(
             user_id,
@@ -47,8 +47,8 @@ impl UserProfile {
         username: String,
         display_name: Option<String>,
         public_key: String,
-        private_key_hash: String,
-        reset_token: String,
+        private_key_hash: Option<String>,
+        reset_token: Option<String>,
         created_at: i64,
     ) -> Self {
         Self {
@@ -68,7 +68,6 @@ impl UserProfile {
             "uuid" => self.user_id,
             "username" => self.username.clone(),
             "public_key" => self.public_key.clone(),
-            "private_key_hash" => self.private_key_hash.clone(),
             "created_at" => self.created_at,
             "storage" => used_dir_space(&format!("users/{}", self.user_id.to_string())),
         };
@@ -88,8 +87,8 @@ impl UserProfile {
         let user_id = j["uuid"].as_i64()?;
         let username = j["username"].as_str()?.to_string();
         let public_key = j["public_key"].as_str()?.to_string();
-        let private_key_hash = j["private_key_hash"].as_str()?.to_string();
-        let reset_token = j["reset_token"].as_str()?.to_string();
+        let private_key_hash = j["private_key_hash"].as_str().map(str::to_owned);
+        let reset_token = j["reset_token"].as_str().map(str::to_owned);
         let created_at = j["created_at"].as_i64()?;
         let display_name = j["display_name"].as_str().map(|s| s.to_string());
 
@@ -127,7 +126,7 @@ impl UserProfile {
         let mut bytes = [0u8; 192];
         OsRng.fill(bytes.as_mut());
         let new_token = general_purpose::STANDARD.encode(&bytes);
-        self.reset_token = new_token.clone();
+        self.reset_token = Some(new_token.clone());
         new_token
     }
 
