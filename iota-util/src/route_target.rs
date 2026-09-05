@@ -42,3 +42,12 @@ impl RouteTarget {
         }
     }
 }
+
+impl std::fmt::Display for RouteTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User(id) => write!(formatter, "User({id})"),
+            Self::Iota(id) => write!(formatter, "Iota({id})"),
+        }
+    }
+}

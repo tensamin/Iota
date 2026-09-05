@@ -270,6 +270,21 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    let messages_exist: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if messages_exist {
+        add_column_if_missing(
+            conn,
+            "key_version",
+            "key_version INTEGER NOT NULL DEFAULT 1",
+        )?;
+    }
+
     if current_version < 5 {
         conn.execute_batch(
             r#"
@@ -814,6 +829,35 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    if current_version < 24 {
+        let pending_relays_exist: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pending_relays')",
+            [],
+            |row| row.get(0),
+        )?;
+        if pending_relays_exist {
+            add_table_column_if_missing(
+                conn,
+                "pending_relays",
+                "delivery_state",
+                "delivery_state TEXT NOT NULL DEFAULT 'ready' CHECK (delivery_state IN ('ready', 'waiting_client', 'quarantined'))",
+            )?;
+            add_table_column_if_missing(conn, "pending_relays", "last_error", "last_error TEXT")?;
+            conn.execute_batch(
+                r#"
+                UPDATE pending_relays
+                SET delivery_state = 'quarantined', last_error = 'target_recipient_mismatch'
+                WHERE target_kind = 0
+                  AND relay_destination_user_id IS NOT NULL
+                  AND destination_id <> relay_destination_user_id;
+                CREATE INDEX IF NOT EXISTS idx_pending_relays_active
+                    ON pending_relays (delivery_state, target_kind, destination_id, id);
+                "#,
+            )?;
+        }
+        conn.pragma_update(None, "user_version", 24)?;
+    }
+
     Ok(())
 }
 
@@ -883,7 +927,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -902,7 +946,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
         for table in [
             "sync_heads",
             "sync_events",
@@ -926,7 +970,13 @@ mod tests {
             )?;
             assert_eq!(exists, 1);
         }
-        for column in ["frame_id", "target_kind", "type_map_version"] {
+        for column in [
+            "frame_id",
+            "target_kind",
+            "type_map_version",
+            "delivery_state",
+            "last_error",
+        ] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('pending_relays') WHERE name = ?1")?;
             assert!(statement.exists([column])?);
@@ -942,7 +992,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
         for column in [
             "id",
             "user_id",
@@ -1037,7 +1087,7 @@ mod tests {
         )?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         assert_eq!(preserved, "remote_committed");
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
         Ok(())
     }
 }

@@ -227,6 +227,11 @@ pub fn apply_verified_relay_content(
             let height = relay_number(&content.content, DataType::Height, &context.type_map)
                 .and_then(|value| i64::try_from(value).ok())
                 .unwrap_or_default();
+            let key_version =
+                relay_number(&content.content, DataType::VersionNumber, &context.type_map)
+                    .and_then(|value| i64::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| "Relay MessageSend has an invalid VersionNumber".to_string())?;
             let reply_to = relay_number(&content.content, DataType::ReplyId, &context.type_map)
                 .and_then(|value| i64::try_from(value).ok());
             if relay_string(
@@ -239,6 +244,22 @@ pub fn apply_verified_relay_content(
                 return Err(
                     "Relay MessageSend identity does not match its protected message ID".into(),
                 );
+            }
+            let chat_id = if sender_id < recipient_id {
+                format!("{sender_id}:{recipient_id}")
+            } else {
+                format!("{recipient_id}:{sender_id}")
+            };
+            let latest_secret = e2ee_storage::get_chat_secret(ChatSecretQuery {
+                user_id: storage_owner.to_string(),
+                chat_id: chat_id.clone(),
+                secret_id: Some(format!("chat:{chat_id}:main")),
+                version: None,
+            })
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Relay MessageSend has no committed chat secret".to_string())?;
+            if latest_secret.version != key_version {
+                return Err("Relay MessageSend uses a stale chat secret version".into());
             }
             chat_files::add_message(chat_files::NewMessage {
                 relay_signer_id: sender_id,
@@ -254,6 +275,7 @@ pub fn apply_verified_relay_content(
                 sent_by_self,
                 content: message,
                 height,
+                key_version,
                 reply_to,
                 origin_iota_received_at: sent_by_self.then_some(accepted_at),
                 destination_iota_received_at: (!sent_by_self).then_some(accepted_at),
@@ -272,8 +294,29 @@ pub fn apply_verified_relay_content(
             let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
                 .and_then(|value| i64::try_from(value).ok())
                 .ok_or_else(|| "Relay MessageEdit is missing SendTime".to_string())?;
-            chat_files::apply_remote_edit(recipient_id, sender_id, send_time, sender_id, message)
-                .map_err(|error| error.to_string())
+            let external_user = if sent_by_self {
+                recipient_id
+            } else {
+                sender_id
+            };
+            let result = if sent_by_self {
+                chat_files::edit_message(
+                    storage_owner,
+                    external_user,
+                    send_time,
+                    sender_id,
+                    message,
+                )
+            } else {
+                chat_files::apply_remote_edit(
+                    storage_owner,
+                    external_user,
+                    send_time,
+                    sender_id,
+                    message,
+                )
+            };
+            result.map_err(|error| error.to_string())
         }
         "MessageReactionAdd" | "MessageReactionRemove" => {
             let reaction = relay_string(&content.content, DataType::Reaction, &context.type_map)
@@ -282,19 +325,45 @@ pub fn apply_verified_relay_content(
             let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
                 .and_then(|value| i64::try_from(value).ok())
                 .ok_or_else(|| "Relay reaction is missing SendTime".to_string())?;
-            let result = if content.message_type == "MessageReactionAdd" {
-                chat_files::add_reaction(recipient_id, sender_id, send_time, sender_id, reaction)
+            let external_user = if sent_by_self {
+                recipient_id
             } else {
-                chat_files::remove_reaction(recipient_id, sender_id, send_time, sender_id, reaction)
+                sender_id
+            };
+            let result = if content.message_type == "MessageReactionAdd" {
+                chat_files::add_reaction(
+                    storage_owner,
+                    external_user,
+                    send_time,
+                    sender_id,
+                    reaction,
+                )
+            } else {
+                chat_files::remove_reaction(
+                    storage_owner,
+                    external_user,
+                    send_time,
+                    sender_id,
+                    reaction,
+                )
             };
             result.map_err(|error| error.to_string())
         }
-        "MessageDeleteLive" => {
+        "MessageDelete" | "MessageDeleteLive" => {
             let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
                 .and_then(|value| i64::try_from(value).ok())
                 .ok_or_else(|| "Relay MessageDeleteLive is missing SendTime".to_string())?;
-            chat_files::apply_remote_delete(recipient_id, sender_id, send_time, sender_id)
-                .map_err(|error| error.to_string())
+            let external_user = if sent_by_self {
+                recipient_id
+            } else {
+                sender_id
+            };
+            let result = if sent_by_self {
+                chat_files::delete_message(storage_owner, external_user, send_time)
+            } else {
+                chat_files::apply_remote_delete(storage_owner, external_user, send_time, sender_id)
+            };
+            result.map_err(|error| error.to_string())
         }
         "SetChatSecret" => {
             let frame = CommunicationValue::new(CommunicationType::SetChatSecret)
@@ -302,7 +371,7 @@ pub fn apply_verified_relay_content(
             let recipients = chat_secret_recipients(&frame)
                 .ok_or_else(|| "Relay SetChatSecret has no recipients".to_string())?;
             let recipient = recipients
-                .into_iter()
+                .iter()
                 .find(|value| value.user_id == storage_owner.to_string())
                 .ok_or_else(|| "Relay SetChatSecret recipient mismatch".to_string())?;
             let chat_id = data_string(&frame, DataType::ChatId)
@@ -310,16 +379,62 @@ pub fn apply_verified_relay_content(
             let secret_id = data_string(&frame, DataType::SecretId)
                 .ok_or_else(|| "Relay SetChatSecret is missing SecretId".to_string())?;
             let version = data_i64(&frame, DataType::VersionNumber)
+                .filter(|value| *value > 0)
                 .ok_or_else(|| "Relay SetChatSecret is missing VersionNumber".to_string())?;
             let wrapping_scheme = data_string(&frame, DataType::WrappingScheme)
                 .ok_or_else(|| "Relay SetChatSecret is missing WrappingScheme".to_string())?;
+            let mut participants = chat_id
+                .split(':')
+                .map(|value| value.parse::<u64>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "Relay SetChatSecret ChatId is not a user pair".to_string())?;
+            if participants.len() != 2
+                || participants.contains(&0)
+                || participants[0] == participants[1]
+            {
+                return Err("Relay SetChatSecret ChatId is not a user pair".into());
+            }
+            participants.sort_unstable();
+            if chat_id != format!("{}:{}", participants[0], participants[1]) {
+                return Err("Relay SetChatSecret ChatId is not canonical".into());
+            }
+            if !participants.contains(&context.signer_id) {
+                return Err("Relay SetChatSecret signer is not in ChatId".into());
+            }
+            if !participants.contains(&context.final_recipient_id) {
+                return Err("Relay SetChatSecret recipient is not in ChatId".into());
+            }
+            if secret_id != format!("chat:{chat_id}:main") {
+                return Err("Relay SetChatSecret has an invalid secret namespace".into());
+            }
+            if context.signer_id != participants[0] {
+                return Err(
+                    "Relay SetChatSecret was signed by a non-authoritative participant".into(),
+                );
+            }
+            if context.final_recipient_id != participants[1] {
+                return Err("Relay SetChatSecret recipient is not the peer participant".into());
+            }
+            if recipients.len() != 2 {
+                return Err("Relay SetChatSecret must contain exactly two recipients".into());
+            }
+            let mut recipient_ids = recipients
+                .iter()
+                .map(|value| value.user_id.parse::<u64>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "Relay SetChatSecret has invalid recipient IDs".to_string())?;
+            recipient_ids.sort_unstable();
+            let expected_recipient_ids = participants.clone();
+            if recipient_ids != expected_recipient_ids {
+                return Err("Relay SetChatSecret recipients do not match relay identities".into());
+            }
             e2ee_storage::put_chat_secret(e2ee_storage::StoredChatSecret {
                 user_id: storage_owner.to_string(),
                 chat_id,
                 secret_id,
                 version,
-                encrypted_secret: recipient.encrypted_secret,
-                kem_ciphertext: recipient.kem_ciphertext,
+                encrypted_secret: recipient.encrypted_secret.clone(),
+                kem_ciphertext: recipient.kem_ciphertext.clone(),
                 wrapping_scheme,
                 created_at,
                 updated_at: now_millis_i64(),
@@ -338,9 +453,20 @@ pub fn apply_verified_relay_content(
             if user_id <= 0 {
                 return Err("Relay AddConversation has an invalid storage owner".into());
             }
+            if sender_id == recipient_id {
+                return Err("Relay AddConversation does not support self conversations".into());
+            }
+            if other_id != sender_id && other_id != recipient_id {
+                return Err("Relay AddConversation does not match relay identities".into());
+            }
+            let expected_partner = if sent_by_self {
+                recipient_id
+            } else {
+                sender_id
+            };
             add_conversation_for_user(
                 user_id,
-                other_id,
+                expected_partner,
                 relay_string(
                     &content.content,
                     DataType::ChatPartnerName,
@@ -474,25 +600,28 @@ fn stored_message_fields(
             DataType::Height,
             DataValue::SignedNumber(message.height as i128),
         ),
+        (
+            DataType::VersionNumber,
+            DataValue::SignedNumber(message.key_version as i128),
+        ),
     ];
     let sender_id = if message.sent_by_self {
         storage_owner
     } else {
         partner_id
     };
-    if let Ok(sender_id) = u128::try_from(sender_id) {
+    if let Some(relay_signer_id) = message.relay_signer_id {
+        fields.push((
+            DataType::SenderId,
+            DataValue::SignedNumber(relay_signer_id.into()),
+        ));
+    } else if let Ok(sender_id) = u128::try_from(sender_id) {
         fields.push((DataType::SenderId, DataValue::UnsignedNumber(sender_id)));
     }
     if let Some(relay_message_id) = &message.relay_message_id {
         fields.push((
             DataType::RelayMessageId,
             DataValue::Str(relay_message_id.clone()),
-        ));
-    }
-    if let Some(relay_signer_id) = message.relay_signer_id {
-        fields.push((
-            DataType::SenderId,
-            DataValue::SignedNumber(relay_signer_id.into()),
         ));
     }
     for (data_type, timestamp) in [
@@ -607,6 +736,7 @@ pub fn handle_get_chat_secret(cv: &CommunicationValue) -> CommunicationValue {
         user_id,
         chat_id,
         secret_id: data_string(cv, DataType::SecretId),
+        version: data_i64(cv, DataType::VersionNumber),
     }) {
         Ok(Some(record)) => CommunicationValue::new(CommunicationType::ChatSecretResponse)
             .with_request_id(cv)
@@ -2323,6 +2453,46 @@ pub fn handle_user_block_check(cv: &CommunicationValue) -> CommunicationValue {
             .with_request_id(cv)
             .add_typed_default(DataType::IsBlocked, DataValue::Bool(blocked)),
         Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+    }
+}
+
+#[cfg(test)]
+mod stored_message_tests {
+    use super::stored_message_value;
+    use iota_storage::util::chat_files::StoredMessage;
+    use mtp::codec::DataValue;
+
+    #[test]
+    fn relay_message_value_has_a_single_sender_id() {
+        let message = StoredMessage {
+            id: 1,
+            external_user: 9,
+            relay_signer_id: Some(9),
+            relay_message_id: Some("relay-1".to_string()),
+            message_time: 2,
+            authored_at: None,
+            origin_iota_received_at: None,
+            destination_iota_received_at: None,
+            client_received_at: None,
+            client_received_recorded_at: None,
+            read_at: None,
+            read_recorded_at: None,
+            delivery_failed_at: None,
+            delivery_failure: None,
+            content: "message".to_string(),
+            edited: false,
+            sent_by_self: false,
+            message_state: "sent".to_string(),
+            height: 1,
+            key_version: 1,
+            reply_to: None,
+            reactions: Vec::new(),
+        };
+
+        let value = stored_message_value(&message, 7, 9);
+
+        assert!(matches!(value, DataValue::Container(_)));
+        assert!(value.to_bytes().is_ok());
     }
 }
 

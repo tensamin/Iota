@@ -212,13 +212,12 @@ where
 pub fn open_verified_relay_content(
     relay: &VerifiedRelay,
     keyrings: &[&Keyring],
-    expected_recipient_id: u64,
 ) -> Result<VerifiedRelayContent, RelayValidationError> {
     Ok(open_relay_content_with_limits_without_replay(
         &relay.metadata,
         keyrings,
         &relay.signing_keys,
-        Some(expected_recipient_id),
+        Some(relay.context.final_recipient_id),
         RelayOpenOptions {
             policy: RELAY_PROTECTION_POLICY,
             decode_limits: relay.metadata.decode_limits(),
@@ -287,6 +286,24 @@ mod tests {
         assert_eq!(verified.context.signer_id, 7);
         assert_eq!(verified.context.final_recipient_id, 42);
         assert_eq!(verified.context.message_id, "accepted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn content_validation_uses_final_recipient_id() -> Result<(), String> {
+        let (signer, recipient, frame) = relay("final-recipient")?;
+        let trusted_key = signer.public_key_bundle();
+        let verified = verify_relay_metadata(&frame, 99, &recipient, move |signer_id| async move {
+            (signer_id == 7)
+                .then_some(vec![trusted_key])
+                .ok_or(RelayValidationError::MissingSigningKeys(signer_id))
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let content = open_verified_relay_content(&verified, &[&recipient])
+            .map_err(|error| error.to_string())?;
+        assert_eq!(content.final_recipient_id, 42);
         Ok(())
     }
 

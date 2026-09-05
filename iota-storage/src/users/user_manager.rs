@@ -303,6 +303,10 @@ pub fn finalize_local_release(
         )?;
         tx.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
         tx.execute(
+            "UPDATE pending_relays SET delivery_state = 'waiting_client', last_error = 'user_released' WHERE target_kind = 0 AND destination_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
             r#"INSERT INTO user_residency (user_id, username, lifecycle_state, data_state, updated_at)
                VALUES (?1, ?2, 'released', COALESCE((SELECT data_state FROM user_residency WHERE user_id = ?1), 'present'), ?3)
                ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, lifecycle_state = 'released', updated_at = excluded.updated_at"#,

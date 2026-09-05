@@ -68,6 +68,7 @@ pub struct StoredMessage {
     pub sent_by_self: bool,
     pub message_state: String,
     pub height: i64,
+    pub key_version: i64,
     pub reply_to: Option<i64>,
     pub reactions: Vec<StoredReaction>,
 }
@@ -82,6 +83,7 @@ pub struct NewMessage<'a> {
     pub sent_by_self: bool,
     pub content: &'a str,
     pub height: i64,
+    pub key_version: i64,
     pub reply_to: Option<i64>,
     pub origin_iota_received_at: Option<i64>,
     pub destination_iota_received_at: Option<i64>,
@@ -596,6 +598,7 @@ pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
         sent_by_self,
         content,
         height,
+        key_version,
         reply_to,
         origin_iota_received_at,
         destination_iota_received_at,
@@ -617,9 +620,9 @@ pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
             r#"
             INSERT INTO messages (
                 storage_owner, external_user, message_time, content, sent_by_self,
-                message_state, height, reply_to, relay_signer_id, relay_message_id,
+                message_state, height, key_version, reply_to, relay_signer_id, relay_message_id,
                 authored_at, origin_iota_received_at, destination_iota_received_at, stored_at, expires_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             "#,
             params![
                 storage_owner,
@@ -629,6 +632,7 @@ pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
                 i64::from(sent_by_self),
                 initial_state.as_str(),
                 height,
+                key_version,
                 reply_to,
                 relay_signer_id,
                 relay_message_id,
@@ -960,7 +964,7 @@ pub fn get_messages(
             SELECT id, relay_signer_id, relay_message_id, message_time, authored_at,
                    origin_iota_received_at, destination_iota_received_at,
                    client_received_at, client_received_recorded_at, read_at,
-                   read_recorded_at, delivery_failed_at, delivery_failure, content, sent_by_self, message_state, height,
+                   read_recorded_at, delivery_failed_at, delivery_failure, content, sent_by_self, message_state, height, key_version,
                    reply_to, edited_count
             FROM messages
             WHERE storage_owner = ?1 AND external_user = ?2 AND deleted_by_external = 0 AND history_deleted = 0
@@ -991,8 +995,9 @@ pub fn get_messages(
                     sent_by_self: row.get::<_, i64>(14)? != 0,
                     message_state: row.get(15)?,
                     height: row.get(16).unwrap_or(0),
-                    reply_to: row.get(17).ok().flatten(),
-                    edited: row.get::<_, i64>(18).unwrap_or(0) > 0,
+                    key_version: row.get(17).unwrap_or(1),
+                    reply_to: row.get(18).ok().flatten(),
+                    edited: row.get::<_, i64>(19).unwrap_or(0) > 0,
                     reactions: Vec::new(),
                 })
             },
@@ -1033,7 +1038,7 @@ pub fn get_message(
             SELECT id, relay_signer_id, relay_message_id, message_time, authored_at,
                    origin_iota_received_at, destination_iota_received_at,
                    client_received_at, client_received_recorded_at, read_at,
-                   read_recorded_at, delivery_failed_at, delivery_failure, content, sent_by_self, message_state, height,
+                   read_recorded_at, delivery_failed_at, delivery_failure, content, sent_by_self, message_state, height, key_version,
                    reply_to, edited_count, external_user
             FROM messages
             WHERE storage_owner = ?1
@@ -1064,9 +1069,10 @@ pub fn get_message(
                 sent_by_self: row.get::<_, i64>(14)? != 0,
                 message_state: row.get(15)?,
                 height: row.get(16).unwrap_or(0),
-                reply_to: row.get(17).ok().flatten(),
-                edited: row.get::<_, i64>(18).unwrap_or(0) > 0,
-                external_user: row.get(19)?,
+                key_version: row.get(17).unwrap_or(1),
+                reply_to: row.get(18).ok().flatten(),
+                edited: row.get::<_, i64>(19).unwrap_or(0) > 0,
+                external_user: row.get(20)?,
                 reactions: Vec::new(),
             })
         })?;
@@ -1138,9 +1144,9 @@ pub fn get_messages_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<StoredMessage
     // A journal id uniquely identifies a row. Load all messages for this owner and retain only
     // those ids; this keeps reaction hydration identical to normal message loading.
     match db::with_db(|conn| {
-        let mut stmt = conn.prepare("SELECT id, relay_signer_id, relay_message_id, message_time, authored_at, origin_iota_received_at, destination_iota_received_at, client_received_at, client_received_recorded_at, read_at, read_recorded_at, delivery_failed_at, delivery_failure, content, sent_by_self, message_state, height, reply_to, edited_count, external_user FROM messages WHERE storage_owner = ?1 AND deleted_by_external = 0 AND history_deleted = 0")?;
+        let mut stmt = conn.prepare("SELECT id, relay_signer_id, relay_message_id, message_time, authored_at, origin_iota_received_at, destination_iota_received_at, client_received_at, client_received_recorded_at, read_at, read_recorded_at, delivery_failed_at, delivery_failure, content, sent_by_self, message_state, height, key_version, reply_to, edited_count, external_user FROM messages WHERE storage_owner = ?1 AND deleted_by_external = 0 AND history_deleted = 0")?;
         let rows = stmt.query_map([storage_owner], |row| {
-            let external_user: i64 = row.get(19)?;
+            let external_user: i64 = row.get(20)?;
             Ok(StoredMessage {
                 id: row.get(0)?,
                 external_user,
@@ -1160,8 +1166,9 @@ pub fn get_messages_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<StoredMessage
                 sent_by_self: row.get::<_, i64>(14)? != 0,
                 message_state: row.get(15)?,
                 height: row.get(16).unwrap_or(0),
-                reply_to: row.get(17).ok().flatten(),
-                edited: row.get::<_, i64>(18).unwrap_or(0) > 0,
+                key_version: row.get(17).unwrap_or(1),
+                reply_to: row.get(18).ok().flatten(),
+                edited: row.get::<_, i64>(19).unwrap_or(0) > 0,
                 reactions: Vec::new(),
             })
         })?;
