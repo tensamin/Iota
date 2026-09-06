@@ -205,7 +205,11 @@ enum UserAppsAction {
 enum UserCredentialAction {
     Export {
         user_id: i64,
-        #[arg(long, value_name = "PATH")]
+        #[arg(
+            id = "credential-destination",
+            long = "destination",
+            value_name = "PATH"
+        )]
         output: PathBuf,
     },
 }
@@ -860,7 +864,7 @@ mod tests {
             "credential".into(),
             "export".into(),
             "42".into(),
-            "--output".into(),
+            "--destination".into(),
             "alice.tu".into(),
         ])
         .unwrap();

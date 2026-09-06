@@ -23,4 +23,5 @@ members = [
     "iota-installer",
     "iota-core",
 ]
+exclude = ["communities"]
 resolver = "3"
