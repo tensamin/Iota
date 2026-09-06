@@ -947,7 +947,7 @@ impl OmikronConnection {
     }
 
     fn client_event_from_relay(
-        message_type: &str,
+        message_type: CommunicationType,
         payload: &DataValue,
         signer_id: u64,
         recipient_id: u64,
@@ -958,7 +958,7 @@ impl OmikronConnection {
         let event_id = next_client_event_id();
 
         match message_type {
-            "MessageSend" => {
+            CommunicationType::MessageSend => {
                 let frame = CommunicationValue::new(CommunicationType::MessageSend)
                     .with_payload(payload.clone());
                 let content = frame.get_data(DataType::Content)?.clone();
@@ -986,7 +986,7 @@ impl OmikronConnection {
                         .add_typed_default(DataType::Message, typed_container(message)),
                 )
             }
-            "SetChatSecret" => {
+            CommunicationType::SetChatSecret => {
                 let frame = CommunicationValue::new(CommunicationType::SetChatSecret)
                     .with_payload(payload.clone());
                 let chat_id = frame.get_data(DataType::ChatId)?.clone();
@@ -1014,7 +1014,7 @@ impl OmikronConnection {
                         ),
                 )
             }
-            "MessageEdit" => {
+            CommunicationType::MessageEdit => {
                 let frame = CommunicationValue::new(CommunicationType::MessageEdit)
                     .with_payload(payload.clone());
                 Some(
@@ -1037,9 +1037,8 @@ impl OmikronConnection {
                         .add_typed_default(DataType::ChatPartnerId, sender.clone()),
                 )
             }
-            "MessageReactionAdd" | "MessageReactionRemove" => {
-                let frame = CommunicationValue::new(CommunicationType::MessageReactionAdd)
-                    .with_payload(payload.clone());
+            CommunicationType::MessageReactionAdd | CommunicationType::MessageReactionRemove => {
+                let frame = CommunicationValue::new(message_type).with_payload(payload.clone());
                 Some(
                     CommunicationValue::new(CommunicationType::MessageReactionLive)
                         .with_id(event_id)
@@ -1057,11 +1056,11 @@ impl OmikronConnection {
                         .add_typed_default(DataType::SenderId, sender)
                         .add_typed_default(
                             DataType::Accepted,
-                            DataValue::Bool(message_type == "MessageReactionAdd"),
+                            DataValue::Bool(message_type == CommunicationType::MessageReactionAdd),
                         ),
                 )
             }
-            "MessageDelete" | "MessageDeleteLive" => {
+            CommunicationType::MessageDelete | CommunicationType::MessageDeleteLive => {
                 let frame = CommunicationValue::new(CommunicationType::MessageDelete)
                     .with_payload(payload.clone());
                 Some(
@@ -1076,7 +1075,7 @@ impl OmikronConnection {
                         .add_typed_default(DataType::ChatPartnerId, sender),
                 )
             }
-            "AddConversation" if recipient_id < signer_id => {
+            CommunicationType::AddConversation if recipient_id < signer_id => {
                 let chat_id = format!("{recipient_id}:{signer_id}");
                 Some(
                     CommunicationValue::new(CommunicationType::ChatSecretForward)
@@ -1797,7 +1796,7 @@ impl OmikronConnection {
                 return;
             }
             client_event = Self::client_event_from_relay(
-                &content.message_type,
+                content.message_type,
                 &content.content,
                 verified.context.signer_id,
                 destination,
@@ -3187,7 +3186,7 @@ impl OmikronConnection {
             let sender_clone = Arc::clone(sender);
             drop(sender_guard);
 
-            log_cv_out!(&cv);
+            log_cv_out!(cv);
 
             if let Err(e) = sender_clone.send(cv).await {
                 self.fail_all_waiting_tasks(format!(

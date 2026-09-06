@@ -444,7 +444,7 @@ impl ClientConnection {
             let sender_clone = Arc::clone(sender);
             drop(sender_guard);
 
-            log_cv_out!(&cv);
+            log_cv_out!(cv);
 
             if let Err(e) = sender_clone.send(cv).await {
                 return Err(e.to_string());

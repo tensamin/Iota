@@ -453,7 +453,7 @@ macro_rules! log_cv_in {
         $crate::log_cv_internal("> ", &$cv, Some($kind))
     };
     ($cv:expr) => {
-        $crate::log_cv_internal("> ", &$cv, None)
+        $crate::log_cv_internal("> ", $cv, None)
     };
 }
 
@@ -463,6 +463,6 @@ macro_rules! log_cv_out {
         $crate::log_cv_internal("< ", &$cv, Some($kind))
     };
     ($cv:expr) => {
-        $crate::log_cv_internal("< ", &$cv, None)
+        $crate::log_cv_internal("< ", $cv, None)
     };
 }

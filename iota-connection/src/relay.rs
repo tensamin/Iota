@@ -197,7 +197,7 @@ where
     let context = VerifiedRelayContext {
         signer_id: metadata.signer_id(),
         final_recipient_id: metadata.final_recipient_id(),
-        message_id: metadata.message_id().to_owned(),
+        message_id: metadata.message_id().to_string(),
         created_at: metadata.created_at(),
         type_map,
     };
@@ -243,7 +243,7 @@ mod tests {
     use mtp::codec::SealedRelayBuilder;
     use mtp::crypto::{DualSigner, Ed25519Signer, Keyring};
 
-    fn relay(message_id: &str) -> Result<(Keyring, Keyring, CommunicationValue), String> {
+    fn relay(message_id: u128) -> Result<(Keyring, Keyring, CommunicationValue), String> {
         let signer_keyring = Keyring::generate();
         let recipient_keyring = Keyring::generate();
         let signer = DualSigner::new(
@@ -253,7 +253,7 @@ mod tests {
         )
         .map_err(|error| error.to_string())?;
         let frame = SealedRelayBuilder::new(
-            "MessageSend",
+            mtp::codec::CommunicationType::MessageSend,
             mtp::codec::DataValue::Str("payload".into()),
             7,
             42,
@@ -273,7 +273,7 @@ mod tests {
 
     #[tokio::test]
     async fn verifies_metadata_with_trusted_signing_key() -> Result<(), String> {
-        let (signer, recipient, frame) = relay("accepted")?;
+        let (signer, recipient, frame) = relay(1)?;
         let trusted_key = signer.public_key_bundle();
         let verified = verify_relay_metadata(&frame, 99, &recipient, move |signer_id| async move {
             (signer_id == 7)
@@ -285,13 +285,13 @@ mod tests {
 
         assert_eq!(verified.context.signer_id, 7);
         assert_eq!(verified.context.final_recipient_id, 42);
-        assert_eq!(verified.context.message_id, "accepted");
+        assert_eq!(verified.context.message_id, "1");
         Ok(())
     }
 
     #[tokio::test]
     async fn content_validation_uses_final_recipient_id() -> Result<(), String> {
-        let (signer, recipient, frame) = relay("final-recipient")?;
+        let (signer, recipient, frame) = relay(2)?;
         let trusted_key = signer.public_key_bundle();
         let verified = verify_relay_metadata(&frame, 99, &recipient, move |signer_id| async move {
             (signer_id == 7)
@@ -309,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_metadata_signed_by_untrusted_key() -> Result<(), String> {
-        let (_signer, recipient, frame) = relay("wrong-key")?;
+        let (_signer, recipient, frame) = relay(3)?;
         let wrong_signer = Keyring::generate();
         let trusted_key = wrong_signer.public_key_bundle();
         let result = verify_relay_metadata(&frame, 99, &recipient, move |_| async move {
@@ -328,7 +328,7 @@ mod tests {
         let signer = Ed25519Signer::new(&signer_keyring.sig_cl_secret_key)
             .map_err(|error| error.to_string())?;
         let frame = SealedRelayBuilder::new(
-            "MessageSend",
+            mtp::codec::CommunicationType::MessageSend,
             mtp::codec::DataValue::Str("payload".into()),
             7,
             42,
@@ -337,7 +337,7 @@ mod tests {
                 .ok_or("invalid test target")?,
             &signer,
         )
-        .message_id("classical-only")
+        .message_id(7_u128)
         .created_at(123)
         .metadata_recipients(vec![recipient_keyring.public_key_bundle()])
         .content_recipients(vec![recipient_keyring.public_key_bundle()])
@@ -355,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_outer_sender_before_key_lookup() -> Result<(), String> {
-        let (_signer, recipient, frame) = relay("outer-sender")?;
+        let (_signer, recipient, frame) = relay(4)?;
         let frame = frame.with_sender(501);
         let result = verify_relay_metadata(&frame, 99, &recipient, |_| async {
             Err(RelayValidationError::MissingSigningKeys(7))
@@ -371,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn verification_does_not_commit_replay_state() -> Result<(), String> {
-        let (signer, recipient, frame) = relay("duplicate")?;
+        let (signer, recipient, frame) = relay(5)?;
         let trusted_key = signer.public_key_bundle();
 
         for _ in 0..2 {
@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn forwarding_preserves_sealed_payload() -> Result<(), String> {
-        let (_signer, _recipient, frame) = relay("forwarding")?;
+        let (_signer, _recipient, frame) = relay(6)?;
         let forwarded = forward_verified_relay(&frame, RouteTarget::User(100))
             .map_err(|error| error.to_string())?;
 

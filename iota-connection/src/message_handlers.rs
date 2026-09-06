@@ -175,8 +175,8 @@ pub fn apply_verified_relay_content(
     let created_at = i64::try_from(context.created_at)
         .map_err(|_| "Relay creation time exceeds the local storage range".to_string())?;
 
-    match content.message_type.as_str() {
-        "MessageState" => {
+    match content.message_type {
+        CommunicationType::MessageState => {
             let partner_id =
                 relay_number(&content.content, DataType::ChatPartnerId, &context.type_map)
                     .and_then(|value| i64::try_from(value).ok())
@@ -218,7 +218,7 @@ pub fn apply_verified_relay_content(
             let _ = partner_id;
             Ok(())
         }
-        "MessageSend" => {
+        CommunicationType::MessageSend => {
             let message = relay_string(&content.content, DataType::Content, &context.type_map)
                 .ok_or_else(|| "Relay MessageSend is missing Content".to_string())?;
             let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
@@ -288,7 +288,7 @@ pub fn apply_verified_relay_content(
             .map_err(|error| error.to_string())?;
             Ok(())
         }
-        "MessageEdit" => {
+        CommunicationType::MessageEdit => {
             let message = relay_string(&content.content, DataType::Content, &context.type_map)
                 .ok_or_else(|| "Relay MessageEdit is missing Content".to_string())?;
             let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
@@ -318,7 +318,7 @@ pub fn apply_verified_relay_content(
             };
             result.map_err(|error| error.to_string())
         }
-        "MessageReactionAdd" | "MessageReactionRemove" => {
+        CommunicationType::MessageReactionAdd | CommunicationType::MessageReactionRemove => {
             let reaction = relay_string(&content.content, DataType::Reaction, &context.type_map)
                 .filter(|value| !value.is_empty() && value.len() <= 64)
                 .ok_or_else(|| "Relay reaction is invalid".to_string())?;
@@ -330,7 +330,7 @@ pub fn apply_verified_relay_content(
             } else {
                 sender_id
             };
-            let result = if content.message_type == "MessageReactionAdd" {
+            let result = if content.message_type == CommunicationType::MessageReactionAdd {
                 chat_files::add_reaction(
                     storage_owner,
                     external_user,
@@ -349,7 +349,7 @@ pub fn apply_verified_relay_content(
             };
             result.map_err(|error| error.to_string())
         }
-        "MessageDelete" | "MessageDeleteLive" => {
+        CommunicationType::MessageDelete | CommunicationType::MessageDeleteLive => {
             let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
                 .and_then(|value| i64::try_from(value).ok())
                 .ok_or_else(|| "Relay MessageDeleteLive is missing SendTime".to_string())?;
@@ -365,7 +365,7 @@ pub fn apply_verified_relay_content(
             };
             result.map_err(|error| error.to_string())
         }
-        "SetChatSecret" => {
+        CommunicationType::SetChatSecret => {
             let frame = CommunicationValue::new(CommunicationType::SetChatSecret)
                 .with_payload(content.content.clone());
             let recipients = chat_secret_recipients(&frame)
@@ -441,7 +441,7 @@ pub fn apply_verified_relay_content(
             })
             .map_err(|error| error.to_string())
         }
-        "AddConversation" => {
+        CommunicationType::AddConversation => {
             let other_id =
                 relay_number(&content.content, DataType::ChatPartnerId, &context.type_map)
                     .and_then(|value| i64::try_from(value).ok())
@@ -485,7 +485,7 @@ pub fn validate_outgoing_receipt_policy(
     context: &VerifiedRelayContext,
     content: &VerifiedRelayContent,
 ) -> Result<(), String> {
-    if content.message_type != "MessageState" {
+    if content.message_type != CommunicationType::MessageState {
         return Ok(());
     }
     let state = relay_string(&content.content, DataType::MessageState, &context.type_map)

@@ -10,7 +10,7 @@ iota-logger = { path = "../iota-logger" }
 iota-state = { path = "../iota-state" }
 iota-storage = { path = "../iota-storage" }
 iota-util = { path = "../iota-util" }
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git", features = [
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "a135d0f0c2b35147011905f8ee0fc37050f69a6c", features = [
     "client",
     "crypto",
     "files",

@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 iota-storage = { path = "../iota-storage" }
 iota-util = { path = "../iota-util" }
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git",  features = ["crypto"] }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "a135d0f0c2b35147011905f8ee0fc37050f69a6c", features = ["crypto"] }
 
 [dev-dependencies]
 tokio = { version = "1.50.0", features = ["macros", "rt"] }

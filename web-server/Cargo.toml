@@ -5,7 +5,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git",  features = ["web-server"] }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "a135d0f0c2b35147011905f8ee0fc37050f69a6c", features = ["web-server"] }
 bytes = "1"
 http = "1"
 iota-logger = { path = "../iota-logger" }
