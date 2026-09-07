@@ -3,7 +3,9 @@ use iota_logger::{log, log_cv_in, log_cv_out, log_t};
 use iota_state::AppState;
 use iota_storage::util::config_util::{CONFIG, modify_config};
 use iota_storage::util::relay_replay;
-use iota_storage::util::{chat_files, client_relay_delivery, outgoing_relay, relay_queue};
+use iota_storage::util::{
+    chat_files, chats_util, client_relay_delivery, outgoing_relay, relay_queue,
+};
 use iota_util::crypto_helper::{self, keyring_from_base64};
 use iota_util::crypto_util::{self};
 use mtp::client::{Client, ClientConfig, MTPConnection, Policy, SendMode, Sender};
@@ -952,6 +954,7 @@ impl OmikronConnection {
         signer_id: u64,
         recipient_id: u64,
         relay_message_id: &str,
+        accepted_at: i64,
     ) -> Option<CommunicationValue> {
         let sender = DataValue::UnsignedNumber(u128::from(signer_id));
         let receiver = recipient_id;
@@ -977,14 +980,32 @@ impl OmikronConnection {
                 if let Some(reply_id) = frame.get_data(DataType::ReplyId) {
                     message.push((DataType::ReplyId, reply_id.clone()));
                 }
-                Some(
-                    CommunicationValue::new(CommunicationType::MessageLive)
-                        .with_id(event_id)
-                        .with_sender(signer_id)
-                        .with_receiver(receiver)
-                        .add_typed_default(DataType::SenderId, sender)
-                        .add_typed_default(DataType::Message, typed_container(message)),
-                )
+                let mut event = CommunicationValue::new(CommunicationType::MessageLive)
+                    .with_id(event_id)
+                    .with_sender(signer_id)
+                    .with_receiver(receiver)
+                    .add_typed_default(DataType::SenderId, sender)
+                    .add_typed_default(DataType::Message, typed_container(message))
+                    .add_typed_default(
+                        DataType::LastMessageAt,
+                        DataValue::SignedNumber(accepted_at.into()),
+                    );
+                if let (Ok(owner), Ok(partner)) =
+                    (i64::try_from(recipient_id), i64::try_from(signer_id))
+                    && let Ok(Some(contact)) = chats_util::get_user(owner, partner)
+                {
+                    event = event.add_typed_default(
+                        DataType::Notifications,
+                        DataValue::SignedNumber(contact.notifications.into()),
+                    );
+                    if let Some(last_message_at) = contact.last_message_at {
+                        event = event.add_typed_default(
+                            DataType::LastMessageAt,
+                            DataValue::SignedNumber(last_message_at.into()),
+                        );
+                    }
+                }
+                Some(event)
             }
             CommunicationType::SetChatSecret => {
                 let frame = CommunicationValue::new(CommunicationType::SetChatSecret)
@@ -1801,6 +1822,7 @@ impl OmikronConnection {
                 verified.context.signer_id,
                 destination,
                 &verified.context.message_id,
+                accepted_at,
             );
             if let Err(error) =
                 relay_replay::mark_applied(verified.context.signer_id, &verified.context.message_id)
@@ -2301,6 +2323,7 @@ impl OmikronConnection {
         dispatch!(DeleteApp, handle_delete_app);
         dispatch!(ClientConnected, handle_client_connected);
         dispatch!(ClientStateAck, handle_client_state_ack);
+        dispatch!(ReadNotification, handle_read_notification);
         dispatch!(MessageEdit, handle_message_edit);
         dispatch!(MessageEditLive, handle_message_edit_live);
         dispatch!(MessageReactionAdd, handle_message_reaction_add);
@@ -2659,6 +2682,14 @@ impl OmikronConnection {
             } else {
                 self.flush_pending_relays_for_user(Some(user_id)).await;
             }
+        }
+    }
+
+    async fn handle_read_notification(self: Arc<Self>, cv: &CommunicationValue) {
+        let mutation = message_handlers::handle_read_notification(cv);
+        let _ = self.send_message(&mutation.response).await;
+        if let Some(changed) = mutation.changed {
+            let _ = self.send_message(&changed).await;
         }
     }
 

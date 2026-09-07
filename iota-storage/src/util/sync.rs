@@ -4,7 +4,7 @@ use crate::util::db;
 use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
 
-pub const CACHE_SCHEMA_VERSION: i64 = 4;
+pub const CACHE_SCHEMA_VERSION: i64 = 5;
 pub const STALE_CLIENT_SYNC_STATE_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

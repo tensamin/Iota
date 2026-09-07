@@ -4,6 +4,8 @@ pub struct Contact {
     pub user_name: Option<String>,
     pub created_at: i64,
     pub last_message_at: Option<i64>,
+    pub notifications: i64,
+    pub notifications_read_at: i64,
 }
 
 impl Default for Contact {
@@ -13,6 +15,8 @@ impl Default for Contact {
             user_name: None,
             created_at: 0,
             last_message_at: None,
+            notifications: 0,
+            notifications_read_at: 0,
         }
     }
 }
@@ -28,6 +32,8 @@ impl Contact {
             user_name: None,
             created_at,
             last_message_at: None,
+            notifications: 0,
+            notifications_read_at: 0,
         }
     }
     pub fn set_last_message_at(&mut self, p0: i64) {

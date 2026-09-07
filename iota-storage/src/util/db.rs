@@ -182,6 +182,8 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
                 user_name TEXT,
                 created_at INTEGER NOT NULL,
                 last_message_at INTEGER,
+                notifications INTEGER NOT NULL DEFAULT 0,
+                notifications_read_at INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(storage_owner, user_id)
             );
             CREATE INDEX IF NOT EXISTS idx_contacts_owner
@@ -858,6 +860,33 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         conn.pragma_update(None, "user_version", 24)?;
     }
 
+    if current_version < 25 {
+        let contacts_exist: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'contacts')",
+            [],
+            |row| row.get(0),
+        )?;
+        if contacts_exist {
+            add_table_column_if_missing(
+                conn,
+                "contacts",
+                "notifications",
+                "notifications INTEGER NOT NULL DEFAULT 0",
+            )?;
+            add_table_column_if_missing(
+                conn,
+                "contacts",
+                "notifications_read_at",
+                "notifications_read_at INTEGER NOT NULL DEFAULT 0",
+            )?;
+            conn.execute(
+                "UPDATE contacts SET notifications_read_at = COALESCE(last_message_at, 0) WHERE notifications_read_at = 0 AND notifications = 0",
+                [],
+            )?;
+        }
+        conn.pragma_update(None, "user_version", 25)?;
+    }
+
     Ok(())
 }
 
@@ -927,7 +956,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 24);
+        assert_eq!(version, 25);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -946,7 +975,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 24);
+        assert_eq!(version, 25);
         for table in [
             "sync_heads",
             "sync_events",
@@ -992,7 +1021,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 24);
+        assert_eq!(version, 25);
         for column in [
             "id",
             "user_id",
@@ -1087,7 +1116,7 @@ mod tests {
         )?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         assert_eq!(preserved, "remote_committed");
-        assert_eq!(version, 24);
+        assert_eq!(version, 25);
         Ok(())
     }
 }

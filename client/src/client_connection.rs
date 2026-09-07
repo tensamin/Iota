@@ -222,6 +222,15 @@ impl ClientConnection {
             return;
         }
 
+        if cv.is_type(CommunicationType::ReadNotification) {
+            let mutation = message_handlers::handle_read_notification(&cv);
+            self.send_message(&mutation.response).await;
+            if let Some(changed) = mutation.changed {
+                self.send_message(&changed).await;
+            }
+            return;
+        }
+
         // ************************************************ //
         // Direct messages                                  //
         // ************************************************ //
