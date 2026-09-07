@@ -1,4 +1,4 @@
-/* Opaque client-owned data is stored without interpreting its encrypted bytes. */
+/* Opaque client-owned bytes. Confidentiality is provided by the client-side blob format. */
 use crate::storage_error::StorageError;
 use crate::util::{db, sync};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
@@ -13,6 +13,13 @@ pub struct UserBlob {
     pub user_id: i64,
     pub blob_id: String,
     pub blob: Vec<u8>,
+    pub revision: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserBlobMetadata {
+    pub blob_id: String,
     pub revision: i64,
     pub updated_at: i64,
 }
@@ -48,6 +55,14 @@ fn from_row(row: &Row<'_>) -> rusqlite::Result<UserBlob> {
         blob: row.get(3)?,
         revision: row.get(4)?,
         updated_at: row.get(5)?,
+    })
+}
+
+fn metadata_from_row(row: &Row<'_>) -> rusqlite::Result<UserBlobMetadata> {
+    Ok(UserBlobMetadata {
+        blob_id: row.get(0)?,
+        revision: row.get(1)?,
+        updated_at: row.get(2)?,
     })
 }
 
@@ -142,6 +157,20 @@ pub fn list(user_id: i64) -> Result<Vec<UserBlob>, StorageError> {
         "SELECT id, user_id, blob_id, blob, revision, updated_at FROM user_blobs WHERE user_id = ?1 AND deleted = 0",
         &[],
     )
+}
+
+pub fn list_metadata(user_id: i64) -> Result<Vec<UserBlobMetadata>, StorageError> {
+    if user_id <= 0 {
+        return Err(StorageError::Other("invalid blob owner".into()));
+    }
+    db::with_db(|conn| {
+        let mut statement = conn.prepare(
+            "SELECT blob_id, revision, updated_at FROM user_blobs WHERE user_id = ?1 AND deleted = 0",
+        )?;
+        let rows = statement.query_map([user_id], metadata_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    })
 }
 pub fn list_by_ids(user_id: i64, ids: &[i64]) -> Result<Vec<UserBlob>, StorageError> {
     if user_id <= 0 {

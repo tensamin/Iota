@@ -5,7 +5,7 @@ use iota_storage::util::communities_util::CommunitiesUtil;
 use iota_storage::util::e2ee_storage::{self, ChatSecretQuery};
 use iota_storage::util::settings;
 use iota_storage::util::synced_settings::{self, SettingScope, SyncedSetting};
-use iota_storage::util::user_blobs::{self, UserBlob};
+use iota_storage::util::user_blobs::{self, UserBlob, UserBlobMetadata};
 use iota_storage::util::{blocked_users, message_storage_policy, receipt_policy};
 use mtp::codec::{
     CommunicationType, CommunicationValue, DataType, DataValue, TypeMap, VerifiedRelayContent,
@@ -1053,28 +1053,6 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
     {
         return sync_error(cv);
     }
-    let (blobs, deleted_blobs) = if mode == "delta" {
-        match sync::delta(user_id, reported_version, head) {
-            Ok(delta) => {
-                let blobs = match user_blobs::list_by_ids(user_id, &delta.blob_upserts) {
-                    Ok(blobs) => blobs,
-                    Err(_) => return sync_error(cv),
-                };
-                let deleted =
-                    match user_blobs::list_deleted_by_ids(user_id, &delta.deleted_blob_ids) {
-                        Ok(blobs) => blobs,
-                        Err(_) => return sync_error(cv),
-                    };
-                (blobs, deleted)
-            }
-            Err(_) => return sync_error(cv),
-        }
-    } else {
-        match user_blobs::list(user_id) {
-            Ok(blobs) => (blobs, Vec::new()),
-            Err(_) => return sync_error(cv),
-        }
-    };
     let blocked_users = match blocked_users::list(user_id) {
         Ok(users) => users,
         Err(_) => return sync_error(cv),
@@ -1124,19 +1102,6 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
         .add_typed_default(
             DataType::Settings,
             DataValue::Array(settings.iter().map(synced_setting_value).collect()),
-        )
-        .add_typed_default(
-            DataType::Blobs,
-            DataValue::Array(blobs.iter().map(blob_value).collect()),
-        )
-        .add_typed_default(
-            DataType::DeletedBlobIds,
-            DataValue::Array(
-                deleted_blobs
-                    .iter()
-                    .map(|blob| DataValue::Str(blob.blob_id.clone()))
-                    .collect(),
-            ),
         )
         .add_typed_default(
             DataType::BlockedUserIds,
@@ -1856,10 +1821,9 @@ fn setting_response(
         )
 }
 
-fn blob_value(blob: &UserBlob) -> DataValue {
+fn blob_metadata_value(blob: &UserBlobMetadata) -> DataValue {
     typed_container(vec![
         (DataType::BlobId, DataValue::Str(blob.blob_id.clone())),
-        (DataType::Blob, DataValue::Bytes(blob.blob.clone())),
         (
             DataType::VersionNumber,
             DataValue::SignedNumber(blob.revision.into()),
@@ -1881,6 +1845,25 @@ fn blob_response(
         .with_receiver(sender_wire_id(blob.user_id))
         .add_typed_default(DataType::BlobId, DataValue::Str(blob.blob_id.clone()))
         .add_typed_default(DataType::Blob, DataValue::Bytes(blob.blob.clone()))
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::SignedNumber(blob.revision.into()),
+        )
+        .add_typed_default(
+            DataType::UpdatedAt,
+            DataValue::SignedNumber(blob.updated_at.into()),
+        )
+}
+
+fn blob_mutation_response(
+    cv: &CommunicationValue,
+    ty: CommunicationType,
+    blob: &UserBlob,
+) -> CommunicationValue {
+    CommunicationValue::new(ty)
+        .with_request_id(cv)
+        .with_receiver(sender_wire_id(blob.user_id))
+        .add_typed_default(DataType::BlobId, DataValue::Str(blob.blob_id.clone()))
         .add_typed_default(
             DataType::VersionNumber,
             DataValue::SignedNumber(blob.revision.into()),
@@ -2152,7 +2135,7 @@ pub fn handle_user_blob_put(cv: &CommunicationValue) -> BlobMutation {
     let expected_revision = data_i64(cv, DataType::ExpectedRevision);
     match user_blobs::put(user_id, &blob_id, &blob, expected_revision) {
         Ok(stored) => BlobMutation {
-            response: blob_response(cv, CommunicationType::UserBlobPut, &stored),
+            response: blob_mutation_response(cv, CommunicationType::UserBlobPut, &stored),
             changed: Some(blob_changed(
                 user_id,
                 stored.blob_id.clone(),
@@ -2227,13 +2210,13 @@ pub fn handle_user_blob_list(cv: &CommunicationValue) -> CommunicationValue {
     if user_id <= 0 {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     }
-    match user_blobs::list(user_id) {
+    match user_blobs::list_metadata(user_id) {
         Ok(blobs) => CommunicationValue::new(CommunicationType::UserBlobList)
             .with_request_id(cv)
             .with_receiver(sender_wire_id(user_id))
             .add_typed_default(
                 DataType::Blobs,
-                DataValue::Array(blobs.iter().map(blob_value).collect()),
+                DataValue::Array(blobs.iter().map(blob_metadata_value).collect()),
             ),
         Err(_) => error_response(cv, CommunicationType::ErrorInternal),
     }
