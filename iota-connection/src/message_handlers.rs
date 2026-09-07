@@ -46,6 +46,12 @@ pub struct PolicyMutation {
     pub changed: Option<CommunicationValue>,
 }
 
+#[derive(Debug)]
+pub struct NotificationMutation {
+    pub response: CommunicationValue,
+    pub changed: Option<CommunicationValue>,
+}
+
 struct SettingLocator {
     scope: SettingScope,
     scope_key: String,
@@ -861,6 +867,10 @@ fn contact_value(
         ));
     }
     fields.push((
+        DataType::Notifications,
+        DataValue::SignedNumber(contact.notifications.into()),
+    ));
+    fields.push((
         DataType::Messages,
         DataValue::Array(
             messages
@@ -1328,12 +1338,86 @@ pub fn handle_get_chats(cv: &CommunicationValue) -> CommunicationValue {
         if let Some(ts) = user.last_message_at {
             container.push((DataType::LastMessageAt, DataValue::SignedNumber(ts as i128)));
         }
+        container.push((
+            DataType::Notifications,
+            DataValue::SignedNumber(user.notifications.into()),
+        ));
         user_array.push(typed_container(container));
     }
     CommunicationValue::new(CommunicationType::GetChats)
         .with_request_id(cv)
         .with_receiver(user_id)
         .add_typed_default(DataType::UserIds, DataValue::Array(user_array))
+}
+
+fn notification_response(
+    ty: CommunicationType,
+    request: &CommunicationValue,
+    owner: i64,
+    contact: &iota_storage::users::contact::Contact,
+) -> CommunicationValue {
+    let mut response = CommunicationValue::new(ty)
+        .with_request_id(request)
+        .with_receiver(sender_wire_id(owner))
+        .add_typed_default(
+            DataType::ChatPartnerId,
+            DataValue::SignedNumber(contact.user_id.into()),
+        )
+        .add_typed_default(
+            DataType::Notifications,
+            DataValue::SignedNumber(contact.notifications.into()),
+        );
+    if let Some(last_message_at) = contact.last_message_at {
+        response = response.add_typed_default(
+            DataType::LastMessageAt,
+            DataValue::SignedNumber(last_message_at.into()),
+        );
+    }
+    response
+}
+
+pub fn handle_read_notification(cv: &CommunicationValue) -> NotificationMutation {
+    let Ok(owner) = required_sender_id(cv) else {
+        return NotificationMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        };
+    };
+    let Some(partner_id) = data_i64(cv, DataType::ChatPartnerId).filter(|id| *id > 0) else {
+        return NotificationMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        };
+    };
+    let Some(through) = data_i64(cv, DataType::LastMessageAt).filter(|time| *time >= 0) else {
+        return NotificationMutation {
+            response: error_response(cv, CommunicationType::ErrorInvalidData),
+            changed: None,
+        };
+    };
+
+    match chats_util::read_notifications(owner, partner_id, through) {
+        Ok(Some(contact)) => NotificationMutation {
+            response: notification_response(
+                CommunicationType::ReadNotification,
+                cv,
+                owner,
+                &contact,
+            ),
+            changed: Some(
+                notification_response(CommunicationType::PushNotification, cv, owner, &contact)
+                    .with_id(next_notification_id()),
+            ),
+        },
+        Ok(None) => NotificationMutation {
+            response: error_response(cv, CommunicationType::ErrorNotFound),
+            changed: None,
+        },
+        Err(_) => NotificationMutation {
+            response: error_response(cv, CommunicationType::ErrorInternal),
+            changed: None,
+        },
+    }
 }
 
 pub fn handle_add_community(cv: &CommunicationValue) -> CommunicationValue {

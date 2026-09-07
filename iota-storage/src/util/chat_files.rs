@@ -658,6 +658,12 @@ pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
                 .unwrap_or(authored_at),
         );
         crate::util::chats_util::upsert_contact(&tx, storage_owner, &contact)?;
+        if !sent_by_self {
+            tx.execute(
+                "UPDATE contacts SET notifications = CASE WHEN notifications < 9223372036854775807 THEN notifications + 1 ELSE notifications END WHERE storage_owner = ?1 AND user_id = ?2",
+                params![storage_owner, external_user],
+            )?;
+        }
         tx.commit()?;
         Ok(msg_id)
     })

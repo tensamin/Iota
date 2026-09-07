@@ -2,7 +2,7 @@ use crate::storage_error::StorageError;
 use crate::users::contact::Contact;
 use crate::util::db;
 use crate::util::sync::{self, EntityType, Operation};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 pub(crate) fn upsert_contact(
     tx: &rusqlite::Transaction<'_>,
@@ -11,8 +11,11 @@ pub(crate) fn upsert_contact(
 ) -> Result<(), StorageError> {
     tx.execute(
         r#"
-        INSERT INTO contacts (storage_owner, user_id, user_name, created_at, last_message_at)
-        VALUES (?1, ?2, ?3, ?4, ?5)
+        INSERT INTO contacts (
+            storage_owner, user_id, user_name, created_at, last_message_at,
+            notifications, notifications_read_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         ON CONFLICT(storage_owner, user_id) DO UPDATE SET
             user_name = COALESCE(excluded.user_name, contacts.user_name),
             created_at = MIN(contacts.created_at, excluded.created_at),
@@ -28,6 +31,8 @@ pub(crate) fn upsert_contact(
             contact.user_name,
             contact.created_at,
             contact.last_message_at,
+            contact.notifications,
+            contact.notifications_read_at,
         ],
     )?;
     sync::record_event(
@@ -69,7 +74,8 @@ pub fn get_user(storage_owner: i64, user_id: i64) -> Result<Option<Contact>, Sto
     db::with_db(|conn| {
         match conn.query_row(
             r#"
-            SELECT user_id, user_name, created_at, last_message_at
+            SELECT user_id, user_name, created_at, last_message_at,
+                   notifications, notifications_read_at
             FROM contacts
             WHERE storage_owner = ?1 AND user_id = ?2
             LIMIT 1
@@ -81,6 +87,8 @@ pub fn get_user(storage_owner: i64, user_id: i64) -> Result<Option<Contact>, Sto
                     user_name: r.get(1)?,
                     created_at: r.get(2)?,
                     last_message_at: r.get(3)?,
+                    notifications: r.get(4)?,
+                    notifications_read_at: r.get(5)?,
                 })
             },
         ) {
@@ -95,7 +103,8 @@ pub fn get_users(storage_owner: i64) -> Result<Vec<Contact>, StorageError> {
     db::with_db(|conn| {
         let mut stmt = conn.prepare(
             r#"
-            SELECT user_id, user_name, created_at, last_message_at
+            SELECT user_id, user_name, created_at, last_message_at,
+                   notifications, notifications_read_at
             FROM contacts
             WHERE storage_owner = ?1
             ORDER BY
@@ -111,6 +120,8 @@ pub fn get_users(storage_owner: i64) -> Result<Vec<Contact>, StorageError> {
                 user_name: r.get(1)?,
                 created_at: r.get(2)?,
                 last_message_at: r.get(3)?,
+                notifications: r.get(4)?,
+                notifications_read_at: r.get(5)?,
             })
         })?;
 
@@ -119,5 +130,70 @@ pub fn get_users(storage_owner: i64) -> Result<Vec<Contact>, StorageError> {
             out.push(row?);
         }
         Ok(out)
+    })
+}
+
+pub fn read_notifications(
+    storage_owner: i64,
+    user_id: i64,
+    through: i64,
+) -> Result<Option<Contact>, StorageError> {
+    db::with_immediate_transaction(|tx| {
+        let Some(current_read_at) = tx
+            .query_row(
+                "SELECT notifications_read_at FROM contacts WHERE storage_owner = ?1 AND user_id = ?2",
+                params![storage_owner, user_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let read_at = current_read_at.max(through);
+        let notifications = tx.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM messages
+            WHERE storage_owner = ?1
+              AND external_user = ?2
+              AND sent_by_self = 0
+              AND deleted_by_external = 0
+              AND history_deleted = 0
+              AND COALESCE(destination_iota_received_at, stored_at, authored_at, message_time) > ?3
+            "#,
+            params![storage_owner, user_id, read_at],
+            |row| row.get::<_, i64>(0),
+        )?;
+        tx.execute(
+            "UPDATE contacts SET notifications = ?3, notifications_read_at = ?4 WHERE storage_owner = ?1 AND user_id = ?2",
+            params![storage_owner, user_id, notifications, read_at],
+        )?;
+        sync::record_event(
+            tx,
+            storage_owner,
+            EntityType::Contact,
+            user_id,
+            Operation::Upsert,
+        )?;
+
+        Ok(Some(tx.query_row(
+            r#"
+            SELECT user_id, user_name, created_at, last_message_at,
+                   notifications, notifications_read_at
+            FROM contacts
+            WHERE storage_owner = ?1 AND user_id = ?2
+            "#,
+            params![storage_owner, user_id],
+            |row| {
+                Ok(Contact {
+                    user_id: row.get(0)?,
+                    user_name: row.get(1)?,
+                    created_at: row.get(2)?,
+                    last_message_at: row.get(3)?,
+                    notifications: row.get(4)?,
+                    notifications_read_at: row.get(5)?,
+                })
+            },
+        )?))
     })
 }
