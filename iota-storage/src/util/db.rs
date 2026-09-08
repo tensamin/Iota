@@ -887,6 +887,22 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         conn.pragma_update(None, "user_version", 25)?;
     }
 
+    if current_version < 26 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS client_device_sync_state (
+                user_id INTEGER NOT NULL,
+                device_id TEXT NOT NULL,
+                acknowledged_version INTEGER NOT NULL,
+                cache_schema_version INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, device_id)
+            );
+            "#,
+        )?;
+        conn.pragma_update(None, "user_version", 26)?;
+    }
+
     Ok(())
 }
 
@@ -956,7 +972,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 25);
+        assert_eq!(version, 26);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -975,11 +991,12 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 25);
+        assert_eq!(version, 26);
         for table in [
             "sync_heads",
             "sync_events",
             "client_sync_state",
+            "client_device_sync_state",
             "user_residency",
             "relay_replay",
             "pending_relays",
@@ -1021,7 +1038,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 25);
+        assert_eq!(version, 26);
         for column in [
             "id",
             "user_id",
@@ -1116,7 +1133,7 @@ mod tests {
         )?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         assert_eq!(preserved, "remote_committed");
-        assert_eq!(version, 25);
+        assert_eq!(version, 26);
         Ok(())
     }
 }

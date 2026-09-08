@@ -451,6 +451,10 @@ fn purge_database_rows(user_id: i64) -> Result<(), crate::storage_error::Storage
             params![user_id],
         )?;
         tx.execute(
+            "DELETE FROM client_device_sync_state WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
             "DELETE FROM client_message_deliveries WHERE user_id = ?1",
             params![user_id],
         )?;

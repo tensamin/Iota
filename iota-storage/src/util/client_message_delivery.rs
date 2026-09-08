@@ -41,11 +41,12 @@ pub fn acknowledge_sync_delivery(
 /* Acknowledge a state-sync response and delete only its recorded visible messages atomically. */
 pub fn acknowledge_client_state(
     user_id: i64,
+    device_id: &str,
     session_id: i64,
     version: i64,
     cache_schema_version: i64,
 ) -> Result<(), StorageError> {
-    if user_id <= 0 || session_id <= 0 || version < 0 {
+    if user_id <= 0 || device_id.is_empty() || session_id <= 0 || version < 0 {
         return Err(StorageError::Other("invalid sync acknowledgement".into()));
     }
     db::with_immediate_transaction(|tx| {
@@ -70,7 +71,7 @@ pub fn acknowledge_client_state(
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        tx.execute("INSERT INTO client_sync_state (user_id, session_id, acknowledged_version, cache_schema_version, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(user_id, session_id) DO UPDATE SET acknowledged_version = MAX(acknowledged_version, excluded.acknowledged_version), cache_schema_version = excluded.cache_schema_version, updated_at = excluded.updated_at", params![user_id, session_id, version, cache_schema_version, sync::now_millis()])?;
+        tx.execute("INSERT INTO client_device_sync_state (user_id, device_id, acknowledged_version, cache_schema_version, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(user_id, device_id) DO UPDATE SET acknowledged_version = MAX(acknowledged_version, excluded.acknowledged_version), cache_schema_version = excluded.cache_schema_version, updated_at = excluded.updated_at", params![user_id, device_id, version, cache_schema_version, sync::now_millis()])?;
         if message_storage_policy::get_in_tx(tx, user_id)?.history_mode
             == message_storage_policy::MessageHistoryMode::DeleteAfterClientDelivery
         {

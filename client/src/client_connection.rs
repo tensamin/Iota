@@ -210,15 +210,21 @@ impl ClientConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::ClientConnected) {
-            self.send_message(&message_handlers::handle_client_connected(&cv))
-                .await;
+        if cv.is_type(CommunicationType::ClientStateGet) {
+            // Durable client synchronization is routed through Omikron, which
+            // is the authority that assigns the numeric transport SessionId.
+            self.send_message(
+                &CommunicationValue::new(CommunicationType::ErrorInvalidData).with_request_id(&cv),
+            )
+            .await;
             return;
         }
 
         if cv.is_type(CommunicationType::ClientStateAck) {
-            self.send_message(&message_handlers::handle_client_state_ack(&cv))
-                .await;
+            self.send_message(
+                &CommunicationValue::new(CommunicationType::ErrorInvalidData).with_request_id(&cv),
+            )
+            .await;
             return;
         }
 

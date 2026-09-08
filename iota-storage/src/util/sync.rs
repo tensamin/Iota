@@ -114,54 +114,27 @@ pub fn head(user_id: i64) -> Result<i64, StorageError> {
     })
 }
 
-pub fn has_session(user_id: i64, session_id: i64) -> Result<bool, StorageError> {
+pub fn has_device(user_id: i64, device_id: &str) -> Result<bool, StorageError> {
     db::with_db(|conn| {
         Ok(conn
             .query_row(
-                "SELECT 1 FROM client_sync_state WHERE user_id = ?1 AND session_id = ?2",
-                params![user_id, session_id],
+                "SELECT 1 FROM client_device_sync_state WHERE user_id = ?1 AND device_id = ?2",
+                params![user_id, device_id],
                 |_| Ok(()),
             )
             .is_ok())
     })
 }
 
-pub fn acknowledged_version(user_id: i64, session_id: i64) -> Result<Option<i64>, StorageError> {
+pub fn acknowledged_version(user_id: i64, device_id: &str) -> Result<Option<i64>, StorageError> {
     db::with_db(|conn| {
         conn.query_row(
-            "SELECT acknowledged_version FROM client_sync_state WHERE user_id = ?1 AND session_id = ?2",
-            params![user_id, session_id],
+            "SELECT acknowledged_version FROM client_device_sync_state WHERE user_id = ?1 AND device_id = ?2",
+            params![user_id, device_id],
             |row| row.get(0),
         )
         .optional()
         .map_err(StorageError::from)
-    })
-}
-
-pub fn acknowledge(
-    user_id: i64,
-    session_id: i64,
-    version: i64,
-    cache_schema_version: i64,
-) -> Result<(), StorageError> {
-    if user_id <= 0 || session_id <= 0 || version < 0 {
-        return Err(StorageError::Other("invalid sync acknowledgement".into()));
-    }
-    db::with_db(|conn| {
-        let head = conn
-            .query_row(
-                "SELECT version FROM sync_heads WHERE user_id = ?1",
-                [user_id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if version > head {
-            return Err(StorageError::Other(
-                "acknowledgement is ahead of head".into(),
-            ));
-        }
-        conn.execute("INSERT INTO client_sync_state (user_id, session_id, acknowledged_version, cache_schema_version, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(user_id, session_id) DO UPDATE SET acknowledged_version = MAX(acknowledged_version, excluded.acknowledged_version), cache_schema_version = excluded.cache_schema_version, updated_at = excluded.updated_at", params![user_id, session_id, version, cache_schema_version, now_millis()])?;
-        Ok(())
     })
 }
 
@@ -173,15 +146,15 @@ pub fn compact_user_sync_state(user_id: i64) -> Result<SyncCompactionResult, Sto
     let stale_before = now_millis().saturating_sub(STALE_CLIENT_SYNC_STATE_MS);
     db::with_immediate_transaction(|tx| {
         tx.execute(
-            "DELETE FROM client_message_deliveries WHERE user_id = ?1 AND session_id IN (SELECT session_id FROM client_sync_state WHERE user_id = ?1 AND updated_at < ?2)",
+            "DELETE FROM client_message_deliveries WHERE user_id = ?1 AND created_at < ?2",
             params![user_id, stale_before],
         )?;
         let removed_stale_clients = tx.execute(
-            "DELETE FROM client_sync_state WHERE user_id = ?1 AND updated_at < ?2",
+            "DELETE FROM client_device_sync_state WHERE user_id = ?1 AND updated_at < ?2",
             params![user_id, stale_before],
         )?;
         let minimum_acknowledged: Option<i64> = tx.query_row(
-            "SELECT MIN(acknowledged_version) FROM client_sync_state WHERE user_id = ?1",
+            "SELECT MIN(acknowledged_version) FROM client_device_sync_state WHERE user_id = ?1",
             [user_id],
             |row| row.get(0),
         )?;

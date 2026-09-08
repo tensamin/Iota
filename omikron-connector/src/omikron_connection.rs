@@ -2321,7 +2321,7 @@ impl OmikronConnection {
         dispatch!(LoadAppData, handle_load_app_data);
         dispatch!(CreateApp, handle_create_app);
         dispatch!(DeleteApp, handle_delete_app);
-        dispatch!(ClientConnected, handle_client_connected);
+        dispatch!(ClientStateGet, handle_client_state_get);
         dispatch!(ClientStateAck, handle_client_state_ack);
         dispatch!(ReadNotification, handle_read_notification);
         dispatch!(MessageEdit, handle_message_edit);
@@ -2622,8 +2622,8 @@ impl OmikronConnection {
             .await;
     }
 
-    async fn handle_client_connected(self: Arc<Self>, cv: &CommunicationValue) {
-        let response = message_handlers::handle_client_connected(cv);
+    async fn handle_client_state_get(self: Arc<Self>, cv: &CommunicationValue) {
+        let response = message_handlers::handle_client_state_get(cv);
         let user_id = cv
             .require_sender()
             .ok()
@@ -2663,7 +2663,7 @@ impl OmikronConnection {
         }
 
         if let Err(error) = self.send_message(&response).await {
-            log!("ClientConnected response delivery failed: {}", error);
+            log!("ClientStateGet response delivery failed: {}", error);
         }
     }
 

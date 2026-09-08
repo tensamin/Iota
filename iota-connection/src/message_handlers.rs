@@ -17,6 +17,17 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static NEXT_NOTIFICATION_ID: AtomicU32 = AtomicU32::new(1);
 
+fn valid_device_id(id: &str) -> bool {
+    id.len() == 36
+        && id
+            .chars()
+            .enumerate()
+            .all(|(index, character)| match index {
+                8 | 13 | 18 | 23 => character == '-',
+                _ => character.is_ascii_hexdigit(),
+            })
+}
+
 fn next_notification_id() -> u32 {
     NEXT_NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed).max(1)
 }
@@ -952,7 +963,7 @@ fn sync_error(cv: &CommunicationValue) -> CommunicationValue {
 }
 
 /// The sender is authenticated by MTP; a UserId embedded by a client is never trusted here.
-pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
+pub fn handle_client_state_get(cv: &CommunicationValue) -> CommunicationValue {
     use iota_storage::util::sync::{self, CACHE_SCHEMA_VERSION};
     let user_id = match required_sender_id(cv) {
         Ok(id) if id > 0 => id,
@@ -962,21 +973,31 @@ pub fn handle_client_connected(cv: &CommunicationValue) -> CommunicationValue {
         Some(id) if id > 0 => id,
         _ => return sync_error(cv),
     };
+    let device_id = match cv.get_data(DataType::DeviceId).and_then(DataValue::as_str) {
+        Some(id) if valid_device_id(id) => id.to_owned(),
+        _ => return sync_error(cv),
+    };
     let reported_version = match data_i64(cv, DataType::VersionNumber) {
         Some(version) if version >= 0 => version,
         _ => return sync_error(cv),
     };
-    let cache_valid = cv.get_data(DataType::CacheValid).as_bool().unwrap_or(false);
-    let schema = data_i64(cv, DataType::CacheSchemaVersion).unwrap_or(0);
+    let cache_valid = match cv.get_data(DataType::CacheValid).as_bool() {
+        Some(value) => value,
+        None => return sync_error(cv),
+    };
+    let schema = match data_i64(cv, DataType::CacheSchemaVersion) {
+        Some(value) if value >= 0 => value,
+        _ => return sync_error(cv),
+    };
     let head = match sync::head(user_id) {
         Ok(version) => version,
         Err(_) => return sync_error(cv),
     };
-    let known_session = sync::has_session(user_id, session_id).unwrap_or(false);
-    let acknowledged_version = sync::acknowledged_version(user_id, session_id).unwrap_or(None);
+    let known_device = sync::has_device(user_id, &device_id).unwrap_or(false);
+    let acknowledged_version = sync::acknowledged_version(user_id, &device_id).unwrap_or(None);
     let full = !cache_valid
         || reported_version == 0
-        || !known_session
+        || !known_device
         || acknowledged_version.is_some_and(|version| reported_version < version)
         || reported_version > head
         || schema != CACHE_SCHEMA_VERSION;
@@ -1181,12 +1202,17 @@ pub fn handle_client_state_ack(cv: &CommunicationValue) -> CommunicationValue {
         Some(id) if id > 0 => id,
         _ => return sync_error(cv),
     };
+    let device_id = match cv.get_data(DataType::DeviceId).and_then(DataValue::as_str) {
+        Some(id) if valid_device_id(id) => id.to_owned(),
+        _ => return sync_error(cv),
+    };
     let version = match data_i64(cv, DataType::VersionNumber) {
         Some(version) if version >= 0 => version,
         _ => return sync_error(cv),
     };
     if iota_storage::util::client_message_delivery::acknowledge_client_state(
         user_id,
+        &device_id,
         session_id,
         version,
         CACHE_SCHEMA_VERSION,
@@ -1874,7 +1900,24 @@ fn blob_mutation_response(
         )
 }
 
-fn blob_changed(user_id: i64, blob_id: String, revision: i64, deleted: bool) -> CommunicationValue {
+fn blob_changed(blob: &UserBlob) -> CommunicationValue {
+    CommunicationValue::new(CommunicationType::UserBlobChanged)
+        .with_id(next_notification_id())
+        .with_receiver(sender_wire_id(blob.user_id))
+        .add_typed_default(DataType::BlobId, DataValue::Str(blob.blob_id.clone()))
+        .add_typed_default(DataType::Blob, DataValue::Bytes(blob.blob.clone()))
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::SignedNumber(blob.revision.into()),
+        )
+        .add_typed_default(
+            DataType::UpdatedAt,
+            DataValue::SignedNumber(blob.updated_at.into()),
+        )
+        .add_typed_default(DataType::Deleted, DataValue::Bool(false))
+}
+
+fn blob_deleted(user_id: i64, blob_id: String, revision: i64) -> CommunicationValue {
     CommunicationValue::new(CommunicationType::UserBlobChanged)
         .with_id(next_notification_id())
         .with_receiver(sender_wire_id(user_id))
@@ -1883,7 +1926,7 @@ fn blob_changed(user_id: i64, blob_id: String, revision: i64, deleted: bool) -> 
             DataType::VersionNumber,
             DataValue::SignedNumber(revision.into()),
         )
-        .add_typed_default(DataType::Deleted, DataValue::Bool(deleted))
+        .add_typed_default(DataType::Deleted, DataValue::Bool(true))
 }
 
 fn blob_request(cv: &CommunicationValue) -> Result<(i64, String), CommunicationValue> {
@@ -2136,12 +2179,7 @@ pub fn handle_user_blob_put(cv: &CommunicationValue) -> BlobMutation {
     match user_blobs::put(user_id, &blob_id, &blob, expected_revision) {
         Ok(stored) => BlobMutation {
             response: blob_mutation_response(cv, CommunicationType::UserBlobPut, &stored),
-            changed: Some(blob_changed(
-                user_id,
-                stored.blob_id.clone(),
-                stored.revision,
-                false,
-            )),
+            changed: Some(blob_changed(&stored)),
         },
         Err(iota_storage::storage_error::StorageError::RevisionConflict) => BlobMutation {
             response: error_response(cv, CommunicationType::ErrorInvalidData),
@@ -2184,7 +2222,7 @@ pub fn handle_user_blob_delete(cv: &CommunicationValue) -> BlobMutation {
                 ),
             changed: deleted
                 .changed
-                .then(|| blob_changed(user_id, blob_id, deleted.revision, true)),
+                .then(|| blob_deleted(user_id, blob_id, deleted.revision)),
         },
         Ok(None) => BlobMutation {
             response: CommunicationValue::new(CommunicationType::UserBlobDelete)
