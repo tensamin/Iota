@@ -2321,8 +2321,8 @@ impl OmikronConnection {
         dispatch!(LoadAppData, handle_load_app_data);
         dispatch!(CreateApp, handle_create_app);
         dispatch!(DeleteApp, handle_delete_app);
-        dispatch!(ClientStateGet, handle_client_state_get);
-        dispatch!(ClientStateAck, handle_client_state_ack);
+        dispatch!(AccountStateRequest, handle_account_state_request);
+        dispatch!(AccountStateApplied, handle_account_state_applied);
         dispatch!(ReadNotification, handle_read_notification);
         dispatch!(MessageEdit, handle_message_edit);
         dispatch!(MessageEditLive, handle_message_edit_live);
@@ -2622,22 +2622,16 @@ impl OmikronConnection {
             .await;
     }
 
-    async fn handle_client_state_get(self: Arc<Self>, cv: &CommunicationValue) {
-        let response = message_handlers::handle_client_state_get(cv);
+    async fn handle_account_state_request(self: Arc<Self>, cv: &CommunicationValue) {
+        let response = message_handlers::handle_account_state_request(cv);
         let user_id = cv
             .require_sender()
             .ok()
             .and_then(|id| i64::try_from(id).ok());
-        let session_id = cv
-            .get_data(DataType::SessionId)
-            .as_number()
-            .and_then(|id| i64::try_from(id).ok());
-
-        if response.is_type(CommunicationType::ClientStateSync) {
+        if response.is_type(CommunicationType::AccountStateSnapshot) {
             log!(
-                "ClientStateSync user={:?} session={:?} stage=generated",
-                user_id,
-                session_id
+                "AccountStateSnapshot user={:?} stage=generated",
+                user_id
             );
             if let Some(user_id) = user_id
                 && let Err(error) = relay_queue::pause_client_deliveries(user_id)
@@ -2647,28 +2641,26 @@ impl OmikronConnection {
 
             if let Err(error) = self.send_message(&response).await {
                 log!(
-                    "Initial ClientStateSync delivery failed for user {:?}, session {:?}: {}",
+                    "Initial AccountStateSnapshot delivery failed for user {:?}: {}",
                     user_id,
-                    session_id,
                     error
                 );
             } else {
                 log!(
-                    "ClientStateSync user={:?} session={:?} stage=sent_to_omikron",
-                    user_id,
-                    session_id
+                    "AccountStateSnapshot user={:?} stage=sent_to_omikron",
+                    user_id
                 );
             }
             return;
         }
 
         if let Err(error) = self.send_message(&response).await {
-            log!("ClientStateGet response delivery failed: {}", error);
+            log!("AccountStateRequest response delivery failed: {}", error);
         }
     }
 
-    async fn handle_client_state_ack(self: Arc<Self>, cv: &CommunicationValue) {
-        let response = message_handlers::handle_client_state_ack(cv);
+    async fn handle_account_state_applied(self: Arc<Self>, cv: &CommunicationValue) {
+        let response = message_handlers::handle_account_state_applied(cv);
         let user_id = cv
             .require_sender()
             .ok()

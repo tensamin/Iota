@@ -210,9 +210,8 @@ impl ClientConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::ClientStateGet) {
-            // Durable client synchronization is routed through Omikron, which
-            // is the authority that assigns the numeric transport SessionId.
+        if cv.is_type(CommunicationType::AccountStateRequest) {
+            // Account initialization is routed through Omikron.
             self.send_message(
                 &CommunicationValue::new(CommunicationType::ErrorInvalidData).with_request_id(&cv),
             )
@@ -220,7 +219,7 @@ impl ClientConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::ClientStateAck) {
+        if cv.is_type(CommunicationType::AccountStateApplied) {
             self.send_message(
                 &CommunicationValue::new(CommunicationType::ErrorInvalidData).with_request_id(&cv),
             )
