@@ -7,6 +7,9 @@ use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+/// Stable machine-wide daemon entry point used by the systemd unit.
+pub const SYSTEM_DAEMON_EXECUTABLE: &str = "/usr/local/libexec/iota/iota-daemon";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Scope {
     User,

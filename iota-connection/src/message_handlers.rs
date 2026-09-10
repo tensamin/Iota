@@ -827,17 +827,10 @@ pub fn handle_delete_app(cv: &CommunicationValue) -> CommunicationValue {
         .to_string();
 
     if !app_identifier.is_empty() {
-        let user = match iota_storage::users::user_manager::get_user(sender_id) {
-            Ok(user) => user,
-            Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
-        };
-        if let Some(mut user) = user {
-            if user.trusted_apps.contains_key(&app_identifier) {
-                user.trusted_apps.remove(&app_identifier);
-                if iota_storage::users::user_manager::update_user(user).is_err() {
-                    return error_response(cv, CommunicationType::ErrorInternal);
-                }
-            }
+        if iota_storage::users::user_manager::revoke_trusted_app(sender_id, &app_identifier)
+            .is_err()
+        {
+            return error_response(cv, CommunicationType::ErrorInternal);
         }
     }
 
@@ -950,6 +943,25 @@ fn account_state_error(cv: &CommunicationValue) -> CommunicationValue {
     error_response(cv, CommunicationType::ErrorInvalidData)
 }
 
+fn add_receipt_policy_data(
+    response: CommunicationValue,
+    policy: &receipt_policy::ReceiptPolicy,
+) -> CommunicationValue {
+    response
+        .add_typed_default(
+            DataType::SendReadReceipts,
+            DataValue::Bool(policy.send_read_receipts),
+        )
+        .add_typed_default(
+            DataType::SendReceivedReceipts,
+            DataValue::Bool(policy.send_received_receipts),
+        )
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::SignedNumber(policy.revision.into()),
+        )
+}
+
 /// The sender is authenticated by MTP; a UserId embedded by a client is never trusted here.
 pub fn handle_account_state_request(cv: &CommunicationValue) -> CommunicationValue {
     let user_id = match required_sender_id(cv) {
@@ -996,7 +1008,7 @@ pub fn handle_account_state_request(cv: &CommunicationValue) -> CommunicationVal
         message_storage_policy::MessageRetention::Forever => None,
         message_storage_policy::MessageRetention::Duration { duration_ms } => Some(duration_ms),
     };
-    let mut response = CommunicationValue::new(CommunicationType::AccountStateSnapshot)
+    let response = CommunicationValue::new(CommunicationType::AccountStateSnapshot)
         .with_request_id(cv)
         .with_receiver(sender_wire_id(user_id))
         .add_typed_default(
@@ -1021,15 +1033,8 @@ pub fn handle_account_state_request(cv: &CommunicationValue) -> CommunicationVal
                     .map(|id| DataValue::SignedNumber(id.into()))
                     .collect(),
             ),
-        )
-        .add_typed_default(
-            DataType::SendReadReceipts,
-            DataValue::Bool(receipt_policy.send_read_receipts),
-        )
-        .add_typed_default(
-            DataType::SendReceivedReceipts,
-            DataValue::Bool(receipt_policy.send_received_receipts),
-        )
+        );
+    let mut response = add_receipt_policy_data(response, &receipt_policy)
         .add_typed_default(
             DataType::MessageHistoryMode,
             DataValue::Str(match message_storage_policy.history_mode {
@@ -1058,6 +1063,45 @@ pub fn handle_account_state_applied(cv: &CommunicationValue) -> CommunicationVal
     };
     let _ = user_id;
     success_response(cv)
+}
+
+#[cfg(test)]
+mod account_state_tests {
+    use super::add_receipt_policy_data;
+    use iota_storage::util::receipt_policy::ReceiptPolicy;
+    use iota_util::mtp_compat::OptionalDataValueExt;
+    use mtp::codec::{CommunicationType, CommunicationValue, DataType};
+
+    #[test]
+    fn snapshot_receipt_policy_includes_its_revision() {
+        let policy = ReceiptPolicy {
+            user_id: 7,
+            send_read_receipts: false,
+            send_received_receipts: true,
+            revision: 42,
+            updated_at: 100,
+        };
+
+        let response = add_receipt_policy_data(
+            CommunicationValue::new(CommunicationType::AccountStateSnapshot),
+            &policy,
+        );
+
+        assert_eq!(
+            response
+                .get_data(DataType::VersionNumber)
+                .as_signed_number(),
+            Some(42)
+        );
+        assert_eq!(
+            response.get_data(DataType::SendReadReceipts).as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            response.get_data(DataType::SendReceivedReceipts).as_bool(),
+            Some(true)
+        );
+    }
 }
 
 pub fn handle_messages_get(cv: &CommunicationValue) -> CommunicationValue {
@@ -2222,21 +2266,10 @@ fn receipt_response(
     ty: CommunicationType,
     policy: receipt_policy::ReceiptPolicy,
 ) -> CommunicationValue {
-    CommunicationValue::new(ty)
+    let response = CommunicationValue::new(ty)
         .with_request_id(cv)
-        .with_receiver(sender_wire_id(policy.user_id))
-        .add_typed_default(
-            DataType::SendReadReceipts,
-            DataValue::Bool(policy.send_read_receipts),
-        )
-        .add_typed_default(
-            DataType::SendReceivedReceipts,
-            DataValue::Bool(policy.send_received_receipts),
-        )
-        .add_typed_default(
-            DataType::VersionNumber,
-            DataValue::SignedNumber(policy.revision.into()),
-        )
+        .with_receiver(sender_wire_id(policy.user_id));
+    add_receipt_policy_data(response, &policy)
 }
 pub fn handle_receipt_policy_get(cv: &CommunicationValue) -> CommunicationValue {
     let Ok(user_id) = authenticated_user(cv) else {

@@ -26,6 +26,8 @@ jobs:
     steps:
       - name: Set up repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Login to Docker Hub
         env:
@@ -41,16 +43,6 @@ jobs:
         run: |
           nix-shell -p docker --run "docker build -f dockerfile -t tensamin/iota:latest . && docker push tensamin/iota:latest"
 
-      - name: Build release binaries
-        run: |
-          set -eu
-
-          nix build .#iota-daemon --print-build-logs
-          install -Dm755 result/bin/iota-daemon dist/iota-daemon
-
-          nix build .#iota-ui --print-build-logs
-          install -Dm755 result/bin/iota-ui dist/iota-ui
-
       - name: Read release metadata
         id: version
         env:
@@ -58,7 +50,7 @@ jobs:
         run: |
           set -eu
 
-          VERSION="$(nix eval --raw .#iota-daemon.version)"
+          VERSION="$(nix eval --raw .#default.version)"
           SHORT_SHA="$(git rev-parse --short=7 HEAD)"
 
           case "$RELEASE_TYPE" in
@@ -80,11 +72,51 @@ jobs:
           echo "tag=$TAG" >> "$FORGEJO_OUTPUT"
           echo "title=$TAG" >> "$FORGEJO_OUTPUT"
           echo "prerelease=$PRERELEASE" >> "$FORGEJO_OUTPUT"
+          ARCH="$(uname -m)"
+          echo "arch=$ARCH" >> "$FORGEJO_OUTPUT"
+          echo "asset_name=iota-${TAG}-linux-${ARCH}.zip" >> "$FORGEJO_OUTPUT"
+          echo "update_manifest_name=iota-update-${TAG}-linux-${ARCH}.json" >> "$FORGEJO_OUTPUT"
+          echo "channel_tag=iota-updates-${RELEASE_TYPE}-linux-${ARCH}" >> "$FORGEJO_OUTPUT"
+          echo "channel_manifest_name=iota-update-linux-${ARCH}.json" >> "$FORGEJO_OUTPUT"
 
-          test -x "dist/iota-daemon"
-          test -x "dist/iota-ui"
+      - name: Build and validate installer bundle
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          ASSET_NAME: ${{ steps.version.outputs.asset_name }}
+          ARCH: ${{ steps.version.outputs.arch }}
+          UPDATE_MANIFEST_NAME: ${{ steps.version.outputs.update_manifest_name }}
+          CHANNEL_TAG: ${{ steps.version.outputs.channel_tag }}
+          CHANNEL_MANIFEST_NAME: ${{ steps.version.outputs.channel_manifest_name }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          SERVER_URL: ${{ forgejo.server_url }}
+          REPO: ${{ forgejo.repository }}
+          IOTA_RELEASE_SIGNING_KEY: ${{ secrets.IOTA_RELEASE_SIGNING_KEY }}
+        run: |
+          set -eu
+          : "${IOTA_RELEASE_SIGNING_KEY:?IOTA_RELEASE_SIGNING_KEY secret is required}"
 
-      - name: Create release and upload binaries
+          nix build "git+file://$PWD?submodules=1#default" --print-build-logs
+          mkdir -p dist/bin
+          install -m755 result/bin/iota dist/bin/iota
+          install -m755 result/bin/iota-daemon dist/bin/iota-daemon
+          install -m755 result/bin/iota-updater dist/bin/iota-updater
+
+          UPDATE_BASE_URL="${SERVER_URL%/}/${REPO}/releases/download/${TAG}"
+          UPDATE_CHANNEL_BASE_URL="${SERVER_URL%/}/${REPO}/releases/download/${CHANNEL_TAG}"
+          PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export ARCH PUBLISHED_AT RELEASE_TYPE TAG UPDATE_BASE_URL UPDATE_MANIFEST_NAME
+          nix-shell -p coreutils jq --run 'bash scripts/build-update-manifest.sh dist/bin "$TAG" "$RELEASE_TYPE" "$PUBLISHED_AT" linux "$ARCH" "$UPDATE_BASE_URL" "dist/$UPDATE_MANIFEST_NAME"'
+          UPDATE_PUBLIC_KEY="$(result/bin/iota-release sign "dist/$UPDATE_MANIFEST_NAME" "dist/$UPDATE_MANIFEST_NAME.sig")"
+          bash scripts/build-release-bundle.sh \
+            dist/bin \
+            "$TAG" \
+            "$UPDATE_CHANNEL_BASE_URL/$CHANNEL_MANIFEST_NAME" \
+            "$UPDATE_PUBLIC_KEY" \
+            "$UPDATE_CHANNEL_BASE_URL/$CHANNEL_MANIFEST_NAME.sig" \
+            "dist/$ASSET_NAME"
+          result/bin/iota-bundle "dist/$ASSET_NAME"
+
+      - name: Create release and upload release assets
         env:
           TOKEN: ${{ forgejo.token }}
           API: ${{ forgejo.api_url }}
@@ -93,6 +125,11 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
           TITLE: ${{ steps.version.outputs.title }}
           PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          ASSET_NAME: ${{ steps.version.outputs.asset_name }}
+          UPDATE_MANIFEST_NAME: ${{ steps.version.outputs.update_manifest_name }}
+          CHANNEL_TAG: ${{ steps.version.outputs.channel_tag }}
+          CHANNEL_MANIFEST_NAME: ${{ steps.version.outputs.channel_manifest_name }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
           DESCRIPTION: ${{ inputs.description }}
         run: |
           nix-shell -p curl jq --run '
@@ -120,11 +157,49 @@ jobs:
               RELEASE_ID="$(echo "$RELEASE_JSON" | jq -r .id)"
             fi
 
-            curl -fsS -X POST "$API/repos/$REPO/releases/$RELEASE_ID/assets?name=iota-daemon" \
-              -H "Authorization: token $TOKEN" \
-              -F "attachment=@dist/iota-daemon"
+            upload_asset() {
+              TARGET_RELEASE_ID="$1"
+              ASSET="$2"
+              PATHNAME="$3"
+              curl -fsS -X POST "$API/repos/$REPO/releases/$TARGET_RELEASE_ID/assets?name=$ASSET" \
+                -H "Authorization: token $TOKEN" \
+                -F "attachment=@$PATHNAME"
+            }
 
-            curl -fsS -X POST "$API/repos/$REPO/releases/$RELEASE_ID/assets?name=iota-ui" \
+            upload_asset "$RELEASE_ID" iota dist/bin/iota
+            upload_asset "$RELEASE_ID" iota-daemon dist/bin/iota-daemon
+            upload_asset "$RELEASE_ID" iota-updater dist/bin/iota-updater
+            upload_asset "$RELEASE_ID" "$UPDATE_MANIFEST_NAME.sig" "dist/$UPDATE_MANIFEST_NAME.sig"
+            upload_asset "$RELEASE_ID" "$ASSET_NAME" "dist/$ASSET_NAME"
+            upload_asset "$RELEASE_ID" "$UPDATE_MANIFEST_NAME" "dist/$UPDATE_MANIFEST_NAME"
+
+            CHANNEL_STATUS=$(curl -s -w "%{http_code}" -o channel_out.json \
               -H "Authorization: token $TOKEN" \
-              -F "attachment=@dist/iota-ui"
+              "$API/repos/$REPO/releases/tags/$CHANNEL_TAG")
+            if [ "$CHANNEL_STATUS" = "200" ]; then
+              CHANNEL_RELEASE_ID="$(jq -r .id channel_out.json)"
+            else
+              CHANNEL_JSON="$(curl -f -sS -X POST "$API/repos/$REPO/releases" \
+                -H "Authorization: token $TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n \
+                  --arg tag "$CHANNEL_TAG" \
+                  --arg name "Iota $RELEASE_TYPE update channel" \
+                  --arg target "$SHA" \
+                  '"'"'{ tag_name: $tag, name: $name, body: "Managed by the release workflow.", target_commitish: $target, draft: false, prerelease: true }'"'"')")"
+              CHANNEL_RELEASE_ID="$(echo "$CHANNEL_JSON" | jq -r .id)"
+            fi
+
+            CHANNEL_ASSETS="$(curl -fsS \
+              -H "Authorization: token $TOKEN" \
+              "$API/repos/$REPO/releases/$CHANNEL_RELEASE_ID/assets")"
+            for CHANNEL_ASSET in "$CHANNEL_MANIFEST_NAME" "$CHANNEL_MANIFEST_NAME.sig"; do
+              echo "$CHANNEL_ASSETS" | jq -r --arg name "$CHANNEL_ASSET" '"'"'.[] | select(.name == $name) | .id'"'"' | while read -r ASSET_ID; do
+                [ -n "$ASSET_ID" ] || continue
+                curl -fsS -X DELETE "$API/repos/$REPO/releases/assets/$ASSET_ID" \
+                  -H "Authorization: token $TOKEN"
+              done
+            done
+            upload_asset "$CHANNEL_RELEASE_ID" "$CHANNEL_MANIFEST_NAME.sig" "dist/$UPDATE_MANIFEST_NAME.sig"
+            upload_asset "$CHANNEL_RELEASE_ID" "$CHANNEL_MANIFEST_NAME" "dist/$UPDATE_MANIFEST_NAME"
           '

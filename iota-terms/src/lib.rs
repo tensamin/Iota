@@ -10,4 +10,4 @@ pub use terms_getter::get_terms;
 
 pub mod doc;
 
-pub use doc::Doc;
+pub use doc::{Doc, LegalDocument};

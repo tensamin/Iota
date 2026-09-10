@@ -38,7 +38,7 @@ async fn main() {
         let session = start_tui(ipc).expect("interactive terminal initialization failed");
         let ui = session.ui();
 
-        let (eula, tos_pp) = match consent_state::check(ui.clone()).await {
+        let consent = match consent_state::check(ui.clone()).await {
             Ok(v) => v,
             Err(e) => {
                 *state.shutdown.write().await = true;
@@ -53,7 +53,7 @@ async fn main() {
             }
         };
 
-        if !eula {
+        if !consent.accepted_eula {
             *state.shutdown.write().await = true;
             loop {
                 if state.active_tasks.is_empty() {
@@ -65,7 +65,7 @@ async fn main() {
             println!("You can find this at 'agreements'!");
             return;
         }
-        if !tos_pp {
+        if !consent.accepted_services {
             *state.shutdown.write().await = true;
             loop {
                 if state.active_tasks.is_empty() {
@@ -102,6 +102,10 @@ async fn main() {
         }
 
         // USER MANAGEMENT
+        if let Err(error) = iota_storage::util::db::initialize_database() {
+            log!("Failed to initialize user storage: {}", error);
+            return;
+        }
         if let Err(_) = user_manager::load_users_sync() {
             log_t!("user_load_failed");
         }

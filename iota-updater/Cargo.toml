@@ -5,11 +5,15 @@ edition = "2024"
 
 [dependencies]
 iota-paths = { path = "../iota-paths" }
+iota-ipc = { path = "../iota-ipc" }
 tokio = { version = "1.50.0", features = ["full"] }
 sha2 = "0.11.0"
 hex = "*"
-serde = "1.0.228"
+serde = { version = "1.0.228", features = ["derive"] }
 tempfile = "3.27.0"
 anyhow = "1.0.102"
 ed25519-dalek = "2.2.0"
 serde_json = "1.0"
+reqwest = "0.13.2"
+fs2 = "0.4.3"
+rusqlite = "0.40.0"

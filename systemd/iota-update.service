@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply signed Tensamin Iota updates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/iota/update.env
+ExecStart=/usr/local/libexec/iota/current/bin/iota-updater apply

@@ -3,14 +3,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use iota_cli::screens::terms_checker::{TermsCheckerScreen, UserChoice};
 use iota_cli::ui::UI;
-use iota_terms::{Doc, TermsType as Type, get_current_docs};
+use iota_terms::{Doc, LegalDocument, TermsType as Type, get_current_docs};
 use iota_util::file_util::{load_file, save_file};
 use tokio::sync::oneshot;
 
-pub async fn check(ui: Arc<UI>) -> Result<(bool, bool), String> {
+pub struct ConsentCheck {
+    pub accepted_eula: bool,
+    pub accepted_services: bool,
+    pub documents: [LegalDocument; 3],
+}
+
+pub async fn check(ui: Arc<UI>) -> Result<ConsentCheck, String> {
     let mut state = ConsentState::load_state();
 
-    ensure_initial_consent(ui.clone(), &mut state).await?;
+    let documents = ensure_initial_consent(ui.clone(), &mut state).await?;
     /*
      * The raw legal endpoint exposes only the current document. Restore this
      * flow when it provides future versions that users can accept early.
@@ -20,7 +26,11 @@ pub async fn check(ui: Arc<UI>) -> Result<(bool, bool), String> {
     state = state.sanitize();
     state.save_state();
 
-    Ok((state.accepted_eula, state.accepted_tos && state.accepted_pp))
+    Ok(ConsentCheck {
+        accepted_eula: state.accepted_eula,
+        accepted_services: state.accepted_tos && state.accepted_pp,
+        documents,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,38 +48,54 @@ pub fn non_interactive_consent() -> NonInteractiveConsent {
     }
 }
 
-async fn ensure_initial_consent(ui: Arc<UI>, state: &mut ConsentState) -> Result<(), String> {
-    if state.accepted_eula && state.accepted_tos && state.accepted_pp {
-        return Ok(());
-    }
-
+async fn ensure_initial_consent(
+    ui: Arc<UI>,
+    state: &mut ConsentState,
+) -> Result<[LegalDocument; 3], String> {
     let (current_eula, current_tos, current_privacy) = get_current_docs().await.ok_or_else(|| {
         "Could not connect to the legal endpoint to fetch the current agreements. Please check your internet connection.".to_string()
     })?;
 
+    let current_eula_doc = current_eula.metadata();
+    let current_tos_doc = current_tos.metadata();
+    let current_privacy_doc = current_privacy.metadata();
+    let documents = [current_eula, current_tos, current_privacy];
+
+    if state.accepts_current_docs(&current_eula_doc, &current_tos_doc, &current_privacy_doc) {
+        return Ok(documents);
+    }
+
+    // A legacy consent file records the document hashes alongside its flags.
+    // Do not carry a flag forward to the durable consent record when its
+    // document has changed; the user must review and accept that revision.
+    state.invalidate_mismatched_consent(&current_eula_doc, &current_tos_doc, &current_privacy_doc);
+
     let (tx, rx) = oneshot::channel();
 
-    ui.set_screen(Box::new(TermsCheckerScreen::new(Some(tx))))
-        .await;
+    ui.set_screen(Box::new(TermsCheckerScreen::new(
+        Some(tx),
+        documents.clone(),
+    )))
+    .await;
 
     let result = rx.await.unwrap_or(UserChoice::Deny);
 
     match result {
         UserChoice::AcceptEULA | UserChoice::AcceptAll => {
             state.accepted_eula = true;
-            state.eula = Some(current_eula);
+            state.eula = Some(current_eula_doc);
 
             if matches!(result, UserChoice::AcceptAll) {
                 state.accepted_tos = true;
                 state.accepted_pp = true;
-                state.tos = Some(current_tos);
-                state.privacy = Some(current_privacy);
+                state.tos = Some(current_tos_doc);
+                state.privacy = Some(current_privacy_doc);
             }
 
             let _ = &state.save_state();
-            Ok(())
+            Ok(documents)
         }
-        UserChoice::Deny => Ok(()),
+        UserChoice::Deny => Ok(documents),
     }
 }
 /*
@@ -245,6 +271,22 @@ pub struct ConsentState {
 }
 
 impl ConsentState {
+    fn accepts_current_docs(&self, eula: &Doc, tos: &Doc, privacy: &Doc) -> bool {
+        self.accepted_eula
+            && self.accepted_tos
+            && self.accepted_pp
+            && eula.equals_some(&self.eula)
+            && tos.equals_some(&self.tos)
+            && privacy.equals_some(&self.privacy)
+    }
+
+    fn invalidate_mismatched_consent(&mut self, eula: &Doc, tos: &Doc, privacy: &Doc) {
+        self.accepted_eula &= eula.equals_some(&self.eula);
+        self.accepted_tos &= tos.equals_some(&self.tos);
+        self.accepted_pp &= privacy.equals_some(&self.privacy);
+        *self = self.clone().sanitize();
+    }
+
     fn sanitize(mut self) -> Self {
         let current_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -486,5 +528,62 @@ impl ConsentState {
         .sanitize();
 
         state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConsentState;
+    use iota_terms::{Doc, TermsType as Type};
+
+    fn doc(doc_type: Type, hash: &str) -> Doc {
+        Doc::new("1".to_owned(), hash.to_owned(), doc_type, 0)
+    }
+
+    #[test]
+    fn accepts_current_docs_requires_each_accepted_hash_to_match() {
+        let eula = doc(Type::EULA, "eula-hash");
+        let tos = doc(Type::TOS, "tos-hash");
+        let privacy = doc(Type::PP, "privacy-hash");
+        let state = ConsentState {
+            eula: Some(eula.clone()),
+            accepted_eula: true,
+            future_eula: None,
+            tos: Some(tos.clone()),
+            accepted_tos: true,
+            future_tos: None,
+            privacy: Some(privacy.clone()),
+            accepted_pp: true,
+            future_privacy: None,
+        };
+
+        assert!(state.accepts_current_docs(&eula, &tos, &privacy));
+        assert!(!state.accepts_current_docs(&doc(Type::EULA, "new-eula-hash"), &tos, &privacy));
+        assert!(!state.accepts_current_docs(&eula, &doc(Type::TOS, "new-tos-hash"), &privacy));
+        assert!(!state.accepts_current_docs(&eula, &tos, &doc(Type::PP, "new-privacy-hash")));
+    }
+
+    #[test]
+    fn invalidating_a_mismatched_eula_revokes_dependent_consent() {
+        let eula = doc(Type::EULA, "old-eula-hash");
+        let tos = doc(Type::TOS, "tos-hash");
+        let privacy = doc(Type::PP, "privacy-hash");
+        let mut state = ConsentState {
+            eula: Some(eula),
+            accepted_eula: true,
+            future_eula: None,
+            tos: Some(tos.clone()),
+            accepted_tos: true,
+            future_tos: None,
+            privacy: Some(privacy.clone()),
+            accepted_pp: true,
+            future_privacy: None,
+        };
+
+        state.invalidate_mismatched_consent(&doc(Type::EULA, "new-eula-hash"), &tos, &privacy);
+
+        assert!(!state.accepted_eula);
+        assert!(!state.accepted_tos);
+        assert!(!state.accepted_pp);
     }
 }

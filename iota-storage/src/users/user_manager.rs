@@ -46,37 +46,7 @@ pub fn try_add_user_with_credential_origin(
     credential_origin: CredentialOrigin,
 ) -> Result<(), crate::storage_error::StorageError> {
     db::with_immediate_transaction(|tx| {
-        tx.execute(
-            r#"
-            INSERT INTO users (user_id, username, public_key, private_key_hash, reset_token, created_at, display_name)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                public_key = excluded.public_key,
-                private_key_hash = excluded.private_key_hash,
-                reset_token = excluded.reset_token,
-                display_name = excluded.display_name
-            "#,
-            params![
-                user.user_id,
-                user.username,
-                user.public_key,
-                user.private_key_hash,
-                user.reset_token,
-                user.created_at,
-                user.display_name,
-            ],
-        )?;
-
-        for (app_id, app_secret) in &user.trusted_apps {
-            tx.execute(
-                r#"
-                INSERT OR REPLACE INTO trusted_apps (user_id, app_id, app_secret)
-                VALUES (?1, ?2, ?3)
-                "#,
-                params![user.user_id, app_id, app_secret],
-            )?;
-        }
+        persist_user_profile(tx, &user)?;
         tx.execute(
             r#"INSERT INTO user_residency (user_id, username, lifecycle_state, data_state, credential_origin, updated_at)
                VALUES (?1, ?2, 'managed', COALESCE((SELECT data_state FROM user_residency WHERE user_id = ?1), 'present'), ?3, ?4)
@@ -88,7 +58,46 @@ pub fn try_add_user_with_credential_origin(
 }
 
 pub fn update_user(user: UserProfile) -> Result<(), crate::storage_error::StorageError> {
-    try_add_user(user)
+    db::with_immediate_transaction(|tx| persist_user_profile(tx, &user))
+}
+
+/// Persist mutable profile data without modifying lifecycle-managed residency.
+fn persist_user_profile(
+    tx: &rusqlite::Transaction<'_>,
+    user: &UserProfile,
+) -> Result<(), crate::storage_error::StorageError> {
+    tx.execute(
+        r#"
+        INSERT INTO users (user_id, username, public_key, private_key_hash, reset_token, created_at, display_name)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username = excluded.username,
+            public_key = excluded.public_key,
+            private_key_hash = excluded.private_key_hash,
+            reset_token = excluded.reset_token,
+            display_name = excluded.display_name
+        "#,
+        params![
+            user.user_id,
+            user.username,
+            user.public_key,
+            user.private_key_hash,
+            user.reset_token,
+            user.created_at,
+            user.display_name,
+        ],
+    )?;
+
+    for (app_id, app_secret) in &user.trusted_apps {
+        tx.execute(
+            r#"
+            INSERT OR REPLACE INTO trusted_apps (user_id, app_id, app_secret)
+            VALUES (?1, ?2, ?3)
+            "#,
+            params![user.user_id, app_id, app_secret],
+        )?;
+    }
+    Ok(())
 }
 
 pub fn get_user_by_username(
@@ -659,9 +668,12 @@ pub fn load_users_sync() -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod purge_tests {
-    use super::{PurgeStage, remaining_purge_stages, run_purge_stages};
+mod tests {
+    use super::{
+        PurgeStage, UserProfile, persist_user_profile, remaining_purge_stages, run_purge_stages,
+    };
     use crate::users::pending_operations::PendingUserOperationPhase;
+    use rusqlite::{Connection, params};
 
     #[test]
     fn prepared_purge_runs_every_stage_before_completion() {
@@ -724,6 +736,82 @@ mod purge_tests {
             assert!(result.is_err());
             assert!(!data_empty);
         }
+    }
+
+    #[test]
+    fn profile_updates_preserve_external_residency_attributes() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    public_key TEXT NOT NULL,
+                    private_key_hash TEXT,
+                    reset_token TEXT,
+                    created_at INTEGER NOT NULL,
+                    display_name TEXT
+                );
+                CREATE TABLE trusted_apps (
+                    user_id INTEGER NOT NULL,
+                    app_id TEXT NOT NULL,
+                    app_secret TEXT NOT NULL,
+                    PRIMARY KEY (user_id, app_id)
+                );
+                CREATE TABLE user_residency (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    lifecycle_state TEXT NOT NULL,
+                    data_state TEXT NOT NULL,
+                    credential_origin TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO users VALUES (1, 'alice', 'old-key', NULL, NULL, 1, NULL);
+                INSERT INTO user_residency VALUES (1, 'alice', 'released', 'empty', 'external', 42);
+                "#,
+            )
+            .unwrap();
+        let mut user = UserProfile::new_with_created_at(
+            1,
+            "alice".into(),
+            Some("Alice".into()),
+            "new-key".into(),
+            None,
+            None,
+            1,
+        );
+        user.trusted_apps.insert("app".into(), "secret".into());
+
+        let transaction = connection.transaction().unwrap();
+        persist_user_profile(&transaction, &user).unwrap();
+        transaction.commit().unwrap();
+
+        let residency: (String, String, String, String, i64) = connection
+            .query_row(
+                "SELECT username, lifecycle_state, data_state, credential_origin, updated_at FROM user_residency WHERE user_id = ?1",
+                params![1],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            residency,
+            (
+                "alice".into(),
+                "released".into(),
+                "empty".into(),
+                "external".into(),
+                42,
+            )
+        );
+        let trusted_app_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM trusted_apps WHERE user_id = ?1",
+                params![1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trusted_app_count, 1);
     }
 }
 

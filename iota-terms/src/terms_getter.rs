@@ -1,4 +1,4 @@
-use crate::doc::Doc;
+use crate::doc::LegalDocument;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +41,7 @@ pub fn get_newest_link(terms_type: Type) -> String {
     get_link(terms_type)
 }
 
-pub async fn get_current_docs() -> Option<(Doc, Doc, Doc)> {
+pub async fn get_current_docs() -> Option<(LegalDocument, LegalDocument, LegalDocument)> {
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     let (eula, tos, privacy) = tokio::join!(
         get_terms(Type::EULA),
@@ -50,9 +50,9 @@ pub async fn get_current_docs() -> Option<(Doc, Doc, Doc)> {
     );
 
     Some((
-        Doc::from_raw(Type::EULA, eula?, timestamp),
-        Doc::from_raw(Type::TOS, tos?, timestamp),
-        Doc::from_raw(Type::PP, privacy?, timestamp),
+        LegalDocument::from_raw(Type::EULA, eula?, timestamp),
+        LegalDocument::from_raw(Type::TOS, tos?, timestamp),
+        LegalDocument::from_raw(Type::PP, privacy?, timestamp),
     ))
 }
 

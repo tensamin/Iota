@@ -108,7 +108,9 @@ async fn main() -> ExitCode {
     let (state_tx, state_rx) = watch::channel(runtime.snapshot());
 
     runtime.set_startup_phase(StartupPhase::LoadingUsers);
-    let storage_error = match iota_storage::util::db::verify_and_backup_database() {
+    let storage_error = match iota_storage::util::db::verify_and_backup_database()
+        .and_then(|()| iota_storage::util::db::initialize_database())
+    {
         Ok(()) => tokio::task::spawn_blocking(user_manager::load_users_sync)
             .await
             .map_err(|error| format!("user storage task failed: {error}"))

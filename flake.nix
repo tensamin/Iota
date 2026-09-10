@@ -46,7 +46,16 @@
             pname = "iota";
             version = "0.1.0";
             src = ./.;
-            cargoBuildFlags = ["-p" "iota" "-p" "iota-daemon"];
+            cargoBuildFlags = [
+              "-p"
+              "iota"
+              "-p"
+              "iota-daemon"
+              "-p"
+              "iota-updater"
+              "-p"
+              "iota-installer"
+            ];
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;

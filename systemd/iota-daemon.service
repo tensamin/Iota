@@ -6,9 +6,10 @@ Requires=iota-daemon.socket
 
 [Service]
 Type=simple
-ExecStart=/usr/local/lib/iota/iota-daemon
+ExecStart=@IOTA_SYSTEM_DAEMON_EXECUTABLE@
 User=iota
 Group=iota
+EnvironmentFile=/etc/iota/update.env
 StateDirectory=iota
 StateDirectoryMode=0750
 Restart=on-failure

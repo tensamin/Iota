@@ -1,5 +1,5 @@
 use crate::startup_error::StartupError;
-use iota_terms::{Doc, TermsType, consent, get_current_docs, get_terms};
+use iota_terms::{LegalDocument, TermsType, consent, get_current_docs, get_terms};
 use std::io::{self, IsTerminal, Write};
 
 pub enum TermsCommand {
@@ -71,25 +71,19 @@ async fn accept(system: bool) -> Result<(), StartupError> {
     })?;
     let mut record = consent::load(&state_dir(system)?);
     for document in [&documents.0, &documents.1, &documents.2] {
-        let text = get_terms(document.doc_type).await.ok_or_else(|| {
-            StartupError::Consent(format!(
-                "Could not fetch {}.",
-                document.doc_type.to_string()
-            ))
-        })?;
         println!(
             "\n===== {} =====\nVersion: {}\nDocument hash: {}\n",
-            document.doc_type.to_string(),
-            document.get_version(),
-            document.get_hash()
+            document.kind().to_string(),
+            document.version(),
+            document.hash()
         );
-        print!("{text}\n");
+        print!("{}\n", document.content());
         if !confirm(document)? {
             return Err(StartupError::Consent(
                 "No terms were accepted. Iota remains inactive.".into(),
             ));
         }
-        record.accept(document);
+        record.accept(&document.metadata());
     }
     consent::save(&state_dir(system)?, &record)
         .map_err(|error| StartupError::Consent(format!("Could not save consent: {error}")))?;
@@ -97,13 +91,12 @@ async fn accept(system: bool) -> Result<(), StartupError> {
     Ok(())
 }
 
-fn confirm(document: &Doc) -> Result<bool, StartupError> {
-    let hash = document.get_hash();
-    let prefix = hash.get(..10).unwrap_or(&hash);
+fn confirm(document: &LegalDocument) -> Result<bool, StartupError> {
+    let prefix = document.hash().get(..10).unwrap_or(document.hash());
     let expected = format!(
         "ACCEPT {} {} {}",
-        document.doc_type.to_str().to_ascii_uppercase(),
-        document.get_version(),
+        document.kind().to_str().to_ascii_uppercase(),
+        document.version(),
         prefix
     );
     print!("To accept this exact document, type:\n{expected}\n> ");

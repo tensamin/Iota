@@ -286,10 +286,10 @@ async fn run_dashboard(
     let result = async {
         let consent = iota_core::consent_state::check(ui.clone()).await
             .map_err(StartupError::Consent)?;
-        if consent != (true, true) {
+        if !consent.accepted_eula || !consent.accepted_services {
             return Err(StartupError::Consent("Cannot continue until the required terms are accepted.".into()));
         }
-        persist_dashboard_consent().await?;
+        persist_dashboard_consent(&consent.documents)?;
         let initial = tokio::select! {
             result = connect_available(&endpoints) => result,
             _ = ui.wait_for_shutdown() => Err(StartupError::Cancelled),
@@ -340,15 +340,14 @@ async fn run_dashboard(
     }
 }
 
-async fn persist_dashboard_consent() -> Result<(), StartupError> {
-    let docs = iota_terms::get_current_docs().await.ok_or_else(|| {
-        StartupError::Consent("Could not verify the current agreements after acceptance.".into())
-    })?;
+fn persist_dashboard_consent(
+    documents: &[iota_terms::LegalDocument; 3],
+) -> Result<(), StartupError> {
     let paths = iota_paths::IotaPaths::resolve(iota_paths::Scope::User)
         .map_err(|error| StartupError::Other(format!("Cannot resolve consent storage: {error}")))?;
     let mut record = iota_terms::consent::load(&paths.state_dir);
-    for document in [&docs.0, &docs.1, &docs.2] {
-        record.accept(document);
+    for document in documents {
+        record.accept(&document.metadata());
     }
     iota_terms::consent::save(&paths.state_dir, &record)
         .map_err(|error| StartupError::Consent(format!("Could not save consent: {error}")))

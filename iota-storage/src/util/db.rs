@@ -1,4 +1,4 @@
-use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
 use r2d2::ManageConnection;
 use rusqlite::{Connection, Transaction};
 use std::path::PathBuf;
@@ -10,15 +10,16 @@ use crate::storage_error::StorageError;
 const DB_NAME: &str = "messages";
 
 /// A simple r2d2 manager for rusqlite connections.
-pub struct SqliteManager;
+pub struct SqliteManager {
+    database_path: PathBuf,
+}
 
 impl ManageConnection for SqliteManager {
     type Connection = Connection;
     type Error = rusqlite::Error;
 
     fn connect(&self) -> Result<Connection, rusqlite::Error> {
-        let path = db_file_path(DB_NAME);
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(&self.database_path)?;
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")?;
         conn.busy_timeout(Duration::from_millis(250))?;
         Ok(conn)
@@ -33,18 +34,43 @@ impl ManageConnection for SqliteManager {
     }
 }
 
-static POOL: Lazy<Arc<r2d2::Pool<SqliteManager>>> = Lazy::new(|| {
-    let manager = SqliteManager;
+static POOL: OnceCell<Arc<r2d2::Pool<SqliteManager>>> = OnceCell::new();
+
+fn create_pool(database_path: PathBuf) -> Result<Arc<r2d2::Pool<SqliteManager>>, StorageError> {
+    create_pool_with_timeout(database_path, Duration::from_secs(30))
+}
+
+fn create_pool_with_timeout(
+    database_path: PathBuf,
+    connection_timeout: Duration,
+) -> Result<Arc<r2d2::Pool<SqliteManager>>, StorageError> {
+    let manager = SqliteManager { database_path };
     let pool = r2d2::Pool::builder()
         .max_size(8)
+        .connection_timeout(connection_timeout)
         .build(manager)
-        .expect("Failed to create database connection pool");
-    run_migrations(&pool).expect("Failed to run database migrations");
-    Arc::new(pool)
-});
+        .map_err(|error| StorageError::Pool(error.to_string()))?;
+    run_migrations(&pool)?;
+    Ok(Arc::new(pool))
+}
 
-pub fn pool() -> Arc<r2d2::Pool<SqliteManager>> {
-    POOL.clone()
+/// Opens the SQLite pool and applies all schema migrations.
+///
+/// Daemon startup calls this after database verification and before storage is
+/// reported healthy, so connection and migration failures become a storage
+/// component failure instead of a lazy-initialization panic.
+pub fn initialize_database() -> Result<(), StorageError> {
+    let storage_dir = iota_util::file_util::storage_directory();
+    std::fs::create_dir_all(&storage_dir)?;
+    let database_path = storage_dir.join(format!("{DB_NAME}.sqlite3"));
+    POOL.get_or_try_init(|| create_pool(database_path))?;
+    Ok(())
+}
+
+pub fn pool() -> Result<Arc<r2d2::Pool<SqliteManager>>, StorageError> {
+    POOL.get()
+        .cloned()
+        .ok_or_else(|| StorageError::Other("database has not been initialized".into()))
 }
 
 pub fn with_db<T, F>(f: F) -> Result<T, StorageError>
@@ -52,7 +78,8 @@ where
     F: FnOnce(&Connection) -> Result<T, StorageError>,
 {
     blocking_region(|| {
-        let conn = POOL.get().map_err(|e| StorageError::Pool(e.to_string()))?;
+        let pool = pool()?;
+        let conn = pool.get().map_err(|e| StorageError::Pool(e.to_string()))?;
         f(&conn)
     })
 }
@@ -62,7 +89,8 @@ where
     F: FnOnce(&Transaction<'_>) -> Result<T, StorageError>,
 {
     blocking_region(|| {
-        let mut conn = POOL.get().map_err(|e| StorageError::Pool(e.to_string()))?;
+        let pool = pool()?;
+        let mut conn = pool.get().map_err(|e| StorageError::Pool(e.to_string()))?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let value = f(&tx)?;
         tx.commit()?;
@@ -961,6 +989,18 @@ pub fn create_general_messages_db() -> Result<Arc<std::sync::Mutex<Connection>>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_creation_failure_is_returned() -> Result<(), StorageError> {
+        let not_a_directory =
+            std::env::temp_dir().join(format!("iota-storage-pool-test-{}", std::process::id()));
+        std::fs::File::create(&not_a_directory)?;
+        let database_path = not_a_directory.join("messages.sqlite3");
+
+        assert!(create_pool_with_timeout(database_path, Duration::from_millis(1)).is_err());
+        std::fs::remove_file(not_a_directory)?;
+        Ok(())
+    }
 
     #[test]
     fn resumes_migration_when_height_exists_before_its_version() -> Result<(), StorageError> {

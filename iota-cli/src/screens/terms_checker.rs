@@ -9,7 +9,7 @@ use crate::{
     util::{buttons::draw_buttons, terms_focus::Focus},
 };
 use crossterm::event::KeyCode;
-use iota_terms::{TermsType, get_link, get_terms};
+use iota_terms::{LegalDocument, TermsType, get_link};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -28,6 +28,7 @@ pub enum UserChoice {
 
 pub struct TermsCheckerScreen {
     sender: Option<oneshot::Sender<UserChoice>>,
+    documents: [LegalDocument; 3],
 
     eula: bool,
     tos: bool,
@@ -37,9 +38,10 @@ pub struct TermsCheckerScreen {
 }
 
 impl TermsCheckerScreen {
-    pub fn new(sender: Option<oneshot::Sender<UserChoice>>) -> Self {
+    pub fn new(sender: Option<oneshot::Sender<UserChoice>>, documents: [LegalDocument; 3]) -> Self {
         Self {
             sender,
+            documents,
             eula: false,
             tos: false,
             pp: false,
@@ -315,21 +317,25 @@ impl Screen for TermsCheckerScreen {
                     _ => None,
                 };
                 if let Some(terms_type) = terms_type {
-                    let fut: Pin<Box<dyn Future<Output = Box<dyn Screen>> + Send>> = Box::pin(
-                        async move {
-                            if let Some(content) = get_terms(terms_type.clone()).await {
+                    let document = self
+                        .documents
+                        .iter()
+                        .find(|document| document.kind() == terms_type)
+                        .cloned();
+                    let fut: Pin<Box<dyn Future<Output = Box<dyn Screen>> + Send>> =
+                        Box::pin(async move {
+                            if let Some(document) = document {
                                 let screen: FileViewer =
-                                    FileViewer::new(terms_type.to_string(), &content);
+                                    FileViewer::new(terms_type.to_string(), document.content());
                                 Box::new(screen) as Box<dyn Screen>
                             } else {
                                 let screen: FileViewer = FileViewer::new(
                                     "Error".to_string(),
-                                    "Could not connect to the legal endpoint to fetch the document. Please check your internet connection.",
+                                    "The fetched legal document is unavailable.",
                                 );
                                 Box::new(screen) as Box<dyn Screen>
                             }
-                        },
-                    );
+                        });
                     InteractionResult::OpenFutureScreen { screen: fut }
                 } else {
                     InteractionResult::Unhandled

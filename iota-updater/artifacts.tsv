@@ -1,0 +1,3 @@
+cli	bin/iota
+daemon	bin/iota-daemon
+updater	bin/iota-updater
