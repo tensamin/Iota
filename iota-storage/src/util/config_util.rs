@@ -5,11 +5,37 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use thiserror::Error;
 
 pub static CONFIG: Lazy<ArcSwap<IotaConfig>> =
     Lazy::new(|| ArcSwap::new(Arc::new(IotaConfig::default())));
 
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("cannot read {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("cannot parse {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: serde_yaml::Error,
+    },
+    #[error("invalid web.bind {bind:?}: {source}")]
+    InvalidWebBind {
+        bind: String,
+        #[source]
+        source: std::net::AddrParseError,
+    },
+    #[error("max_ipc_clients must be greater than zero")]
+    InvalidMaxIpcClients,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IotaConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iota_id: Option<u64>,
@@ -49,6 +75,7 @@ impl Default for WebMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebSettings {
     #[serde(default)]
     pub mode: WebMode,
@@ -113,30 +140,54 @@ impl Default for IotaConfig {
     }
 }
 
-pub fn load_config() {
-    load_config_from(&default_config_path());
+pub fn load_config() -> Result<(), ConfigError> {
+    load_config_from(&default_config_path())
 }
 
 /// Loading is intentionally side-effect free: a missing configuration means
 /// documented defaults, not a newly-created file.
-pub fn load_config_from(path: &Path) {
+pub fn load_config_from(path: &Path) -> Result<(), ConfigError> {
     let s = match fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-        Err(error) => {
-            eprintln!("Failed to read {}: {error}", path.display());
-            return;
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            CONFIG.store(Arc::new(IotaConfig::default()));
+            return Ok(());
+        }
+        Err(source) => {
+            return Err(ConfigError::Read {
+                path: path.into(),
+                source,
+            });
         }
     };
 
-    match serde_yaml::from_str::<IotaConfig>(&s) {
-        Ok(parsed) => {
-            CONFIG.store(Arc::new(parsed));
-        }
-        Err(e) => {
-            eprintln!("Failed to parse {}: {e}", path.display());
-        }
+    let parsed = parse_config(path, &s)?;
+    CONFIG.store(Arc::new(parsed));
+    Ok(())
+}
+
+fn parse_config(path: &Path, yaml: &str) -> Result<IotaConfig, ConfigError> {
+    let parsed = serde_yaml::from_str::<IotaConfig>(yaml).map_err(|source| ConfigError::Parse {
+        path: path.into(),
+        source,
+    })?;
+    validate_config(&parsed)?;
+    Ok(parsed)
+}
+
+pub fn validate_config(config: &IotaConfig) -> Result<(), ConfigError> {
+    config
+        .web
+        .bind
+        .parse::<std::net::IpAddr>()
+        .map_err(|source| ConfigError::InvalidWebBind {
+            bind: config.web.bind.clone(),
+            source,
+        })?;
+    if config.max_ipc_clients == 0 {
+        return Err(ConfigError::InvalidMaxIpcClients);
     }
+    Ok(())
 }
 
 pub fn clear_config() {
@@ -232,6 +283,9 @@ pub fn modify_config_value(key: &str, value: &str) -> Result<(), &'static str> {
             Ok(())
         }
         "web.bind" => {
+            value
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| "invalid web.bind")?;
             let bind = value.to_string();
             modify_config(|cfg| cfg.web.bind = bind);
             Ok(())
@@ -243,4 +297,46 @@ static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn configure_config_path(path: PathBuf) {
     let _ = CONFIG_PATH.set(path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigError, IotaConfig, parse_config, validate_config};
+    use std::path::Path;
+
+    #[test]
+    fn malformed_yaml_is_rejected() {
+        assert!(matches!(
+            parse_config(Path::new("config.yaml"), "web: ["),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_explicit_fields_are_rejected() {
+        assert!(matches!(
+            parse_config(Path::new("config.yaml"), "unexpected: true\n"),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_explicit_bind_is_rejected() {
+        let mut config = IotaConfig::default();
+        config.web.bind = "localhost:1984".into();
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigError::InvalidWebBind { .. })
+        ));
+    }
+
+    #[test]
+    fn zero_ipc_capacity_is_rejected() {
+        let mut config = IotaConfig::default();
+        config.max_ipc_clients = 0;
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigError::InvalidMaxIpcClients)
+        ));
+    }
 }

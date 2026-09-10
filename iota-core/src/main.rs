@@ -96,7 +96,10 @@ async fn main() {
         logger::startup();
 
         // BASIC CONFIGURATION
-        iota_storage::util::config_util::load_config();
+        if let Err(error) = iota_storage::util::config_util::load_config() {
+            log!("Cannot load Iota configuration: {}", error);
+            return;
+        }
 
         // USER MANAGEMENT
         if let Err(_) = user_manager::load_users_sync() {
@@ -108,7 +111,14 @@ async fn main() {
 
         let mut sb = "".to_string();
 
-        for up in user_manager::get_users() {
+        let users = match user_manager::get_users() {
+            Ok(users) => users,
+            Err(error) => {
+                log!("Failed to load users: {}", error);
+                return;
+            }
+        };
+        for up in users {
             sb = sb + "," + &up.user_id.to_string().as_str();
         }
 
@@ -180,7 +190,9 @@ async fn main() {
                 sleep(Duration::from_secs(1)).await;
             }
             iota_storage::util::config_util::clear_config();
-            user_manager::clear();
+            if let Err(error) = user_manager::clear() {
+                log!("Failed to clear users: {}", error);
+            }
             // Commhnities have not been implemented yet.
             /*community_manager::clear();*/
             *state.app.lock().unwrap() = AppState::new();

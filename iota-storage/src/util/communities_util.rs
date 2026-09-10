@@ -23,8 +23,13 @@ impl CommunitiesUtil {
         })
     }
 
-    pub fn add_community(storage_owner: i64, address: String, title: String, position: String) {
-        if let Err(e) = db::with_db(|conn| {
+    pub fn add_community(
+        storage_owner: i64,
+        address: String,
+        title: String,
+        position: String,
+    ) -> Result<(), StorageError> {
+        db::with_db(|conn| {
             conn.execute(
                 r#"
                 INSERT INTO communities (storage_owner, address, title, position)
@@ -36,9 +41,7 @@ impl CommunitiesUtil {
                 params![storage_owner, address, title, position],
             )?;
             Ok(())
-        }) {
-            eprintln!("Failed to add_community: {}", e);
-        }
+        })
     }
 
     pub fn remove_community(
@@ -59,8 +62,8 @@ impl CommunitiesUtil {
         })
     }
 
-    pub fn get_communities(storage_owner: i64) -> Vec<StoredCommunity> {
-        match db::with_db(|conn| {
+    pub fn get_communities(storage_owner: i64) -> Result<Vec<StoredCommunity>, StorageError> {
+        db::with_db(|conn| {
             let mut stmt = conn.prepare(
                 r#"
                 SELECT address, title, position
@@ -77,20 +80,7 @@ impl CommunitiesUtil {
                 })
             })?;
 
-            let mut out = Vec::new();
-            for row in rows {
-                match row {
-                    Ok(community) => out.push(community),
-                    Err(e) => eprintln!("Failed to read community row: {}", e),
-                }
-            }
-            Ok(out)
-        }) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("Failed to query communities in get_communities: {}", e);
-                Vec::new()
-            }
-        }
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
     }
 }

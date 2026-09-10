@@ -763,8 +763,10 @@ impl OmikronConnection {
                         continue;
                     }
                     let Some(msg_id) = cv.id() else {
+                        let permit = self.handler_semaphore.clone().acquire_owned().await;
                         let self_clone = self.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             self_clone.handle_message_impl(cv).await;
                         });
                         continue;
@@ -2629,10 +2631,7 @@ impl OmikronConnection {
             .ok()
             .and_then(|id| i64::try_from(id).ok());
         if response.is_type(CommunicationType::AccountStateSnapshot) {
-            log!(
-                "AccountStateSnapshot user={:?} stage=generated",
-                user_id
-            );
+            log!("AccountStateSnapshot user={:?} stage=generated", user_id);
             if let Some(user_id) = user_id
                 && let Err(error) = relay_queue::pause_client_deliveries(user_id)
             {

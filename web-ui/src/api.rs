@@ -107,7 +107,10 @@ async fn users_get(req: HttpRequest, ssl: web::Data<bool>) -> impl Responder {
         return forbidden();
     }
 
-    let users = iota_storage::users::user_manager::get_users();
+    let users = match iota_storage::users::user_manager::get_users() {
+        Ok(users) => users,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
 
     let list: Vec<_> = users
         .into_iter()
@@ -134,7 +137,9 @@ async fn users_remove(
         Err(response) => return response,
     };
 
-    iota_storage::users::user_manager::remove_user(uuid);
+    if iota_storage::users::user_manager::remove_user(uuid).is_err() {
+        return HttpResponse::InternalServerError().finish();
+    }
     iota_storage::users::user_manager::save_users();
 
     success()

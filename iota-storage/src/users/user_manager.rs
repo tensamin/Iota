@@ -33,10 +33,8 @@ fn now_millis() -> i64 {
         .as_millis() as i64
 }
 
-pub fn add_user(user: UserProfile) {
-    if let Err(e) = try_add_user(user) {
-        eprintln!("Failed to add_user: {}", e);
-    }
+pub fn add_user(user: UserProfile) -> Result<(), crate::storage_error::StorageError> {
+    try_add_user(user)
 }
 
 pub fn try_add_user(user: UserProfile) -> Result<(), crate::storage_error::StorageError> {
@@ -89,12 +87,14 @@ pub fn try_add_user_with_credential_origin(
     })
 }
 
-pub fn update_user(user: UserProfile) {
-    add_user(user);
+pub fn update_user(user: UserProfile) -> Result<(), crate::storage_error::StorageError> {
+    try_add_user(user)
 }
 
-pub fn get_user_by_username(username: &str) -> Option<UserProfile> {
-    match db::with_db(|conn| {
+pub fn get_user_by_username(
+    username: &str,
+) -> Result<Option<UserProfile>, crate::storage_error::StorageError> {
+    let user = db::with_db(|conn| {
         match conn.query_row(
             "SELECT user_id, username, public_key, private_key_hash, reset_token, created_at, display_name FROM users WHERE username = ?1 LIMIT 1",
             params![username],
@@ -116,13 +116,12 @@ pub fn get_user_by_username(username: &str) -> Option<UserProfile> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
-    }) {
-        Ok(opt) => opt,
-        Err(e) => {
-            eprintln!("Error querying user by username: {}", e);
-            None
-        }
-    }
+    })?;
+    user.map(|mut user| {
+        user.trusted_apps = load_trusted_apps(user.user_id)?;
+        Ok(user)
+    })
+    .transpose()
 }
 
 pub fn get_user(user_id: i64) -> Result<Option<UserProfile>, crate::storage_error::StorageError> {
@@ -156,8 +155,8 @@ pub fn get_user(user_id: i64) -> Result<Option<UserProfile>, crate::storage_erro
     .transpose()
 }
 
-pub fn get_users() -> Vec<UserProfile> {
-    match db::with_db(|conn| {
+pub fn get_users() -> Result<Vec<UserProfile>, crate::storage_error::StorageError> {
+    db::with_db(|conn| {
         let mut stmt = conn.prepare(
             r#"
             SELECT user_id, username, public_key, private_key_hash, reset_token, created_at, display_name
@@ -189,41 +188,36 @@ pub fn get_users() -> Vec<UserProfile> {
 
         let mut out = Vec::new();
         for row in rows {
-            match row {
-                Ok(mut user) => {
-                    user.trusted_apps = load_trusted_apps(user.user_id)?;
-                    out.push(user);
-                }
-                Err(e) => eprintln!("Failed to read user row: {}", e),
-            }
+            let mut user = row?;
+            user.trusted_apps = load_trusted_apps_from(conn, user.user_id)?;
+            out.push(user);
         }
         Ok(out)
-    }) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Failed to query users: {}", e);
-            Vec::new()
-        }
-    }
+    })
 }
 
 fn load_trusted_apps(
     user_id: i64,
 ) -> Result<std::collections::HashMap<String, String>, crate::storage_error::StorageError> {
-    db::with_db(|conn| {
-        let mut stmt =
-            conn.prepare("SELECT app_id, app_secret FROM trusted_apps WHERE user_id = ?1")?;
-        let rows = stmt.query_map(params![user_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
+    db::with_db(|conn| load_trusted_apps_from(conn, user_id))
+}
 
-        let mut map = std::collections::HashMap::new();
-        for row in rows {
-            let (key, value) = row?;
-            map.insert(key, value);
-        }
-        Ok(map)
-    })
+fn load_trusted_apps_from(
+    conn: &rusqlite::Connection,
+    user_id: i64,
+) -> Result<std::collections::HashMap<String, String>, crate::storage_error::StorageError> {
+    let mut stmt =
+        conn.prepare("SELECT app_id, app_secret FROM trusted_apps WHERE user_id = ?1")?;
+    let rows = stmt.query_map(params![user_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let (key, value) = row?;
+        map.insert(key, value);
+    }
+    Ok(map)
 }
 
 pub fn revoke_trusted_app(
@@ -249,17 +243,15 @@ pub fn revoke_all_trusted_apps(user_id: i64) -> Result<usize, crate::storage_err
     })
 }
 
-pub fn remove_user(user_id: i64) {
-    if let Err(e) = db::with_db(|conn| {
+pub fn remove_user(user_id: i64) -> Result<(), crate::storage_error::StorageError> {
+    db::with_immediate_transaction(|conn| {
         conn.execute(
             "DELETE FROM trusted_apps WHERE user_id = ?1",
             params![user_id],
         )?;
         conn.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
         Ok(())
-    }) {
-        eprintln!("Failed to remove_user: {}", e);
-    }
+    })
 }
 
 /// Remove only local management authority. Hosted content is intentionally
@@ -281,15 +273,12 @@ pub fn finalize_local_release(
     user_id: i64,
     username_hint: Option<&str>,
 ) -> Result<(), crate::storage_error::StorageError> {
-    let username = get_user(user_id)?
-        .map(|user| user.username)
-        .or_else(|| {
-            get_residency_by_id(user_id)
-                .ok()
-                .flatten()
-                .map(|residency| residency.username)
-        })
-        .or_else(|| username_hint.map(str::to_owned));
+    let username = match get_user(user_id)? {
+        Some(user) => Some(user.username),
+        None => get_residency_by_id(user_id)?
+            .map(|residency| residency.username)
+            .or_else(|| username_hint.map(str::to_owned)),
+    };
     let Some(username) = username else {
         return Err(crate::storage_error::StorageError::Other(
             "user residency was not found".into(),
@@ -553,12 +542,13 @@ pub fn purge_user_data(user_id: i64) -> Result<(), crate::storage_error::Storage
 /// Complete local erasure is idempotent and is the target for a durable
 /// Omega-hosted erasure request after account deletion.
 pub fn erase_user_locally(user_id: i64) -> Result<(), crate::storage_error::StorageError> {
-    let username = get_user(user_id)?.map(|user| user.username).or_else(|| {
-        get_residency()
+    let username = match get_user(user_id)? {
+        Some(user) => Some(user.username),
+        None => get_residency()?
             .into_iter()
             .find(|entry| entry.user_id == user_id)
-            .map(|entry| entry.username)
-    });
+            .map(|entry| entry.username),
+    };
     purge_user_data(user_id)?;
     db::with_db(|conn| {
         conn.execute(
@@ -576,20 +566,29 @@ pub fn erase_user_locally(user_id: i64) -> Result<(), crate::storage_error::Stor
         .map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))
 }
 
-pub fn get_residency() -> Vec<UserResidency> {
+pub fn get_residency() -> Result<Vec<UserResidency>, crate::storage_error::StorageError> {
     db::with_db(|conn| {
         let mut stmt = conn.prepare("SELECT user_id, username, lifecycle_state, data_state, credential_origin FROM user_residency ORDER BY username")?;
         let rows = stmt.query_map([], |row| {
             let lifecycle: String = row.get(2)?;
             Ok(UserResidency {
-                user_id: row.get(0)?, username: row.get(1)?,
-                state: if lifecycle == "managed" { LocalUserState::Managed } else { LocalUserState::Released },
+                user_id: row.get(0)?,
+                username: row.get(1)?,
+                state: if lifecycle == "managed" {
+                    LocalUserState::Managed
+                } else {
+                    LocalUserState::Released
+                },
                 data_present: row.get::<_, String>(3)? == "present",
-                credential_origin: if row.get::<_, String>(4)? == "external" { CredentialOrigin::External } else { CredentialOrigin::Local },
+                credential_origin: if row.get::<_, String>(4)? == "external" {
+                    CredentialOrigin::External
+                } else {
+                    CredentialOrigin::Local
+                },
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }).unwrap_or_default()
+    })
 }
 
 pub fn get_residency_by_id(
@@ -622,15 +621,13 @@ pub fn get_residency_by_id(
     })
 }
 
-pub fn clear() {
-    if let Err(e) = db::with_db(|conn| {
+pub fn clear() -> Result<(), crate::storage_error::StorageError> {
+    db::with_immediate_transaction(|conn| {
         conn.execute_batch(
             "DELETE FROM trusted_apps; DELETE FROM users; DELETE FROM user_residency;",
         )?;
         Ok(())
-    }) {
-        eprintln!("Failed to clear users: {}", e);
-    }
+    })
 }
 
 pub fn save_users() {
@@ -648,7 +645,7 @@ pub fn load_users_sync() -> std::io::Result<()> {
         if let json::JsonValue::Array(arr) = parsed {
             for j in arr.iter() {
                 if let Some(up) = UserProfile::from_json(j) {
-                    add_user(up);
+                    try_add_user(up).map_err(|error| std::io::Error::other(error.to_string()))?;
                 }
             }
         }

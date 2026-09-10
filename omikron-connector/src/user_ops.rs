@@ -399,7 +399,14 @@ pub async fn reconcile_managed_users(connection: &dyn OmikronClient) {
             _ => {}
         }
     }
-    for user in iota_storage::users::user_manager::get_users() {
+    let users = match iota_storage::users::user_manager::get_users() {
+        Ok(users) => users,
+        Err(error) => {
+            log!("Could not load local users for reconciliation: {}", error);
+            return;
+        }
+    };
+    for user in users {
         let request = CommunicationValue::new(CommunicationType::GetUserData).add_typed_default(
             DataType::UserId,
             DataValue::SignedNumber(user.user_id.into()),

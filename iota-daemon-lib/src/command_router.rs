@@ -210,28 +210,31 @@ impl CommandRouter {
                         .collect::<std::collections::HashMap<_, _>>(),
                     Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
                 };
-                let users = user_manager::get_residency()
-                    .into_iter()
-                    .map(|user| {
-                        let user_id = user.user_id;
-                        let profile = user_manager::get_user(user.user_id)?;
-                        Ok(UserSummary {
-                            credential_status: credential_status(&user, profile.as_ref()),
-                            user_id,
-                            username: user.username,
-                            state: match user.state {
-                                user_manager::LocalUserState::Managed => {
-                                    iota_ipc::LocalUserState::Managed
-                                }
-                                user_manager::LocalUserState::Released => {
-                                    iota_ipc::LocalUserState::Released
-                                }
-                            },
-                            data_present: user.data_present,
-                            pending_operation: pending.get(&user_id).cloned(),
-                        })
+                let users = match user_manager::get_residency() {
+                    Ok(users) => users,
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                }
+                .into_iter()
+                .map(|user| {
+                    let user_id = user.user_id;
+                    let profile = user_manager::get_user(user.user_id)?;
+                    Ok(UserSummary {
+                        credential_status: credential_status(&user, profile.as_ref()),
+                        user_id,
+                        username: user.username,
+                        state: match user.state {
+                            user_manager::LocalUserState::Managed => {
+                                iota_ipc::LocalUserState::Managed
+                            }
+                            user_manager::LocalUserState::Released => {
+                                iota_ipc::LocalUserState::Released
+                            }
+                        },
+                        data_present: user.data_present,
+                        pending_operation: pending.get(&user_id).cloned(),
                     })
-                    .collect::<Result<Vec<_>, iota_storage::storage_error::StorageError>>();
+                })
+                .collect::<Result<Vec<_>, iota_storage::storage_error::StorageError>>();
                 let Ok(users) = users else {
                     return ResponseResult::Error(IpcErrorCode::StorageFailure);
                 };
@@ -628,12 +631,12 @@ impl CommandRouter {
                     Err(_e) => ResponseResult::Error(IpcErrorCode::InvalidRequest),
                 }
             }
-            LocalRequest::ReloadConfig => {
-                config_util::load_config();
-                ResponseResult::Ok(ResponsePayload::Acknowledged {
+            LocalRequest::ReloadConfig => match config_util::load_config() {
+                Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
                     message: "Configuration reloaded".into(),
-                })
-            }
+                }),
+                Err(_) => ResponseResult::Error(IpcErrorCode::InvalidRequest),
+            },
             LocalRequest::GetOmikronStatus => {
                 let connected = self.services.omikron.is_connected().await;
                 let iota_id = config_util::CONFIG.load().iota_id;
@@ -743,7 +746,12 @@ impl CommandRouter {
                     return ResponseResult::Ok(ResponsePayload::Communities(Vec::new()));
                 };
                 let stored =
-                    iota_storage::util::communities_util::CommunitiesUtil::get_communities(iota_id);
+                    match iota_storage::util::communities_util::CommunitiesUtil::get_communities(
+                        iota_id,
+                    ) {
+                        Ok(stored) => stored,
+                        Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                    };
                 let summaries: Vec<CommunitySummary> = stored
                     .into_iter()
                     .map(|c| CommunitySummary {

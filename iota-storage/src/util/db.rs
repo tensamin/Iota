@@ -51,19 +51,42 @@ pub fn with_db<T, F>(f: F) -> Result<T, StorageError>
 where
     F: FnOnce(&Connection) -> Result<T, StorageError>,
 {
-    let conn = POOL.get().map_err(|e| StorageError::Pool(e.to_string()))?;
-    f(&conn)
+    blocking_region(|| {
+        let conn = POOL.get().map_err(|e| StorageError::Pool(e.to_string()))?;
+        f(&conn)
+    })
 }
 
 pub fn with_immediate_transaction<T, F>(f: F) -> Result<T, StorageError>
 where
     F: FnOnce(&Transaction<'_>) -> Result<T, StorageError>,
 {
-    let mut conn = POOL.get().map_err(|e| StorageError::Pool(e.to_string()))?;
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let value = f(&tx)?;
-    tx.commit()?;
-    Ok(value)
+    blocking_region(|| {
+        let mut conn = POOL.get().map_err(|e| StorageError::Pool(e.to_string()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let value = f(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    })
+}
+
+/* SQLite remains synchronous, but daemon transports run on Tokio. Entering a
+ * blocking region lets Tokio replace the worker that is waiting on the bounded
+ * eight-connection pool, so database latency cannot stall unrelated I/O. A
+ * current-thread runtime (used by unit tests and small tools) has no worker to
+ * hand off and therefore executes directly. */
+fn blocking_region<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle)
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) =>
+        {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 /* Verify the persistent database before the pool is initialized. A corrupt
@@ -156,9 +179,7 @@ fn add_table_column_if_missing(
 }
 
 fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
-    let current_version: i64 = conn
-        .pragma_query_value(None, "user_version", |r| r.get(0))
-        .unwrap_or(0);
+    let current_version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
 
     if current_version < 1 {
         conn.execute_batch(
@@ -272,13 +293,11 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
-    let messages_exist: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
+    let messages_exist: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages')",
+        [],
+        |row| row.get(0),
+    )?;
     if messages_exist {
         add_column_if_missing(
             conn,
@@ -926,19 +945,12 @@ pub fn with_conn<T, F>(shared: &Arc<std::sync::Mutex<Connection>>, f: F) -> Resu
 where
     F: FnOnce(&Connection) -> Result<T, rusqlite::Error>,
 {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(|| {
-            let guard = shared
-                .lock()
-                .map_err(|e| format!("DB mutex poisoned: {:?}", e))?;
-            f(&*guard).map_err(|e| e.to_string())
-        })
-    } else {
+    blocking_region(|| {
         let guard = shared
             .lock()
             .map_err(|e| format!("DB mutex poisoned: {:?}", e))?;
         f(&*guard).map_err(|e| e.to_string())
-    }
+    })
 }
 
 /// Legacy - kept for e2ee_storage which uses its own DB.

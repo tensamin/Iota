@@ -2,7 +2,6 @@ use crate::storage_error::StorageError;
 use crate::util::db;
 use crate::util::message_storage_policy::{self, MessageRetention};
 use crate::util::sync::{self, EntityType, Operation};
-use iota_logger::log;
 use rusqlite::{OptionalExtension, Transaction, params};
 
 pub const MAX_UNIQUE_REACTIONS_PER_MESSAGE: usize = 10;
@@ -907,9 +906,9 @@ pub fn change_message_state(
 fn load_reactions(
     conn: &rusqlite::Connection,
     msg_ids: &[i64],
-) -> std::collections::HashMap<i64, Vec<StoredReaction>> {
+) -> Result<std::collections::HashMap<i64, Vec<StoredReaction>>, StorageError> {
     if msg_ids.is_empty() {
-        return std::collections::HashMap::new();
+        return Ok(std::collections::HashMap::new());
     }
 
     let placeholders: Vec<String> = msg_ids
@@ -924,34 +923,33 @@ fn load_reactions(
 
     let mut map: std::collections::HashMap<i64, Vec<StoredReaction>> =
         std::collections::HashMap::new();
-    if let Ok(mut stmt) = conn.prepare(&query) {
-        let params: Vec<&dyn rusqlite::types::ToSql> = msg_ids
+    let mut stmt = conn.prepare(&query)?;
+    let params: Vec<&dyn rusqlite::types::ToSql> = msg_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            StoredReaction {
+                reaction: row.get(1)?,
+                user_id: row.get(2)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let row = row?;
+        let reactions = map.entry(row.0).or_default();
+        if reactions
             .iter()
-            .map(|id| id as &dyn rusqlite::types::ToSql)
-            .collect();
-        if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                StoredReaction {
-                    reaction: row.get(1)?,
-                    user_id: row.get(2)?,
-                },
-            ))
-        }) {
-            for row in rows.flatten() {
-                let reactions = map.entry(row.0).or_default();
-                if reactions
-                    .iter()
-                    .any(|stored: &StoredReaction| stored.reaction == row.1.reaction)
-                {
-                    reactions.push(row.1);
-                } else if reactions.len() < MAX_UNIQUE_REACTIONS_PER_MESSAGE {
-                    reactions.push(row.1);
-                }
-            }
+            .any(|stored: &StoredReaction| stored.reaction == row.1.reaction)
+        {
+            reactions.push(row.1);
+        } else if reactions.len() < MAX_UNIQUE_REACTIONS_PER_MESSAGE {
+            reactions.push(row.1);
         }
     }
-    map
+    Ok(map)
 }
 
 pub fn get_messages(
@@ -959,12 +957,12 @@ pub fn get_messages(
     external_user: i64,
     loaded_messages: i64,
     amount: i64,
-) -> Vec<StoredMessage> {
+) -> Result<Vec<StoredMessage>, StorageError> {
     if amount <= 0 || loaded_messages < 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    match db::with_db(|conn| {
+    db::with_db(|conn| {
         let mut stmt = conn.prepare(
             r#"
             SELECT id, relay_signer_id, relay_message_id, message_time, authored_at,
@@ -1000,10 +998,10 @@ pub fn get_messages(
                     content: row.get(13)?,
                     sent_by_self: row.get::<_, i64>(14)? != 0,
                     message_state: row.get(15)?,
-                    height: row.get(16).unwrap_or(0),
-                    key_version: row.get(17).unwrap_or(1),
-                    reply_to: row.get(18).ok().flatten(),
-                    edited: row.get::<_, i64>(19).unwrap_or(0) > 0,
+                    height: row.get(16)?,
+                    key_version: row.get(17)?,
+                    reply_to: row.get(18)?,
+                    edited: row.get::<_, i64>(19)? > 0,
                     reactions: Vec::new(),
                 })
             },
@@ -1011,26 +1009,17 @@ pub fn get_messages(
 
         let mut out = Vec::new();
         for row in rows {
-            match row {
-                Ok(msg) => out.push(msg),
-                Err(e) => log!("Failed to read row from sqlite: {}", e),
-            }
+            out.push(row?);
         }
 
         let msg_ids: Vec<i64> = out.iter().map(|m| m.id).collect();
-        let reaction_map = load_reactions(conn, &msg_ids);
+        let reaction_map = load_reactions(conn, &msg_ids)?;
         for msg in &mut out {
             msg.reactions = reaction_map.get(&msg.id).cloned().unwrap_or_default();
         }
 
         Ok(out)
-    }) {
-        Ok(v) => v,
-        Err(e) => {
-            log!("Failed to query messages: {}", e);
-            Vec::new()
-        }
-    }
+    })
 }
 
 pub fn get_message(
@@ -1074,10 +1063,10 @@ pub fn get_message(
                 content: row.get(13)?,
                 sent_by_self: row.get::<_, i64>(14)? != 0,
                 message_state: row.get(15)?,
-                height: row.get(16).unwrap_or(0),
-                key_version: row.get(17).unwrap_or(1),
-                reply_to: row.get(18).ok().flatten(),
-                edited: row.get::<_, i64>(19).unwrap_or(0) > 0,
+                height: row.get(16)?,
+                key_version: row.get(17)?,
+                reply_to: row.get(18)?,
+                edited: row.get::<_, i64>(19)? > 0,
                 external_user: row.get(20)?,
                 reactions: Vec::new(),
             })
@@ -1099,7 +1088,7 @@ pub fn get_message(
         }
 
         let mut message = messages.into_iter().next().expect("checked non-empty");
-        let reaction_map = load_reactions(conn, &[message.id]);
+        let reaction_map = load_reactions(conn, &[message.id])?;
         message.reactions = reaction_map.get(&message.id).cloned().unwrap_or_default();
         Ok(Some(message))
     })
@@ -1142,14 +1131,17 @@ pub fn get_message_with_offset(
     Ok(Some((message, offset)))
 }
 
-pub fn get_messages_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<StoredMessage> {
+pub fn get_messages_by_ids(
+    storage_owner: i64,
+    ids: &[i64],
+) -> Result<Vec<StoredMessage>, StorageError> {
     if ids.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let wanted: std::collections::HashSet<i64> = ids.iter().copied().collect();
     // A journal id uniquely identifies a row. Load all messages for this owner and retain only
     // those ids; this keeps reaction hydration identical to normal message loading.
-    match db::with_db(|conn| {
+    db::with_db(|conn| {
         let mut stmt = conn.prepare("SELECT id, relay_signer_id, relay_message_id, message_time, authored_at, origin_iota_received_at, destination_iota_received_at, client_received_at, client_received_recorded_at, read_at, read_recorded_at, delivery_failed_at, delivery_failure, content, sent_by_self, message_state, height, key_version, reply_to, edited_count, external_user FROM messages WHERE storage_owner = ?1 AND deleted_by_external = 0 AND history_deleted = 0")?;
         let rows = stmt.query_map([storage_owner], |row| {
             let external_user: i64 = row.get(20)?;
@@ -1171,10 +1163,10 @@ pub fn get_messages_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<StoredMessage
                 content: row.get(13)?,
                 sent_by_self: row.get::<_, i64>(14)? != 0,
                 message_state: row.get(15)?,
-                height: row.get(16).unwrap_or(0),
-                key_version: row.get(17).unwrap_or(1),
-                reply_to: row.get(18).ok().flatten(),
-                edited: row.get::<_, i64>(19).unwrap_or(0) > 0,
+                height: row.get(16)?,
+                key_version: row.get(17)?,
+                reply_to: row.get(18)?,
+                edited: row.get::<_, i64>(19)? > 0,
                 reactions: Vec::new(),
             })
         })?;
@@ -1185,35 +1177,24 @@ pub fn get_messages_by_ids(storage_owner: i64, ids: &[i64]) -> Vec<StoredMessage
                 messages.push(message);
             }
         }
-        let reaction_map = load_reactions(conn, &messages.iter().map(|m| m.id).collect::<Vec<_>>());
+        let reaction_map =
+            load_reactions(conn, &messages.iter().map(|m| m.id).collect::<Vec<_>>())?;
         for message in &mut messages {
             message.reactions = reaction_map.get(&message.id).cloned().unwrap_or_default();
         }
         Ok(messages)
-    }) {
-        Ok(messages) => messages,
-        Err(e) => {
-            log!("Failed to query messages by id: {}", e);
-            Vec::new()
-        }
-    }
+    })
 }
 
-pub fn get_all_messages(storage_owner: i64) -> Vec<StoredMessage> {
-    let ids = match db::with_db(|conn| {
+pub fn get_all_messages(storage_owner: i64) -> Result<Vec<StoredMessage>, StorageError> {
+    let ids = db::with_db(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id FROM messages WHERE storage_owner = ?1 AND deleted_by_external = 0 AND history_deleted = 0",
         )?;
         Ok(stmt
             .query_map([storage_owner], |row| row.get::<_, i64>(0))?
             .collect::<Result<Vec<_>, _>>()?)
-    }) {
-        Ok(ids) => ids,
-        Err(e) => {
-            log!("Failed to query all messages: {}", e);
-            return Vec::new();
-        }
-    };
+    })?;
     get_messages_by_ids(storage_owner, &ids)
 }
 

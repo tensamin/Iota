@@ -775,7 +775,7 @@ pub fn handle_get_chat_secret(cv: &CommunicationValue) -> CommunicationValue {
                 DataValue::SignedNumber(record.updated_at as i128),
             ),
         Ok(None) => error_response(cv, CommunicationType::ErrorNotSet),
-        Err(_) => error_response(cv, CommunicationType::ErrorInvalidData),
+        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
     }
 }
 
@@ -803,7 +803,9 @@ pub fn handle_create_app(cv: &CommunicationValue) -> CommunicationValue {
         if let Some(mut user) = user {
             if !user.trusted_apps.contains_key(&app_identifier) {
                 user.trusted_apps.insert(app_identifier, app_public_key);
-                iota_storage::users::user_manager::update_user(user);
+                if iota_storage::users::user_manager::update_user(user).is_err() {
+                    return error_response(cv, CommunicationType::ErrorInternal);
+                }
             }
         }
     }
@@ -832,7 +834,9 @@ pub fn handle_delete_app(cv: &CommunicationValue) -> CommunicationValue {
         if let Some(mut user) = user {
             if user.trusted_apps.contains_key(&app_identifier) {
                 user.trusted_apps.remove(&app_identifier);
-                iota_storage::users::user_manager::update_user(user);
+                if iota_storage::users::user_manager::update_user(user).is_err() {
+                    return error_response(cv, CommunicationType::ErrorInternal);
+                }
             }
         }
     }
@@ -954,12 +958,15 @@ pub fn handle_account_state_request(cv: &CommunicationValue) -> CommunicationVal
     };
     let contacts = match chats_util::get_users(user_id) {
         Ok(contacts) => contacts,
-        Err(_) => return account_state_error(cv),
+        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
     };
-    let messages = chat_files::get_all_messages(user_id);
+    let messages = match chat_files::get_all_messages(user_id) {
+        Ok(messages) => messages,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+    };
     let settings = match synced_settings::list(user_id) {
         Ok(settings) => settings,
-        Err(_) => return account_state_error(cv),
+        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
     };
     let message_values = messages
         .iter()
@@ -967,18 +974,22 @@ pub fn handle_account_state_request(cv: &CommunicationValue) -> CommunicationVal
         .collect();
     let blocked_users = match blocked_users::list(user_id) {
         Ok(users) => users,
-        Err(_) => return account_state_error(cv),
+        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
     };
     let receipt_policy = match receipt_policy::get(user_id) {
         Ok(policy) => policy,
-        Err(_) => return account_state_error(cv),
+        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
     };
     let message_storage_policy = match message_storage_policy::get(user_id) {
         Ok(policy) => policy,
-        Err(_) => return account_state_error(cv),
+        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
     };
     let contact_ids = match current_contact_ids(user_id) {
         Ok(contact_ids) => contact_ids,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+    };
+    let communities = match community_values(user_id) {
+        Ok(communities) => communities,
         Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
     };
     let retention_duration = match message_storage_policy.retention {
@@ -1028,10 +1039,7 @@ pub fn handle_account_state_request(cv: &CommunicationValue) -> CommunicationVal
                 }
             }),
         )
-        .add_typed_default(
-            DataType::Communities,
-            DataValue::Array(community_values(user_id)),
-        )
+        .add_typed_default(DataType::Communities, DataValue::Array(communities))
         .add_typed_default(DataType::UserIds, contact_ids)
         .add_typed_default(DataType::Calls, DataValue::Array(Vec::new()));
     if let Some(duration_ms) = retention_duration {
@@ -1069,7 +1077,10 @@ pub fn handle_messages_get(cv: &CommunicationValue) -> CommunicationValue {
     let Some(amount) = data_i64(cv, DataType::Amount).filter(|amount| *amount > 0) else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
-    let messages = chat_files::get_messages(my_id_i64, partner_id, offset, amount);
+    let messages = match chat_files::get_messages(my_id_i64, partner_id, offset, amount) {
+        Ok(messages) => messages,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+    };
     let mut msg_array: Vec<DataValue> = Vec::new();
     for m in &messages {
         msg_array.push(stored_message_value(m, my_id_i64, partner_id));
@@ -1096,12 +1107,12 @@ pub fn handle_message_get(cv: &CommunicationValue) -> CommunicationValue {
         {
             Ok(Some((message, offset))) => (message, Some(offset)),
             Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
-            Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+            Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
         },
         None => match chat_files::get_message(owner, send_time, None) {
             Ok(Some(message)) => (message, None),
             Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
-            Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+            Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
         },
     };
 
@@ -1245,12 +1256,16 @@ pub fn handle_add_community(cv: &CommunicationValue) -> CommunicationValue {
     let Some(position) = cv.get_data(DataType::Position).as_str() else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
-    CommunitiesUtil::add_community(
+    if CommunitiesUtil::add_community(
         sender_id,
         address.to_string(),
         title.to_string(),
         position.to_string(),
-    );
+    )
+    .is_err()
+    {
+        return error_response(cv, CommunicationType::ErrorInternal);
+    }
     CommunicationValue::new(CommunicationType::AddCommunity)
         .with_request_id(cv)
         .with_receiver(sender_wire_id(sender_id))
@@ -1261,17 +1276,18 @@ pub fn handle_get_communities(cv: &CommunicationValue) -> CommunicationValue {
         Ok(sender_id) => sender_id,
         Err(response) => return response,
     };
+    let communities = match community_values(sender_id) {
+        Ok(communities) => communities,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+    };
     CommunicationValue::new(CommunicationType::GetCommunities)
         .with_request_id(cv)
         .with_receiver(sender_wire_id(sender_id))
-        .add_typed_default(
-            DataType::Communities,
-            DataValue::Array(community_values(sender_id)),
-        )
+        .add_typed_default(DataType::Communities, DataValue::Array(communities))
 }
 
-fn community_values(storage_owner: i64) -> Vec<DataValue> {
-    CommunitiesUtil::get_communities(storage_owner)
+fn community_values(storage_owner: i64) -> Result<Vec<DataValue>, StorageError> {
+    Ok(CommunitiesUtil::get_communities(storage_owner)?
         .into_iter()
         .map(|community| {
             typed_container(vec![
@@ -1283,7 +1299,7 @@ fn community_values(storage_owner: i64) -> Vec<DataValue> {
                 (DataType::Position, DataValue::Str(community.position)),
             ])
         })
-        .collect()
+        .collect())
 }
 
 pub fn handle_remove_community(cv: &CommunicationValue) -> CommunicationValue {
@@ -1321,7 +1337,7 @@ pub fn handle_global_settings_save(cv: &CommunicationValue) -> CommunicationValu
     };
 
     if settings::save_global(my_id_i64, settings_value).is_err() {
-        return error_response(cv, CommunicationType::ErrorInvalidData);
+        return error_response(cv, CommunicationType::ErrorInternal);
     }
 
     let mut response = CommunicationValue::new(CommunicationType::GlobalSettingsSave)
@@ -1347,7 +1363,7 @@ pub fn handle_global_settings_load(cv: &CommunicationValue) -> CommunicationValu
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
     let Ok(settings_value) = settings::load_global(my_id_i64) else {
-        return error_response(cv, CommunicationType::ErrorInvalidData);
+        return error_response(cv, CommunicationType::ErrorInternal);
     };
     let Some(settings_value_str) = settings_value else {
         let mut response = CommunicationValue::new(CommunicationType::ErrorNotFound)
@@ -1469,7 +1485,7 @@ pub fn handle_settings_save(
     };
 
     if settings::save(my_id_i64, session_id_i64, settings_name, settings_value).is_err() {
-        return error_response(cv, CommunicationType::ErrorInvalidData);
+        return error_response(cv, CommunicationType::ErrorInternal);
     }
 
     CommunicationValue::new(CommunicationType::SettingsSave)
@@ -1558,7 +1574,7 @@ pub fn handle_settings_load(
     }
 
     let Ok(settings_value) = settings::load(my_id_i64, session_id_i64, settings_name) else {
-        return error_response(cv, CommunicationType::ErrorInvalidData);
+        return error_response(cv, CommunicationType::ErrorInternal);
     };
     let Some(settings_value_str) = settings_value else {
         return CommunicationValue::new(CommunicationType::ErrorNotFound)
@@ -1626,7 +1642,7 @@ pub fn handle_settings_list(
     };
 
     let Ok(settings) = settings::list(my_id_i64, session_id_i64) else {
-        return error_response(cv, CommunicationType::ErrorInvalidData);
+        return error_response(cv, CommunicationType::ErrorInternal);
     };
     let settings_json = settings.into_iter().map(DataValue::Str).collect();
     CommunicationValue::new(CommunicationType::SettingsList)

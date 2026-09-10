@@ -90,7 +90,10 @@ async fn main() -> ExitCode {
     }
     iota_util::file_util::configure_storage_directory(paths.storage_dir.clone());
     iota_storage::util::config_util::configure_config_path(paths.config_file.clone());
-    iota_storage::util::config_util::load_config_from(&paths.config_file);
+    if let Err(error) = iota_storage::util::config_util::load_config_from(&paths.config_file) {
+        eprintln!("Cannot load Iota configuration: {error}");
+        return ExitCode::FAILURE;
+    }
     omikron_connector::omikron_connection::configure_identity_path(paths.keyring_file());
     match paths.scope {
         iota_paths::Scope::User => logger::startup_with_log_dir(Some(paths.log_dir.clone())),
@@ -332,10 +335,7 @@ async fn main() -> ExitCode {
             iota_storage::util::config_util::WebMode::Loopback => web_server::WebMode::Loopback,
             iota_storage::util::config_util::WebMode::Network => web_server::WebMode::Network,
         },
-        bind: web
-            .bind
-            .parse()
-            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        bind: web.bind.parse().expect("web.bind was validated at startup"),
         port: web.port,
         asset_dir: resolve_config_path(&paths.config_file, &web.asset_dir, &paths.asset_dir),
         tls: web
