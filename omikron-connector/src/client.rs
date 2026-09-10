@@ -8,6 +8,7 @@ pub enum OmikronError {
     Timeout(String),
     Authentication(String),
     Rejected(CommunicationType, String),
+    Storage(String),
     Internal(String),
 }
 
@@ -18,6 +19,7 @@ impl std::fmt::Display for OmikronError {
             | Self::Timeout(v)
             | Self::Authentication(v)
             | Self::Rejected(_, v)
+            | Self::Storage(v)
             | Self::Internal(v) => f.write_str(v),
         }
     }
@@ -42,6 +44,12 @@ pub trait OmikronClient: Send + Sync {
         value: &CommunicationValue,
         timeout: Duration,
     ) -> Result<CommunicationValue, OmikronError>;
+    async fn sync_omega_invitations(&self) -> Result<(), OmikronError> {
+        Err(OmikronError::Internal(
+            "invitation synchronization is unavailable".into(),
+        ))
+    }
+    async fn flush_pending_invitation_actions(&self) {}
     async fn reconnect(&self) -> Result<(), OmikronError>;
     /// Replace the local Iota identity and wait for the new identity to
     /// register/authenticate. This is deliberately available while offline:

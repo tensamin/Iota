@@ -2,10 +2,11 @@ use crate::log_buffer::LogBuffer;
 use crate::{DaemonRuntime, DaemonServices};
 use iota_ipc::{
     CommunitySummary, ComponentStatusResponse, ConfigResponse, DaemonMessage, ExitIntent,
-    IpcErrorCode, LocalRequest, LogEntriesResponse, LogEntry, MAX_MESSAGE_SIZE,
-    OmikronStatusResponse, ReconcileAction, ResponseEnvelope, ResponsePayload, ResponseResult,
-    StatusResponse, TaskSummary, UpdateStatusResponse, UserDetailResponse, UserDiagnostics,
-    UserOperationKind, UserOperationSummary, UserReconcileResult, UserSummary,
+    InvitationAuthority, InvitationCreated, InvitationState, InvitationSummary, IpcErrorCode,
+    LocalRequest, LogEntriesResponse, LogEntry, MAX_MESSAGE_SIZE, OmikronStatusResponse,
+    ReconcileAction, ResponseEnvelope, ResponsePayload, ResponseResult, StatusResponse,
+    TaskSummary, UpdateStatusResponse, UserDetailResponse, UserDiagnostics, UserOperationKind,
+    UserOperationSummary, UserReconcileResult, UserSummary,
 };
 use iota_logger::{log, log_command};
 use iota_storage::users::pending_operations::{
@@ -13,6 +14,7 @@ use iota_storage::users::pending_operations::{
 };
 use iota_storage::users::user_manager;
 use iota_storage::util::config_util::{self};
+use iota_util::mtp_compat::OptionalDataValueExt;
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -149,6 +151,10 @@ impl CommandRouter {
                 | LocalRequest::ReconcileUser { .. }
                 | LocalRequest::ReleaseUser { .. }
                 | LocalRequest::CompleteDeleteUser { .. }
+                | LocalRequest::CreateInvitation {
+                    authority: InvitationAuthority::Omega,
+                    ..
+                }
         );
         if needs_omikron && !self.services.omikron.is_connected().await {
             return ResponseResult::Error(
@@ -239,6 +245,269 @@ impl CommandRouter {
                     return ResponseResult::Error(IpcErrorCode::StorageFailure);
                 };
                 ResponseResult::Ok(ResponsePayload::Users(users))
+            }
+            LocalRequest::CreateInvitation {
+                authority,
+                lifetime_seconds,
+                password,
+                label,
+            } => {
+                if authority == InvitationAuthority::Iota {
+                    return ResponseResult::Error(IpcErrorCode::Unsupported);
+                }
+                if lifetime_seconds == 0 || lifetime_seconds > 7 * 24 * 60 * 60 {
+                    return ResponseResult::Error(IpcErrorCode::InvalidRequest);
+                }
+                let password_protected = password.is_some();
+                let mut request = CommunicationValue::new(CommunicationType::CreateUserInvitation)
+                    .add_typed_default(
+                        DataType::InvitationAuthority,
+                        DataValue::Str("omega".into()),
+                    )
+                    .add_typed_default(
+                        DataType::InvitationLifetimeSeconds,
+                        DataValue::SignedNumber(lifetime_seconds.into()),
+                    );
+                if let Some(password) = password {
+                    request = request.add_typed_default(
+                        DataType::InvitationPassword,
+                        DataValue::Str(password.0),
+                    );
+                }
+                if let Some(label) = label.as_ref() {
+                    request = request.add_typed_default(
+                        DataType::InvitationLabel,
+                        DataValue::Str(label.clone()),
+                    );
+                }
+                let response = match self
+                    .services
+                    .omikron
+                    .await_response(&request, Duration::from_secs(20))
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(omikron_connector::OmikronError::Timeout(_)) => {
+                        return ResponseResult::Error(IpcErrorCode::Timeout);
+                    }
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::OmikronUnavailable),
+                };
+                let invitation_id = response
+                    .get_data(DataType::InvitationId)
+                    .as_signed_number()
+                    .and_then(|value| i64::try_from(value).ok());
+                let raw_token = response
+                    .get_data(DataType::InvitationToken)
+                    .as_str()
+                    .map(str::to_owned);
+                let expires_at = response
+                    .get_data(DataType::InvitationExpiresAt)
+                    .as_signed_number()
+                    .and_then(|value| i64::try_from(value).ok());
+                let created_at = response
+                    .get_data(DataType::InvitationCreatedAt)
+                    .as_signed_number()
+                    .and_then(|value| i64::try_from(value).ok());
+                let remote_revision = response
+                    .get_data(DataType::InvitationRevision)
+                    .as_signed_number()
+                    .and_then(|value| i64::try_from(value).ok())
+                    .unwrap_or(1);
+                let short_url = response
+                    .get_data(DataType::Link)
+                    .as_str()
+                    .map(str::to_owned);
+                let Some((invitation_id, raw_token, created_at, expires_at)) = invitation_id
+                    .zip(raw_token)
+                    .zip(created_at)
+                    .zip(expires_at)
+                    .map(|(((id, token), created), expires)| (id, token, created, expires))
+                else {
+                    return ResponseResult::Error(IpcErrorCode::InternalFailure);
+                };
+                let summary = iota_storage::users::invitations::InvitationSummary {
+                    invitation_id,
+                    authority: iota_storage::users::invitations::InvitationAuthority::Omega,
+                    label,
+                    password_protected,
+                    created_at,
+                    expires_at: Some(expires_at),
+                    state: iota_storage::users::invitations::InvitationState::Pending,
+                    remote_revision,
+                    redeemed_user_id: None,
+                    redeemed_at: None,
+                    revoked_at: None,
+                    pending_action: None,
+                    pending_action_at: None,
+                    last_synced_at: Some(now_millis()),
+                    local_provisioned_user_id: None,
+                    local_provisioned_at: None,
+                };
+                if iota_storage::users::invitations::insert(&summary, None, now_millis()).is_err() {
+                    return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                }
+                ResponseResult::Ok(ResponsePayload::InvitationCreated(InvitationCreated {
+                    authority,
+                    invitation_id,
+                    raw_token: iota_ipc::SecretString(raw_token),
+                    expires_at,
+                    short_url,
+                }))
+            }
+            LocalRequest::ListInvitations { authority } => {
+                if authority != Some(InvitationAuthority::Iota)
+                    && self.services.omikron.is_connected().await
+                {
+                    match self.services.omikron.sync_omega_invitations().await {
+                        Ok(()) => {}
+                        Err(omikron_connector::OmikronError::Storage(_)) => {
+                            return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                        }
+                        Err(omikron_connector::OmikronError::Timeout(_)) => {
+                            return ResponseResult::Error(IpcErrorCode::Timeout);
+                        }
+                        Err(omikron_connector::OmikronError::Disconnected(_)) => {
+                            return ResponseResult::Error(IpcErrorCode::OmikronUnavailable);
+                        }
+                        Err(_) => return ResponseResult::Error(IpcErrorCode::InternalFailure),
+                    }
+                }
+                if iota_storage::users::invitations::expire_pending(now_millis()).is_err() {
+                    return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                }
+                let invitations = match iota_storage::users::invitations::list() {
+                    Ok(invitations) => invitations,
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                let mut summaries = Vec::new();
+                for invitation in invitations {
+                    let invitation_authority = match invitation.authority {
+                        iota_storage::users::invitations::InvitationAuthority::Omega => {
+                            InvitationAuthority::Omega
+                        }
+                        iota_storage::users::invitations::InvitationAuthority::Iota => {
+                            InvitationAuthority::Iota
+                        }
+                    };
+                    if authority.is_some_and(|filter| filter != invitation_authority) {
+                        continue;
+                    }
+                    let display_state = if invitation.pending_action
+                        == Some(iota_storage::users::invitations::PendingAction::Revoke)
+                    {
+                        InvitationState::RevocationPending
+                    } else if invitation.authority
+                        == iota_storage::users::invitations::InvitationAuthority::Omega
+                        && invitation.state
+                            == iota_storage::users::invitations::InvitationState::Pending
+                        && invitation
+                            .expires_at
+                            .is_some_and(|expires_at| expires_at <= now_millis())
+                    {
+                        InvitationState::Expired
+                    } else {
+                        match invitation.state {
+                            iota_storage::users::invitations::InvitationState::Pending => {
+                                InvitationState::Pending
+                            }
+                            iota_storage::users::invitations::InvitationState::Provisioning => {
+                                InvitationState::Provisioning
+                            }
+                            iota_storage::users::invitations::InvitationState::Redeemed => {
+                                InvitationState::Redeemed
+                            }
+                            iota_storage::users::invitations::InvitationState::Revoked => {
+                                InvitationState::Revoked
+                            }
+                            iota_storage::users::invitations::InvitationState::Expired => {
+                                InvitationState::Expired
+                            }
+                        }
+                    };
+                    summaries.push(InvitationSummary {
+                        authority: invitation_authority,
+                        invitation_id: invitation.invitation_id,
+                        label: invitation.label,
+                        password_protected: invitation.password_protected,
+                        created_at: invitation.created_at,
+                        expires_at: invitation.expires_at,
+                        state: display_state,
+                        redeemed_user_id: invitation.redeemed_user_id,
+                        local_provisioned_user_id: invitation.local_provisioned_user_id,
+                        local_provisioned_at: invitation.local_provisioned_at,
+                    });
+                }
+                ResponseResult::Ok(ResponsePayload::Invitations(summaries))
+            }
+            LocalRequest::RevokeInvitation {
+                authority,
+                invitation_id,
+            } => {
+                if authority == InvitationAuthority::Iota {
+                    return ResponseResult::Error(IpcErrorCode::Unsupported);
+                }
+                let changed = match iota_storage::users::invitations::mark_revoke_pending(
+                    invitation_id,
+                    now_millis(),
+                ) {
+                    Ok(changed) => changed,
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                if !changed {
+                    return ResponseResult::Error(IpcErrorCode::Conflict);
+                }
+                if self.services.omikron.is_connected().await {
+                    self.services
+                        .omikron
+                        .flush_pending_invitation_actions()
+                        .await;
+                }
+                let invitation =
+                    match iota_storage::users::invitations::list()
+                        .ok()
+                        .and_then(|items| {
+                            items
+                                .into_iter()
+                                .find(|item| item.invitation_id == invitation_id)
+                        }) {
+                        Some(invitation) => invitation,
+                        None => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                    };
+                let state = if invitation.pending_action
+                    == Some(iota_storage::users::invitations::PendingAction::Revoke)
+                {
+                    InvitationState::RevocationPending
+                } else {
+                    match invitation.state {
+                        iota_storage::users::invitations::InvitationState::Pending => {
+                            InvitationState::Pending
+                        }
+                        iota_storage::users::invitations::InvitationState::Provisioning => {
+                            InvitationState::Provisioning
+                        }
+                        iota_storage::users::invitations::InvitationState::Redeemed => {
+                            InvitationState::Redeemed
+                        }
+                        iota_storage::users::invitations::InvitationState::Revoked => {
+                            InvitationState::Revoked
+                        }
+                        iota_storage::users::invitations::InvitationState::Expired => {
+                            InvitationState::Expired
+                        }
+                    }
+                };
+                ResponseResult::Ok(ResponsePayload::InvitationUpdated(InvitationSummary {
+                    authority: InvitationAuthority::Omega,
+                    invitation_id,
+                    label: invitation.label,
+                    password_protected: invitation.password_protected,
+                    created_at: invitation.created_at,
+                    expires_at: invitation.expires_at,
+                    state,
+                    redeemed_user_id: invitation.redeemed_user_id,
+                    local_provisioned_user_id: invitation.local_provisioned_user_id,
+                    local_provisioned_at: invitation.local_provisioned_at,
+                }))
             }
             LocalRequest::CreateUser { username } => {
                 match omikron_connector::user_ops::create_user(

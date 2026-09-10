@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$#" -ne 6 ]]; then
-    echo "usage: $0 BINARY_DIRECTORY PRODUCT_VERSION UPDATE_MANIFEST_URL UPDATE_PUBLIC_KEY UPDATE_SIGNATURE_URL OUTPUT.zip" >&2
+if [[ "$#" -ne 9 ]]; then
+    echo "usage: $0 BINARY_DIRECTORY PRODUCT_VERSION RELEASE_MANIFEST UPDATE_MANIFEST_URL UPDATE_PUBLIC_KEY UPDATE_SIGNATURE_URL UPDATE_CHANNEL UPDATE_SIGNING_KEY_ID OUTPUT.zip" >&2
     exit 2
 fi
 
 binary_directory="$1"
 product_version="$2"
-update_manifest_url="$3"
-update_public_key="$4"
-update_signature_url="$5"
-output="$6"
+release_manifest="$3"
+update_manifest_url="$4"
+update_public_key="$5"
+update_signature_url="$6"
+update_channel="$7"
+update_signing_key_id="$8"
+output="$9"
 repository_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 contract="$repository_directory/iota-installer/bundle-files.txt"
 staging_directory="$(mktemp -d)"
@@ -19,6 +22,20 @@ trap 'rm -rf "$staging_directory"' EXIT
 
 if [[ ! "$product_version" =~ ^[0-9A-Za-z][0-9A-Za-z.+_-]*$ ]]; then
     echo "product version contains unsupported characters: $product_version" >&2
+    exit 2
+fi
+if ! jq -e \
+    --arg product_version "$product_version" \
+    --arg channel "$update_channel" \
+    --arg key_id "$update_signing_key_id" \
+    '.product_version == $product_version
+        and .channel == $channel
+        and .release_signing_key_id == $key_id
+        and (.release_sequence | type == "number" and . > 0)
+        and (.published_at | type == "string" and length > 0)
+        and (.expires_at | type == "string" and length > 0)' \
+    "$release_manifest" >/dev/null; then
+    echo "release manifest identity or anti-rollback metadata is invalid" >&2
     exit 2
 fi
 
@@ -37,13 +54,15 @@ while IFS= read -r bundle_path; do
             install -m 0755 "$binary_directory/${bundle_path#bin/}" "$destination"
             ;;
         manifest.json)
-            printf '{"product_version":"%s"}\n' "$product_version" > "$destination"
+            install -m 0644 "$release_manifest" "$destination"
             ;;
         systemd/update.env)
-            printf 'IOTA_UPDATE_MANIFEST=%s\nIOTA_UPDATE_PUBLIC_KEY=%s\nIOTA_UPDATE_SIGNATURE=%s\n' \
+            printf 'IOTA_UPDATE_MANIFEST=%s\nIOTA_UPDATE_PUBLIC_KEY=%s\nIOTA_UPDATE_SIGNATURE=%s\nIOTA_UPDATE_CHANNEL=%s\nIOTA_UPDATE_SIGNING_KEY_ID=%s\n' \
                 "$update_manifest_url" \
                 "$update_public_key" \
                 "$update_signature_url" \
+                "$update_channel" \
+                "$update_signing_key_id" \
                 > "$destination"
             ;;
         *)

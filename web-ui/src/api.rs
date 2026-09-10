@@ -226,6 +226,7 @@ fn ipc_error_response(code: IpcErrorCode) -> HttpResponse {
     let status = match code {
         IpcErrorCode::InvalidRequest => actix_web::http::StatusCode::BAD_REQUEST,
         IpcErrorCode::Conflict => actix_web::http::StatusCode::CONFLICT,
+        IpcErrorCode::Unsupported => actix_web::http::StatusCode::NOT_IMPLEMENTED,
         IpcErrorCode::NotReady | IpcErrorCode::OmikronUnavailable => {
             actix_web::http::StatusCode::SERVICE_UNAVAILABLE
         }

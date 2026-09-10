@@ -183,6 +183,41 @@ fn product_version(staging: &Path) -> Result<String> {
         .with_context(|| format!("read bundle manifest {}", manifest_path.display()))?;
     let manifest: serde_json::Value = serde_json::from_str(&contents)
         .with_context(|| format!("parse bundle manifest {}", manifest_path.display()))?;
+    for name in [
+        "product_version",
+        "channel",
+        "published_at",
+        "expires_at",
+        "release_signing_key_id",
+    ] {
+        manifest
+            .get(name)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("bundle manifest {name} must be a non-empty string"))?;
+    }
+    for name in [
+        "release_sequence",
+        "minimum_data_schema",
+        "supported_ipc_min",
+        "supported_ipc_max",
+    ] {
+        let value = manifest
+            .get(name)
+            .and_then(|value| value.as_u64())
+            .with_context(|| format!("bundle manifest {name} must be an unsigned integer"))?;
+        if name == "release_sequence" && value == 0 {
+            bail!("bundle manifest release_sequence must be greater than zero");
+        }
+    }
+    manifest
+        .get("artifacts")
+        .and_then(|value| value.as_array())
+        .context("bundle manifest artifacts must be an array")?;
+    manifest
+        .get("rollback_compatible")
+        .and_then(|value| value.as_bool())
+        .context("bundle manifest rollback_compatible must be a boolean")?;
     let version = manifest
         .get("product_version")
         .and_then(|value| value.as_str())
@@ -218,6 +253,8 @@ fn validate_update_environment(staging: &Path) -> Result<()> {
         "IOTA_UPDATE_MANIFEST",
         "IOTA_UPDATE_PUBLIC_KEY",
         "IOTA_UPDATE_SIGNATURE",
+        "IOTA_UPDATE_CHANNEL",
+        "IOTA_UPDATE_SIGNING_KEY_ID",
     ] {
         let value = entries
             .get(name)
@@ -227,7 +264,7 @@ fn validate_update_environment(staging: &Path) -> Result<()> {
             bail!("updater environment variable {name} contains whitespace");
         }
     }
-    if entries.len() != 3 {
+    if entries.len() != 5 {
         bail!("updater environment contains unexpected variables");
     }
     let public_key = entries
@@ -239,6 +276,27 @@ fn validate_update_environment(staging: &Path) -> Result<()> {
             .all(|character| character.is_ascii_hexdigit())
     {
         bail!("IOTA_UPDATE_PUBLIC_KEY must be 32-byte hex");
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(staging.join("manifest.json")).context("read bundle manifest")?,
+    )
+    .context("parse bundle manifest")?;
+    for (environment_name, manifest_name) in [
+        ("IOTA_UPDATE_CHANNEL", "channel"),
+        ("IOTA_UPDATE_SIGNING_KEY_ID", "release_signing_key_id"),
+    ] {
+        let environment_value = entries
+            .get(environment_name)
+            .with_context(|| format!("updater environment is missing {environment_name}"))?;
+        let manifest_value = manifest
+            .get(manifest_name)
+            .and_then(|value| value.as_str())
+            .with_context(|| format!("bundle manifest is missing {manifest_name}"))?;
+        if *environment_value != manifest_value {
+            bail!(
+                "updater environment {environment_name} does not match bundle manifest {manifest_name}"
+            );
+        }
     }
     Ok(())
 }
@@ -279,11 +337,26 @@ mod tests {
                 .start_file(name, SimpleFileOptions::default())
                 .unwrap();
             if name == "manifest.json" {
-                write!(archive, "{{\"product_version\":\"{product_version}\"}}").unwrap();
+                let manifest = serde_json::json!({
+                    "product_version": product_version,
+                    "channel": "stable",
+                    "release_sequence": 1,
+                    "published_at": "2026-09-10T00:00:00Z",
+                    "expires_at": "2026-10-10T00:00:00Z",
+                    "minimum_data_schema": 1,
+                    "supported_ipc_min": 2,
+                    "supported_ipc_max": 4,
+                    "artifacts": [],
+                    "release_signing_key_id": "primary",
+                    "rollback_compatible": true
+                });
+                archive
+                    .write_all(&serde_json::to_vec(&manifest).unwrap())
+                    .unwrap();
             } else if name == "systemd/update.env" {
                 archive
                     .write_all(
-                        b"IOTA_UPDATE_MANIFEST=https://example.invalid/manifest.json\nIOTA_UPDATE_PUBLIC_KEY=0707070707070707070707070707070707070707070707070707070707070707\nIOTA_UPDATE_SIGNATURE=https://example.invalid/manifest.json.sig\n",
+                        b"IOTA_UPDATE_MANIFEST=https://example.invalid/manifest.json\nIOTA_UPDATE_PUBLIC_KEY=0707070707070707070707070707070707070707070707070707070707070707\nIOTA_UPDATE_SIGNATURE=https://example.invalid/manifest.json.sig\nIOTA_UPDATE_CHANNEL=stable\nIOTA_UPDATE_SIGNING_KEY_ID=primary\n",
                     )
                     .unwrap();
             } else {
@@ -353,5 +426,19 @@ mod tests {
         let error = validate_update_environment(directory.path()).unwrap_err();
 
         assert!(error.to_string().contains("IOTA_UPDATE_PUBLIC_KEY"));
+    }
+
+    #[test]
+    fn rejects_legacy_bundle_manifest_without_sequence_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("manifest.json"),
+            br#"{"product_version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let error = product_version(directory.path()).unwrap_err();
+
+        assert!(error.to_string().contains("channel"));
     }
 }

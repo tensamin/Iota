@@ -25,6 +25,7 @@ pub enum AddUserPhase {
 pub struct AddUserFlow {
     pub phase: AddUserPhase,
     pub methods: MenuState<AddUserMethod>,
+    pub invitation_authorities: MenuState<iota_ipc::InvitationAuthority>,
     pub username: TextInput,
     pub import_path: TextInput,
     pub credential: Option<iota_ipc::SecretString>,
@@ -39,7 +40,7 @@ impl AddUserFlow {
             methods: MenuState::new(vec![
                 MenuItem {
                     label: "Share an invitation".into(),
-                    description: Some("Not supported by the connected daemon".into()),
+                    description: Some("Create a single-use onboarding credential".into()),
                     value: AddUserMethod::Invitation,
                     enabled: invitation_supported,
                     disabled_reason: Some("Not supported by the connected daemon".into()),
@@ -58,6 +59,22 @@ impl AddUserFlow {
                     enabled: tu_inspection_supported,
                     disabled_reason: (!tu_inspection_supported)
                         .then(|| "TU inspection is not supported by the connected daemon".into()),
+                },
+            ]),
+            invitation_authorities: MenuState::new(vec![
+                MenuItem {
+                    label: "Omega".into(),
+                    description: Some("Central invitation authority".into()),
+                    value: iota_ipc::InvitationAuthority::Omega,
+                    enabled: true,
+                    disabled_reason: None,
+                },
+                MenuItem {
+                    label: "This Iota".into(),
+                    description: Some("Local invitation authority".into()),
+                    value: iota_ipc::InvitationAuthority::Iota,
+                    enabled: false,
+                    disabled_reason: Some("Local invitations are not implemented yet".into()),
                 },
             ]),
             username: TextInput::new("Username"),

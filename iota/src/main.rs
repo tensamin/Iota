@@ -843,6 +843,32 @@ async fn run_command(
                         }
                     }
                 }
+                ResponsePayload::InvitationCreated(invitation) => {
+                    println!("Invitation: {}", invitation.invitation_id);
+                    println!("Token: {}", invitation.raw_token.0);
+                    if let Some(url) = invitation.short_url {
+                        println!("Link: {url}");
+                    }
+                    println!("Expires: {}", invitation.expires_at);
+                }
+                ResponsePayload::Invitations(invitations) => {
+                    if invitations.is_empty() {
+                        println!("No invitations.");
+                    } else {
+                        for invitation in invitations {
+                            println!(
+                                "{} ({:?}, {:?})",
+                                invitation.invitation_id, invitation.authority, invitation.state
+                            );
+                        }
+                    }
+                }
+                ResponsePayload::InvitationUpdated(invitation) => {
+                    println!(
+                        "Invitation {} is {:?}",
+                        invitation.invitation_id, invitation.state
+                    );
+                }
                 ResponsePayload::UserCreated { user_id, username } => {
                     println!(
                         "{} {} ({})",
@@ -1023,6 +1049,35 @@ fn render_structured(payload: &ResponsePayload, output: OutputFormat) -> Result<
 
 fn render_table(payload: &ResponsePayload) {
     match payload {
+        ResponsePayload::InvitationCreated(invitation) => {
+            println!("{:<15} {}", "Invitation ID", invitation.invitation_id);
+            println!(
+                "{:<15} {}",
+                "Authority",
+                format!("{:?}", invitation.authority)
+            );
+            println!("{:<15} {}", "Token", invitation.raw_token.0);
+            println!("{:<15} {}", "Expires", invitation.expires_at);
+            if let Some(url) = &invitation.short_url {
+                println!("{:<15} {}", "Link", url);
+            }
+        }
+        ResponsePayload::Invitations(invitations) => {
+            println!("{:<16} {:<10} {:<14} LABEL", "ID", "AUTHORITY", "STATE");
+            for invitation in invitations {
+                println!(
+                    "{:<16} {:<10} {:<14} {}",
+                    invitation.invitation_id,
+                    format!("{:?}", invitation.authority),
+                    format!("{:?}", invitation.state),
+                    invitation.label.as_deref().unwrap_or("-")
+                );
+            }
+        }
+        ResponsePayload::InvitationUpdated(invitation) => {
+            println!("{:<15} {}", "Invitation ID", invitation.invitation_id);
+            println!("{:<15} {:?}", "State", invitation.state);
+        }
         ResponsePayload::Users(users) => {
             if users.is_empty() {
                 println!("No users.");

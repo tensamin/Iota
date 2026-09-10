@@ -45,6 +45,19 @@ pub enum LocalRequest {
     GetStatus,
     ListTasks,
     ListUsers,
+    CreateInvitation {
+        authority: InvitationAuthority,
+        lifetime_seconds: u64,
+        password: Option<SecretString>,
+        label: Option<String>,
+    },
+    ListInvitations {
+        authority: Option<InvitationAuthority>,
+    },
+    RevokeInvitation {
+        authority: InvitationAuthority,
+        invitation_id: i64,
+    },
     CreateUser {
         username: String,
     },
@@ -148,6 +161,7 @@ impl LocalRequest {
             Self::GetStatus
             | Self::ListTasks
             | Self::ListUsers
+            | Self::ListInvitations { .. }
             | Self::GetDaemonStatus
             | Self::GetOmikronStatus
             | Self::ListComponents
@@ -160,6 +174,8 @@ impl LocalRequest {
             Self::ReconnectOmikron | Self::ReloadConfig => IpcRole::Operate,
 
             Self::CreateUser { .. }
+            | Self::CreateInvitation { .. }
+            | Self::RevokeInvitation { .. }
             | Self::InspectTuCredential { .. }
             | Self::AttachUserFromTu { .. }
             | Self::ReconcileUser { .. }
@@ -249,6 +265,9 @@ pub enum ResponsePayload {
     Status(StatusResponse),
     Tasks(Vec<TaskSummary>),
     Users(Vec<UserSummary>),
+    InvitationCreated(InvitationCreated),
+    Invitations(Vec<InvitationSummary>),
+    InvitationUpdated(InvitationSummary),
     UserCreated {
         user_id: i64,
         username: String,
@@ -325,6 +344,49 @@ pub struct UpdateStatusResponse {
 pub struct CommunitySummary {
     pub name: String,
     pub title: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InvitationAuthority {
+    Omega,
+    Iota,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InvitationState {
+    Pending,
+    RevocationPending,
+    Provisioning,
+    Redeemed,
+    Revoked,
+    Expired,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InvitationCreated {
+    pub authority: InvitationAuthority,
+    pub invitation_id: i64,
+    pub raw_token: SecretString,
+    pub expires_at: i64,
+    pub short_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InvitationSummary {
+    pub authority: InvitationAuthority,
+    pub invitation_id: i64,
+    pub label: Option<String>,
+    pub password_protected: bool,
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
+    pub state: InvitationState,
+    pub redeemed_user_id: Option<i64>,
+    #[serde(default)]
+    pub local_provisioned_user_id: Option<i64>,
+    #[serde(default)]
+    pub local_provisioned_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -427,6 +489,7 @@ pub enum IpcErrorCode {
     Conflict,
     StorageFailure,
     OmikronUnavailable,
+    Unsupported,
     UnsupportedVersion,
     NotReady,
     Disconnected,
@@ -444,6 +507,7 @@ impl std::fmt::Display for IpcErrorCode {
             Self::Conflict => "the request conflicts with current daemon state",
             Self::StorageFailure => "the daemon could not access local storage",
             Self::OmikronUnavailable => "Omikron is unavailable",
+            Self::Unsupported => "the requested operation is not implemented",
             Self::UnsupportedVersion => "the client and daemon protocol versions are incompatible",
             Self::NotReady => "the daemon is not ready yet",
             Self::Disconnected => "the daemon connection was lost",

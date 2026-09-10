@@ -18,6 +18,18 @@ on:
         description: "Release description"
         required: true
         type: string
+      release_sequence:
+        description: "Monotonic sequence allocated for this update channel"
+        required: true
+        type: string
+      expires_at:
+        description: "Signed manifest expiry in RFC 3339 format"
+        required: true
+        type: string
+
+concurrency:
+  group: iota-release-${{ inputs.release_type }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -88,8 +100,11 @@ jobs:
           CHANNEL_TAG: ${{ steps.version.outputs.channel_tag }}
           CHANNEL_MANIFEST_NAME: ${{ steps.version.outputs.channel_manifest_name }}
           RELEASE_TYPE: ${{ inputs.release_type }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+          EXPIRES_AT: ${{ inputs.expires_at }}
           SERVER_URL: ${{ forgejo.server_url }}
           REPO: ${{ forgejo.repository }}
+          TOKEN: ${{ forgejo.token }}
           IOTA_RELEASE_SIGNING_KEY: ${{ secrets.IOTA_RELEASE_SIGNING_KEY }}
         run: |
           set -eu
@@ -103,17 +118,45 @@ jobs:
 
           UPDATE_BASE_URL="${SERVER_URL%/}/${REPO}/releases/download/${TAG}"
           UPDATE_CHANNEL_BASE_URL="${SERVER_URL%/}/${REPO}/releases/download/${CHANNEL_TAG}"
+          export UPDATE_CHANNEL_BASE_URL
+          nix-shell -p curl jq --run '
+            set -eu
+            CHANNEL_STATUS="$(curl -L -sS -w "%{http_code}" -o previous-channel-manifest.json \
+              -H "Authorization: token $TOKEN" \
+              "$UPDATE_CHANNEL_BASE_URL/$CHANNEL_MANIFEST_NAME")"
+            case "$CHANNEL_STATUS" in
+              200)
+                jq -e \
+                  --argjson proposed "$RELEASE_SEQUENCE" \
+                  --arg version "$TAG" \
+                  "(.release_sequence < \$proposed) or (.release_sequence == \$proposed and .product_version == \$version)" \
+                  previous-channel-manifest.json >/dev/null || {
+                    echo "release sequence must increase, or identify the same release during a refresh"
+                    exit 1
+                  }
+                ;;
+              404) ;;
+              *)
+                echo "could not read current channel manifest: HTTP $CHANNEL_STATUS"
+                exit 1
+                ;;
+            esac
+          '
           PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          export ARCH PUBLISHED_AT RELEASE_TYPE TAG UPDATE_BASE_URL UPDATE_MANIFEST_NAME
-          nix-shell -p coreutils jq --run 'bash scripts/build-update-manifest.sh dist/bin "$TAG" "$RELEASE_TYPE" "$PUBLISHED_AT" linux "$ARCH" "$UPDATE_BASE_URL" "dist/$UPDATE_MANIFEST_NAME"'
+          export ARCH EXPIRES_AT PUBLISHED_AT RELEASE_SEQUENCE RELEASE_TYPE TAG UPDATE_BASE_URL UPDATE_MANIFEST_NAME
+          nix-shell -p coreutils jq --run 'bash scripts/build-update-manifest.sh dist/bin "$TAG" "$RELEASE_TYPE" "$RELEASE_SEQUENCE" "$PUBLISHED_AT" "$EXPIRES_AT" linux "$ARCH" "$UPDATE_BASE_URL" "dist/$UPDATE_MANIFEST_NAME"'
           UPDATE_PUBLIC_KEY="$(result/bin/iota-release sign "dist/$UPDATE_MANIFEST_NAME" "dist/$UPDATE_MANIFEST_NAME.sig")"
-          bash scripts/build-release-bundle.sh \
+          export UPDATE_PUBLIC_KEY
+          nix-shell -p jq zip --run 'bash scripts/build-release-bundle.sh \
             dist/bin \
             "$TAG" \
+            "dist/$UPDATE_MANIFEST_NAME" \
             "$UPDATE_CHANNEL_BASE_URL/$CHANNEL_MANIFEST_NAME" \
             "$UPDATE_PUBLIC_KEY" \
             "$UPDATE_CHANNEL_BASE_URL/$CHANNEL_MANIFEST_NAME.sig" \
-            "dist/$ASSET_NAME"
+            "$RELEASE_TYPE" \
+            primary \
+            "dist/$ASSET_NAME"'
           result/bin/iota-bundle "dist/$ASSET_NAME"
 
       - name: Create release and upload release assets

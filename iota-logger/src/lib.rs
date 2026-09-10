@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mtp::codec::{CommunicationValue, DataTypeId, DataValue, Version};
+use mtp::codec::{CommunicationValue, DataTypeId, DataValue, TypeMap, Version};
 use ratatui::style::Color;
 
 use iota_state::{UNIQUE, UiLogEntry};
@@ -354,6 +354,10 @@ fn format_data_container(data: Vec<(DataTypeId, DataValue)>, version: Version) -
         .map(|(key, value)| {
             let key_str = key.to_string();
 
+            if is_secret_data_type(key) {
+                return format!("{}=<redacted>", key_str);
+            }
+
             match value {
                 DataValue::Str(s) => format!("{}=\"{}\"", key_str, abbreviate_string(&s)),
 
@@ -380,6 +384,13 @@ fn format_data_container(data: Vec<(DataTypeId, DataValue)>, version: Version) -
         .collect();
 
     parts.join(", ")
+}
+
+fn is_secret_data_type(key: DataTypeId) -> bool {
+    matches!(
+        TypeMap::latest().data_type_name(key.0),
+        Some("InvitationToken" | "InvitationPassword" | "ResetToken" | "RegisterId" | "NewToken")
+    )
 }
 
 fn format_array(arr: Vec<DataValue>, version: Version) -> String {
@@ -427,13 +438,32 @@ fn abbreviate_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::abbreviate_string;
+    use super::{abbreviate_string, format_cv};
+    use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
 
     #[test]
     fn abbreviates_only_strings_longer_than_eight_characters() {
         assert_eq!(abbreviate_string("12345678"), "12345678");
         assert_eq!(abbreviate_string("123456789"), "1234...6789");
         assert_eq!(abbreviate_string("YWJjZGVmZ2hpag=="), "YWJj...ag==");
+    }
+
+    #[test]
+    fn redacts_invitation_and_account_credentials() {
+        let reset_token = DataType::ResetToken.try_to_id(&TypeMap::latest()).unwrap();
+        let value = CommunicationValue::new(CommunicationType::RedeemUserInvitation)
+            .add_typed_default(DataType::InvitationToken, DataValue::Str("short123".into()))
+            .add_typed_default(
+                DataType::Invitations,
+                DataValue::Array(vec![DataValue::Container(vec![(
+                    reset_token,
+                    DataValue::Str("reset-secret".into()),
+                )])]),
+            );
+        let formatted = format_cv(&value);
+        assert!(!formatted.contains("short123"));
+        assert!(!formatted.contains("reset-secret"));
+        assert_eq!(formatted.matches("<redacted>").count(), 2);
     }
 }
 

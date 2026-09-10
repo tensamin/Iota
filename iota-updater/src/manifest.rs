@@ -7,7 +7,9 @@ use sha2::{Digest, Sha256};
 pub struct ReleaseManifest {
     pub product_version: String,
     pub channel: String,
+    pub release_sequence: u64,
     pub published_at: String,
+    pub expires_at: String,
     pub minimum_data_schema: u64,
     pub supported_ipc_min: u16,
     pub supported_ipc_max: u16,

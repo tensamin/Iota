@@ -7,6 +7,12 @@ use std::{
 };
 
 #[derive(Clone, Debug)]
+pub struct Activation {
+    pub previous_target: PathBuf,
+    pub new_target: PathBuf,
+}
+
+#[derive(Clone, Debug)]
 pub struct UpdateTransaction {
     pub root: PathBuf,
     pub staging: PathBuf,
@@ -43,6 +49,11 @@ impl UpdateTransaction {
             .context("update already in progress")?;
         Ok(UpdateLock { _file: file })
     }
+    pub fn current_target(&self) -> Result<PathBuf> {
+        let current = self.root.join("current");
+        fs::read_link(&current)
+            .with_context(|| format!("read current release link {}", current.display()))
+    }
     pub fn stage_artifact(&self, source: &Path, artifact: &Artifact) -> Result<PathBuf> {
         let artifact_path = Path::new(&artifact.path);
         if artifact_path.is_absolute()
@@ -65,9 +76,15 @@ impl UpdateTransaction {
         set_executable_if_binary(&target, artifact)?;
         Ok(target)
     }
-    pub fn activate(&self, version: &str) -> Result<()> {
+    pub fn activate(&self, version: &str) -> Result<Activation> {
+        let current = self.root.join("current");
+        let previous_target = self.current_target()?;
         let version_dir = self.root.join("versions").join(version);
-        fs::create_dir_all(version_dir.parent().unwrap())?;
+        fs::create_dir_all(
+            version_dir
+                .parent()
+                .context("release version directory has no parent")?,
+        )?;
         if version_dir.exists() {
             anyhow::bail!("release version already exists: {}", version_dir.display());
         }
@@ -80,20 +97,44 @@ impl UpdateTransaction {
             }
             Err(error) => return Err(error).context("activate staged release"),
         }
-        let current_tmp = self.root.join("current.new");
-        let _ = fs::remove_file(&current_tmp);
-        std::os::unix::fs::symlink(&version_dir, &current_tmp)?;
-        fs::rename(current_tmp, self.root.join("current"))?;
-        Ok(())
+        replace_symlink(&current, &version_dir, &self.root.join("current.new"))?;
+        Ok(Activation {
+            previous_target,
+            new_target: version_dir,
+        })
+    }
+    pub fn restore_activation(&self, activation: &Activation) -> Result<()> {
+        replace_symlink(
+            &self.root.join("current"),
+            &activation.previous_target,
+            &self.root.join("current.rollback"),
+        )
     }
     pub fn rollback(&self, previous: &str) -> Result<()> {
-        let current = self.root.join("current");
-        let tmp = self.root.join("current.rollback");
-        let _ = fs::remove_file(&tmp);
-        std::os::unix::fs::symlink(self.root.join("versions").join(previous), &tmp)?;
-        fs::rename(tmp, current)?;
-        Ok(())
+        replace_symlink(
+            &self.root.join("current"),
+            &self.root.join("versions").join(previous),
+            &self.root.join("current.rollback"),
+        )
     }
+}
+
+#[cfg(unix)]
+fn replace_symlink(link: &Path, target: &Path, temporary: &Path) -> Result<()> {
+    match fs::remove_file(temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("remove stale temporary release link"),
+    }
+    std::os::unix::fs::symlink(target, temporary).with_context(|| {
+        format!(
+            "create temporary symlink {} -> {}",
+            temporary.display(),
+            target.display()
+        )
+    })?;
+    fs::rename(temporary, link).with_context(|| format!("replace symlink {}", link.display()))?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -169,12 +210,21 @@ mod tests {
         drop(lock);
         assert!(tx.acquire().is_ok());
         assert!(tx.lock_file.exists());
+        let old_release = dir.path().join("versions/0.9.0");
+        std::fs::create_dir_all(&old_release).unwrap();
+        std::os::unix::fs::symlink(&old_release, dir.path().join("current")).unwrap();
         std::fs::create_dir_all(&tx.staging).unwrap();
         std::fs::write(tx.staging.join("manifest.json"), b"ok").unwrap();
-        tx.activate("1.0.0").unwrap();
+        let activation = tx.activate("1.0.0").unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("current/manifest.json")).unwrap(),
             "ok"
+        );
+        assert_eq!(activation.previous_target, old_release);
+        tx.restore_activation(&activation).unwrap();
+        assert_eq!(
+            std::fs::read_link(dir.path().join("current")).unwrap(),
+            old_release
         );
     }
 }

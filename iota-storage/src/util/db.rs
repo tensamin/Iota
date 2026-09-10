@@ -934,6 +934,47 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         conn.pragma_update(None, "user_version", 25)?;
     }
 
+    if current_version < 27 {
+        let invitation_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user_invitations')",
+            [],
+            |row| row.get(0),
+        )?;
+        if invitation_exists {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE user_invitations RENAME TO user_invitations_before_authority;
+                CREATE TABLE user_invitations (
+                    invitation_id INTEGER PRIMARY KEY,
+                    authority TEXT NOT NULL CHECK (authority IN ('omega', 'iota')),
+                    token_hash BLOB NOT NULL,
+                    label TEXT,
+                    password_protected INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER,
+                    state TEXT NOT NULL CHECK (state IN ('pending', 'provisioning', 'redeemed', 'revoked', 'expired')),
+                    redeemed_user_id INTEGER,
+                    redeemed_at INTEGER,
+                    revoked_at INTEGER,
+                    local_revocation_pending INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO user_invitations (
+                    invitation_id, authority, token_hash, created_at, expires_at,
+                    state, redeemed_user_id, redeemed_at, revoked_at
+                )
+                SELECT CAST(invitation_id AS INTEGER), 'omega', token_hash, created_at, expires_at,
+                       state, redeemed_user_id, redeemed_at, revoked_at
+                FROM user_invitations_before_authority
+                WHERE CAST(invitation_id AS INTEGER) > 0;
+                DROP TABLE user_invitations_before_authority;
+                CREATE INDEX idx_user_invitations_state_created
+                    ON user_invitations (state, created_at);
+                "#,
+            )?;
+        }
+        conn.pragma_update(None, "user_version", 27)?;
+    }
+
     if current_version < 26 {
         conn.execute_batch(
             r#"
@@ -947,7 +988,63 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
             );
             "#,
         )?;
-        conn.pragma_update(None, "user_version", 26)?;
+        conn.pragma_update(None, "user_version", 27)?;
+    }
+
+    if current_version < 28 {
+        let invitation_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user_invitations')",
+            [],
+            |row| row.get(0),
+        )?;
+        if invitation_exists {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE user_invitations RENAME TO user_invitations_before_revision;
+                CREATE TABLE user_invitations (
+                    invitation_id INTEGER PRIMARY KEY,
+                    authority TEXT NOT NULL CHECK (authority IN ('omega', 'iota')),
+                    token_hash BLOB,
+                    label TEXT,
+                    password_protected INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER,
+                    state TEXT NOT NULL CHECK (state IN ('pending', 'provisioning', 'redeemed', 'revoked', 'expired')),
+                    redeemed_user_id INTEGER,
+                    redeemed_at INTEGER,
+                    revoked_at INTEGER,
+                    pending_action TEXT CHECK (pending_action IS NULL OR pending_action = 'revoke'),
+                    pending_action_at INTEGER,
+                    remote_revision INTEGER NOT NULL DEFAULT 0,
+                    last_synced_at INTEGER
+                );
+                INSERT INTO user_invitations (
+                    invitation_id, authority, token_hash, label, password_protected,
+                    created_at, expires_at, state, redeemed_user_id, redeemed_at,
+                    revoked_at, pending_action, pending_action_at
+                )
+                SELECT invitation_id, authority,
+                       CASE WHEN authority = 'iota' THEN token_hash ELSE NULL END,
+                       label, password_protected, created_at, expires_at, state,
+                       redeemed_user_id, redeemed_at, revoked_at,
+                       CASE WHEN local_revocation_pending = 1 THEN 'revoke' ELSE NULL END,
+                       CASE WHEN local_revocation_pending = 1 THEN revoked_at ELSE NULL END
+                FROM user_invitations_before_revision;
+                DROP TABLE user_invitations_before_revision;
+                CREATE INDEX idx_user_invitations_state_created
+                    ON user_invitations (state, created_at);
+                "#,
+            )?;
+        }
+        conn.pragma_update(None, "user_version", 28)?;
+    }
+
+    if current_version < 29 {
+        conn.execute_batch(
+            "ALTER TABLE user_invitations ADD COLUMN local_provisioned_user_id INTEGER; \
+             ALTER TABLE user_invitations ADD COLUMN local_provisioned_at INTEGER;",
+        )?;
+        conn.pragma_update(None, "user_version", 29)?;
     }
 
     Ok(())
@@ -1024,7 +1121,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 26);
+        assert_eq!(version, 29);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -1043,7 +1140,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 26);
+        assert_eq!(version, 29);
         for table in [
             "sync_heads",
             "sync_events",
@@ -1090,7 +1187,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 26);
+        assert_eq!(version, 29);
         for column in [
             "id",
             "user_id",
@@ -1185,7 +1282,40 @@ mod tests {
         )?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         assert_eq!(preserved, "remote_committed");
-        assert_eq!(version, 26);
+        assert_eq!(version, 29);
+        Ok(())
+    }
+
+    #[test]
+    fn invitation_authority_migration_preserves_numeric_invitations() -> Result<(), StorageError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE user_invitations (
+                invitation_id TEXT PRIMARY KEY,
+                token_hash BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                state TEXT NOT NULL,
+                redeemed_user_id INTEGER,
+                redeemed_at INTEGER,
+                revoked_at INTEGER
+            );
+            INSERT INTO user_invitations (
+                invitation_id, token_hash, created_at, expires_at, state
+            ) VALUES ('42', X'0102', 10, 20, 'pending');
+            PRAGMA user_version = 26;
+            "#,
+        )?;
+
+        run_migrations_on_connection(&conn)?;
+
+        let row: (i64, String, String, Option<String>) = conn.query_row(
+            "SELECT invitation_id, authority, state, pending_action FROM user_invitations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(row, (42, "omega".into(), "pending".into(), None));
         Ok(())
     }
 }

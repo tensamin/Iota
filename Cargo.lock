@@ -2290,6 +2290,7 @@ name = "iota-updater"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "ed25519-dalek 2.2.0",
  "fs2",
  "hex",

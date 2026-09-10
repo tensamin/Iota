@@ -484,6 +484,38 @@ impl IpcClient {
                         .join("\n")
                 }
             }
+            ResponsePayload::InvitationCreated(invitation) => format!(
+                "Created {:?} invitation {}\nToken: {}\nExpires: {}{}",
+                invitation.authority,
+                invitation.invitation_id,
+                invitation.raw_token.0,
+                invitation.expires_at,
+                invitation
+                    .short_url
+                    .as_ref()
+                    .map(|url| format!("\nLink: {url}"))
+                    .unwrap_or_default(),
+            ),
+            ResponsePayload::Invitations(invitations) => {
+                if invitations.is_empty() {
+                    "No invitations.".into()
+                } else {
+                    invitations
+                        .iter()
+                        .map(|invitation| {
+                            format!(
+                                "{} ({:?}, {:?})",
+                                invitation.invitation_id, invitation.authority, invitation.state
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            }
+            ResponsePayload::InvitationUpdated(invitation) => format!(
+                "Invitation {} is {:?}",
+                invitation.invitation_id, invitation.state
+            ),
             ResponsePayload::UserCreated { user_id, username } => {
                 format!("Created user {} ({})", username, user_id)
             }
@@ -588,6 +620,7 @@ impl IpcClient {
             iota_ipc::IpcErrorCode::OmikronUnavailable => {
                 "Omikron is unavailable; try reconnecting."
             }
+            iota_ipc::IpcErrorCode::Unsupported => "The daemon does not implement this operation.",
             iota_ipc::IpcErrorCode::UnsupportedVersion => {
                 "CLI and daemon versions are incompatible."
             }

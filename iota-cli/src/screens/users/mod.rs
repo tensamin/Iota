@@ -399,6 +399,42 @@ impl UsersScreen {
             }),
         }
     }
+    fn start_invitation(&mut self, authority: iota_ipc::InvitationAuthority) -> InteractionResult {
+        self.pending = true;
+        self.message = Some("Creating invitation…".into());
+        self.overlay = None;
+        let ipc = self.ipc.clone();
+        InteractionResult::AppTask {
+            task: Box::pin(async move {
+                let result = match ipc
+                    .send_request(iota_ipc::LocalRequest::CreateInvitation {
+                        authority,
+                        lifetime_seconds: 7 * 24 * 60 * 60,
+                        password: None,
+                        label: None,
+                    })
+                    .await
+                {
+                    Ok(iota_ipc::ResponseResult::Ok(
+                        iota_ipc::ResponsePayload::InvitationCreated(invitation),
+                    )) => Ok(format!(
+                        "Invitation {} created. Token: {}  Link: {}",
+                        invitation.invitation_id,
+                        invitation.raw_token.0,
+                        invitation.short_url.as_deref().unwrap_or("unavailable")
+                    )),
+                    Ok(iota_ipc::ResponseResult::Error(error)) => {
+                        Err(format!("Create invitation failed: {error}"))
+                    }
+                    Ok(_) => Err(
+                        "Create invitation failed: daemon returned an unexpected response.".into(),
+                    ),
+                    Err(error) => Err(format!("Create invitation failed: {error}")),
+                };
+                UiEvent::App(AppEvent::UserOperationFinished(result))
+            }),
+        }
+    }
     fn refresh(&self) -> InteractionResult {
         let ipc = self.ipc.clone();
         InteractionResult::AppTask {
@@ -648,6 +684,33 @@ impl UsersScreen {
                         Paragraph::new(format!("TU path  [{value}]\n\n{message}")),
                         inner,
                     );
+                }
+                AddUserPhase::ConfigureInvitation => {
+                    let lines = flow
+                        .invitation_authorities
+                        .items()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, item)| {
+                            Line::from(format!(
+                                "{} {}{}",
+                                if flow.invitation_authorities.selected_index() == Some(index) {
+                                    ">"
+                                } else {
+                                    " "
+                                },
+                                item.label,
+                                item.disabled_reason
+                                    .as_ref()
+                                    .map(|reason| format!(" ({reason})"))
+                                    .unwrap_or_default()
+                            ))
+                        })
+                        .chain(std::iter::once(Line::from(
+                            "\nEnter creates a single-use invitation valid for one week.",
+                        )))
+                        .collect::<Vec<_>>();
+                    frame.render_widget(Paragraph::new(lines), inner);
                 }
                 AddUserPhase::InspectingTu => {
                     frame.render_widget(Paragraph::new("Inspecting credential…"), inner);
@@ -991,6 +1054,29 @@ impl Screen for UsersScreen {
                                     InteractionResult::Handled
                                 }
                             },
+                            AddUserPhase::ConfigureInvitation => {
+                                if flow.invitation_authorities.handle_key(key.code) {
+                                    return InteractionResult::Handled;
+                                }
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        flow.phase = AddUserPhase::ChooseMethod;
+                                        InteractionResult::Handled
+                                    }
+                                    KeyCode::Enter => {
+                                        let authority = flow
+                                            .invitation_authorities
+                                            .selected_item()
+                                            .map(|item| item.value);
+                                        if let Some(authority) = authority {
+                                            self.start_invitation(authority)
+                                        } else {
+                                            InteractionResult::Handled
+                                        }
+                                    }
+                                    _ => InteractionResult::Handled,
+                                }
+                            }
                             AddUserPhase::ReviewImport => match key.code {
                                 KeyCode::Esc => {
                                     flow.phase = AddUserPhase::ConfigureImport;

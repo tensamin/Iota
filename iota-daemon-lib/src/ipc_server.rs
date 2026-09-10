@@ -22,8 +22,6 @@ use uuid::Uuid;
 const CLIENT_CHANNEL_SIZE: usize = 256;
 const MAX_CONFIGURED_IPC_CLIENTS: usize = 4096;
 
-/// Maximum handshake retries before giving up.
-const MAX_HANDSHAKE_RETRIES: u32 = 1;
 const CLIENT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Minimum metric subscription interval to prevent excessive update rates.
@@ -368,73 +366,67 @@ async fn handle_client(
     eprintln!("IPC handshake started (pid={}, uid={})", peer.pid, peer.uid);
 
     // --- Handshake ---
-    let mut negotiated_version: Option<u16> = None;
-    for _ in 0..MAX_HANDSHAKE_RETRIES {
-        match timeout(
-            std::time::Duration::from_secs(15),
-            read_msg::<_, ClientMessage>(&mut reader),
-        )
-        .await
-        {
-            Err(_) => {
+    let negotiated_version = match timeout(
+        std::time::Duration::from_secs(15),
+        read_msg::<_, ClientMessage>(&mut reader),
+    )
+    .await
+    {
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "IPC Hello timed out",
+            ));
+        }
+        Ok(result) => match result {
+            Ok(ClientMessage::Hello { supported_versions }) => {
+                let version = supported_versions
+                    .iter()
+                    .copied()
+                    .filter(|v| *v >= MIN_PROTOCOL_VERSION && *v <= PROTOCOL_VERSION)
+                    .max()
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "No compatible IPC protocol version",
+                        )
+                    })?;
+                let ack = DaemonMessage::HelloAck(HelloAck {
+                    protocol_version: version,
+                    daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                    instance_id: instance_id.clone(),
+                    startup_phase: runtime.current_startup_phase().into(),
+                    capabilities: vec![
+                        "commands".into(),
+                        "metrics".into(),
+                        "logs".into(),
+                        "user_management_v2".into(),
+                        "tu_inspection_v1".into(),
+                        "credential_export_v1".into(),
+                        "user_invitations_v1".into(),
+                    ],
+                    lifecycle: *runtime.lifecycle.borrow(),
+                    health: runtime.overall_health(),
+                    deployment_mode: from_environment().mode,
+                    supervisor: from_environment().supervisor,
+                });
+                write_client_message(&mut writer, &ack).await?;
+                eprintln!(
+                    "IPC handshake acknowledged (pid={}, uid={})",
+                    peer.pid, peer.uid
+                );
+                version
+            }
+            Ok(_) => {
+                // Unexpected first message, send an error and close.
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "IPC Hello timed out",
+                    std::io::ErrorKind::InvalidData,
+                    "Expected Hello as first message",
                 ));
             }
-            Ok(result) => match result {
-                Ok(ClientMessage::Hello { supported_versions }) => {
-                    let version = supported_versions
-                        .iter()
-                        .copied()
-                        .filter(|v| *v >= MIN_PROTOCOL_VERSION && *v <= PROTOCOL_VERSION)
-                        .max()
-                        .ok_or_else(|| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::Unsupported,
-                                "No compatible IPC protocol version",
-                            )
-                        })?;
-                    negotiated_version = Some(version);
-                    let ack = DaemonMessage::HelloAck(HelloAck {
-                        protocol_version: version,
-                        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-                        instance_id: instance_id.clone(),
-                        startup_phase: runtime.current_startup_phase().into(),
-                        capabilities: vec![
-                            "commands".into(),
-                            "metrics".into(),
-                            "logs".into(),
-                            "user_management_v2".into(),
-                            "tu_inspection_v1".into(),
-                            "credential_export_v1".into(),
-                        ],
-                        lifecycle: *runtime.lifecycle.borrow(),
-                        health: runtime.overall_health(),
-                        deployment_mode: from_environment().mode,
-                        supervisor: from_environment().supervisor,
-                    });
-                    write_client_message(&mut writer, &ack).await?;
-                    eprintln!(
-                        "IPC handshake acknowledged (pid={}, uid={})",
-                        peer.pid, peer.uid
-                    );
-                    break;
-                }
-                Ok(_) => {
-                    // Unexpected first message, send an error and close.
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Expected Hello as first message",
-                    ));
-                }
-                Err(e) => return Err(e),
-            },
-        }
-    }
-    let negotiated_version = negotiated_version.ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "Handshake failed after retries")
-    })?;
+            Err(e) => return Err(e),
+        },
+    };
 
     log!("IPC client connected (pid={}, uid={})", peer.pid, peer.uid);
 
