@@ -850,6 +850,9 @@ async fn run_command(
                         println!("Link: {url}");
                     }
                     println!("Expires: {}", invitation.expires_at);
+                    if !invitation.mirror_synced {
+                        println!("Warning: local invitation metadata is still synchronizing.");
+                    }
                 }
                 ResponsePayload::Invitations(invitations) => {
                     if invitations.is_empty() {

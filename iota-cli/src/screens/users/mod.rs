@@ -418,10 +418,15 @@ impl UsersScreen {
                     Ok(iota_ipc::ResponseResult::Ok(
                         iota_ipc::ResponsePayload::InvitationCreated(invitation),
                     )) => Ok(format!(
-                        "Invitation {} created. Token: {}  Link: {}",
+                        "Invitation {} created. Token: {}  Link: {}{}",
                         invitation.invitation_id,
                         invitation.raw_token.0,
-                        invitation.short_url.as_deref().unwrap_or("unavailable")
+                        invitation.short_url.as_deref().unwrap_or("unavailable"),
+                        if invitation.mirror_synced {
+                            ""
+                        } else {
+                            "  Local metadata is still synchronizing."
+                        }
                     )),
                     Ok(iota_ipc::ResponseResult::Error(error)) => {
                         Err(format!("Create invitation failed: {error}"))

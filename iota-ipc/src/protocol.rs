@@ -371,6 +371,8 @@ pub struct InvitationCreated {
     pub raw_token: SecretString,
     pub expires_at: i64,
     pub short_url: Option<String>,
+    #[serde(default)]
+    pub mirror_synced: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -63,6 +63,35 @@ fn now_millis() -> i64 {
         .as_millis() as i64
 }
 
+fn invitation_created_after_mirror(
+    authority: InvitationAuthority,
+    invitation_id: i64,
+    raw_token: String,
+    expires_at: i64,
+    short_url: Option<String>,
+    mirror_result: Result<(), iota_storage::storage_error::StorageError>,
+) -> InvitationCreated {
+    let mirror_synced = match mirror_result {
+        Ok(()) => true,
+        Err(error) => {
+            log!(
+                "Invitation {} was created by Omega, but its local mirror could not be stored: {}",
+                invitation_id,
+                error
+            );
+            false
+        }
+    };
+    InvitationCreated {
+        authority,
+        invitation_id,
+        raw_token: iota_ipc::SecretString(raw_token),
+        expires_at,
+        short_url,
+        mirror_synced,
+    }
+}
+
 fn bounded_log_entries(mut entries: Vec<LogEntry>) -> Vec<LogEntry> {
     entries.truncate(MAX_LOG_ENTRIES_PER_RESPONSE);
     while !entries.is_empty() {
@@ -343,16 +372,18 @@ impl CommandRouter {
                     local_provisioned_user_id: None,
                     local_provisioned_at: None,
                 };
-                if iota_storage::users::invitations::insert(&summary, None, now_millis()).is_err() {
-                    return ResponseResult::Error(IpcErrorCode::StorageFailure);
-                }
-                ResponseResult::Ok(ResponsePayload::InvitationCreated(InvitationCreated {
-                    authority,
-                    invitation_id,
-                    raw_token: iota_ipc::SecretString(raw_token),
-                    expires_at,
-                    short_url,
-                }))
+                let mirror_result =
+                    iota_storage::users::invitations::insert(&summary, None, now_millis());
+                ResponseResult::Ok(ResponsePayload::InvitationCreated(
+                    invitation_created_after_mirror(
+                        authority,
+                        invitation_id,
+                        raw_token,
+                        expires_at,
+                        short_url,
+                        mirror_result,
+                    ),
+                ))
             }
             LocalRequest::ListInvitations { authority } => {
                 if authority != Some(InvitationAuthority::Iota)
@@ -1036,7 +1067,10 @@ impl CommandRouter {
 
 #[cfg(test)]
 mod tests {
-    use super::{IpcRole, LocalRequest, bounded_log_entries};
+    use super::{
+        InvitationAuthority, IpcRole, LocalRequest, bounded_log_entries,
+        invitation_created_after_mirror,
+    };
     use iota_ipc::{ExitIntent, LogEntry, SecretString};
 
     #[test]
@@ -1118,5 +1152,26 @@ mod tests {
         }];
 
         assert!(bounded_log_entries(entries).is_empty());
+    }
+
+    #[test]
+    fn omega_creation_credentials_survive_a_local_mirror_failure() {
+        let created = invitation_created_after_mirror(
+            InvitationAuthority::Omega,
+            7,
+            "raw-token".into(),
+            99,
+            Some("https://omega/direct/short".into()),
+            Err(iota_storage::storage_error::StorageError::Other(
+                "injected mirror failure".into(),
+            )),
+        );
+
+        assert_eq!(created.raw_token.0, "raw-token");
+        assert_eq!(
+            created.short_url.as_deref(),
+            Some("https://omega/direct/short")
+        );
+        assert!(!created.mirror_synced);
     }
 }

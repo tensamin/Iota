@@ -128,7 +128,7 @@ fn insert_in_tx(
     synced_at: i64,
 ) -> Result<(), StorageError> {
     tx.execute(
-            "INSERT INTO user_invitations (invitation_id, authority, token_hash, label, password_protected, created_at, expires_at, state, redeemed_user_id, redeemed_at, revoked_at, pending_action, pending_action_at, remote_revision, last_synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12, ?13) ON CONFLICT(invitation_id) DO UPDATE SET authority = excluded.authority, token_hash = excluded.token_hash, label = excluded.label, password_protected = excluded.password_protected, expires_at = excluded.expires_at, state = excluded.state, redeemed_user_id = excluded.redeemed_user_id, redeemed_at = excluded.redeemed_at, revoked_at = excluded.revoked_at, remote_revision = excluded.remote_revision, last_synced_at = excluded.last_synced_at WHERE excluded.remote_revision >= user_invitations.remote_revision",
+            "INSERT INTO user_invitations (invitation_id, authority, token_hash, label, password_protected, created_at, expires_at, state, redeemed_user_id, redeemed_at, revoked_at, pending_action, pending_action_at, remote_revision, last_synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12, ?13) ON CONFLICT(authority, invitation_id) DO UPDATE SET token_hash = excluded.token_hash, label = excluded.label, password_protected = excluded.password_protected, expires_at = excluded.expires_at, state = excluded.state, redeemed_user_id = excluded.redeemed_user_id, redeemed_at = excluded.redeemed_at, revoked_at = excluded.revoked_at, remote_revision = excluded.remote_revision, last_synced_at = excluded.last_synced_at WHERE excluded.remote_revision >= user_invitations.remote_revision",
             params![summary.invitation_id, summary.authority.as_str(), token_hash, summary.label, summary.password_protected, summary.created_at, summary.expires_at, summary.state.as_str(), summary.redeemed_user_id, summary.redeemed_at, summary.revoked_at, summary.remote_revision, synced_at],
         )?;
     Ok(())
@@ -207,7 +207,7 @@ pub fn apply_revoke_result(
 ) -> Result<bool, StorageError> {
     db::with_immediate_transaction(|tx| {
         let changed = tx.execute(
-            "UPDATE user_invitations SET state = ?2, remote_revision = ?3, revoked_at = ?4, pending_action = NULL, pending_action_at = NULL, last_synced_at = ?5 WHERE invitation_id = ?1 AND ?3 >= remote_revision",
+            "UPDATE user_invitations SET state = ?2, remote_revision = ?3, revoked_at = ?4, pending_action = NULL, pending_action_at = NULL, last_synced_at = ?5 WHERE invitation_id = ?1 AND authority = 'omega' AND ?3 >= remote_revision",
             params![invitation_id, state.as_str(), remote_revision, revoked_at, synced_at],
         )?;
         Ok(changed == 1)
@@ -272,7 +272,7 @@ fn apply_external_invitation_provisioning_in_tx(
             return Ok(ProvisioningResult::Conflict);
         }
         tx.execute(
-                "UPDATE user_invitations SET local_provisioned_user_id = ?2, local_provisioned_at = COALESCE(local_provisioned_at, ?3) WHERE invitation_id = ?1",
+                "UPDATE user_invitations SET local_provisioned_user_id = ?2, local_provisioned_at = COALESCE(local_provisioned_at, ?3) WHERE invitation_id = ?1 AND authority = 'omega'",
                 params![invitation_id, user.user_id, changed_at],
             )?;
         return Ok(ProvisioningResult::AlreadyApplied);
@@ -286,7 +286,7 @@ fn apply_external_invitation_provisioning_in_tx(
             params![user.user_id, user.username, changed_at],
         )?;
     tx.execute(
-            "UPDATE user_invitations SET local_provisioned_user_id = ?2, local_provisioned_at = ?3 WHERE invitation_id = ?1",
+            "UPDATE user_invitations SET local_provisioned_user_id = ?2, local_provisioned_at = ?3 WHERE invitation_id = ?1 AND authority = 'omega'",
             params![invitation_id, user.user_id, changed_at],
         )?;
     Ok(ProvisioningResult::Created)
@@ -300,7 +300,7 @@ mod tests {
     fn database() -> Result<Connection, StorageError> {
         let connection = Connection::open_in_memory()?;
         connection.execute_batch(
-            "CREATE TABLE user_invitations (invitation_id INTEGER PRIMARY KEY, authority TEXT NOT NULL, token_hash BLOB, label TEXT, password_protected INTEGER NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER, state TEXT NOT NULL, redeemed_user_id INTEGER, redeemed_at INTEGER, revoked_at INTEGER, pending_action TEXT, pending_action_at INTEGER, remote_revision INTEGER NOT NULL DEFAULT 0, last_synced_at INTEGER, local_provisioned_user_id INTEGER, local_provisioned_at INTEGER); CREATE TABLE users (user_id INTEGER PRIMARY KEY, username TEXT NOT NULL, public_key TEXT NOT NULL, private_key_hash TEXT, reset_token TEXT, created_at INTEGER NOT NULL, display_name TEXT); CREATE TABLE user_residency (user_id INTEGER PRIMARY KEY, username TEXT NOT NULL, lifecycle_state TEXT NOT NULL, data_state TEXT NOT NULL, credential_origin TEXT NOT NULL, updated_at INTEGER NOT NULL);",
+            "CREATE TABLE user_invitations (invitation_id INTEGER NOT NULL, authority TEXT NOT NULL, token_hash BLOB, label TEXT, password_protected INTEGER NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER, state TEXT NOT NULL, redeemed_user_id INTEGER, redeemed_at INTEGER, revoked_at INTEGER, pending_action TEXT, pending_action_at INTEGER, remote_revision INTEGER NOT NULL DEFAULT 0, last_synced_at INTEGER, local_provisioned_user_id INTEGER, local_provisioned_at INTEGER, PRIMARY KEY (authority, invitation_id)); CREATE TABLE users (user_id INTEGER PRIMARY KEY, username TEXT NOT NULL, public_key TEXT NOT NULL, private_key_hash TEXT, reset_token TEXT, created_at INTEGER NOT NULL, display_name TEXT); CREATE TABLE user_residency (user_id INTEGER PRIMARY KEY, username TEXT NOT NULL, lifecycle_state TEXT NOT NULL, data_state TEXT NOT NULL, credential_origin TEXT NOT NULL, updated_at INTEGER NOT NULL);",
         )?;
         Ok(connection)
     }
@@ -437,6 +437,48 @@ mod tests {
         assert_eq!(
             apply_external_invitation_provisioning_in_tx(&tx, 7, 2, &profile("key-a"), 32)?,
             ProvisioningResult::MissingInvitation
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn equal_numeric_ids_are_isolated_by_authority() -> Result<(), StorageError> {
+        let mut connection = database()?;
+        let tx = connection.transaction()?;
+        let omega = summary(3, InvitationState::Pending);
+        let mut local = omega.clone();
+        local.authority = InvitationAuthority::Iota;
+        local.state = InvitationState::Redeemed;
+        insert_in_tx(&tx, &omega, None, 30)?;
+        insert_in_tx(&tx, &local, Some(&[1, 2]), 31)?;
+
+        assert_eq!(
+            tx.query_row(
+                "SELECT COUNT(*) FROM user_invitations WHERE invitation_id = 7",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            2
+        );
+        assert!(mark_revoke_pending_in_tx(&tx, 7, 32)?);
+        let rows = tx
+            .prepare(
+                "SELECT authority, state, pending_action FROM user_invitations WHERE invitation_id = 7 ORDER BY authority",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            rows,
+            vec![
+                ("iota".into(), "redeemed".into(), None),
+                ("omega".into(), "pending".into(), Some("revoke".into())),
+            ]
         );
         Ok(())
     }

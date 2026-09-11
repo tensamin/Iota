@@ -958,14 +958,9 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
                     revoked_at INTEGER,
                     local_revocation_pending INTEGER NOT NULL DEFAULT 0
                 );
-                INSERT INTO user_invitations (
-                    invitation_id, authority, token_hash, created_at, expires_at,
-                    state, redeemed_user_id, redeemed_at, revoked_at
-                )
-                SELECT CAST(invitation_id AS INTEGER), 'omega', token_hash, created_at, expires_at,
-                       state, redeemed_user_id, redeemed_at, revoked_at
-                FROM user_invitations_before_authority
-                WHERE CAST(invitation_id AS INTEGER) > 0;
+                /* Omega owns these mirror records. Historical string identifiers
+                   cannot be mapped safely into Omega's numeric namespace, so a
+                   fresh authoritative snapshot rebuilds them after reconnect. */
                 DROP TABLE user_invitations_before_authority;
                 CREATE INDEX idx_user_invitations_state_created
                     ON user_invitations (state, created_at);
@@ -1047,6 +1042,40 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         conn.pragma_update(None, "user_version", 29)?;
     }
 
+    if current_version < 30 {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE user_invitations RENAME TO user_invitations_before_composite_key;
+            CREATE TABLE user_invitations (
+                invitation_id INTEGER NOT NULL,
+                authority TEXT NOT NULL CHECK (authority IN ('omega', 'iota')),
+                token_hash BLOB,
+                label TEXT,
+                password_protected INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                state TEXT NOT NULL CHECK (state IN ('pending', 'provisioning', 'redeemed', 'revoked', 'expired')),
+                redeemed_user_id INTEGER,
+                redeemed_at INTEGER,
+                revoked_at INTEGER,
+                pending_action TEXT CHECK (pending_action IS NULL OR pending_action = 'revoke'),
+                pending_action_at INTEGER,
+                remote_revision INTEGER NOT NULL DEFAULT 0,
+                last_synced_at INTEGER,
+                local_provisioned_user_id INTEGER,
+                local_provisioned_at INTEGER,
+                PRIMARY KEY (authority, invitation_id)
+            );
+            INSERT INTO user_invitations
+            SELECT * FROM user_invitations_before_composite_key;
+            DROP TABLE user_invitations_before_composite_key;
+            CREATE INDEX idx_user_invitations_state_created
+                ON user_invitations (authority, state, created_at);
+            PRAGMA user_version = 30;
+            "#,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1121,7 +1150,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 29);
+        assert_eq!(version, 30);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -1140,7 +1169,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 29);
+        assert_eq!(version, 30);
         for table in [
             "sync_heads",
             "sync_events",
@@ -1187,7 +1216,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 29);
+        assert_eq!(version, 30);
         for column in [
             "id",
             "user_id",
@@ -1282,12 +1311,13 @@ mod tests {
         )?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         assert_eq!(preserved, "remote_committed");
-        assert_eq!(version, 29);
+        assert_eq!(version, 30);
         Ok(())
     }
 
     #[test]
-    fn invitation_authority_migration_preserves_numeric_invitations() -> Result<(), StorageError> {
+    fn invitation_authority_migration_discards_unmappable_omega_mirrors() -> Result<(), StorageError>
+    {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(
             r#"
@@ -1303,19 +1333,23 @@ mod tests {
             );
             INSERT INTO user_invitations (
                 invitation_id, token_hash, created_at, expires_at, state
-            ) VALUES ('42', X'0102', 10, 20, 'pending');
+            ) VALUES
+                ('42', X'0102', 10, 20, 'pending'),
+                ('4f40e654-1234-1234-1234-123456789abc', X'0102', 10, 20, 'pending'),
+                ('af40e654-1234-1234-1234-123456789abc', X'0102', 10, 20, 'pending'),
+                ('malformed', X'0102', 10, 20, 'pending');
             PRAGMA user_version = 26;
             "#,
         )?;
 
         run_migrations_on_connection(&conn)?;
 
-        let row: (i64, String, String, Option<String>) = conn.query_row(
-            "SELECT invitation_id, authority, state, pending_action FROM user_invitations",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        assert_eq!(row, (42, "omega".into(), "pending".into(), None));
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM user_invitations", [], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(count, 0);
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 30);
         Ok(())
     }
 }

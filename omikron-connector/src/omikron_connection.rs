@@ -150,6 +150,15 @@ fn container_signed_i64(
         .and_then(|value| i64::try_from(value).ok())
 }
 
+fn targets_iota(value: &CommunicationValue, expected_iota_id: Option<u64>) -> bool {
+    let target = value
+        .get_data(DataType::IotaId)
+        .as_signed_number()
+        .and_then(|id| u64::try_from(id).ok())
+        .filter(|id| *id > 0);
+    target.is_some() && target == expected_iota_id
+}
+
 fn parse_omega_invitation(
     fields: &[(DataTypeId, DataValue)],
     type_map: &TypeMap,
@@ -2665,6 +2674,12 @@ impl OmikronConnection {
     /// Omega-authorized account cleanup. The storage operation is idempotent;
     /// acknowledgement is therefore safe to retry after a reconnect.
     async fn handle_erase_hosted_user_data(self: Arc<Self>, cv: &CommunicationValue) {
+        if !targets_iota(cv, CONFIG.load().iota_id) {
+            let _ = self
+                .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
+                .await;
+            return;
+        }
         let Some(user_id) = cv
             .get_data(DataType::UserId)
             .as_signed_number()
@@ -2693,6 +2708,12 @@ impl OmikronConnection {
     /* Omega sends only public account metadata here. The locally created
      * profile records an external credential origin and never receives a TU. */
     async fn handle_iota_user_provisioning(self: Arc<Self>, cv: &CommunicationValue) {
+        if !targets_iota(cv, CONFIG.load().iota_id) {
+            let _ = self
+                .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
+                .await;
+            return;
+        }
         let user_id = cv
             .get_data(DataType::UserId)
             .as_signed_number()
@@ -4096,6 +4117,20 @@ mod tests {
 
         fields.retain(|(id, _)| Some(*id) != DataType::InvitationRevision.try_to_id(&type_map));
         assert!(parse_omega_invitation(&fields, &type_map, 42, 20).is_err());
+    }
+
+    #[test]
+    fn omega_control_target_requires_signed_local_iota_id() {
+        let matching = CommunicationValue::new(CommunicationType::ProvisionIotaUser)
+            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(42));
+        let wrong = CommunicationValue::new(CommunicationType::EraseHostedUserData)
+            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(43));
+        let unsigned = CommunicationValue::new(CommunicationType::EraseHostedUserData)
+            .add_typed_default(DataType::IotaId, DataValue::UnsignedNumber(42));
+        assert!(targets_iota(&matching, Some(42)));
+        assert!(!targets_iota(&wrong, Some(42)));
+        assert!(!targets_iota(&unsigned, Some(42)));
+        assert!(!targets_iota(&matching, None));
     }
 
     #[test]

@@ -485,7 +485,7 @@ impl IpcClient {
                 }
             }
             ResponsePayload::InvitationCreated(invitation) => format!(
-                "Created {:?} invitation {}\nToken: {}\nExpires: {}{}",
+                "Created {:?} invitation {}\nToken: {}\nExpires: {}{}{}",
                 invitation.authority,
                 invitation.invitation_id,
                 invitation.raw_token.0,
@@ -495,6 +495,11 @@ impl IpcClient {
                     .as_ref()
                     .map(|url| format!("\nLink: {url}"))
                     .unwrap_or_default(),
+                if invitation.mirror_synced {
+                    String::new()
+                } else {
+                    "\nWarning: local invitation metadata is still synchronizing.".into()
+                },
             ),
             ResponsePayload::Invitations(invitations) => {
                 if invitations.is_empty() {
