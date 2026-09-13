@@ -7,17 +7,19 @@ pub mod invitations;
 pub mod list;
 pub mod model;
 
+use crate::theme::ResolvedTheme;
 use crate::{
     controls::button::{ActionButton, ButtonIntent, render_button},
-    interaction_result::InteractionResult,
     ipc_client::IpcClient,
-    render_context::RenderContext,
-    screens::screens::{AppAction, AppEvent, HitMap, KeyHint, Screen, UiEvent},
+    screens::screens::{
+        AppAction, AppEvent, HitMap, IotaEffect, IotaInteraction, IotaMessage, IotaScreen, KeyHint,
+        UiEvent,
+    },
 };
 use action_menu::UserActionMenu;
 use add_flow::{AddUserFlow, AddUserPhase};
 use confirmations::UserConfirmation;
-use credential_export::{CredentialExportState, write_private_export};
+use credential_export::CredentialExportState;
 use crossterm::event::{KeyCode, KeyModifiers};
 use model::{FocusZone, UserAction, UserAdminTab, available_action_groups};
 use ratatui::{
@@ -26,12 +28,9 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
-use std::{
-    any::Any,
-    sync::{
-        Arc,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 
 #[derive(Clone, Debug)]
@@ -150,18 +149,18 @@ impl UsersScreen {
             .map(available_action_groups)
             .unwrap_or_default()
     }
-    fn begin_action(&mut self, action: UserAction) -> InteractionResult {
+    fn begin_action(&mut self, action: UserAction) -> IotaInteraction {
         if action == UserAction::ExportTu && !self.credential_export_supported() {
             self.message =
                 Some("Credential export is not supported by the connected daemon.".into());
-            return InteractionResult::Handled;
+            return IotaInteraction::Changed;
         }
         if let Some(user) = self.selected_user().cloned() {
             if action == UserAction::ExportTu {
                 self.overlay = Some(UsersOverlay::CredentialExport(CredentialExportState::new(
                     user,
                 )));
-                return InteractionResult::Handled;
+                return IotaInteraction::Changed;
             }
             if action.requires_confirmation() {
                 self.overlay = Some(UsersOverlay::Confirm(UserConfirmation { user, action }));
@@ -169,7 +168,7 @@ impl UsersScreen {
                 return self.start_operation(action, user.user_id);
             }
         }
-        InteractionResult::Handled
+        IotaInteraction::Changed
     }
     fn credential_export_supported(&self) -> bool {
         self.ipc
@@ -197,290 +196,59 @@ impl UsersScreen {
             capabilities.iter().any(|value| value == "tu_inspection_v1"),
         )
     }
-    fn start_tu_inspection(&mut self, credential: iota_ipc::SecretString) -> InteractionResult {
-        let ipc = self.ipc.clone();
+    fn start_tu_inspection(&mut self, credential: iota_ipc::SecretString) -> IotaInteraction {
         if let Some(UsersOverlay::Add(flow)) = self.overlay.as_mut() {
             flow.phase = AddUserPhase::InspectingTu;
             flow.credential = Some(credential.clone());
             flow.error = None;
         }
-        InteractionResult::AppTask {
-            task: Box::pin(async move {
-                let result = match ipc
-                    .send_request(iota_ipc::LocalRequest::InspectTuCredential { credential })
-                    .await
-                {
-                    Ok(iota_ipc::ResponseResult::Ok(
-                        iota_ipc::ResponsePayload::TuCredentialPreview(preview),
-                    )) => Ok(preview),
-                    Ok(iota_ipc::ResponseResult::Error(error)) => {
-                        Err(format!("Credential inspection failed: {error}"))
-                    }
-                    Ok(_) => Err(
-                        "Credential inspection failed: daemon returned an unexpected response."
-                            .into(),
-                    ),
-                    Err(error) => Err(format!("Credential inspection failed: {error}")),
-                };
-                UiEvent::App(AppEvent::TuInspected(result))
-            }),
-        }
+        IotaInteraction::Effect(IotaEffect::InspectTu { credential })
     }
-    fn start_tu_attachment(&mut self, credential: iota_ipc::SecretString) -> InteractionResult {
+    fn start_tu_attachment(&mut self, credential: iota_ipc::SecretString) -> IotaInteraction {
         self.pending = true;
         self.overlay = None;
         self.message = Some("Attaching existing user…".into());
-        let ipc = self.ipc.clone();
-        InteractionResult::AppTask {
-            task: Box::pin(async move {
-                let result = match ipc
-                    .send_request(iota_ipc::LocalRequest::AttachUserFromTu { credential })
-                    .await
-                {
-                    Ok(iota_ipc::ResponseResult::Ok(_)) => Ok("Attached existing user.".into()),
-                    Ok(iota_ipc::ResponseResult::Error(error)) => {
-                        Err(format!("Attach existing user failed: {error}"))
-                    }
-                    Err(error) => Err(format!("Attach existing user failed: {error}")),
-                };
-                UiEvent::App(AppEvent::UserOperationFinished(result))
-            }),
-        }
+        IotaInteraction::Effect(IotaEffect::AttachUserFromTu { credential })
     }
-    fn start_operation(&mut self, action: UserAction, user_id: i64) -> InteractionResult {
+    fn start_operation(&mut self, action: UserAction, user_id: i64) -> IotaInteraction {
         self.pending = true;
         self.overlay = None;
         self.message = Some(format!("{}…", action.label()));
-        let ipc = self.ipc.clone();
-        InteractionResult::AppTask {
-            task: Box::pin(async move {
-                let response = match action {
-                    UserAction::Release => {
-                        ipc.send_request(iota_ipc::LocalRequest::ReleaseUser { user_id })
-                            .await
-                    }
-                    UserAction::PurgeData => {
-                        ipc.send_request(iota_ipc::LocalRequest::PurgeUserData { user_id })
-                            .await
-                    }
-                    UserAction::ExportTu => {
-                        return UiEvent::App(AppEvent::UserOperationFinished(Err(
-                            "Credential export requires a destination path.".into(),
-                        )));
-                    }
-                    UserAction::DeleteAccount => {
-                        ipc.send_request(iota_ipc::LocalRequest::CompleteDeleteUser {
-                            user_id,
-                            credential: None,
-                        })
-                        .await
-                    }
-                    UserAction::Reconcile => {
-                        ipc.send_request(iota_ipc::LocalRequest::ReconcileUser { user_id })
-                            .await
-                    }
-                    UserAction::Diagnostics => {
-                        ipc.send_request(iota_ipc::LocalRequest::GetUserDiagnostics { user_id })
-                            .await
-                    }
-                    UserAction::ForceDetach => {
-                        ipc.send_request(iota_ipc::LocalRequest::ForceDetachUser { user_id })
-                            .await
-                    }
-                    UserAction::ForgetResidency => {
-                        ipc.send_request(iota_ipc::LocalRequest::ForgetReleasedUser { user_id })
-                            .await
-                    }
-                };
-                let result = match response {
-                    Ok(iota_ipc::ResponseResult::Ok(
-                        iota_ipc::ResponsePayload::UserDiagnostics(diagnostics),
-                    )) => Ok(format!(
-                        "Diagnostics: state={:?}, data={}, credential={}, trusted apps={}, pending={}",
-                        diagnostics.local_state,
-                        if diagnostics.data_present {
-                            "present"
-                        } else {
-                            "empty"
-                        },
-                        context::credential_status_label(diagnostics.credential_status),
-                        diagnostics.trusted_app_count,
-                        diagnostics
-                            .pending_operation
-                            .unwrap_or_else(|| "none".into()),
-                    )),
-                    Ok(iota_ipc::ResponseResult::Ok(
-                        iota_ipc::ResponsePayload::UserReconciled(result),
-                    )) => Ok(format!("Reconciliation result: {:?}.", result.action)),
-                    Ok(iota_ipc::ResponseResult::Ok(_)) => {
-                        Ok(format!("{} completed.", action.label()))
-                    }
-                    Ok(iota_ipc::ResponseResult::Error(error)) => {
-                        Err(format!("{} failed: {error}", action.label()))
-                    }
-                    Err(error) => Err(format!("{} failed: {error}", action.label())),
-                };
-                UiEvent::App(AppEvent::UserOperationFinished(result))
-            }),
-        }
+        IotaInteraction::Effect(IotaEffect::RunUserOperation { action, user_id })
     }
     fn start_credential_export(
         &mut self,
         user_id: i64,
         destination: std::path::PathBuf,
-    ) -> InteractionResult {
+    ) -> IotaInteraction {
         self.pending = true;
         self.overlay = None;
         self.message = Some("Exporting credential…".into());
-        let ipc = self.ipc.clone();
-        InteractionResult::AppTask {
-            task: Box::pin(async move {
-                let result = match ipc
-                    .send_request(iota_ipc::LocalRequest::ExportUserCredential { user_id })
-                    .await
-                {
-                    Ok(iota_ipc::ResponseResult::Ok(
-                        iota_ipc::ResponsePayload::UserCredentialExport {
-                            user_id: response_user_id,
-                            username,
-                            credential,
-                        },
-                    )) if response_user_id == user_id => {
-                        write_private_export(&destination, credential.0.as_bytes())
-                            .map(|()| {
-                                format!(
-                                    "Exported credential for {username} to {}.",
-                                    destination.display()
-                                )
-                            })
-                            .map_err(|error| {
-                                format!(
-                                    "Credential export failed for {}: {error}",
-                                    destination.display()
-                                )
-                            })
-                    }
-                    Ok(iota_ipc::ResponseResult::Ok(_)) => Err(
-                        "Credential export failed: daemon returned an unexpected response.".into(),
-                    ),
-                    Ok(iota_ipc::ResponseResult::Error(error)) => {
-                        Err(format!("Credential export failed: {error}"))
-                    }
-                    Err(error) => Err(format!("Credential export failed: {error}")),
-                };
-                UiEvent::App(AppEvent::CredentialExportFinished(result))
-            }),
-        }
+        IotaInteraction::Effect(IotaEffect::ExportCredential {
+            user_id,
+            destination,
+        })
     }
-    fn start_create(&mut self, username: String) -> InteractionResult {
+    fn start_create(&mut self, username: String) -> IotaInteraction {
         self.pending = true;
         self.message = Some("Creating user…".into());
         self.overlay = None;
-        let ipc = self.ipc.clone();
-        InteractionResult::AppTask {
-            task: Box::pin(async move {
-                let result = match ipc
-                    .send_request(iota_ipc::LocalRequest::CreateUser { username })
-                    .await
-                {
-                    Ok(iota_ipc::ResponseResult::Ok(iota_ipc::ResponsePayload::UserCreated {
-                        username,
-                        user_id,
-                    })) => Ok(format!("Created user {username} ({user_id}).")),
-                    Ok(iota_ipc::ResponseResult::Error(error)) => {
-                        Err(format!("Create user failed: {error}"))
-                    }
-                    Ok(_) => {
-                        Err("Create user failed: daemon returned an unexpected response.".into())
-                    }
-                    Err(error) => Err(format!("Create user failed: {error}")),
-                };
-                UiEvent::App(AppEvent::UserOperationFinished(result))
-            }),
-        }
+        IotaInteraction::Effect(IotaEffect::CreateUser { username })
     }
-    fn start_invitation(&mut self, authority: iota_ipc::InvitationAuthority) -> InteractionResult {
+    fn start_invitation(&mut self, authority: iota_ipc::InvitationAuthority) -> IotaInteraction {
         self.pending = true;
         self.message = Some("Creating invitation…".into());
         self.overlay = None;
-        let ipc = self.ipc.clone();
-        InteractionResult::AppTask {
-            task: Box::pin(async move {
-                let result = match ipc
-                    .send_request(iota_ipc::LocalRequest::CreateInvitation {
-                        authority,
-                        lifetime_seconds: 7 * 24 * 60 * 60,
-                        password: None,
-                        label: None,
-                    })
-                    .await
-                {
-                    Ok(iota_ipc::ResponseResult::Ok(
-                        iota_ipc::ResponsePayload::InvitationCreated(invitation),
-                    )) => Ok(format!(
-                        "Invitation {} created. Token: {}  Link: {}{}",
-                        invitation.invitation_id,
-                        invitation.raw_token.0,
-                        invitation.short_url.as_deref().unwrap_or("unavailable"),
-                        if invitation.mirror_synced {
-                            ""
-                        } else {
-                            "  Local metadata is still synchronizing."
-                        }
-                    )),
-                    Ok(iota_ipc::ResponseResult::Error(error)) => {
-                        Err(format!("Create invitation failed: {error}"))
-                    }
-                    Ok(_) => Err(
-                        "Create invitation failed: daemon returned an unexpected response.".into(),
-                    ),
-                    Err(error) => Err(format!("Create invitation failed: {error}")),
-                };
-                UiEvent::App(AppEvent::UserOperationFinished(result))
-            }),
-        }
+        IotaInteraction::Effect(IotaEffect::CreateInvitation { authority })
     }
-    fn refresh(&self) -> InteractionResult {
-        let ipc = self.ipc.clone();
-        InteractionResult::AppTask {
-            task: Box::pin(async move {
-                let result = match ipc.send_request(iota_ipc::LocalRequest::ListUsers).await {
-                    Ok(iota_ipc::ResponseResult::Ok(iota_ipc::ResponsePayload::Users(users))) => {
-                        Ok(users
-                            .into_iter()
-                            .map(|user| UserEntry {
-                                user_id: user.user_id,
-                                username: user.username,
-                                state: user.state,
-                                data_present: user.data_present,
-                                credential_status: user.credential_status,
-                                pending_operation: user.pending_operation,
-                            })
-                            .collect())
-                    }
-                    Ok(iota_ipc::ResponseResult::Error(error)) => {
-                        Err(format!("Cannot reload users: {error}"))
-                    }
-                    Ok(_) => {
-                        Err("Cannot reload users: daemon returned an unexpected response.".into())
-                    }
-                    Err(error) => Err(format!("Cannot reload users: {error}")),
-                };
-                UiEvent::App(AppEvent::UsersLoaded(result))
-            }),
-        }
+    fn refresh(&self) -> IotaInteraction {
+        IotaInteraction::Effect(IotaEffect::RefreshUsers)
     }
-    fn render_list(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        context: &RenderContext<'_>,
-        hits: &mut HitMap,
-    ) {
+    fn render_list(&self, frame: &mut Frame, area: Rect, theme: &ResolvedTheme, hits: &mut HitMap) {
         let block = Block::default()
             .title(" Users ")
             .borders(Borders::ALL)
-            .border_style(context.theme.borders.normal);
+            .border_style(theme.borders.normal);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         self.viewport_height
@@ -533,7 +301,7 @@ impl UsersScreen {
                     width: inner.width,
                     height: 1,
                 },
-                AppAction::SelectUser(user.user_id),
+                IotaMessage::Action(AppAction::SelectUser(user.user_id)),
             );
         }
         frame.render_widget(Paragraph::new(lines), inner);
@@ -542,13 +310,13 @@ impl UsersScreen {
         &self,
         frame: &mut Frame,
         area: Rect,
-        context: &RenderContext<'_>,
+        theme: &ResolvedTheme,
         hits: &mut HitMap,
     ) {
         let block = Block::default()
             .title(" Selected user ")
             .borders(Borders::ALL)
-            .border_style(context.theme.borders.normal);
+            .border_style(theme.borders.normal);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let Some(user) = self.selected_user() else {
@@ -560,10 +328,7 @@ impl UsersScreen {
         };
         let groups = self.groups();
         let details = vec![
-            Line::from(Span::styled(
-                user.username.as_str(),
-                context.theme.text.normal,
-            )),
+            Line::from(Span::styled(user.username.as_str(), theme.text.normal)),
             Line::from(format!("State        {}", context::state_label(user))),
             Line::from(format!(
                 "Hosted data  {}",
@@ -601,10 +366,13 @@ impl UsersScreen {
                     focused,
                     enabled: !self.pending,
                 },
-                context.theme,
+                theme,
             );
             if !self.pending {
-                hits.register(buttons[index], AppAction::OpenUserGroup(entry.group));
+                hits.register(
+                    buttons[index],
+                    IotaMessage::Action(AppAction::OpenUserGroup(entry.group)),
+                );
             }
         }
     }
@@ -612,15 +380,15 @@ impl UsersScreen {
         &self,
         frame: &mut Frame,
         rect: Rect,
-        context: &RenderContext<'_>,
+        theme: &ResolvedTheme,
         hits: &mut HitMap,
     ) {
         let Some(overlay) = &self.overlay else {
             return;
         };
-        let area = crate::layout::fit::centered_rect(
+        let area = ratatool::layout::centered_rect(
             rect,
-            crate::layout::fit::RequiredSize {
+            ratatool::layout::RequiredSize {
                 width: 56,
                 height: 12,
             },
@@ -638,8 +406,8 @@ impl UsersScreen {
                 UsersOverlay::CredentialExport(_) => " Export TU ",
             })
             .borders(Borders::ALL)
-            .border_style(context.theme.borders.focused)
-            .style(context.theme.surfaces.overlay);
+            .border_style(theme.borders.focused)
+            .style(theme.surfaces.overlay);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         match overlay {
@@ -669,7 +437,7 @@ impl UsersScreen {
                     frame.render_widget(Paragraph::new(lines), inner);
                 }
                 AddUserPhase::ConfigureCreate => {
-                    let value = flow.username.display_value();
+                    let value = flow.username.value();
                     let message = flow
                         .error
                         .as_deref()
@@ -680,7 +448,7 @@ impl UsersScreen {
                     );
                 }
                 AddUserPhase::ConfigureImport => {
-                    let value = flow.import_path.display_value();
+                    let value = flow.import_path.value();
                     let message = flow
                         .error
                         .as_deref()
@@ -777,7 +545,7 @@ impl UsersScreen {
                         focused: false,
                         enabled: true,
                     },
-                    context.theme,
+                    theme,
                 );
                 render_button(
                     frame,
@@ -788,13 +556,13 @@ impl UsersScreen {
                         focused: true,
                         enabled: !self.pending,
                     },
-                    context.theme,
+                    theme,
                 );
-                hits.register(buttons[0], AppAction::CancelDialog);
-                hits.register(buttons[1], AppAction::ConfirmDialog);
+                hits.register(buttons[0], IotaMessage::Action(AppAction::CancelDialog));
+                hits.register(buttons[1], IotaMessage::Action(AppAction::ConfirmDialog));
             }
             UsersOverlay::CredentialExport(export) => {
-                let value = export.destination.display_value();
+                let value = export.destination.value();
                 let message = export
                     .error
                     .as_deref()
@@ -811,24 +579,18 @@ impl UsersScreen {
     }
 }
 
-impl Screen for UsersScreen {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-    fn render(
+impl IotaScreen for UsersScreen {
+    fn render_legacy(
         &self,
         frame: &mut Frame,
         rect: Rect,
-        context: &RenderContext<'_>,
+        theme: &ResolvedTheme,
         hits: &mut HitMap,
     ) {
         let outer = Block::default()
             .title(" User management ")
             .borders(Borders::ALL)
-            .border_style(context.theme.borders.normal);
+            .border_style(theme.borders.normal);
         let inner = outer.inner(rect);
         frame.render_widget(outer, rect);
         let rows = Layout::vertical([
@@ -860,10 +622,13 @@ impl Screen for UsersScreen {
                     focused: self.active_tab == tab,
                     enabled: !self.pending,
                 },
-                context.theme,
+                theme,
             );
             if !self.pending {
-                hits.register(header[index], AppAction::SetUserAdminTab(tab));
+                hits.register(
+                    header[index],
+                    IotaMessage::Action(AppAction::SetUserAdminTab(tab)),
+                );
             }
         }
         frame.render_widget(
@@ -873,9 +638,9 @@ impl Screen for UsersScreen {
                 "Pending, redeemed, revoked, and expired invitations".into()
             })
             .style(if self.filtering {
-                context.theme.text.normal
+                theme.text.normal
             } else {
-                context.theme.text.muted
+                theme.text.muted
             }),
             header[2],
         );
@@ -894,10 +659,10 @@ impl Screen for UsersScreen {
                 focused: self.focus_zone == FocusZone::Toolbar && self.toolbar_index == 0,
                 enabled: add_enabled,
             },
-            context.theme,
+            theme,
         );
         if add_enabled {
-            hits.register(header[3], AppAction::AddUser);
+            hits.register(header[3], IotaMessage::Action(AppAction::AddUser));
         }
         let panes = if rows[1].width >= 70 {
             Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
@@ -906,24 +671,25 @@ impl Screen for UsersScreen {
             Layout::horizontal([Constraint::Percentage(100), Constraint::Length(0)]).split(rows[1])
         };
         if self.active_tab == UserAdminTab::Users {
-            self.render_list(frame, panes[0], context, hits);
+            self.render_list(frame, panes[0], theme, hits);
             if panes[1].width > 0 {
-                self.render_context(frame, panes[1], context, hits);
+                self.render_context(frame, panes[1], theme, hits);
             }
         } else {
-            invitations::render(frame, rows[1], context, self.invitation_supported());
+            invitations::render(frame, rows[1], theme, self.invitation_supported());
         }
         if let Some(message) = &self.message {
             frame.render_widget(
-                Paragraph::new(message.as_str()).style(context.theme.text.muted),
+                Paragraph::new(message.as_str()).style(theme.text.muted),
                 rows[2],
             );
         }
-        self.render_overlay(frame, rect, context, hits);
+        self.render_overlay(frame, rect, theme, hits);
     }
-    fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
+    fn handle_event(&mut self, event: &UiEvent) -> IotaInteraction {
+        let event = event.clone();
         match event {
-            UiEvent::App(AppEvent::UsersLoaded(result)) => {
+            UiEvent::Message(IotaMessage::Event(AppEvent::UsersLoaded(result))) => {
                 self.loading = false;
                 match result {
                     Ok(users) => {
@@ -932,9 +698,9 @@ impl Screen for UsersScreen {
                     }
                     Err(error) => self.message = Some(error),
                 }
-                return InteractionResult::Handled;
+                return IotaInteraction::Changed;
             }
-            UiEvent::App(AppEvent::UserOperationFinished(result)) => {
+            UiEvent::Message(IotaMessage::Event(AppEvent::UserOperationFinished(result))) => {
                 self.pending = false;
                 self.message = Some(match result {
                     Ok(message) => message,
@@ -942,15 +708,15 @@ impl Screen for UsersScreen {
                 });
                 return self.refresh();
             }
-            UiEvent::App(AppEvent::CredentialExportFinished(result)) => {
+            UiEvent::Message(IotaMessage::Event(AppEvent::CredentialExportFinished(result))) => {
                 self.pending = false;
                 self.message = Some(match result {
                     Ok(message) => message,
                     Err(error) => error,
                 });
-                return InteractionResult::Handled;
+                return IotaInteraction::Changed;
             }
-            UiEvent::App(AppEvent::TuInspected(result)) => {
+            UiEvent::Message(IotaMessage::Event(AppEvent::TuInspected(result))) => {
                 if let Some(UsersOverlay::Add(flow)) = self.overlay.as_mut() {
                     match result {
                         Ok(preview) => {
@@ -961,7 +727,7 @@ impl Screen for UsersScreen {
                         }
                     }
                 }
-                return InteractionResult::Handled;
+                return IotaInteraction::Changed;
             }
             UiEvent::Paste(text) => {
                 if let Some(UsersOverlay::Add(flow)) = self.overlay.as_mut() {
@@ -972,74 +738,77 @@ impl Screen for UsersScreen {
                         _ => None,
                     };
                     if let Some(input) = input {
-                        for character in sanitized.chars() {
-                            input.handle_key(KeyCode::Char(character));
-                        }
-                        return InteractionResult::Handled;
+                        input.insert_text(&sanitized);
+                        return IotaInteraction::Changed;
                     }
                 }
                 if let Some(UsersOverlay::CredentialExport(export)) = self.overlay.as_mut() {
-                    for character in text.replace(['\r', '\n'], " ").chars() {
-                        export.destination.handle_key(KeyCode::Char(character));
-                    }
-                    return InteractionResult::Handled;
+                    export
+                        .destination
+                        .insert_text(&text.replace(['\r', '\n'], " "));
+                    return IotaInteraction::Changed;
                 }
                 if self.filtering {
                     self.filter.push_str(&text.replace(['\r', '\n'], " "));
                     self.restore_selection();
-                    return InteractionResult::Handled;
+                    return IotaInteraction::Changed;
                 }
-                return InteractionResult::Unhandled;
+                return IotaInteraction::Unhandled;
             }
             UiEvent::Key(key) => {
                 if let Some(overlay) = &mut self.overlay {
                     match overlay {
                         UsersOverlay::Add(flow) => match flow.phase {
                             AddUserPhase::ChooseMethod => {
-                                if flow.methods.handle_key(key.code) {
-                                    return InteractionResult::Handled;
+                                if matches!(
+                                    flow.methods.handle_key(key.code),
+                                    ratatool::MenuResult::Moved
+                                        | ratatool::MenuResult::Unchanged
+                                        | ratatool::MenuResult::NoSelection
+                                ) {
+                                    return IotaInteraction::Changed;
                                 }
                                 match key.code {
                                     KeyCode::Enter => {
                                         flow.choose();
-                                        InteractionResult::Handled
+                                        IotaInteraction::Changed
                                     }
                                     KeyCode::Esc => {
                                         self.overlay = None;
-                                        InteractionResult::Handled
+                                        IotaInteraction::Changed
                                     }
-                                    _ => InteractionResult::Handled,
+                                    _ => IotaInteraction::Changed,
                                 }
                             }
                             AddUserPhase::ConfigureCreate => match key.code {
                                 KeyCode::Esc => {
                                     flow.phase = AddUserPhase::ChooseMethod;
-                                    InteractionResult::Handled
+                                    IotaInteraction::Changed
                                 }
                                 KeyCode::Enter => {
                                     let username = flow.username.value().trim().to_owned();
                                     if username.is_empty() {
                                         flow.error = Some("A username is required.".into());
-                                        InteractionResult::Handled
+                                        IotaInteraction::Changed
                                     } else {
                                         self.start_create(username)
                                     }
                                 }
                                 _ => {
-                                    flow.username.handle_key(key.code);
-                                    InteractionResult::Handled
+                                    flow.username.handle_key(key);
+                                    IotaInteraction::Changed
                                 }
                             },
                             AddUserPhase::ConfigureImport => match key.code {
                                 KeyCode::Esc => {
                                     flow.phase = AddUserPhase::ChooseMethod;
-                                    InteractionResult::Handled
+                                    IotaInteraction::Changed
                                 }
                                 KeyCode::Enter => {
                                     let path = flow.import_path.value().trim();
                                     if path.is_empty() {
                                         flow.error = Some("A TU path is required.".into());
-                                        InteractionResult::Handled
+                                        IotaInteraction::Changed
                                     } else {
                                         match std::fs::read_to_string(path) {
                                             Ok(contents) => self.start_tu_inspection(
@@ -1049,24 +818,29 @@ impl Screen for UsersScreen {
                                                 flow.error = Some(format!(
                                                     "Cannot read credential {path}: {error}"
                                                 ));
-                                                InteractionResult::Handled
+                                                IotaInteraction::Changed
                                             }
                                         }
                                     }
                                 }
                                 _ => {
-                                    flow.import_path.handle_key(key.code);
-                                    InteractionResult::Handled
+                                    flow.import_path.handle_key(key);
+                                    IotaInteraction::Changed
                                 }
                             },
                             AddUserPhase::ConfigureInvitation => {
-                                if flow.invitation_authorities.handle_key(key.code) {
-                                    return InteractionResult::Handled;
+                                if matches!(
+                                    flow.invitation_authorities.handle_key(key.code),
+                                    ratatool::MenuResult::Moved
+                                        | ratatool::MenuResult::Unchanged
+                                        | ratatool::MenuResult::NoSelection
+                                ) {
+                                    return IotaInteraction::Changed;
                                 }
                                 match key.code {
                                     KeyCode::Esc => {
                                         flow.phase = AddUserPhase::ChooseMethod;
-                                        InteractionResult::Handled
+                                        IotaInteraction::Changed
                                     }
                                     KeyCode::Enter => {
                                         let authority = flow
@@ -1076,16 +850,16 @@ impl Screen for UsersScreen {
                                         if let Some(authority) = authority {
                                             self.start_invitation(authority)
                                         } else {
-                                            InteractionResult::Handled
+                                            IotaInteraction::Changed
                                         }
                                     }
-                                    _ => InteractionResult::Handled,
+                                    _ => IotaInteraction::Changed,
                                 }
                             }
                             AddUserPhase::ReviewImport => match key.code {
                                 KeyCode::Esc => {
                                     flow.phase = AddUserPhase::ConfigureImport;
-                                    InteractionResult::Handled
+                                    IotaInteraction::Changed
                                 }
                                 KeyCode::Enter => {
                                     if let Some(credential) = flow.credential.clone() {
@@ -1095,56 +869,64 @@ impl Screen for UsersScreen {
                                         flow.error =
                                             Some("Credential must be inspected again.".into());
                                         flow.phase = AddUserPhase::ConfigureImport;
-                                        InteractionResult::Handled
+                                        IotaInteraction::Changed
                                     }
                                 }
-                                _ => InteractionResult::Handled,
+                                _ => IotaInteraction::Changed,
                             },
                             _ => {
                                 self.overlay = None;
-                                InteractionResult::Handled
+                                IotaInteraction::Changed
                             }
                         },
                         UsersOverlay::UserMenu(menu) => {
-                            if menu.menu.handle_key(key.code) {
-                                return InteractionResult::Handled;
+                            match menu.menu.handle_key(key.code) {
+                                ratatool::MenuResult::Moved
+                                | ratatool::MenuResult::Unchanged
+                                | ratatool::MenuResult::NoSelection => {
+                                    return IotaInteraction::Changed;
+                                }
+                                ratatool::MenuResult::Activated(action) => {
+                                    return self.begin_action(action);
+                                }
+                                ratatool::MenuResult::Unhandled => {}
                             }
                             match key.code {
                                 KeyCode::Esc => {
                                     self.overlay = None;
-                                    InteractionResult::Handled
+                                    IotaInteraction::Changed
                                 }
                                 KeyCode::Enter => {
                                     let action = menu.menu.selected_item().map(|item| item.value);
-                                    action.map_or(InteractionResult::Handled, |action| {
+                                    action.map_or(IotaInteraction::Changed, |action| {
                                         self.begin_action(action)
                                     })
                                 }
-                                _ => InteractionResult::Handled,
+                                _ => IotaInteraction::Changed,
                             }
                         }
                         UsersOverlay::Confirm(confirm) => match key.code {
                             KeyCode::Esc => {
                                 self.overlay = None;
-                                InteractionResult::Handled
+                                IotaInteraction::Changed
                             }
                             KeyCode::Enter => {
                                 let action = confirm.action;
                                 let user_id = confirm.user.user_id;
                                 self.start_operation(action, user_id)
                             }
-                            _ => InteractionResult::Handled,
+                            _ => IotaInteraction::Changed,
                         },
                         UsersOverlay::CredentialExport(export) => match key.code {
                             KeyCode::Esc => {
                                 self.overlay = None;
-                                InteractionResult::Handled
+                                IotaInteraction::Changed
                             }
                             KeyCode::Enter => {
                                 let destination = export.destination.value().trim();
                                 if destination.is_empty() {
                                     export.error = Some("A destination path is required.".into());
-                                    InteractionResult::Handled
+                                    IotaInteraction::Changed
                                 } else {
                                     let user_id = export.user.user_id;
                                     let destination = std::path::PathBuf::from(destination);
@@ -1152,29 +934,29 @@ impl Screen for UsersScreen {
                                 }
                             }
                             _ => {
-                                export.destination.handle_key(key.code);
-                                InteractionResult::Handled
+                                export.destination.handle_key(key);
+                                IotaInteraction::Changed
                             }
                         },
                     }
                 } else if self.active_tab == UserAdminTab::Invitations {
                     match key.code {
-                        KeyCode::Esc => InteractionResult::CloseScreen,
+                        KeyCode::Esc => IotaInteraction::Pop,
                         KeyCode::Char('a') | KeyCode::Char('A') => {
                             if self.invitation_supported() {
                                 self.overlay = Some(UsersOverlay::Add(self.new_add_flow()));
                             } else {
                                 self.message = Some(invitations::UNSUPPORTED_MESSAGE.into());
                             }
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
                         KeyCode::Char('u') | KeyCode::Char('U') => {
                             self.active_tab = UserAdminTab::Users;
                             self.focus_zone = FocusZone::UserList;
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
-                        KeyCode::Char('i') | KeyCode::Char('I') => InteractionResult::Handled,
-                        _ => InteractionResult::Unhandled,
+                        KeyCode::Char('i') | KeyCode::Char('I') => IotaInteraction::Changed,
+                        _ => IotaInteraction::Unhandled,
                     }
                 } else if self.filtering {
                     match key.code {
@@ -1198,54 +980,54 @@ impl Screen for UsersScreen {
                         }
                         _ => {}
                     };
-                    InteractionResult::Handled
+                    IotaInteraction::Changed
                 } else {
                     match key.code {
-                        KeyCode::Esc => InteractionResult::CloseScreen,
+                        KeyCode::Esc => IotaInteraction::Pop,
                         KeyCode::Char('/') => {
                             self.filtering = true;
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') => {
                             self.overlay = Some(UsersOverlay::Add(self.new_add_flow()));
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
                         KeyCode::Char('i') | KeyCode::Char('I') => {
                             self.active_tab = UserAdminTab::Invitations;
                             self.filtering = false;
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
                             self.move_selection(1);
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             self.move_selection(-1);
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
                         KeyCode::PageDown => {
                             self.move_selection(
                                 self.viewport_height.load(Ordering::Relaxed) as isize
                             );
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
                         KeyCode::PageUp => {
                             self.move_selection(
                                 -(self.viewport_height.load(Ordering::Relaxed) as isize),
                             );
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
                         KeyCode::Home => {
                             self.selected_user_id =
                                 self.visible_users().first().map(|user| user.user_id);
                             self.keep_selected_visible();
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
                         KeyCode::End => {
                             self.selected_user_id =
                                 self.visible_users().last().map(|user| user.user_id);
                             self.keep_selected_visible();
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
                         KeyCode::Tab => {
                             self.focus_zone = match self.focus_zone {
@@ -1254,20 +1036,20 @@ impl Screen for UsersScreen {
                                 FocusZone::UserList => FocusZone::UserActions,
                                 FocusZone::UserActions => FocusZone::Toolbar,
                             };
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
                         KeyCode::Left if self.focus_zone == FocusZone::UserActions => {
                             self.action_group_index = self.action_group_index.saturating_sub(1);
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
                         KeyCode::Right if self.focus_zone == FocusZone::UserActions => {
                             let last = self.groups().len().saturating_sub(1);
                             self.action_group_index = (self.action_group_index + 1).min(last);
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
                         KeyCode::Enter if self.focus_zone == FocusZone::Toolbar => {
                             self.overlay = Some(UsersOverlay::Add(self.new_add_flow()));
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
                         KeyCode::Enter if self.focus_zone == FocusZone::UserActions => {
                             if let Some(entry) = self.groups().get(self.action_group_index) {
@@ -1277,16 +1059,16 @@ impl Screen for UsersScreen {
                                     self.credential_export_supported(),
                                 )));
                             }
-                            InteractionResult::Handled
+                            IotaInteraction::Changed
                         }
-                        _ => InteractionResult::Unhandled,
+                        _ => IotaInteraction::Unhandled,
                     }
                 }
             }
-            _ => InteractionResult::Unhandled,
+            _ => IotaInteraction::Unhandled,
         }
     }
-    fn handle_action(&mut self, action: AppAction) -> InteractionResult {
+    fn handle_action(&mut self, action: AppAction) -> IotaInteraction {
         match action {
             AppAction::AddUser => {
                 if self.active_tab == UserAdminTab::Invitations && !self.invitation_supported() {
@@ -1294,7 +1076,7 @@ impl Screen for UsersScreen {
                 } else {
                     self.overlay = Some(UsersOverlay::Add(self.new_add_flow()));
                 }
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             AppAction::SetUserAdminTab(tab) if self.overlay.is_none() => {
                 self.active_tab = tab;
@@ -1304,13 +1086,13 @@ impl Screen for UsersScreen {
                 } else {
                     FocusZone::Toolbar
                 };
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             AppAction::SelectUser(id) if self.overlay.is_none() => {
                 self.selected_user_id = Some(id);
                 self.focus_zone = FocusZone::UserList;
                 self.keep_selected_visible();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             AppAction::OpenUserGroup(group) if self.overlay.is_none() => {
                 if let Some(entry) = self.groups().into_iter().find(|entry| entry.group == group) {
@@ -1320,20 +1102,20 @@ impl Screen for UsersScreen {
                         self.credential_export_supported(),
                     )));
                 }
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             AppAction::ActivateUserAction(action) => self.begin_action(action),
             AppAction::ConfirmDialog => match &self.overlay {
                 Some(UsersOverlay::Confirm(confirm)) => {
                     self.start_operation(confirm.action, confirm.user.user_id)
                 }
-                _ => InteractionResult::Unhandled,
+                _ => IotaInteraction::Unhandled,
             },
             AppAction::CancelDialog => {
                 self.overlay = None;
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
-            _ => InteractionResult::Unhandled,
+            _ => IotaInteraction::Unhandled,
         }
     }
     fn key_hints(&self) -> Vec<KeyHint> {

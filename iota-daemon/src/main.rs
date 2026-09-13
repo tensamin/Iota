@@ -94,6 +94,14 @@ async fn main() -> ExitCode {
         eprintln!("Cannot load Iota configuration: {error}");
         return ExitCode::FAILURE;
     }
+    let node_identity =
+        match iota_identity::LocalNodeIdentity::load_or_create(&paths.keyring_file(), None) {
+            Ok(identity) => identity,
+            Err(error) => {
+                eprintln!("Cannot load Iota node identity: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
     omikron_connector::omikron_connection::configure_identity_path(paths.keyring_file());
     match paths.scope {
         iota_paths::Scope::User => logger::startup_with_log_dir(Some(paths.log_dir.clone())),
@@ -136,94 +144,135 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let omikron = match omikron_connector::omikron_connection::connect_initial(
-        runtime.cancellation.clone(),
-        runtime.state.active_tasks.clone(),
-        runtime.state.app.clone(),
-    )
-    .await
-    {
-        Ok(connection) => connection,
-        Err(omikron_connector::OmikronStartupError::InitialConnectionTimeout { connection }) => {
-            runtime.set_component_degraded(
-                iota_ipc::ComponentId::Omikron,
-                "Omikron connection unavailable; retrying".into(),
-            );
-            connection
+    let (services, omikron) = if CONFIG.load().omikron_host.is_some() {
+        let omikron = Arc::new(omikron_connector::OmikronConnection::with_cancellation(
+            runtime.cancellation.clone(),
+            runtime.state.active_tasks.clone(),
+            runtime.state.app.clone(),
+        ));
+        let services = match DaemonServices::new(omikron.clone()) {
+            Ok(services) => services,
+            Err(error) => {
+                eprintln!("Cannot initialize daemon identity services: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        omikron.connect().await;
+        if omikron
+            .await_connection(Some(Duration::from_secs(45)))
+            .await
+            .is_err()
+        {
+            if omikron.has_auth_failure().await {
+                runtime.set_component_failed(
+                    iota_ipc::ComponentId::Omikron,
+                    "Omikron authentication failed; inspect authenticated relay and Omega status before rotating Iota identity".into(),
+                );
+            } else {
+                runtime.set_component_degraded(
+                    iota_ipc::ComponentId::Omikron,
+                    "Omikron connection unavailable; retrying".into(),
+                );
+            }
         }
-        Err(omikron_connector::OmikronStartupError::Authentication { connection }) => {
-            runtime.set_component_failed(
-                iota_ipc::ComponentId::Omikron,
-                "Omikron authentication failed; inspect the authenticated relay and Omega status before rotating the Iota identity".into(),
-            );
-            // Keep IPC alive: identity rotation is the supported recovery
-            // action and must remain available after authentication fails.
-            connection
-        }
-        Err(omikron_connector::OmikronStartupError::Construction(error)) => {
-            eprintln!("Cannot construct Omikron connection: {error}");
-            return ExitCode::FAILURE;
-        }
+        (services, Some(omikron))
+    } else {
+        let services = match DaemonServices::standalone(node_identity.clone()) {
+            Ok(services) => services,
+            Err(error) => {
+                eprintln!("Cannot initialize standalone daemon services: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        runtime.set_component_healthy(
+            iota_ipc::ComponentId::Omikron,
+            Some("disabled in standalone mode".into()),
+        );
+        (services, None)
     };
-    let omikron_health = omikron.clone();
-    let omikron_reconcile = omikron.clone();
-    let services = DaemonServices::new(omikron);
-    let health_runtime = runtime.clone();
-    runtime
-        .tasks
-        .spawn_tracked("omikron-health", async move {
-            let mut states = omikron_health.connection_state();
-            loop {
-                let state = *states.borrow();
-                match state {
-                    omikron_connector::omikron_connection::ConnectionState::Connected {
-                        ..
-                    } => {
-                        let ping_ms = *omikron_health.last_ping.lock().await;
-                        let message = if ping_ms >= 0 {
-                            format!("connected (RTT: {ping_ms} ms)")
-                        } else {
-                            "connected (waiting for RTT sample)".into()
-                        };
-                        health_runtime
-                            .set_component_healthy(iota_ipc::ComponentId::Omikron, Some(message));
+    let lifecycle_services = services.clone();
+    let lifecycle_runtime = runtime.clone();
+    if omikron.is_none() {
+        let dispatcher =
+            iota_connection::relay_service::PendingRelayDispatcher::new(services.router.clone());
+        let dispatcher_runtime = runtime.clone();
+        runtime
+            .tasks
+            .spawn_tracked("pending-relay-dispatch", async move {
+                loop {
+                    if let Err(error) = dispatcher.dispatch_ready(100).await {
+                        log!("Pending Relay dispatch failed: {error:?}");
                     }
-                    omikron_connector::omikron_connection::ConnectionState::Connecting => {
-                        health_runtime.set_component_degraded(
-                            iota_ipc::ComponentId::Omikron,
-                            "connecting to Omikron".into(),
-                        );
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+                        _ = dispatcher_runtime.cancellation.cancelled() => break,
                     }
-                    omikron_connector::omikron_connection::ConnectionState::Disconnected => {
-                        let message = omikron_health
-                            .get_auth_failure()
-                            .await
-                            .unwrap_or_else(|| "disconnected; retrying".into());
-                        if omikron_health.has_auth_failure().await {
-                            health_runtime
-                                .set_component_failed(iota_ipc::ComponentId::Omikron, message);
-                        } else {
-                            health_runtime
-                                .set_component_degraded(iota_ipc::ComponentId::Omikron, message);
+                }
+                Ok(())
+            })
+            .await;
+    }
+    if let Some(omikron_health) = omikron {
+        let health_runtime = runtime.clone();
+        runtime
+            .tasks
+            .spawn_tracked("omikron-health", async move {
+                let mut states = omikron_health.connection_state();
+                loop {
+                    let state = *states.borrow();
+                    match state {
+                        omikron_connector::omikron_connection::ConnectionState::Connected {
+                            ..
+                        } => {
+                            let ping_ms = *omikron_health.last_ping.lock().await;
+                            let message = if ping_ms >= 0 {
+                                format!("connected (RTT: {ping_ms} ms)")
+                            } else {
+                                "connected (waiting for RTT sample)".into()
+                            };
+                            health_runtime.set_component_healthy(
+                                iota_ipc::ComponentId::Omikron,
+                                Some(message),
+                            );
+                        }
+                        omikron_connector::omikron_connection::ConnectionState::Connecting => {
+                            health_runtime.set_component_degraded(
+                                iota_ipc::ComponentId::Omikron,
+                                "connecting to Omikron".into(),
+                            );
+                        }
+                        omikron_connector::omikron_connection::ConnectionState::Disconnected => {
+                            let message = omikron_health
+                                .get_auth_failure()
+                                .await
+                                .unwrap_or_else(|| "disconnected; retrying".into());
+                            if omikron_health.has_auth_failure().await {
+                                health_runtime
+                                    .set_component_failed(iota_ipc::ComponentId::Omikron, message);
+                            } else {
+                                health_runtime.set_component_degraded(
+                                    iota_ipc::ComponentId::Omikron,
+                                    message,
+                                );
+                            }
                         }
                     }
+                    tokio::select! {
+                        changed = states.changed() => if changed.is_err() { break },
+                        // RTT is updated by MTP's heartbeat independently of a
+                        // connection-state transition, so periodically refresh
+                        // the component detail while connected.
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                        _ = health_runtime.cancellation.cancelled() => break,
+                    }
                 }
-                tokio::select! {
-                    changed = states.changed() => if changed.is_err() { break },
-                    // RTT is updated by MTP's heartbeat independently of a
-                    // connection-state transition, so periodically refresh
-                    // the component detail while connected.
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
-                    _ = health_runtime.cancellation.cancelled() => break,
-                }
-            }
-            Ok(())
-        })
-        .await;
+                Ok(())
+            })
+            .await;
+    }
     runtime
         .tasks
         .spawn_tracked("user-lifecycle-reconciliation", async move {
-            let mut states = omikron_reconcile.connection_state();
             loop {
                 match iota_storage::users::pending_operations::get_all() {
                     Ok(operations) => {
@@ -242,18 +291,14 @@ async fn main() -> ExitCode {
                     }
                     Err(error) => log!("Pending purge reconciliation could not read storage: {error}"),
                 }
-                if matches!(
-                    *states.borrow(),
-                    omikron_connector::omikron_connection::ConnectionState::Connected { .. }
-                ) {
-                    omikron_connector::user_ops::reconcile_managed_users(
-                        omikron_reconcile.as_ref(),
-                    )
-                    .await;
+                if lifecycle_services.accounts.is_available().await
+                    && let Err(error) = lifecycle_services.accounts.reconcile_managed_users().await
+                {
+                    log!("Managed user reconciliation failed: {error:?}");
                 }
                 tokio::select! {
-                    changed = states.changed() => if changed.is_err() { break },
                     _ = tokio::time::sleep(Duration::from_secs(30)) => {},
+                    _ = lifecycle_runtime.cancellation.cancelled() => break,
                 }
             }
             Ok(())
@@ -262,7 +307,7 @@ async fn main() -> ExitCode {
     let ipc_server = match IpcServer::bind(
         socket.clone(),
         runtime.clone(),
-        services,
+        services.clone(),
         log_tx.clone(),
         log_buffer.clone(),
         state_rx,
@@ -330,7 +375,186 @@ async fn main() -> ExitCode {
         .await;
 
     // --- Web server ---
-    let web = CONFIG.load().web.clone();
+    let config = CONFIG.load();
+    let web = config.web.clone();
+    let relay_router_settings = config.relay_routers.clone();
+    drop(config);
+    let direct_endpoints = match web
+        .direct_endpoints
+        .iter()
+        .cloned()
+        .map(iota_identity::AuthorityLocator::new)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(endpoints) => endpoints,
+        Err(error) => {
+            eprintln!("Cannot load federation direct endpoints: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let relay_hints = match web
+        .relay_hints
+        .iter()
+        .cloned()
+        .chain(
+            relay_router_settings
+                .iter()
+                .map(|router| router.endpoint.clone()),
+        )
+        .map(iota_identity::AuthorityLocator::new)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(endpoints) => endpoints,
+        Err(error) => {
+            eprintln!("Cannot load federation relay hints: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut relay_hints = relay_hints;
+    relay_hints.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    relay_hints.dedup();
+    let node_descriptor = match iota_storage::node_directory::SqliteNodeDirectory
+        .ensure_local_descriptor(
+            &node_identity,
+            direct_endpoints,
+            relay_hints,
+            iota_storage::util::sync::now_millis(),
+        ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            eprintln!("Cannot publish Iota node descriptor: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if services.centralized.is_some()
+        && let Some(iota_id) = CONFIG.load().iota_id
+    {
+        let omega = match iota_identity::AuthorityLocator::new(
+            omikron_connector::omega_discovery::omega_host(),
+        ) {
+            Ok(omega) => omega,
+            Err(error) => {
+                eprintln!("Cannot load Omega federation endpoint: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let wire = match node_descriptor.to_wire_v1() {
+            Ok(wire) => wire,
+            Err(error) => {
+                eprintln!("Cannot encode node descriptor for Omega: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(error) = other_iota::publish_omega_node_descriptor(&omega, iota_id, &wire).await
+        {
+            log!("Omega node descriptor publication failed: {error}");
+        }
+    }
+    let client_connections = Arc::new(client::ClientConnectionManager::new(
+        services.local_users.clone(),
+        services.principals.clone(),
+        services.auth.hosted_accounts.clone(),
+        services.sessions.clone(),
+        services.relay.clone(),
+    ));
+    if let Some(relay_routers) = &services.relay_routers {
+        for router in &relay_router_settings {
+            let endpoint = match iota_identity::AuthorityLocator::new(router.endpoint.clone()) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    eprintln!("Cannot load relay router endpoint: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let public_key = match iota_identity::PublicKeyBundle::from_base64(&router.public_key) {
+                Ok(public_key) => public_key,
+                Err(error) => {
+                    eprintln!("Cannot load relay router public key: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let certificate_path =
+                resolve_config_path(&paths.config_file, &router.certificate, &paths.config_dir);
+            let certificate = match std::fs::read(&certificate_path) {
+                Ok(certificate) if !certificate.is_empty() => certificate,
+                Ok(_) => {
+                    eprintln!(
+                        "Cannot load relay router certificate {}: file is empty",
+                        certificate_path.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Cannot load relay router certificate {}: {error}",
+                        certificate_path.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            let router_runtime = runtime.clone();
+            let relay_routers = relay_routers.clone();
+            let relay = services.relay.clone();
+            let identity = node_identity.clone();
+            let deliveries: Arc<dyn other_iota::LocalDeliverySink> = client_connections.clone();
+            runtime
+                .tasks
+                .spawn_tracked("relay-router", async move {
+                    loop {
+                        match other_iota::relay_router::RelayRouterClient::connect(
+                            identity.clone(),
+                            &endpoint,
+                            certificate.clone(),
+                            public_key.clone(),
+                            relay.clone(),
+                            deliveries.clone(),
+                        )
+                        .await
+                        {
+                            Ok(connected) => {
+                                relay_routers.add(connected.clone());
+                                tokio::select! {
+                                    _ = connected.wait_disconnected() => {},
+                                    _ = router_runtime.cancellation.cancelled() => break,
+                                }
+                            }
+                            Err(error) => {
+                                log!(
+                                    "Relay router {} connection failed: {error}",
+                                    endpoint.as_str()
+                                );
+                            }
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                            _ = router_runtime.cancellation.cancelled() => break,
+                        }
+                    }
+                    Ok(())
+                })
+                .await;
+        }
+    }
+    let mtp_handler: Arc<dyn web_server::MtpConnectionHandler> =
+        if let Some(router) = services.direct_router.clone() {
+            let nodes: Arc<dyn iota_identity::NodeDirectory> =
+                Arc::new(iota_storage::node_directory::SqliteNodeDirectory);
+            let deliveries: Arc<dyn other_iota::LocalDeliverySink> = client_connections.clone();
+            let peers = Arc::new(other_iota::PeerManager::new(
+                node_identity.clone(),
+                nodes,
+                router.clone(),
+                services.relay.clone(),
+                deliveries,
+            ));
+            router.attach_manager(&peers);
+            Arc::new(client::ConnectionGateway::new(
+                client_connections.clone(),
+                peers,
+            ))
+        } else {
+            client_connections.clone()
+        };
     let web_config = web_server::WebConfig {
         mode: match web.mode {
             iota_storage::util::config_util::WebMode::Disabled => web_server::WebMode::Disabled,
@@ -352,6 +576,33 @@ async fn main() -> ExitCode {
                 key: resolve_config_path(&paths.config_file, &key, &paths.config_dir),
             }),
         required: web.required,
+        authority_discovery: iota_identity::AuthorityDiscoveryDocument {
+            version: 1,
+            service: iota_identity::AuthorityKind::Iota,
+            authority_id: node_identity.authority_id().clone(),
+            node_id: Some(node_identity.node_id().clone()),
+            public_key: match node_identity.public_keys().try_to_base64() {
+                Ok(public_key) => public_key,
+                Err(error) => {
+                    eprintln!("Cannot encode Iota discovery identity: {error}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            protocols: vec!["identity-http-v1".into(), "mtp-relay-v2".into()],
+            node_descriptor: Some("/federation/v1/node".into()),
+            direct_endpoints: Vec::new(),
+            relay_hints: Vec::new(),
+        },
+        local_users: services.local_users.clone(),
+        descriptor_publisher: Arc::new(
+            iota_storage::identity::SqliteLocalDescriptorPublisher::new(node_identity.clone()),
+        ),
+        node_descriptor,
+        node_identity: node_identity.clone(),
+        client_keys: Arc::new(client::HostedAndPeerKeyResolver::new(
+            services.local_users.clone(),
+        )),
+        mtp_handler,
     };
     match web_server::start(web_config, runtime.cancellation.clone()).await {
         Ok(None) => {

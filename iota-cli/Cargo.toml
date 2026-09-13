@@ -15,10 +15,11 @@ iota-paths = { path = "../iota-paths" }
 
 
 chrono = "0.4.43"
-crossterm = "*"
+crossterm = "0.29.0"
 once_cell = "1.21.3"
 open = "5.3.3"
-ratatui = "0.30.0"
+ratatool = { git = "https://git.methanium.net/methanium/ratatool.git", features = ["tokio"] }
+ratatui = "0.30.2"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 tokio = { version = "1.50.0", features = ["full"] }

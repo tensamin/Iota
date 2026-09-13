@@ -13,11 +13,11 @@ use std::{
 };
 use tokio::time::Instant;
 
+use crate::theme::ResolvedTheme;
 use crate::{
     elements::elements::{Element, InteractableElement, JoinableElement},
-    interaction_result::InteractionResult,
     ipc_client::IpcClient,
-    render_context::RenderContext,
+    screens::screens::IotaInteraction,
     util::borders::draw_block_joins,
 };
 
@@ -300,18 +300,13 @@ impl Element for ConsoleCard {
         self
     }
 
-    fn render(&self, f: &mut Frame, r: Rect, context: &RenderContext<'_>) {
-        if matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) {
-            let inner = crate::controls::panel::render_panel(
-                f,
-                r,
-                &self.title,
-                self.focused,
-                context.theme,
-            );
+    fn render(&self, f: &mut Frame, r: Rect, theme: &ResolvedTheme) {
+        if matches!(theme.chrome, crate::theme::ChromeMode::Surfaces) {
+            let inner =
+                crate::controls::panel::render_panel(f, r, &self.title, self.focused, theme);
             f.render_widget(
-                Paragraph::new(Line::from(self.render_cursor_spans(context.theme)))
-                    .style(context.theme.console.text),
+                Paragraph::new(Line::from(self.render_cursor_spans(theme)))
+                    .style(theme.console.text),
                 inner,
             );
             return;
@@ -319,15 +314,15 @@ impl Element for ConsoleCard {
         let block = Block::default()
             .borders(self.borders)
             .title(self.title.clone())
-            .title_style(context.theme.console.title)
+            .title_style(theme.console.title)
             .border_style(if self.focused {
-                context.theme.console.focused_border
+                theme.console.focused_border
             } else {
-                context.theme.console.border
+                theme.console.border
             })
-            .style(context.theme.console.text);
+            .style(theme.console.text);
 
-        let spans = self.render_cursor_spans(context.theme);
+        let spans = self.render_cursor_spans(theme);
         let par = Paragraph::new(Line::from(spans))
             .block(block)
             .scroll((0, 0));
@@ -338,9 +333,9 @@ impl Element for ConsoleCard {
             self.borders,
             self.joins,
             if self.focused {
-                context.theme.borders.focused
+                theme.borders.focused
             } else {
-                context.theme.borders.normal
+                theme.borders.normal
             },
         );
     }
@@ -389,7 +384,7 @@ impl InteractableElement for ConsoleCard {
         self
     }
 
-    fn interact(&mut self, key: KeyEvent) -> InteractionResult {
+    fn interact(&mut self, key: KeyEvent) -> IotaInteraction {
         // Check if a previously failed command should be restored.
         if let Some(restored) = self.pending_restore.lock().unwrap().take() {
             self.content = restored;
@@ -401,26 +396,26 @@ impl InteractableElement for ConsoleCard {
             if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
                 self.dispatch_command(command);
             }
-            return InteractionResult::Handled;
+            return IotaInteraction::Changed;
         }
 
         match key.code {
             KeyCode::Enter => {
                 if self.content.is_empty() {
-                    return InteractionResult::Handled;
+                    return IotaInteraction::Changed;
                 }
 
                 let command = self.content.clone();
                 if let Some(error) = iota_ipc::text_commands::validation_error(&command) {
                     self.message = Some(error);
-                    return InteractionResult::Handled;
+                    return IotaInteraction::Changed;
                 }
                 if command.trim_start_matches('/').trim() == "help" {
                     self.message = Some(format!(
                         "Commands: {}",
                         iota_ipc::text_commands::COMMANDS.join(", ")
                     ));
-                    return InteractionResult::Handled;
+                    return IotaInteraction::Changed;
                 }
                 if self.history.last() != Some(&command) {
                     self.history.push(command.clone());
@@ -434,12 +429,12 @@ impl InteractableElement for ConsoleCard {
                 } else {
                     self.dispatch_command(command);
                 }
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Backspace => {
                 self.message = None;
                 self.delete_at_cursor();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Delete => {
                 self.message = None;
@@ -454,41 +449,41 @@ impl InteractableElement for ConsoleCard {
                         .unwrap_or(self.content.len());
                     self.content.replace_range(start..end, "");
                 }
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Left => {
                 self.move_cursor_left();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Right => {
                 self.move_cursor_right();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Home => {
                 self.cursor_position = 0;
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::End => {
                 self.cursor_position = self.content.chars().count();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Up => {
                 self.history_previous();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Down => {
                 self.history_next();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Tab if !self.content.is_empty() => {
                 if self.complete() {
-                    InteractionResult::Handled
+                    IotaInteraction::Changed
                 } else {
                     self.message = Some("No command completion.".into());
-                    InteractionResult::Handled
+                    IotaInteraction::Changed
                 }
             }
-            KeyCode::Tab | KeyCode::BackTab => InteractionResult::Unhandled,
+            KeyCode::Tab | KeyCode::BackTab => IotaInteraction::Unhandled,
             _ => {
                 if !key
                     .modifiers
@@ -497,10 +492,10 @@ impl InteractableElement for ConsoleCard {
                     if let Some(c) = key.code.as_char() {
                         self.insert_at_cursor(c);
                         self.message = None;
-                        return InteractionResult::Handled;
+                        return IotaInteraction::Changed;
                     }
                 }
-                InteractionResult::Unhandled
+                IotaInteraction::Unhandled
             }
         }
     }

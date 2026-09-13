@@ -17,6 +17,10 @@ impl ThemeName {
     pub fn supported_names() -> &'static str {
         "monospace, binary, ansi, surface"
     }
+
+    pub fn ratatool_id(self) -> ratatool::ThemeId {
+        ratatool::ThemeId::new(self.to_string())
+    }
 }
 
 impl fmt::Display for ThemeName {

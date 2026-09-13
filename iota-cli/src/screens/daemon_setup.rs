@@ -1,44 +1,36 @@
+use crate::theme::ResolvedTheme;
 use crate::{
     controls::{
         button::{ActionButton, ButtonIntent, render_button},
-        choice::{ChoiceKind, render_choice_line},
-        radio_group::{RadioGroup, RadioItem},
+        choice::{ChoiceKind, ChoiceVisualState, render_choice_line},
     },
-    interaction_result::InteractionResult,
-    render_context::RenderContext,
-    screens::screens::{HitMap, Screen, UiEvent},
+    screens::screens::{HitMap, IotaInteraction, IotaScreen, UiEvent},
 };
 use crossterm::event::KeyCode;
+use ratatool::{DisabledFocusPolicy, RadioGroup, RadioGroupError, RadioItem};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     text::{Line, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use std::any::Any;
 use tokio::sync::oneshot;
 
 /// Kept on screen while the launcher waits for the daemon's IPC hello.  The
 /// setup choice screen is intentionally closed before its decision is sent,
 /// so without this the terminal would otherwise be blank during startup.
 pub struct DaemonStartingScreen;
-impl Screen for DaemonStartingScreen {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-    fn render(
+impl IotaScreen for DaemonStartingScreen {
+    fn render_legacy(
         &self,
         frame: &mut Frame,
         area: Rect,
-        context: &RenderContext<'_>,
+        theme: &ResolvedTheme,
         _hits: &mut HitMap,
     ) {
-        let popup = crate::layout::fit::centered_rect(
+        let popup = ratatool::layout::centered_rect(
             area,
-            crate::layout::fit::RequiredSize {
+            ratatool::layout::RequiredSize {
                 width: 48,
                 height: 5,
             },
@@ -52,13 +44,13 @@ impl Screen for DaemonStartingScreen {
                 Block::default()
                     .title(" Iota daemon ")
                     .borders(Borders::ALL)
-                    .border_style(context.theme.borders.normal),
+                    .border_style(theme.borders.normal),
             ),
             popup,
         );
     }
-    fn handle_event(&mut self, _: UiEvent) -> InteractionResult {
-        InteractionResult::Handled
+    fn handle_event(&mut self, _: &UiEvent) -> IotaInteraction {
+        IotaInteraction::Changed
     }
 }
 
@@ -99,7 +91,7 @@ impl DaemonSetupScreen {
         options: Vec<LaunchOption>,
         message: impl Into<String>,
         sender: oneshot::Sender<DaemonSetupDecision>,
-    ) -> Result<Self, crate::controls::radio_group::RadioGroupError> {
+    ) -> Result<Self, RadioGroupError> {
         let items: Vec<RadioItem<DaemonLaunchMode>> = options
             .into_iter()
             .map(|o| RadioItem {
@@ -119,9 +111,9 @@ impl DaemonSetupScreen {
             .iter()
             .find(|item| item.enabled)
             .map(|item| item.value)
-            .ok_or(crate::controls::radio_group::RadioGroupError::NoEnabledItems)?;
+            .ok_or(RadioGroupError::NoEnabledItems)?;
         let mut choices = RadioGroup::new(items, None, default)?;
-        choices.set_focus_policy(crate::controls::navigation::DisabledFocusPolicy::Include);
+        choices.set_focus_policy(DisabledFocusPolicy::Include);
         Ok(Self {
             choices,
             focus: Focus::Options,
@@ -134,15 +126,15 @@ impl DaemonSetupScreen {
             let _ = tx.send(d);
         }
     }
-    fn activate(&mut self) -> InteractionResult {
+    fn activate(&mut self) -> IotaInteraction {
         match self.focus {
             Focus::Options => {
                 self.choices.select_focused();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             Focus::Exit => {
                 self.complete(DaemonSetupDecision::Exit);
-                InteractionResult::CloseScreen
+                IotaInteraction::Pop
             }
             Focus::Action => {
                 let choice = *self.choices.selected();
@@ -154,9 +146,9 @@ impl DaemonSetupScreen {
                     .is_some_and(|i| i.enabled)
                 {
                     self.complete(DaemonSetupDecision::Start(choice));
-                    InteractionResult::CloseScreen
+                    IotaInteraction::Pop
                 } else {
-                    InteractionResult::Handled
+                    IotaInteraction::Changed
                 }
             }
         }
@@ -190,23 +182,17 @@ impl DaemonSetupScreen {
         };
     }
 }
-impl Screen for DaemonSetupScreen {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-    fn render(
+impl IotaScreen for DaemonSetupScreen {
+    fn render_legacy(
         &self,
         frame: &mut Frame,
         area: Rect,
-        context: &RenderContext<'_>,
+        theme: &ResolvedTheme,
         _hits: &mut HitMap,
     ) {
-        let popup = crate::layout::fit::centered_rect(
+        let popup = ratatool::layout::centered_rect(
             area,
-            crate::layout::fit::RequiredSize {
+            ratatool::layout::RequiredSize {
                 width: 68,
                 height: 16,
             },
@@ -216,14 +202,18 @@ impl Screen for DaemonSetupScreen {
             lines.push(render_choice_line(
                 &item.label,
                 ChoiceKind::Radio,
-                self.choices.visual_state(&item.value),
-                context.theme,
+                {
+                    let state = self.choices.visual_state(&item.value);
+                    ChoiceVisualState {
+                        selected: state.selected,
+                        focused: state.focused,
+                        enabled: state.enabled,
+                    }
+                },
+                theme,
             ));
             if let Some(reason) = &item.description {
-                lines.push(Line::styled(
-                    format!("    {reason}"),
-                    context.theme.text.muted,
-                ));
+                lines.push(Line::styled(format!("    {reason}"), theme.text.muted));
             }
         }
         let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(popup);
@@ -248,7 +238,7 @@ impl Screen for DaemonSetupScreen {
                 focused: self.focus == Focus::Exit,
                 enabled: true,
             },
-            context.theme,
+            theme,
         );
         let selected = *self.choices.selected();
         let enabled = self
@@ -275,28 +265,29 @@ impl Screen for DaemonSetupScreen {
                 focused: self.focus == Focus::Action,
                 enabled,
             },
-            context.theme,
+            theme,
         );
     }
-    fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
+    fn handle_event(&mut self, event: &UiEvent) -> IotaInteraction {
+        let event = event.clone();
         let UiEvent::Key(event) = event else {
-            return InteractionResult::Unhandled;
+            return IotaInteraction::Unhandled;
         };
         match event.code {
             KeyCode::Esc => {
                 self.complete(DaemonSetupDecision::Exit);
-                InteractionResult::CloseScreen
+                IotaInteraction::Pop
             }
             KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
                 self.next();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Up | KeyCode::Left | KeyCode::BackTab => {
                 self.previous();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.activate(),
-            _ => InteractionResult::Unhandled,
+            _ => IotaInteraction::Unhandled,
         }
     }
 }

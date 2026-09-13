@@ -1,10 +1,9 @@
+use crate::theme::ResolvedTheme;
 use crate::{
     controls::choice::{ChoiceKind, ChoiceVisualState, render_choice_line},
-    interaction_result::InteractionResult,
-    render_context::RenderContext,
     screens::{
         md_viewer::FileViewer,
-        screens::{HitMap, Screen, UiEvent},
+        screens::{HitMap, IotaInteraction, IotaScreen, UiEvent},
     },
     util::{buttons::draw_buttons, terms_focus::Focus},
 };
@@ -16,7 +15,6 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph},
 };
-use std::{any::Any, pin::Pin};
 use tokio::sync::oneshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,15 +48,8 @@ impl TermsCheckerScreen {
     }
 }
 
-impl Screen for TermsCheckerScreen {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn render(&self, f: &mut Frame, size: Rect, context: &RenderContext<'_>, _hits: &mut HitMap) {
+impl IotaScreen for TermsCheckerScreen {
+    fn render_legacy(&self, f: &mut Frame, size: Rect, theme: &ResolvedTheme, _hits: &mut HitMap) {
         let mut needed_height = 5;
 
         if size.height < 6 || size.width < 27 {
@@ -176,7 +167,7 @@ impl Screen for TermsCheckerScreen {
                     focused: self.focus == Focus::Eula,
                     enabled: true,
                 },
-                context.theme,
+                theme,
             ),
             render_choice_line(
                 tos_text,
@@ -186,7 +177,7 @@ impl Screen for TermsCheckerScreen {
                     focused: self.focus == Focus::Tos,
                     enabled: self.eula,
                 },
-                context.theme,
+                theme,
             ),
             render_choice_line(
                 pp_text,
@@ -196,7 +187,7 @@ impl Screen for TermsCheckerScreen {
                     focused: self.focus == Focus::Pp,
                     enabled: self.eula,
                 },
-                context.theme,
+                theme,
             ),
             Line::from(""),
             Line::from("¹ Necessary– required to run the program"),
@@ -217,19 +208,19 @@ impl Screen for TermsCheckerScreen {
 
         if size.width < 60 || size.height < needed_height as u16 {
             let width_style = if size.width > 76 {
-                context.theme.status.success
+                theme.status.success
             } else if size.width >= 60 {
-                context.theme.status.warning
+                theme.status.warning
             } else {
-                context.theme.status.error
+                theme.status.error
             };
 
             let height_style = if size.height > 19 {
-                context.theme.status.success
+                theme.status.success
             } else if size.height >= 13 {
-                context.theme.status.warning
+                theme.status.warning
             } else {
-                context.theme.status.error
+                theme.status.error
             };
 
             let warning_text = Text::from(vec![
@@ -271,13 +262,14 @@ impl Screen for TermsCheckerScreen {
             true,
             false,
             true,
-            context.theme,
+            theme,
         );
     }
 
-    fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
+    fn handle_event(&mut self, event: &UiEvent) -> IotaInteraction {
+        let event = event.clone();
         let UiEvent::Key(event) = event else {
-            return InteractionResult::Unhandled;
+            return IotaInteraction::Unhandled;
         };
         let mut possible_states = vec![Focus::Eula, Focus::Tos, Focus::Pp, Focus::Cancel];
 
@@ -293,21 +285,21 @@ impl Screen for TermsCheckerScreen {
                 if let Some(sender) = self.sender.take() {
                     let _ = sender.send(UserChoice::Deny);
                 }
-                InteractionResult::CloseScreen
+                IotaInteraction::Pop
             }
             KeyCode::Up | KeyCode::Left => {
                 self.focus.prev(&possible_states);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
                 self.focus.next(&possible_states);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => {
                 if let Some(sender) = self.sender.take() {
                     let _ = sender.send(UserChoice::Deny);
                 }
-                InteractionResult::CloseScreen
+                IotaInteraction::Pop
             }
             KeyCode::Char('o') | KeyCode::Char('O') => {
                 let terms_type = match self.focus {
@@ -322,77 +314,75 @@ impl Screen for TermsCheckerScreen {
                         .iter()
                         .find(|document| document.kind() == terms_type)
                         .cloned();
-                    let fut: Pin<Box<dyn Future<Output = Box<dyn Screen>> + Send>> =
-                        Box::pin(async move {
-                            if let Some(document) = document {
-                                let screen: FileViewer =
-                                    FileViewer::new(terms_type.to_string(), document.content());
-                                Box::new(screen) as Box<dyn Screen>
-                            } else {
-                                let screen: FileViewer = FileViewer::new(
-                                    "Error".to_string(),
-                                    "The fetched legal document is unavailable.",
-                                );
-                                Box::new(screen) as Box<dyn Screen>
-                            }
-                        });
-                    InteractionResult::OpenFutureScreen { screen: fut }
+                    let screen = match document {
+                        Some(document) => {
+                            FileViewer::new(terms_type.to_string(), document.content())
+                        }
+                        None => FileViewer::new(
+                            "Error".to_string(),
+                            "The fetched legal document is unavailable.",
+                        ),
+                    };
+                    IotaInteraction::Push {
+                        screen: Box::new(screen),
+                        presentation: ratatool::ScreenPresentation::Replace,
+                    }
                 } else {
-                    InteractionResult::Unhandled
+                    IotaInteraction::Unhandled
                 }
             }
             KeyCode::Char('l') | KeyCode::Char('L') => match self.focus {
                 Focus::Eula => {
                     let _ = open::that(get_link(TermsType::EULA));
-                    InteractionResult::Handled
+                    IotaInteraction::Changed
                 }
                 Focus::Tos => {
                     let _ = open::that(get_link(TermsType::TOS));
-                    InteractionResult::Handled
+                    IotaInteraction::Changed
                 }
                 Focus::Pp => {
                     let _ = open::that(get_link(TermsType::PP));
-                    InteractionResult::Handled
+                    IotaInteraction::Changed
                 }
-                _ => InteractionResult::Unhandled,
+                _ => IotaInteraction::Unhandled,
             },
             KeyCode::Enter | KeyCode::Char(' ') => match self.focus {
                 Focus::Eula => {
                     self.eula = !self.eula;
                     self.tos = false;
                     self.pp = false;
-                    InteractionResult::Handled
+                    IotaInteraction::Changed
                 }
                 Focus::Tos if self.eula => {
                     self.tos = !self.tos;
-                    InteractionResult::Handled
+                    IotaInteraction::Changed
                 }
                 Focus::Pp if self.eula => {
                     self.pp = !self.pp;
-                    InteractionResult::Handled
+                    IotaInteraction::Changed
                 }
                 Focus::Cancel => {
                     if let Some(sender) = self.sender.take() {
                         let _ = sender.send(UserChoice::Deny);
                     }
-                    InteractionResult::CloseScreen
+                    IotaInteraction::Pop
                 }
                 Focus::Continue if self.eula => {
                     if let Some(sender) = self.sender.take() {
                         let _ = sender.send(UserChoice::AcceptEULA);
                     }
-                    InteractionResult::CloseScreen
+                    IotaInteraction::Pop
                 }
                 Focus::ContinueAll if self.eula && self.tos && self.pp => {
                     if let Some(sender) = self.sender.take() {
                         let _ = sender.send(UserChoice::AcceptAll);
                     }
-                    InteractionResult::CloseScreen
+                    IotaInteraction::Pop
                 }
-                _ => InteractionResult::Unhandled,
+                _ => IotaInteraction::Unhandled,
             },
 
-            _ => InteractionResult::Unhandled,
+            _ => IotaInteraction::Unhandled,
         }
     }
 }

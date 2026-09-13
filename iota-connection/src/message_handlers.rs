@@ -25,6 +25,8 @@ fn next_notification_id() -> u32 {
 pub struct MessageMutation {
     pub sender_id: i64,
     pub partner_id: i64,
+    pub partner_principal: iota_identity::PrincipalHandle,
+    pub sender_principal: iota_identity::PrincipalHandle,
     pub send_time: i64,
 }
 
@@ -77,10 +79,20 @@ pub fn message_mutation(cv: &CommunicationValue) -> Result<MessageMutation, Comm
     let send_time = data_i64(cv, DataType::SendTime)
         .filter(|time| *time > 0)
         .ok_or_else(|| error_response(cv, CommunicationType::ErrorInvalidData))?;
+    let partner_principal = chats_util::get_user(sender_id, partner_id)
+        .map_err(|_| error_response(cv, CommunicationType::ErrorInternal))?
+        .and_then(|contact| contact.principal)
+        .ok_or_else(|| error_response(cv, CommunicationType::ErrorNotFound))?;
+    let sender_principal = iota_storage::identity::SqlitePrincipalStore
+        .principal_for_local_user(iota_identity::LocalUserId(sender_id))
+        .map_err(|_| error_response(cv, CommunicationType::ErrorInternal))?
+        .ok_or_else(|| error_response(cv, CommunicationType::ErrorNotFound))?;
 
     Ok(MessageMutation {
         sender_id,
         partner_id,
+        partner_principal,
+        sender_principal,
         send_time,
     })
 }
@@ -169,6 +181,8 @@ fn validate_relay_identity(
 pub fn apply_verified_relay_content(
     context: &VerifiedRelayContext,
     content: &VerifiedRelayContent,
+    signer_principal: iota_identity::PrincipalHandle,
+    recipient_principal: iota_identity::PrincipalHandle,
     accepted_at: i64,
     storage_owner: i64,
     sent_by_self: bool,
@@ -205,6 +219,7 @@ pub fn apply_verified_relay_content(
                 return chat_files::change_message_state_by_relay_id(
                     storage_owner,
                     recipient_id,
+                    recipient_principal,
                     relay_message_id,
                     state,
                 )
@@ -213,8 +228,10 @@ pub fn apply_verified_relay_content(
             chat_files::record_message_receipt(
                 storage_owner,
                 recipient_id,
+                recipient_principal,
                 relay_message_id,
                 sender_id,
+                signer_principal,
                 &context.message_id,
                 state,
                 event_at,
@@ -251,15 +268,25 @@ pub fn apply_verified_relay_content(
                     "Relay MessageSend identity does not match its protected message ID".into(),
                 );
             }
-            let chat_id = if sender_id < recipient_id {
+            let chat_id = e2ee_storage::principal_chat_id(signer_principal, recipient_principal)
+                .ok_or_else(|| "Relay MessageSend has an invalid principal pair".to_string())?;
+            let legacy_chat_id = if sender_id < recipient_id {
                 format!("{sender_id}:{recipient_id}")
             } else {
                 format!("{recipient_id}:{sender_id}")
             };
+            e2ee_storage::migrate_chat_secret_namespace(
+                &storage_owner.to_string(),
+                &legacy_chat_id,
+                &format!("chat:{legacy_chat_id}:main"),
+                &chat_id,
+                &e2ee_storage::principal_secret_id(&chat_id),
+            )
+            .map_err(|error| error.to_string())?;
             let latest_secret = e2ee_storage::get_chat_secret(ChatSecretQuery {
                 user_id: storage_owner.to_string(),
                 chat_id: chat_id.clone(),
-                secret_id: Some(format!("chat:{chat_id}:main")),
+                secret_id: Some(e2ee_storage::principal_secret_id(&chat_id)),
                 version: None,
             })
             .map_err(|error| error.to_string())?
@@ -269,6 +296,7 @@ pub fn apply_verified_relay_content(
             }
             chat_files::add_message(chat_files::NewMessage {
                 relay_signer_id: sender_id,
+                relay_signer_principal: signer_principal,
                 relay_message_id: &context.message_id,
                 authored_at: created_at,
                 send_time,
@@ -277,6 +305,11 @@ pub fn apply_verified_relay_content(
                     recipient_id
                 } else {
                     sender_id
+                },
+                external_principal: if sent_by_self {
+                    recipient_principal
+                } else {
+                    signer_principal
                 },
                 sent_by_self,
                 content: message,
@@ -305,18 +338,25 @@ pub fn apply_verified_relay_content(
             } else {
                 sender_id
             };
+            let external_principal = if sent_by_self {
+                recipient_principal
+            } else {
+                signer_principal
+            };
             let result = if sent_by_self {
-                chat_files::edit_message(
+                chat_files::edit_message_for_principal(
                     storage_owner,
                     external_user,
+                    external_principal,
                     send_time,
                     sender_id,
                     message,
                 )
             } else {
-                chat_files::apply_remote_edit(
+                chat_files::apply_remote_edit_for_principal(
                     storage_owner,
                     external_user,
+                    external_principal,
                     send_time,
                     sender_id,
                     message,
@@ -336,20 +376,29 @@ pub fn apply_verified_relay_content(
             } else {
                 sender_id
             };
+            let external_principal = if sent_by_self {
+                recipient_principal
+            } else {
+                signer_principal
+            };
             let result = if content.message_type == CommunicationType::MessageReactionAdd {
-                chat_files::add_reaction(
+                chat_files::add_reaction_for_principal(
                     storage_owner,
                     external_user,
+                    external_principal,
                     send_time,
                     sender_id,
+                    signer_principal,
                     reaction,
                 )
             } else {
-                chat_files::remove_reaction(
+                chat_files::remove_reaction_for_principal(
                     storage_owner,
                     external_user,
+                    external_principal,
                     send_time,
                     sender_id,
+                    signer_principal,
                     reaction,
                 )
             };
@@ -364,10 +413,26 @@ pub fn apply_verified_relay_content(
             } else {
                 sender_id
             };
-            let result = if sent_by_self {
-                chat_files::delete_message(storage_owner, external_user, send_time)
+            let external_principal = if sent_by_self {
+                recipient_principal
             } else {
-                chat_files::apply_remote_delete(storage_owner, external_user, send_time, sender_id)
+                signer_principal
+            };
+            let result = if sent_by_self {
+                chat_files::delete_message_for_principal(
+                    storage_owner,
+                    external_user,
+                    external_principal,
+                    send_time,
+                )
+            } else {
+                chat_files::apply_remote_delete_for_principal(
+                    storage_owner,
+                    external_user,
+                    external_principal,
+                    send_time,
+                    sender_id,
+                )
             };
             result.map_err(|error| error.to_string())
         }
@@ -434,10 +499,23 @@ pub fn apply_verified_relay_content(
             if recipient_ids != expected_recipient_ids {
                 return Err("Relay SetChatSecret recipients do not match relay identities".into());
             }
+            let principal_chat_id =
+                e2ee_storage::principal_chat_id(signer_principal, recipient_principal).ok_or_else(
+                    || "Relay SetChatSecret has an invalid principal pair".to_string(),
+                )?;
+            let principal_secret_id = e2ee_storage::principal_secret_id(&principal_chat_id);
+            e2ee_storage::migrate_chat_secret_namespace(
+                &storage_owner.to_string(),
+                &chat_id,
+                &secret_id,
+                &principal_chat_id,
+                &principal_secret_id,
+            )
+            .map_err(|error| error.to_string())?;
             e2ee_storage::put_chat_secret(e2ee_storage::StoredChatSecret {
                 user_id: storage_owner.to_string(),
-                chat_id,
-                secret_id,
+                chat_id: principal_chat_id,
+                secret_id: principal_secret_id,
                 version,
                 encrypted_secret: recipient.encrypted_secret.clone(),
                 kem_ciphertext: recipient.kem_ciphertext.clone(),
@@ -520,9 +598,10 @@ pub fn handle_message_edit(cv: &CommunicationValue) -> CommunicationValue {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
 
-    match chat_files::edit_message(
+    match chat_files::edit_message_for_principal(
         mutation.sender_id,
         mutation.partner_id,
+        mutation.partner_principal,
         mutation.send_time,
         mutation.sender_id,
         content,
@@ -545,19 +624,23 @@ pub fn handle_message_reaction(cv: &CommunicationValue, add: bool) -> Communicat
     }
 
     let result = if add {
-        chat_files::add_reaction(
+        chat_files::add_reaction_for_principal(
             mutation.sender_id,
             mutation.partner_id,
+            mutation.partner_principal,
             mutation.send_time,
             mutation.sender_id,
+            mutation.sender_principal,
             reaction,
         )
     } else {
-        chat_files::remove_reaction(
+        chat_files::remove_reaction_for_principal(
             mutation.sender_id,
             mutation.partner_id,
+            mutation.partner_principal,
             mutation.send_time,
             mutation.sender_id,
+            mutation.sender_principal,
             reaction,
         )
     };
@@ -577,7 +660,12 @@ pub fn handle_message_delete(cv: &CommunicationValue) -> CommunicationValue {
         Err(response) => return response,
     };
 
-    match chat_files::delete_message(mutation.sender_id, mutation.partner_id, mutation.send_time) {
+    match chat_files::delete_message_for_principal(
+        mutation.sender_id,
+        mutation.partner_id,
+        mutation.partner_principal,
+        mutation.send_time,
+    ) {
         Ok(()) => success_response(cv),
         Err(_) => error_response(cv, CommunicationType::ErrorNotFound),
     }
@@ -738,18 +826,92 @@ pub fn handle_get_chat_secret(cv: &CommunicationValue) -> CommunicationValue {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
 
+    let mut participants = match chat_id
+        .split(':')
+        .map(str::parse::<i64>)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(participants) => participants,
+        Err(_) => return error_response(cv, CommunicationType::ErrorInvalidData),
+    };
+    if participants.len() != 2
+        || participants.iter().any(|participant| *participant <= 0)
+        || participants[0] == participants[1]
+        || !participants.contains(&sender_id)
+    {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    }
+    participants.sort_unstable();
+    if chat_id != format!("{}:{}", participants[0], participants[1]) {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    }
+    let partner_id = if participants[0] == sender_id {
+        participants[1]
+    } else {
+        participants[0]
+    };
+    let partner_principal = match chats_util::get_user(sender_id, partner_id) {
+        Ok(Some(contact)) => match contact.principal {
+            Some(principal) => principal,
+            None => return error_response(cv, CommunicationType::ErrorNotFound),
+        },
+        Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
+        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+    };
+    let owner_principal = match iota_storage::identity::SqlitePrincipalStore
+        .principal_for_local_user(iota_identity::LocalUserId(sender_id))
+    {
+        Ok(Some(principal)) => principal,
+        Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
+        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+    };
+    let Some(principal_chat_id) =
+        e2ee_storage::principal_chat_id(owner_principal, partner_principal)
+    else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let requested_secret_id = data_string(cv, DataType::SecretId);
+    let legacy_main_secret_id = format!("chat:{chat_id}:main");
+    if e2ee_storage::migrate_chat_secret_namespace(
+        &user_id,
+        &chat_id,
+        &legacy_main_secret_id,
+        &principal_chat_id,
+        &e2ee_storage::principal_secret_id(&principal_chat_id),
+    )
+    .is_err()
+    {
+        return error_response(cv, CommunicationType::ErrorInternal);
+    }
+    let principal_secret_id = requested_secret_id.as_ref().map(|secret_id| {
+        if secret_id == &legacy_main_secret_id {
+            e2ee_storage::principal_secret_id(&principal_chat_id)
+        } else {
+            format!("{principal_chat_id}:{secret_id}")
+        }
+    });
+
     match e2ee_storage::get_chat_secret(ChatSecretQuery {
         user_id,
-        chat_id,
-        secret_id: data_string(cv, DataType::SecretId),
+        chat_id: principal_chat_id.clone(),
+        secret_id: principal_secret_id,
         version: data_i64(cv, DataType::VersionNumber),
     }) {
         Ok(Some(record)) => CommunicationValue::new(CommunicationType::ChatSecretResponse)
             .with_request_id(cv)
             .with_receiver(sender_wire_id(sender_id))
             .add_typed_default(DataType::UserId, DataValue::Str(record.user_id))
-            .add_typed_default(DataType::ChatId, DataValue::Str(record.chat_id))
-            .add_typed_default(DataType::SecretId, DataValue::Str(record.secret_id))
+            .add_typed_default(DataType::ChatId, DataValue::Str(chat_id))
+            .add_typed_default(
+                DataType::SecretId,
+                DataValue::Str(requested_secret_id.unwrap_or_else(|| {
+                    if record.secret_id == e2ee_storage::principal_secret_id(&principal_chat_id) {
+                        legacy_main_secret_id
+                    } else {
+                        record.secret_id
+                    }
+                })),
+            )
             .add_typed_default(
                 DataType::VersionNumber,
                 DataValue::SignedNumber(record.version as i128),
@@ -1030,7 +1192,7 @@ pub fn handle_account_state_request(cv: &CommunicationValue) -> CommunicationVal
             DataValue::Array(
                 blocked_users
                     .into_iter()
-                    .map(|id| DataValue::SignedNumber(id.into()))
+                    .map(|blocked| DataValue::SignedNumber(blocked.blocked_user_id.into()))
                     .collect(),
             ),
         );
@@ -1153,7 +1315,7 @@ pub fn handle_message_get(cv: &CommunicationValue) -> CommunicationValue {
             Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
             Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
         },
-        None => match chat_files::get_message(owner, send_time, None) {
+        None => match chat_files::get_message(owner, send_time, None, None) {
             Ok(Some(message)) => (message, None),
             Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
             Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
@@ -1262,7 +1424,20 @@ pub fn handle_read_notification(cv: &CommunicationValue) -> NotificationMutation
         };
     };
 
-    match chats_util::read_notifications(owner, partner_id, through) {
+    let Ok(Some(contact)) = chats_util::get_user(owner, partner_id) else {
+        return NotificationMutation {
+            response: error_response(cv, CommunicationType::ErrorNotFound),
+            changed: None,
+        };
+    };
+    let Some(principal) = contact.principal else {
+        return NotificationMutation {
+            response: error_response(cv, CommunicationType::ErrorInternal),
+            changed: None,
+        };
+    };
+
+    match chats_util::read_notifications(owner, principal, through) {
         Ok(Some(contact)) => NotificationMutation {
             response: notification_response(
                 CommunicationType::ReadNotification,
@@ -2161,7 +2336,19 @@ pub fn handle_user_block(cv: &CommunicationValue) -> PolicyMutation {
             changed: None,
         };
     };
-    match blocked_users::block(user_id, blocked_user_id) {
+    let Ok(Some(contact)) = chats_util::get_user(user_id, blocked_user_id) else {
+        return PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorNotFound),
+            changed: None,
+        };
+    };
+    let Some(blocked_principal) = contact.principal else {
+        return PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorInternal),
+            changed: None,
+        };
+    };
+    match blocked_users::block(user_id, blocked_principal) {
         Ok(record) => PolicyMutation {
             response: CommunicationValue::new(CommunicationType::UserBlock)
                 .with_request_id(cv)
@@ -2209,7 +2396,19 @@ pub fn handle_user_unblock(cv: &CommunicationValue) -> PolicyMutation {
             changed: None,
         };
     };
-    match blocked_users::unblock(user_id, blocked_user_id) {
+    let Ok(Some(contact)) = chats_util::get_user(user_id, blocked_user_id) else {
+        return PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorNotFound),
+            changed: None,
+        };
+    };
+    let Some(blocked_principal) = contact.principal else {
+        return PolicyMutation {
+            response: error_response(cv, CommunicationType::ErrorInternal),
+            changed: None,
+        };
+    };
+    match blocked_users::unblock(user_id, blocked_principal) {
         Ok(mutation) => PolicyMutation {
             response: CommunicationValue::new(CommunicationType::UserUnblock)
                 .with_request_id(cv)
@@ -2253,7 +2452,7 @@ pub fn handle_blocked_users_get(cv: &CommunicationValue) -> CommunicationValue {
                 DataValue::Array(
                     users
                         .into_iter()
-                        .map(|id| DataValue::SignedNumber(id.into()))
+                        .map(|blocked| DataValue::SignedNumber(blocked.blocked_user_id.into()))
                         .collect(),
                 ),
             ),
@@ -2422,7 +2621,15 @@ pub fn handle_user_block_check(cv: &CommunicationValue) -> CommunicationValue {
     let Some(receiver_id) = data_i64(cv, DataType::ReceiverId).filter(|id| *id > 0) else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
-    match blocked_users::is_blocked(receiver_id, sender_id) {
+    let sender_principal = match chats_util::get_user(receiver_id, sender_id) {
+        Ok(Some(contact)) => match contact.principal {
+            Some(principal) => principal,
+            None => return error_response(cv, CommunicationType::ErrorNotFound),
+        },
+        Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
+        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+    };
+    match blocked_users::is_principal_blocked(receiver_id, sender_principal) {
         Ok(blocked) => CommunicationValue::new(CommunicationType::UserBlockCheck)
             .with_request_id(cv)
             .add_typed_default(DataType::IsBlocked, DataValue::Bool(blocked)),
@@ -2439,9 +2646,11 @@ mod stored_message_tests {
     #[test]
     fn relay_message_value_has_a_single_sender_id() {
         let message = StoredMessage {
+            external_principal: None,
             id: 1,
             external_user: 9,
             relay_signer_id: Some(9),
+            relay_signer_principal: None,
             relay_message_id: Some("relay-1".to_string()),
             message_time: 2,
             authored_at: None,
@@ -2548,4 +2757,48 @@ mod synced_settings_tests {
 
         assert!(response.is_err());
     }
+}
+#[derive(Clone, Debug)]
+pub struct RelayApplicationContext {
+    pub signer: iota_identity::PrincipalHandle,
+    pub recipient: iota_identity::PrincipalHandle,
+    pub signer_principal: iota_identity::PrincipalId,
+    pub recipient_principal: iota_identity::PrincipalId,
+    pub hosted_sender: Option<iota_identity::LocalUserId>,
+    pub hosted_recipient: Option<iota_identity::LocalUserId>,
+    pub legacy: Option<LegacyRelayApplicationData>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LegacyRelayApplicationData {
+    pub signer_id: u64,
+    pub recipient_id: u64,
+}
+
+pub fn apply_relay_application_content(
+    application: &RelayApplicationContext,
+    context: &VerifiedRelayContext,
+    content: &VerifiedRelayContent,
+    accepted_at: i64,
+) -> Result<(), String> {
+    if application.signer_principal.user_id != context.signer_id
+        || application.recipient_principal.user_id != context.final_recipient_id
+    {
+        return Err("Relay application identity does not match verified content".into());
+    }
+    let (storage_owner, sent_by_self) =
+        match (application.hosted_sender, application.hosted_recipient) {
+            (Some(sender), _) => (sender.0, true),
+            (None, Some(recipient)) => (recipient.0, false),
+            (None, None) => return Err("Relay application has no hosted principal".into()),
+        };
+    apply_verified_relay_content(
+        context,
+        content,
+        application.signer,
+        application.recipient,
+        accepted_at,
+        storage_owner,
+        sent_by_self,
+    )
 }

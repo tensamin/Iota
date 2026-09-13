@@ -13,11 +13,11 @@ pub fn empty_message(supported: bool) -> &'static str {
 pub fn render(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
-    context: &crate::render_context::RenderContext<'_>,
+    theme: &crate::theme::ResolvedTheme,
     supported: bool,
 ) {
     frame.render_widget(
-        ratatui::widgets::Paragraph::new(empty_message(supported)).style(context.theme.text.muted),
+        ratatui::widgets::Paragraph::new(empty_message(supported)).style(theme.text.muted),
         area,
     );
 }

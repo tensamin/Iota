@@ -1,5 +1,3 @@
-use std::any::Any;
-
 use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
@@ -7,15 +5,15 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+use crate::theme::ResolvedTheme;
 use crate::{
     elements::{
         elements::Element,
         graph_card::{GRAPHS, GraphCard},
     },
-    interaction_result::InteractionResult,
-    render_context::RenderContext,
-    screens::screens::{AppAction, HitMap, KeyHint, Screen, UiEvent},
-    ui::UI,
+    screens::screens::{
+        AppAction, HitMap, IotaInteraction, IotaMessage, IotaScreen, KeyHint, UiEvent,
+    },
 };
 
 const RANGES: &[(usize, &str)] = &[(30, "Recent"), (120, "Medium"), (300, "Long")];
@@ -26,18 +24,17 @@ pub struct MetricsScreen {
 }
 
 impl MetricsScreen {
-    pub async fn new(ui: std::sync::Arc<UI>) -> Option<Self> {
-        let state = ui.client_state().await?;
+    pub fn from_state(state: iota_state::ClientState) -> Self {
         let mut screen = Self {
             graphs: vec![
-                GraphCard::new(ui.clone(), state.clone(), GRAPHS::Ram, "RAM".into()),
-                GraphCard::new(ui.clone(), state.clone(), GRAPHS::Cpu, "CPU".into()),
-                GraphCard::new(ui, state, GRAPHS::Ping, "Ping".into()),
+                GraphCard::new(state.clone(), GRAPHS::Ram, "RAM".into()),
+                GraphCard::new(state.clone(), GRAPHS::Cpu, "CPU".into()),
+                GraphCard::new(state, GRAPHS::Ping, "Ping".into()),
             ],
             range_index: 0,
         };
         screen.apply_range();
-        Some(screen)
+        screen
     }
 
     fn apply_range(&mut self) {
@@ -54,26 +51,18 @@ impl MetricsScreen {
     }
 }
 
-impl Screen for MetricsScreen {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn render(
+impl IotaScreen for MetricsScreen {
+    fn render_legacy(
         &self,
         frame: &mut Frame,
         area: Rect,
-        context: &RenderContext<'_>,
+        theme: &ResolvedTheme,
         hits: &mut HitMap,
     ) {
         let block = Block::default()
             .title(" Metrics ")
             .borders(Borders::ALL)
-            .border_style(context.theme.borders.normal);
+            .border_style(theme.borders.normal);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let rows = Layout::vertical([
@@ -88,32 +77,31 @@ impl Screen for MetricsScreen {
                 "Range: {} ({} samples)   Left/Right to change",
                 RANGES[self.range_index].1, RANGES[self.range_index].0
             ))
-            .style(context.theme.text.heading),
+            .style(theme.text.heading),
             rows[0],
         );
         for (graph, graph_area) in self.graphs.iter().zip(rows[1..].iter()) {
-            graph.render(frame, *graph_area, context);
+            graph.render(frame, *graph_area, theme);
         }
-        hits.register(rows[0], AppAction::OpenMetrics);
+        hits.register(rows[0], IotaMessage::Action(AppAction::OpenMetrics));
     }
 
-    fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
+    fn handle_event(&mut self, event: &UiEvent) -> IotaInteraction {
+        let event = event.clone();
         let UiEvent::Key(key) = event else {
-            return InteractionResult::Unhandled;
+            return IotaInteraction::Unhandled;
         };
         match key.code {
             KeyCode::Left => {
                 self.change_range(-1);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Right => {
                 self.change_range(1);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
-            KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => {
-                InteractionResult::CloseScreen
-            }
-            _ => InteractionResult::Unhandled,
+            KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => IotaInteraction::Pop,
+            _ => IotaInteraction::Unhandled,
         }
     }
 

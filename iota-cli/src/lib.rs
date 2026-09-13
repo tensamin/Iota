@@ -24,12 +24,7 @@ pub mod util {
 pub mod app_state;
 pub mod controls;
 pub mod help_overlay;
-pub mod input_handler;
-pub mod interaction_result;
 pub mod ipc_client;
-pub mod layout;
-pub mod notification;
-pub mod render_context;
 pub mod theme;
 pub mod ui;
 pub use ui::TuiSession;

@@ -9,9 +9,7 @@ use iota_ipc::{
     UserOperationSummary, UserReconcileResult, UserSummary,
 };
 use iota_logger::{log, log_command};
-use iota_storage::users::pending_operations::{
-    self, PendingUserOperation, PendingUserOperationKind, PendingUserOperationPhase,
-};
+use iota_storage::users::pending_operations::{self, PendingUserOperationKind};
 use iota_storage::users::user_manager;
 use iota_storage::util::config_util::{self};
 use iota_util::mtp_compat::OptionalDataValueExt;
@@ -19,7 +17,9 @@ use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::accounts::{AccountError, CreateUserRequest};
 use crate::daemon_state::{ShutdownReason, StartupPhase};
+use iota_identity::LocalUserId;
 
 pub use iota_ipc::IpcRole;
 
@@ -172,7 +172,7 @@ impl CommandRouter {
         {
             return ResponseResult::Error(IpcErrorCode::Unauthorized);
         }
-        let needs_omikron = matches!(
+        let needs_account_authority = matches!(
             request,
             LocalRequest::CreateUser { .. }
                 | LocalRequest::InspectTuCredential { .. }
@@ -180,12 +180,17 @@ impl CommandRouter {
                 | LocalRequest::ReconcileUser { .. }
                 | LocalRequest::ReleaseUser { .. }
                 | LocalRequest::CompleteDeleteUser { .. }
-                | LocalRequest::CreateInvitation {
-                    authority: InvitationAuthority::Omega,
-                    ..
-                }
         );
-        if needs_omikron && !self.services.omikron.is_connected().await {
+        let needs_centralized_provider = matches!(
+            request,
+            LocalRequest::CreateInvitation {
+                authority: InvitationAuthority::Omega,
+                ..
+            }
+        );
+        if (needs_account_authority && !self.services.accounts.is_available().await)
+            || (needs_centralized_provider && self.services.centralized.is_none())
+        {
             return ResponseResult::Error(
                 if self.runtime.current_startup_phase() != StartupPhase::Ready {
                     IpcErrorCode::NotReady
@@ -287,6 +292,9 @@ impl CommandRouter {
                 if lifetime_seconds == 0 || lifetime_seconds > 7 * 24 * 60 * 60 {
                     return ResponseResult::Error(IpcErrorCode::InvalidRequest);
                 }
+                let Some(omikron) = self.services.omikron() else {
+                    return ResponseResult::Error(IpcErrorCode::OmikronUnavailable);
+                };
                 let password_protected = password.is_some();
                 let mut request = CommunicationValue::new(CommunicationType::CreateUserInvitation)
                     .add_typed_default(
@@ -309,9 +317,7 @@ impl CommandRouter {
                         DataValue::Str(label.clone()),
                     );
                 }
-                let response = match self
-                    .services
-                    .omikron
+                let response = match omikron
                     .await_response(&request, Duration::from_secs(20))
                     .await
                 {
@@ -387,9 +393,10 @@ impl CommandRouter {
             }
             LocalRequest::ListInvitations { authority } => {
                 if authority != Some(InvitationAuthority::Iota)
-                    && self.services.omikron.is_connected().await
+                    && let Some(omikron) = self.services.omikron()
+                    && omikron.is_connected().await
                 {
-                    match self.services.omikron.sync_omega_invitations().await {
+                    match omikron.sync_omega_invitations().await {
                         Ok(()) => {}
                         Err(omikron_connector::OmikronError::Storage(_)) => {
                             return ResponseResult::Error(IpcErrorCode::StorageFailure);
@@ -487,11 +494,10 @@ impl CommandRouter {
                 if !changed {
                     return ResponseResult::Error(IpcErrorCode::Conflict);
                 }
-                if self.services.omikron.is_connected().await {
-                    self.services
-                        .omikron
-                        .flush_pending_invitation_actions()
-                        .await;
+                if let Some(omikron) = self.services.omikron()
+                    && omikron.is_connected().await
+                {
+                    omikron.flush_pending_invitation_actions().await;
                 }
                 let invitation =
                     match iota_storage::users::invitations::list()
@@ -541,40 +547,41 @@ impl CommandRouter {
                 }))
             }
             LocalRequest::CreateUser { username } => {
-                match omikron_connector::user_ops::create_user(
-                    self.services.omikron.as_ref(),
-                    &username,
-                )
-                .await
+                match self
+                    .services
+                    .accounts
+                    .create_user(CreateUserRequest { username })
+                    .await
                 {
                     Ok(user) => ResponseResult::Ok(ResponsePayload::UserCreated {
-                        user_id: user.user_id,
+                        user_id: user.user.0,
                         username: user.username,
                     }),
                     Err(error) => {
                         log!("User creation failed: {error:?}");
                         match error {
-                            omikron_connector::user_ops::CreateUserError::InvalidUsername => {
+                            AccountError::InvalidRequest(_) => {
                                 ResponseResult::Error(IpcErrorCode::InvalidRequest)
                             }
-                            omikron_connector::user_ops::CreateUserError::Transport(
-                                omikron_connector::OmikronError::Timeout(_),
-                            ) => ResponseResult::Error(IpcErrorCode::Timeout),
-                            omikron_connector::user_ops::CreateUserError::Transport(_) => {
+                            AccountError::Timeout(_) => {
+                                ResponseResult::Error(IpcErrorCode::Timeout)
+                            }
+                            AccountError::Unavailable(_) => {
                                 ResponseResult::Error(IpcErrorCode::OmikronUnavailable)
                             }
-                            omikron_connector::user_ops::CreateUserError::RemoteRejected => {
+                            AccountError::Conflict(_) => {
                                 ResponseResult::Error(IpcErrorCode::Conflict)
                             }
-                            omikron_connector::user_ops::CreateUserError::LocalFinalizationPending { .. } => {
+                            AccountError::Storage(_) => {
                                 ResponseResult::Error(IpcErrorCode::StorageFailure)
                             }
-                            omikron_connector::user_ops::CreateUserError::LocalPersistence(_) => {
-                                ResponseResult::Error(IpcErrorCode::StorageFailure)
-                            }
-                            omikron_connector::user_ops::CreateUserError::InvalidResponse => {
+                            AccountError::Internal(_) => {
                                 ResponseResult::Error(IpcErrorCode::InternalFailure)
                             }
+                            AccountError::Unauthorized(_) => {
+                                ResponseResult::Error(IpcErrorCode::Unauthorized)
+                            }
+                            AccountError::NotFound => ResponseResult::Error(IpcErrorCode::NotFound),
                         }
                     }
                 }
@@ -594,14 +601,14 @@ impl CommandRouter {
                 }
             },
             LocalRequest::AttachUserFromTu { credential } => {
-                match omikron_connector::user_ops::attach_user_from_tu(
-                    self.services.omikron.as_ref(),
-                    &credential.0,
-                )
-                .await
+                match self
+                    .services
+                    .accounts
+                    .attach_user(credential.0.as_bytes())
+                    .await
                 {
                     Ok(user) => ResponseResult::Ok(ResponsePayload::Acknowledged {
-                        message: format!("Added {} ({}) to this Iota", user.username, user.user_id),
+                        message: format!("Added {} ({}) to this Iota", user.username, user.user.0),
                     }),
                     Err(error) => {
                         log!("Credential attach failed: {error:?}");
@@ -610,15 +617,15 @@ impl CommandRouter {
                 }
             }
             LocalRequest::InspectTuCredential { credential } => {
-                match omikron_connector::user_ops::inspect_tu_credential(
-                    self.services.omikron.as_ref(),
-                    &credential.0,
-                )
-                .await
+                match self
+                    .services
+                    .accounts
+                    .inspect_credential(credential.0.as_bytes())
+                    .await
                 {
                     Ok(preview) => ResponseResult::Ok(ResponsePayload::TuCredentialPreview(
                         iota_ipc::TuCredentialPreview {
-                            user_id: preview.user_id,
+                            user_id: preview.user.0,
                             username: preview.username,
                             assigned_iota_id: preview.assigned_iota_id,
                         },
@@ -635,32 +642,20 @@ impl CommandRouter {
                     Ok(None) => return ResponseResult::Error(IpcErrorCode::NotFound),
                     Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
                 };
-                let omega_iota_id = match omikron_connector::user_ops::get_remote_user_assignment(
-                    self.services.omikron.as_ref(),
-                    user_id,
-                )
-                .await
+                let reconciliation = match self
+                    .services
+                    .accounts
+                    .reconcile_user(LocalUserId(user_id))
+                    .await
                 {
-                    Ok(assignment) => assignment,
+                    Ok(result) => result,
                     Err(error) => {
                         log!("User reconciliation failed for {user_id}: {error:?}");
                         return ResponseResult::Error(IpcErrorCode::OmikronUnavailable);
                     }
                 };
-                let local_iota_id = config_util::CONFIG
-                    .load()
-                    .iota_id
-                    .and_then(|id| i64::try_from(id).ok());
-                let action = if residency.state == user_manager::LocalUserState::Managed
-                    && omega_iota_id != local_iota_id
-                {
-                    match user_manager::finalize_local_release(user_id, Some(&residency.username)) {
-                        Ok(()) => ReconcileAction::ReleasedLocally,
-                        Err(error) => {
-                            log!("User reconciliation cleanup failed for {user_id}: {error}");
-                            return ResponseResult::Error(IpcErrorCode::StorageFailure);
-                        }
-                    }
+                let action = if reconciliation.released_locally {
+                    ReconcileAction::ReleasedLocally
                 } else {
                     ReconcileAction::None
                 };
@@ -672,7 +667,7 @@ impl CommandRouter {
                             iota_ipc::LocalUserState::Released
                         }
                     },
-                    omega_iota_id,
+                    omega_iota_id: reconciliation.remote_iota_id,
                     action,
                 }))
             }
@@ -787,12 +782,11 @@ impl CommandRouter {
                 let Ok(contents) = contents else {
                     return ResponseResult::Error(IpcErrorCode::Unauthorized);
                 };
-                match omikron_connector::user_ops::complete_delete_user_with_tu(
-                    self.services.omikron.as_ref(),
-                    &contents,
-                    user_id,
-                )
-                .await
+                match self
+                    .services
+                    .accounts
+                    .delete_user(LocalUserId(user_id), contents.as_bytes())
+                    .await
                 {
                     Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
                         message: format!("Deleted Tensamin account {user_id}"),
@@ -805,76 +799,41 @@ impl CommandRouter {
             }
             LocalRequest::RemoveUser { .. } => ResponseResult::Error(IpcErrorCode::InvalidRequest),
             LocalRequest::ReleaseUser { user_id } => {
-                let user = match user_manager::get_user(user_id) {
-                    Ok(user) => user,
-                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
-                };
-                let Some(user) = user else {
-                    return ResponseResult::Error(IpcErrorCode::NotFound);
-                };
-                if pending_operations::upsert(&PendingUserOperation {
-                    user_id,
-                    operation: PendingUserOperationKind::Release,
-                    username: user.username,
-                    public_key: None,
-                    private_key_hash: None,
-                    reset_token: None,
-                    registration_token: None,
-                    phase: PendingUserOperationPhase::Prepared,
-                    created_at: now_millis(),
-                })
-                .is_err()
-                {
-                    return ResponseResult::Error(IpcErrorCode::StorageFailure);
-                }
-                let request = CommunicationValue::new(CommunicationType::ReleaseUserFromIota)
-                    .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
                 match self
                     .services
-                    .omikron
-                    .await_response(&request, Duration::from_secs(20))
+                    .accounts
+                    .release_user(LocalUserId(user_id))
                     .await
                 {
-                    Ok(response) if response.is_type(CommunicationType::Success) => {
-                        match user_manager::release_user(user_id) {
-                            Ok(()) if pending_operations::remove(user_id).is_ok() => {
-                                ResponseResult::Ok(ResponsePayload::Acknowledged {
-                                    message: format!(
-                                        "Released user {user_id}; hosted data was retained"
-                                    ),
-                                })
-                            }
-                            Ok(()) => ResponseResult::Error(IpcErrorCode::StorageFailure),
-                            Err(error) => {
-                                log!(
-                                    "Remote release succeeded but local cleanup failed for {user_id}: {error}"
-                                );
-                                ResponseResult::Error(IpcErrorCode::StorageFailure)
-                            }
-                        }
-                    }
-                    Ok(response) if response.is_type(CommunicationType::ErrorNotAuthenticated) => {
-                        let _ = pending_operations::remove(user_id);
+                    Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: format!("Released user {user_id}; hosted data was retained"),
+                    }),
+                    Err(AccountError::NotFound) => ResponseResult::Error(IpcErrorCode::NotFound),
+                    Err(AccountError::Unauthorized(_)) => {
                         ResponseResult::Error(IpcErrorCode::Unauthorized)
                     }
-                    Ok(_) => {
-                        let _ = pending_operations::remove(user_id);
-                        ResponseResult::Error(IpcErrorCode::Conflict)
+                    Err(AccountError::Conflict(_)) => ResponseResult::Error(IpcErrorCode::Conflict),
+                    Err(AccountError::Timeout(_)) => ResponseResult::Error(IpcErrorCode::Timeout),
+                    Err(AccountError::Unavailable(_)) => {
+                        ResponseResult::Error(IpcErrorCode::OmikronUnavailable)
                     }
-                    Err(omikron_connector::OmikronError::Timeout(_)) => {
-                        ResponseResult::Error(IpcErrorCode::Timeout)
+                    Err(AccountError::Storage(_)) => {
+                        ResponseResult::Error(IpcErrorCode::StorageFailure)
                     }
-                    Err(_) => ResponseResult::Error(IpcErrorCode::OmikronUnavailable),
+                    Err(_) => ResponseResult::Error(IpcErrorCode::InternalFailure),
                 }
             }
-            LocalRequest::ReconnectOmikron => match self.services.omikron.reconnect().await {
-                Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
-                    message: "Reconnected to Omikron server".into(),
-                }),
-                Err(_) => ResponseResult::Error(IpcErrorCode::OmikronUnavailable),
+            LocalRequest::ReconnectOmikron => match self.services.omikron() {
+                Some(omikron) => match omikron.reconnect().await {
+                    Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: "Reconnected to Omikron server".into(),
+                    }),
+                    Err(_) => ResponseResult::Error(IpcErrorCode::OmikronUnavailable),
+                },
+                None => ResponseResult::Error(IpcErrorCode::OmikronUnavailable),
             },
-            LocalRequest::RotateIotaIdentity => {
-                match self.services.omikron.rotate_identity().await {
+            LocalRequest::RotateIotaIdentity => match self.services.omikron() {
+                Some(omikron) => match omikron.rotate_identity().await {
                     Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
                         message: "New identity registered with Omikron".into(),
                     }),
@@ -882,8 +841,9 @@ impl CommandRouter {
                         log!("Iota identity rotation failed: {}", error);
                         ResponseResult::Error(IpcErrorCode::OmikronUnavailable)
                     }
-                }
-            }
+                },
+                None => ResponseResult::Error(IpcErrorCode::OmikronUnavailable),
+            },
             LocalRequest::RequestProcessExit { intent } => {
                 if matches!(intent, ExitIntent::Restart)
                     && !matches!(
@@ -938,7 +898,10 @@ impl CommandRouter {
                 Err(_) => ResponseResult::Error(IpcErrorCode::InvalidRequest),
             },
             LocalRequest::GetOmikronStatus => {
-                let connected = self.services.omikron.is_connected().await;
+                let connected = match self.services.omikron() {
+                    Some(omikron) => omikron.is_connected().await,
+                    None => false,
+                };
                 let iota_id = config_util::CONFIG.load().iota_id;
                 ResponseResult::Ok(ResponsePayload::OmikronStatus(OmikronStatusResponse {
                     connected,

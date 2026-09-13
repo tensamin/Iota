@@ -1,5 +1,5 @@
 use super::model::{UserAction, UserActionGroup};
-use crate::controls::menu::{MenuItem, MenuState};
+use ratatool::{MenuItem, MenuState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserActionMenu {

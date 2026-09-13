@@ -76,6 +76,7 @@ pub struct IpcClient {
     pending: Mutex<HashMap<u64, PendingRequest>>,
     connection_state: watch::Sender<IpcConnectionState>,
     daemon_status: watch::Sender<DaemonStatus>,
+    ui_updates: watch::Sender<u64>,
     path: PathBuf,
     reconnector_started: AtomicBool,
     cancellation: CancellationToken,
@@ -110,6 +111,7 @@ impl IpcClient {
         };
         let (conn_state_tx, _) = watch::channel(IpcConnectionState::Connected);
         let (daemon_status_tx, _) = watch::channel(initial_status);
+        let (ui_updates_tx, _) = watch::channel(0);
         let client = Arc::new(Self {
             state: ClientState::new(),
             writer: Mutex::new(Some(ActiveWriter {
@@ -122,6 +124,7 @@ impl IpcClient {
             pending: Mutex::new(HashMap::new()),
             connection_state: conn_state_tx,
             daemon_status: daemon_status_tx,
+            ui_updates: ui_updates_tx,
             path: path.clone(),
             reconnector_started: AtomicBool::new(false),
             cancellation: CancellationToken::new(),
@@ -413,6 +416,10 @@ impl IpcClient {
 
     pub fn daemon_status(&self) -> watch::Receiver<DaemonStatus> {
         self.daemon_status.subscribe()
+    }
+
+    pub fn ui_updates(&self) -> watch::Receiver<u64> {
+        self.ui_updates.subscribe()
     }
 
     /// Stop the IPC reader/reconnector and release the socket writer.  This
@@ -903,5 +910,8 @@ impl IpcClient {
                 });
             }
         }
+        self.ui_updates.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
     }
 }

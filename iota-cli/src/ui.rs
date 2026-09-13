@@ -1,267 +1,239 @@
+use std::{
+    io,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
+
+use crossterm::event::{KeyCode, KeyModifiers};
+use once_cell::sync::Lazy;
+use ratatool::{
+    AsyncEventSource, Interaction, NotificationOverlay, Runtime, ScreenPresentation,
+    SessionOptions, TerminalSession, ThemeState,
+};
+use ratatui::layout::{Constraint, Layout, Rect};
+use tokio::{
+    sync::{RwLock, mpsc},
+    task::JoinHandle,
+};
+use tokio_util::sync::CancellationToken;
+
 use crate::{
     controls::header::{HEADER_ITEMS, render_header},
     help_overlay::HelpOverlay,
-    input_handler::setup_input_handler,
-    interaction_result::InteractionResult,
     ipc_client::{DaemonStatus, IpcClient, IpcConnectionState},
-    notification::{Notification, render_notification_area},
-    render_context::RenderContext,
     screens::{
-        main_screen::MainScreen,
         metrics::MetricsScreen,
         overview::OverviewScreen,
-        screens::{AppAction, AppEvent, HitMap, Screen, UiEvent},
+        screens::{
+            AppAction, AppEvent, HitMap, IotaEffect, IotaInteraction, IotaMessage, IotaScreen,
+            UiEvent,
+        },
         settings::SettingsScreen,
-        users::{UserEntry, UsersScreen},
+        users::{
+            UserEntry, UsersScreen, context::credential_status_label,
+            credential_export::write_private_export, model::UserAction,
+        },
     },
     theme::{self, ResolvedTheme, ThemeName},
 };
-use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, MouseEventKind,
-};
-use once_cell::sync::Lazy;
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Layout, Rect},
-};
-use std::{
-    io,
-    io::Stdout,
-    panic::PanicHookInfo,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-};
-use tokio::sync::{Notify, RwLock, mpsc};
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-
-/// UI state and rendering
 
 pub static FPS: Lazy<RwLock<(f64, f64)>> = Lazy::new(|| RwLock::new((0.0, 0.0)));
 
-pub struct UI {
-    ipc: RwLock<Option<Arc<IpcClient>>>,
+const UI_EVENT_CAPACITY: usize = 128;
+const UI_COMMAND_CAPACITY: usize = 32;
+static NEXT_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
+
+struct DriverThemeConfig {
+    selected: ThemeName,
+    color: theme::TerminalPolicy,
+    unicode: theme::TerminalPolicy,
+}
+
+pub struct DaemonViewState {
+    pub connection: tokio::sync::watch::Receiver<IpcConnectionState>,
+    pub status: tokio::sync::watch::Receiver<DaemonStatus>,
+}
+
+struct IotaScreenEntry {
+    screen: Box<dyn IotaScreen>,
+    presentation: ScreenPresentation,
+}
+
+pub struct IotaShellState {
+    screens: Vec<IotaScreenEntry>,
+    header_focus: Option<usize>,
+    notifications: NotificationOverlay,
+    daemon_view: Option<DaemonViewState>,
+    ipc: Option<Arc<IpcClient>>,
+    theme: ResolvedTheme,
     shutdown_on_empty: bool,
+}
+
+pub type SharedShellState = Arc<Mutex<IotaShellState>>;
+
+pub enum UiCommand {
+    Push(Box<dyn IotaScreen>, ScreenPresentation),
+    ReplaceRoot(Box<dyn IotaScreen>),
+    AttachDaemon(Arc<IpcClient>),
+    Notify(ratatool::Notification),
+    SetTheme(Box<ResolvedTheme>),
+    Shutdown,
+    Redraw,
+}
+
+#[derive(Clone)]
+pub struct UiHandle {
+    commands: mpsc::Sender<UiCommand>,
+    event_tx: mpsc::Sender<IotaMessage>,
     cancellation: CancellationToken,
-    pub terminal: Arc<Mutex<Terminal<CrosstermBackend<Stdout>>>>,
-    screen_stack: Arc<RwLock<Vec<Box<dyn Screen>>>>,
-    theme: RwLock<Arc<ResolvedTheme>>,
-    pub(crate) invalidation: Notify,
+    ipc: Arc<RwLock<Option<Arc<IpcClient>>>>,
     failure: Arc<Mutex<Option<String>>>,
-    hits: Mutex<HitMap>,
-    app_event_tx: mpsc::UnboundedSender<UiEvent>,
-    app_event_rx: Mutex<Option<mpsc::UnboundedReceiver<UiEvent>>>,
-    header_focus: Mutex<Option<usize>>,
-    notifications: Arc<Mutex<Vec<Notification>>>,
+}
+
+pub struct TuiSession {
+    ui: Arc<UiHandle>,
+    driver: JoinHandle<io::Result<()>>,
 }
 
 pub fn start_tui(ipc: Arc<IpcClient>) -> io::Result<TuiSession> {
     start_tui_with_theme(ipc, theme::resolve(ThemeName::Ansi))
 }
 
-pub fn start_tui_with_theme(ipc: Arc<IpcClient>, theme: ResolvedTheme) -> io::Result<TuiSession> {
-    start_session(UI::new(Some(ipc), true, theme)?)
+pub fn start_tui_with_theme(
+    ipc: Arc<IpcClient>,
+    initial_theme: ResolvedTheme,
+) -> io::Result<TuiSession> {
+    let config = theme::UiConfig::load_or_default();
+    start_session(Some(ipc), true, initial_theme, config.color, config.unicode)
 }
 
 pub fn start_bootstrap_tui() -> io::Result<TuiSession> {
     start_bootstrap_tui_with_theme(theme::resolve(ThemeName::Ansi))
 }
 
-pub fn start_bootstrap_tui_with_theme(theme: ResolvedTheme) -> io::Result<TuiSession> {
-    start_session(UI::new(None, false, theme)?)
+pub fn start_bootstrap_tui_with_theme(initial_theme: ResolvedTheme) -> io::Result<TuiSession> {
+    let config = theme::UiConfig::load_or_default();
+    start_session(None, false, initial_theme, config.color, config.unicode)
 }
 
-fn start_session(ui: UI) -> io::Result<TuiSession> {
-    let ui = Arc::new(ui);
-    let mut app_event_rx = ui
-        .app_event_rx
-        .lock()
-        .map_err(|_| io::Error::other("application event queue poisoned"))?
-        .take()
-        .ok_or_else(|| io::Error::other("application event queue already started"))?;
-    let app_ui = ui.clone();
-    let app_event_task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = app_ui.cancellation.cancelled() => break,
-                event = app_event_rx.recv() => match event {
-                    Some(event) => app_ui.clone().handle_event(event).await,
-                    None => break,
-                },
-            }
-        }
+pub fn start_bootstrap_tui_with_config(
+    selected: ThemeName,
+    color: theme::TerminalPolicy,
+    unicode: theme::TerminalPolicy,
+) -> io::Result<TuiSession> {
+    start_session(None, false, theme::resolve(selected), color, unicode)
+}
+
+fn start_session(
+    ipc: Option<Arc<IpcClient>>,
+    shutdown_on_empty: bool,
+    initial_theme: ResolvedTheme,
+    color_policy: theme::TerminalPolicy,
+    unicode_policy: theme::TerminalPolicy,
+) -> io::Result<TuiSession> {
+    let session = TerminalSession::enter(SessionOptions {
+        mouse_capture: true,
+        ..SessionOptions::default()
+    })?;
+    let (commands, command_rx) = mpsc::channel(UI_COMMAND_CAPACITY);
+    let (event_tx, event_source) = AsyncEventSource::channel(UI_EVENT_CAPACITY);
+    let cancellation = CancellationToken::new();
+    let selected_theme = initial_theme.name;
+    let shared_ipc = Arc::new(RwLock::new(ipc.clone()));
+    let failure = Arc::new(Mutex::new(None));
+    let shell = Arc::new(Mutex::new(IotaShellState {
+        screens: Vec::new(),
+        header_focus: None,
+        notifications: NotificationOverlay::default(),
+        daemon_view: ipc.as_ref().map(daemon_view),
+        ipc,
+        theme: initial_theme,
+        shutdown_on_empty,
+    }));
+    let ui = Arc::new(UiHandle {
+        commands: commands.clone(),
+        event_tx: event_tx.clone(),
+        cancellation: cancellation.clone(),
+        ipc: shared_ipc,
+        failure: failure.clone(),
     });
-    let uic = ui.clone();
-    let renderer_task = tokio::spawn(async move {
-        let cancellation = uic.cancellation_token();
-        let result: io::Result<()> = loop {
-            tokio::select! {
-                _ = cancellation.cancelled() => break Ok(()),
-                _ = uic.invalidation.notified() => { if !uic.is_shutdown() { uic.render().await?; } },
-            }
-        };
+    let driver = tokio::spawn(async move {
+        let result = run_driver(
+            session,
+            shell,
+            command_rx,
+            event_source,
+            event_tx,
+            cancellation.clone(),
+            DriverThemeConfig {
+                selected: selected_theme,
+                color: color_policy,
+                unicode: unicode_policy,
+            },
+        )
+        .await;
         if let Err(error) = &result {
-            *uic.failure.lock().unwrap() = Some(error.to_string());
-            uic.request_shutdown();
+            if let Ok(mut slot) = failure.lock() {
+                *slot = Some(error.to_string());
+            }
+            cancellation.cancel();
         }
         result
     });
-    let input_task = setup_input_handler(ui.clone());
-    // Some terminals deliver Ctrl+C as SIGINT even while crossterm is in raw
-    // mode. Keep this independent of key-event handling for bootstrap work.
-    let signal_task = {
-        #[cfg(unix)]
-        {
-            let signal_ui = ui.clone();
-            Some(tokio::spawn(async move {
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    signal_ui.request_shutdown();
-                }
-            }))
-        }
-        #[cfg(not(unix))]
-        {
-            None
-        }
-    };
-    let previous_hook = Arc::new(Mutex::new(Some(std::panic::take_hook())));
-    let hook_for_panic = previous_hook.clone();
-    std::panic::set_hook(Box::new(move |info: &PanicHookInfo<'_>| {
-        ratatui::restore();
-        if let Some(hook) = hook_for_panic.lock().unwrap().as_ref() {
-            hook(info);
-        }
-    }));
-    Ok(TuiSession {
-        ui,
-        renderer_task,
-        input_task,
-        app_event_task,
-        signal_task,
-        restored: AtomicBool::new(false),
-        previous_hook,
-    })
+    Ok(TuiSession { ui, driver })
 }
 
-pub struct TuiSession {
-    ui: Arc<UI>,
-    renderer_task: JoinHandle<io::Result<()>>,
-    input_task: JoinHandle<Result<(), String>>,
-    app_event_task: JoinHandle<()>,
-    signal_task: Option<JoinHandle<()>>,
-    restored: AtomicBool,
-    previous_hook: Arc<Mutex<Option<Box<dyn Fn(&PanicHookInfo<'_>) + Send + Sync + 'static>>>>,
+fn daemon_view(ipc: &Arc<IpcClient>) -> DaemonViewState {
+    DaemonViewState {
+        connection: ipc.connection_status(),
+        status: ipc.daemon_status(),
+    }
 }
 
 impl TuiSession {
-    pub fn ui(&self) -> Arc<UI> {
+    pub fn ui(&self) -> Arc<UiHandle> {
         self.ui.clone()
     }
+
     pub async fn shutdown(mut self) -> Option<String> {
         self.ui.request_shutdown();
-        // Restore raw-mode state before waiting on cooperative tasks.  A
-        // misbehaving task must never leave the invoking shell unusable.
-        self.restore_terminal_once();
-        let renderer =
-            tokio::time::timeout(std::time::Duration::from_secs(2), &mut self.renderer_task).await;
-        let input =
-            tokio::time::timeout(std::time::Duration::from_secs(2), &mut self.input_task).await;
-        self.app_event_task.abort();
-        if renderer.is_err() {
-            self.renderer_task.abort();
-        }
-        if input.is_err() {
-            self.input_task.abort();
-        }
-        if let Some(task) = self.signal_task.as_mut() {
-            task.abort();
-            let _ = task.await;
-        }
-        self.restore_panic_hook();
-        match renderer {
-            Err(_) => Some("renderer did not stop within 2 seconds".into()),
-            Ok(Err(error)) => Some(format!("renderer task failed: {error}")),
+        match tokio::time::timeout(std::time::Duration::from_secs(2), &mut self.driver).await {
+            Err(_) => {
+                self.driver.abort();
+                Some("UiHandle driver did not stop within 2 seconds".into())
+            }
+            Ok(Err(error)) => Some(format!("UiHandle driver task failed: {error}")),
             Ok(Ok(Err(error))) => Some(error.to_string()),
-            Ok(Ok(Ok(()))) => match input {
-                Err(_) => Some("input handler did not stop within 2 seconds".into()),
-                Ok(Err(error)) => Some(format!("input handler failed: {error}")),
-                Ok(Ok(Err(error))) => Some(error),
-                Ok(Ok(Ok(()))) => None,
-            },
-        }
-    }
-    fn restore_terminal_once(&self) {
-        if !self.restored.swap(true, Ordering::AcqRel) {
-            let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
-            ratatui::restore();
-        }
-    }
-    fn restore_panic_hook(&self) {
-        if let Some(hook) = self.previous_hook.lock().unwrap().take() {
-            std::panic::set_hook(hook);
+            Ok(Ok(Ok(()))) => self.ui.failure(),
         }
     }
 }
+
 impl Drop for TuiSession {
     fn drop(&mut self) {
         self.ui.request_shutdown();
-        self.renderer_task.abort();
-        self.input_task.abort();
-        self.app_event_task.abort();
-        if let Some(task) = self.signal_task.as_ref() {
-            task.abort();
-        }
-        self.restore_panic_hook();
-        self.restore_terminal_once();
+        self.driver.abort();
     }
 }
-impl UI {
-    pub(crate) fn new(
-        ipc: Option<Arc<IpcClient>>,
-        shutdown_on_empty: bool,
-        theme: ResolvedTheme,
-    ) -> io::Result<Self> {
-        let terminal = ratatui::try_init()?;
-        crossterm::execute!(io::stdout(), EnableMouseCapture)?;
-        let (app_event_tx, app_event_rx) = mpsc::unbounded_channel();
-        Ok(Self {
-            ipc: RwLock::new(ipc),
-            shutdown_on_empty,
-            cancellation: CancellationToken::new(),
-            terminal: Arc::new(Mutex::new(terminal)),
-            screen_stack: Arc::new(RwLock::new(Vec::new())),
-            theme: RwLock::new(Arc::new(theme)),
-            invalidation: Notify::new(),
-            failure: Arc::new(Mutex::new(None)),
-            hits: Mutex::new(HitMap::default()),
-            app_event_tx,
-            app_event_rx: Mutex::new(Some(app_event_rx)),
-            header_focus: Mutex::new(None),
-            notifications: Arc::new(Mutex::new(Vec::new())),
-        })
-    }
 
+impl UiHandle {
     pub async fn ipc(&self) -> Option<Arc<IpcClient>> {
         self.ipc.read().await.clone()
     }
 
-    pub async fn client_state(&self) -> Option<iota_state::ClientState> {
-        self.ipc.read().await.as_ref().map(|ipc| ipc.state())
-    }
-
     pub async fn attach_daemon(&self, ipc: Arc<IpcClient>) {
-        *self.ipc.write().await = Some(ipc);
+        *self.ipc.write().await = Some(ipc.clone());
+        let _ = self.commands.send(UiCommand::AttachDaemon(ipc)).await;
     }
 
     pub async fn set_theme(&self, theme: ResolvedTheme) {
-        *self.theme.write().await = Arc::new(theme);
-        self.invalidate();
-    }
-    pub async fn theme_name(&self) -> ThemeName {
-        self.theme.read().await.name
+        let _ = self
+            .commands
+            .send(UiCommand::SetTheme(Box::new(theme)))
+            .await;
     }
 
     pub fn is_shutdown(&self) -> bool {
@@ -270,16 +242,17 @@ impl UI {
 
     pub fn request_shutdown(&self) {
         self.cancellation.cancel();
-        self.invalidate();
+        let _ = self.commands.try_send(UiCommand::Shutdown);
     }
+
     pub fn invalidate(&self) {
-        self.invalidation.notify_one();
+        let _ = self.event_tx.try_send(IotaMessage::Invalidate);
     }
+
     pub fn failure(&self) -> Option<String> {
-        self.failure.lock().ok().and_then(|f| f.clone())
+        self.failure.lock().ok().and_then(|failure| failure.clone())
     }
-    /// Lets bootstrap operations race their work against Ctrl+C without
-    /// blocking the input task or leaving the terminal in raw mode.
+
     pub async fn wait_for_shutdown(&self) {
         self.cancellation.cancelled().await;
     }
@@ -288,108 +261,679 @@ impl UI {
         self.cancellation.clone()
     }
 
-    pub async fn push_notification(&self, notification: Notification) {
-        if let Ok(mut notifications) = self.notifications.lock() {
-            notifications.push(notification);
-            self.invalidate();
+    pub async fn push_notification(&self, mut notification: ratatool::Notification) {
+        if notification.id == 0 {
+            notification.id = NEXT_NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = self.commands.send(UiCommand::Notify(notification)).await;
+    }
+
+    pub async fn set_screen(&self, screen: Box<dyn IotaScreen>) {
+        let _ = self
+            .commands
+            .send(UiCommand::Push(screen, ScreenPresentation::Replace))
+            .await;
+    }
+
+    pub async fn replace_screen(&self, screen: Box<dyn IotaScreen>) {
+        self.set_root_screen(screen).await;
+    }
+
+    pub async fn set_root_screen(&self, screen: Box<dyn IotaScreen>) {
+        let _ = self.commands.send(UiCommand::ReplaceRoot(screen)).await;
+    }
+
+    pub async fn render(&self) -> io::Result<()> {
+        self.commands
+            .send(UiCommand::Redraw)
+            .await
+            .map_err(|_| io::Error::other("UiHandle driver is closed"))
+    }
+}
+
+struct IotaShell {
+    state: SharedShellState,
+}
+
+impl IotaShell {
+    fn new(state: SharedShellState) -> Self {
+        Self { state }
+    }
+
+    fn route_interaction(
+        &self,
+        state: &mut IotaShellState,
+        interaction: IotaInteraction,
+    ) -> Interaction<IotaMessage> {
+        match interaction {
+            IotaInteraction::Unhandled => Interaction::Unhandled,
+            IotaInteraction::Changed => Interaction::changed(),
+            IotaInteraction::Push {
+                screen,
+                presentation,
+            } => {
+                state.screens.push(IotaScreenEntry {
+                    screen,
+                    presentation,
+                });
+                Interaction::changed()
+            }
+            IotaInteraction::Pop => {
+                state.screens.pop();
+                if state.screens.is_empty() && state.shutdown_on_empty {
+                    Interaction::Exit
+                } else {
+                    Interaction::changed()
+                }
+            }
+            IotaInteraction::Effect(effect) => Interaction::message(IotaMessage::Effect(effect)),
+            IotaInteraction::Exit => Interaction::Exit,
         }
     }
 
-    pub async fn clear_expired_notifications(&self) {
-        if let Ok(mut notifications) = self.notifications.lock() {
-            let before = notifications.len();
-            notifications.retain(|n| !n.is_expired());
-            if notifications.len() != before {
-                self.invalidate();
+    fn dispatch_action(
+        &self,
+        state: &mut IotaShellState,
+        action: AppAction,
+    ) -> Interaction<IotaMessage> {
+        let interaction = match action {
+            AppAction::Quit => IotaInteraction::Exit,
+            AppAction::OpenMain => {
+                state.screens.truncate(1);
+                IotaInteraction::Changed
             }
+            AppAction::OpenOverview => match &state.daemon_view {
+                Some(view) => IotaInteraction::Push {
+                    screen: Box::new(OverviewScreen::new(
+                        view.connection.clone(),
+                        view.status.clone(),
+                    )),
+                    presentation: ScreenPresentation::Replace,
+                },
+                None => IotaInteraction::Unhandled,
+            },
+            AppAction::OpenUsers => IotaInteraction::Effect(IotaEffect::OpenUsers),
+            AppAction::OpenSettings => IotaInteraction::Push {
+                screen: Box::new(SettingsScreen::new(state.theme.name)),
+                presentation: ScreenPresentation::Replace,
+            },
+            AppAction::OpenMetrics => match &state.ipc {
+                Some(ipc) => IotaInteraction::Push {
+                    screen: Box::new(MetricsScreen::from_state(ipc.state())),
+                    presentation: ScreenPresentation::Replace,
+                },
+                None => IotaInteraction::Unhandled,
+            },
+            action => state
+                .screens
+                .last_mut()
+                .map_or(IotaInteraction::Unhandled, |entry| {
+                    entry.screen.handle_action(action)
+                }),
+        };
+        self.route_interaction(state, interaction)
+    }
+}
+
+impl ratatool::Screen<IotaMessage> for IotaShell {
+    fn render(&mut self, ui: &mut ratatool::UiFrame<'_, '_, IotaMessage>, area: Rect) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let rows = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        let theme = state.theme.clone();
+        let (connection, daemon) = state
+            .daemon_view
+            .as_ref()
+            .map(|view| {
+                (
+                    view.connection.borrow().clone(),
+                    view.status.borrow().clone(),
+                )
+            })
+            .unwrap_or_else(|| (IpcConnectionState::Disconnected, DaemonStatus::default()));
+
+        let mut header_hits = HitMap::new();
+        render_header(
+            ui.frame(),
+            rows[0],
+            &connection,
+            &daemon,
+            &theme,
+            &mut header_hits,
+            state.header_focus,
+        );
+        for region in header_hits.regions() {
+            ui.hit_map().register(region.area, region.action.clone());
         }
+
+        let first_visible = state
+            .screens
+            .iter()
+            .rposition(|entry| entry.presentation == ScreenPresentation::Replace)
+            .unwrap_or(0);
+        for entry in &mut state.screens[first_visible..] {
+            if entry.presentation == ScreenPresentation::ModalOverlay {
+                ui.hit_map().clear();
+            }
+            entry.screen.render(ui, rows[1], &theme);
+        }
+
+        let hints = if state.header_focus.is_some() {
+            " Left/Right: choose   Enter: activate   Esc/F6: screen".to_owned()
+        } else {
+            let mut hints = state
+                .screens
+                .last()
+                .map(|entry| entry.screen.key_hints())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|hint| format!("{}: {}", hint.keys, hint.action))
+                .collect::<Vec<_>>();
+            if !hints.iter().any(|hint| hint.contains('?')) {
+                hints.push("?: Help".into());
+            }
+            format!(" {}", hints.join("   "))
+        };
+        let footer_style = ui.theme().surfaces.footer.patch(ui.theme().text.muted);
+        ui.frame().render_widget(
+            ratatui::widgets::Paragraph::new(hints).style(footer_style),
+            rows[2],
+        );
+        ui.notifications(rows[1], &state.notifications);
     }
 
-    pub async fn notifications(&self) -> Vec<Notification> {
-        self.notifications
-            .lock()
-            .map(|n| n.clone())
-            .unwrap_or_default()
+    fn handle_event(&mut self, event: &ratatool::UiEvent<IotaMessage>) -> Interaction<IotaMessage> {
+        let Ok(mut state) = self.state.lock() else {
+            return Interaction::Unhandled;
+        };
+        match event {
+            ratatool::UiEvent::Message(IotaMessage::Action(action)) => {
+                self.dispatch_action(&mut state, *action)
+            }
+            ratatool::UiEvent::Message(IotaMessage::Effect(effect)) => {
+                Interaction::message(IotaMessage::Effect(effect.clone()))
+            }
+            ratatool::UiEvent::Message(IotaMessage::Event(event)) => {
+                let interaction =
+                    state
+                        .screens
+                        .last_mut()
+                        .map_or(IotaInteraction::Unhandled, |entry| {
+                            entry
+                                .screen
+                                .handle_event(&UiEvent::Message(IotaMessage::Event(event.clone())))
+                        });
+                self.route_interaction(&mut state, interaction)
+            }
+            ratatool::UiEvent::Message(IotaMessage::Invalidate) => Interaction::changed(),
+            ratatool::UiEvent::Tick => {
+                if state.notifications.expire(Instant::now()) {
+                    Interaction::changed()
+                } else {
+                    Interaction::unchanged()
+                }
+            }
+            ratatool::UiEvent::Key(key) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('c'))
+                {
+                    return Interaction::Exit;
+                }
+                if key.code == KeyCode::F(6) {
+                    state.header_focus = if state.header_focus.is_some() {
+                        None
+                    } else {
+                        Some(0)
+                    };
+                    return Interaction::changed();
+                }
+                if key.code == KeyCode::Char('?') {
+                    state.screens.push(IotaScreenEntry {
+                        screen: Box::new(HelpOverlay::new()),
+                        presentation: ScreenPresentation::ModalOverlay,
+                    });
+                    return Interaction::changed();
+                }
+                if let Some(index) = state.header_focus {
+                    match key.code {
+                        KeyCode::Left | KeyCode::BackTab => {
+                            state.header_focus =
+                                Some((index + HEADER_ITEMS.len() - 1) % HEADER_ITEMS.len())
+                        }
+                        KeyCode::Right | KeyCode::Tab => {
+                            state.header_focus = Some((index + 1) % HEADER_ITEMS.len())
+                        }
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            let action = HEADER_ITEMS.get(index).map(|item| item.action);
+                            state.header_focus = None;
+                            if let Some(action) = action {
+                                return self.dispatch_action(&mut state, action);
+                            }
+                        }
+                        KeyCode::Esc => state.header_focus = None,
+                        _ => {}
+                    }
+                    return Interaction::changed();
+                }
+                let interaction = state
+                    .screens
+                    .last_mut()
+                    .map_or(IotaInteraction::Unhandled, |entry| {
+                        entry.screen.handle_event(&UiEvent::Key(*key))
+                    });
+                self.route_interaction(&mut state, interaction)
+            }
+            ratatool::UiEvent::Paste(text) => {
+                let interaction = state
+                    .screens
+                    .last_mut()
+                    .map_or(IotaInteraction::Unhandled, |entry| {
+                        entry.screen.handle_event(&UiEvent::Paste(text.clone()))
+                    });
+                self.route_interaction(&mut state, interaction)
+            }
+            ratatool::UiEvent::Resize { width, height } => {
+                let interaction =
+                    state
+                        .screens
+                        .last_mut()
+                        .map_or(IotaInteraction::Unhandled, |entry| {
+                            entry.screen.handle_event(&UiEvent::Resize {
+                                width: *width,
+                                height: *height,
+                            })
+                        });
+                self.route_interaction(&mut state, interaction)
+            }
+            ratatool::UiEvent::Pointer { event, hit } => {
+                let interaction =
+                    state
+                        .screens
+                        .last_mut()
+                        .map_or(IotaInteraction::Unhandled, |entry| {
+                            entry.screen.handle_event(&UiEvent::Pointer {
+                                event: *event,
+                                hit: hit.clone(),
+                            })
+                        });
+                self.route_interaction(&mut state, interaction)
+            }
+            ratatool::UiEvent::Mouse(_) => Interaction::Unhandled,
+        }
     }
+}
 
-    pub async fn set_screen(&self, screen: Box<dyn Screen>) {
-        self.screen_stack.write().await.push(screen);
-        self.invalidate();
-    }
-    pub async fn replace_screen(&self, screen: Box<dyn Screen>) {
-        let mut stack = self.screen_stack.write().await;
-        stack.clear();
-        stack.push(screen);
-        self.invalidate();
-    }
-    pub async fn set_root_screen(&self, screen: Box<dyn Screen>) {
-        let mut stack = self.screen_stack.write().await;
-        stack.clear();
-        stack.push(screen);
-        self.invalidate();
-    }
-    pub async fn handle_input(self: Arc<Self>, key_event: KeyEvent) {
-        self.handle_event(UiEvent::Key(key_event)).await;
-    }
-    pub async fn handle_event(self: Arc<Self>, event: UiEvent) {
-        if matches!(&event, UiEvent::App(AppEvent::OpenUsers)) {
-            self.open_users().await;
-            return;
-        }
-        if matches!(&event, UiEvent::App(AppEvent::OpenMetrics)) {
-            if let Some(screen) = MetricsScreen::new(self.clone()).await {
-                self.set_screen(Box::new(screen)).await;
+async fn run_driver(
+    mut session: TerminalSession,
+    shell: SharedShellState,
+    mut command_rx: mpsc::Receiver<UiCommand>,
+    mut event_source: AsyncEventSource<IotaMessage>,
+    event_tx: mpsc::Sender<IotaMessage>,
+    cancellation: CancellationToken,
+    theme_config: DriverThemeConfig,
+) -> io::Result<()> {
+    let registry = theme::registry();
+    let profile = ratatool::detect_current(&theme::terminal_options(
+        theme_config.color,
+        theme_config.unicode,
+    ));
+    let mut theme_state = ThemeState::new(theme_config.selected.ratatool_id(), profile, &registry)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut runtime = Runtime::new(IotaShell::new(shell.clone()));
+
+    while runtime.is_running() {
+        runtime.draw_if_due(session.terminal_mut(), &theme_state)?;
+        let deadline = runtime.next_redraw();
+        tokio::select! {
+            result = event_source.next(deadline) => {
+                let Some(event) = result? else { break };
+                if let Some(message) = runtime.dispatch(event) {
+                    handle_runtime_message(message, &mut runtime, &shell, &event_tx, &mut theme_state, &registry).await?;
+                }
             }
-            return;
-        }
-        if let UiEvent::App(AppEvent::ApplyTheme { theme, persist }) = &event {
-            self.set_theme(theme::resolve(*theme)).await;
-            if *persist {
-                let mut config = theme::UiConfig::load().unwrap_or_default();
-                config.theme = *theme;
-                let result = config
-                    .save()
-                    .map_err(|error| format!("Could not save UI settings: {error}"));
-                let _ = self
-                    .app_event_tx
-                    .send(UiEvent::App(AppEvent::ThemeSaved(result)));
+            command = command_rx.recv() => {
+                let Some(command) = command else { break };
+                apply_ui_command(command, &shell, &mut runtime, &event_tx, &mut theme_state, &registry).await?;
             }
-            return;
+            _ = cancellation.cancelled() => runtime.request_exit(),
+            _ = ctrl_c() => runtime.request_exit(),
         }
-        if let UiEvent::App(AppEvent::SaveSettings {
-            theme,
+    }
+    cancellation.cancel();
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn ctrl_c() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(not(unix))]
+async fn ctrl_c() {
+    std::future::pending::<()>().await;
+}
+
+async fn apply_ui_command(
+    command: UiCommand,
+    shell: &SharedShellState,
+    runtime: &mut Runtime<IotaMessage>,
+    event_tx: &mpsc::Sender<IotaMessage>,
+    theme_state: &mut ThemeState,
+    registry: &ratatool::ThemeRegistry,
+) -> io::Result<()> {
+    match command {
+        UiCommand::Push(screen, presentation) => {
+            shell
+                .lock()
+                .map_err(|_| io::Error::other("shell state poisoned"))?
+                .screens
+                .push(IotaScreenEntry {
+                    screen,
+                    presentation,
+                });
+            runtime.request_redraw();
+        }
+        UiCommand::ReplaceRoot(screen) => {
+            let mut state = shell
+                .lock()
+                .map_err(|_| io::Error::other("shell state poisoned"))?;
+            state.screens.clear();
+            state.screens.push(IotaScreenEntry {
+                screen,
+                presentation: ScreenPresentation::Replace,
+            });
+            runtime.request_redraw();
+        }
+        UiCommand::AttachDaemon(ipc) => {
+            let mut state = shell
+                .lock()
+                .map_err(|_| io::Error::other("shell state poisoned"))?;
+            state.daemon_view = Some(daemon_view(&ipc));
+            state.ipc = Some(ipc.clone());
+            drop(state);
+            bridge_daemon_updates(ipc, event_tx.clone());
+            runtime.request_redraw();
+        }
+        UiCommand::Notify(notification) => {
+            let deadline = {
+                let mut state = shell
+                    .lock()
+                    .map_err(|_| io::Error::other("shell state poisoned"))?;
+                state.notifications.push(notification);
+                state.notifications.next_expiration()
+            };
+            if let Some(deadline) = deadline {
+                runtime.request_redraw_at(deadline);
+            }
+            runtime.request_redraw();
+        }
+        UiCommand::SetTheme(theme) => {
+            theme_state
+                .select_theme(theme.name.ratatool_id(), registry)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            shell
+                .lock()
+                .map_err(|_| io::Error::other("shell state poisoned"))?
+                .theme = *theme;
+            runtime.request_redraw();
+        }
+        UiCommand::Shutdown => runtime.request_exit(),
+        UiCommand::Redraw => runtime.request_redraw(),
+    }
+    Ok(())
+}
+
+async fn handle_runtime_message(
+    message: IotaMessage,
+    runtime: &mut Runtime<IotaMessage>,
+    shell: &SharedShellState,
+    event_tx: &mpsc::Sender<IotaMessage>,
+    theme_state: &mut ThemeState,
+    registry: &ratatool::ThemeRegistry,
+) -> io::Result<()> {
+    match message {
+        IotaMessage::Action(action) => {
+            let interaction = {
+                let mut state = shell
+                    .lock()
+                    .map_err(|_| io::Error::other("shell state poisoned"))?;
+                let shell_screen = IotaShell::new(shell.clone());
+                shell_screen.dispatch_action(&mut state, action)
+            };
+            match interaction {
+                Interaction::Exit => runtime.request_exit(),
+                Interaction::Handled {
+                    changed: true,
+                    message,
+                } => {
+                    runtime.request_redraw();
+                    if let Some(message) = message {
+                        Box::pin(handle_runtime_message(
+                            message,
+                            runtime,
+                            shell,
+                            event_tx,
+                            theme_state,
+                            registry,
+                        ))
+                        .await?;
+                    }
+                }
+                Interaction::Handled {
+                    message: Some(message),
+                    ..
+                } => {
+                    Box::pin(handle_runtime_message(
+                        message,
+                        runtime,
+                        shell,
+                        event_tx,
+                        theme_state,
+                        registry,
+                    ))
+                    .await?
+                }
+                _ => {}
+            }
+        }
+        IotaMessage::Effect(effect) => {
+            run_effect(effect, runtime, shell, event_tx, theme_state, registry).await?
+        }
+        IotaMessage::Event(_) => {
+            let _ = event_tx.send(message).await;
+        }
+        IotaMessage::Invalidate => runtime.request_redraw(),
+    }
+    Ok(())
+}
+
+async fn run_effect(
+    effect: IotaEffect,
+    runtime: &mut Runtime<IotaMessage>,
+    shell: &SharedShellState,
+    event_tx: &mpsc::Sender<IotaMessage>,
+    theme_state: &mut ThemeState,
+    registry: &ratatool::ThemeRegistry,
+) -> io::Result<()> {
+    match effect {
+        IotaEffect::OpenUsers => {
+            let ipc = shell
+                .lock()
+                .map_err(|_| io::Error::other("shell state poisoned"))?
+                .ipc
+                .clone();
+            if let Some(ipc) = ipc {
+                shell
+                    .lock()
+                    .map_err(|_| io::Error::other("shell state poisoned"))?
+                    .screens
+                    .push(IotaScreenEntry {
+                        screen: Box::new(UsersScreen::loading(ipc.clone())),
+                        presentation: ScreenPresentation::Replace,
+                    });
+                runtime.request_redraw();
+                spawn_users_load(ipc, event_tx.clone());
+            }
+        }
+        IotaEffect::OpenMetrics => {
+            let ipc = shell
+                .lock()
+                .map_err(|_| io::Error::other("shell state poisoned"))?
+                .ipc
+                .clone();
+            if let Some(ipc) = ipc {
+                shell
+                    .lock()
+                    .map_err(|_| io::Error::other("shell state poisoned"))?
+                    .screens
+                    .push(IotaScreenEntry {
+                        screen: Box::new(MetricsScreen::from_state(ipc.state())),
+                        presentation: ScreenPresentation::Replace,
+                    });
+                runtime.request_redraw();
+            }
+        }
+        IotaEffect::OpenOverview => {
+            let view = {
+                let state = shell
+                    .lock()
+                    .map_err(|_| io::Error::other("shell state poisoned"))?;
+                state
+                    .daemon_view
+                    .as_ref()
+                    .map(|view| (view.connection.clone(), view.status.clone()))
+            };
+            if let Some((connection, status)) = view {
+                shell
+                    .lock()
+                    .map_err(|_| io::Error::other("shell state poisoned"))?
+                    .screens
+                    .push(IotaScreenEntry {
+                        screen: Box::new(OverviewScreen::new(connection, status)),
+                        presentation: ScreenPresentation::Replace,
+                    });
+                runtime.request_redraw();
+            }
+        }
+        IotaEffect::ApplyTheme {
+            theme: name,
+            persist,
+        } => {
+            theme_state
+                .select_theme(name.ratatool_id(), registry)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            shell
+                .lock()
+                .map_err(|_| io::Error::other("shell state poisoned"))?
+                .theme = theme::resolve(name);
+            runtime.request_redraw();
+            if persist {
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let mut config = theme::UiConfig::load_or_default();
+                    config.theme = name;
+                    let result = config
+                        .save()
+                        .map_err(|error| format!("Could not save UiHandle settings: {error}"));
+                    let _ = tx
+                        .send(IotaMessage::Event(AppEvent::ThemeSaved(result)))
+                        .await;
+                });
+            }
+        }
+        IotaEffect::SaveSettings {
+            theme: name,
             color,
             unicode,
             cli_output,
             cli_require_confirmation,
-        }) = &event
-        {
-            self.set_theme(theme::resolve(*theme)).await;
-            let mut config = theme::UiConfig::load().unwrap_or_default();
-            config.theme = *theme;
-            config.color = *color;
-            config.unicode = *unicode;
-            config.cli_output = *cli_output;
-            config.cli_require_confirmation = *cli_require_confirmation;
-            let result = config
-                .save()
-                .map_err(|error| format!("Could not save UI settings: {error}"));
-            let _ = self
-                .app_event_tx
-                .send(UiEvent::App(AppEvent::ThemeSaved(result)));
-            return;
-        }
-        if matches!(&event, UiEvent::App(AppEvent::RegenerateKeysRequested)) {
-            let Some(ipc) = self.ipc().await else {
-                let _ = self
-                    .app_event_tx
-                    .send(UiEvent::App(AppEvent::KeysRegenerated(Err(
-                        "Not connected to daemon.".into(),
-                    ))));
-                return;
-            };
-            let sender = self.app_event_tx.clone();
+        } => {
+            let options = theme::terminal_options(color, unicode);
+            let profile = ratatool::detect_current(&options);
+            theme_state
+                .select_theme(name.ratatool_id(), registry)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            theme_state
+                .set_profile(profile, registry)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            shell
+                .lock()
+                .map_err(|_| io::Error::other("shell state poisoned"))?
+                .theme = theme::resolve_with_capabilities(
+                name,
+                !matches!(profile.color_depth, ratatool::ColorDepth::None),
+                matches!(profile.charset, ratatool::Charset::Unicode),
+            );
+            runtime.request_redraw();
+            let tx = event_tx.clone();
             tokio::spawn(async move {
+                let mut config = theme::UiConfig::load_or_default();
+                config.theme = name;
+                config.color = color;
+                config.unicode = unicode;
+                config.cli_output = cli_output;
+                config.cli_require_confirmation = cli_require_confirmation;
+                let result = config
+                    .save()
+                    .map_err(|error| format!("Could not save UiHandle settings: {error}"));
+                let _ = tx
+                    .send(IotaMessage::Event(AppEvent::ThemeSaved(result)))
+                    .await;
+            });
+        }
+        other => spawn_ipc_effect(other, shell, event_tx.clone())?,
+    }
+    Ok(())
+}
+
+fn spawn_users_load(ipc: Arc<IpcClient>, tx: mpsc::Sender<IotaMessage>) {
+    tokio::spawn(async move {
+        let result = list_users(&ipc).await;
+        let _ = tx
+            .send(IotaMessage::Event(AppEvent::UsersLoaded(result)))
+            .await;
+    });
+}
+
+async fn list_users(ipc: &IpcClient) -> Result<Vec<UserEntry>, String> {
+    match ipc.send_request(iota_ipc::LocalRequest::ListUsers).await {
+        Ok(iota_ipc::ResponseResult::Ok(iota_ipc::ResponsePayload::Users(users))) => Ok(users
+            .into_iter()
+            .map(|user| UserEntry {
+                user_id: user.user_id,
+                username: user.username,
+                state: user.state,
+                data_present: user.data_present,
+                credential_status: user.credential_status,
+                pending_operation: user.pending_operation,
+            })
+            .collect()),
+        Ok(iota_ipc::ResponseResult::Error(error)) => Err(format!("Cannot load users: {error}")),
+        Ok(_) => Err("Daemon returned an unexpected response while loading users.".into()),
+        Err(error) => Err(format!("Cannot load users: {error}")),
+    }
+}
+
+fn spawn_ipc_effect(
+    effect: IotaEffect,
+    shell: &SharedShellState,
+    tx: mpsc::Sender<IotaMessage>,
+) -> io::Result<()> {
+    let ipc = shell
+        .lock()
+        .map_err(|_| io::Error::other("shell state poisoned"))?
+        .ipc
+        .clone();
+    let Some(ipc) = ipc else { return Ok(()) };
+    tokio::spawn(async move {
+        let event = match effect {
+            IotaEffect::RegenerateKeys => {
                 let result = match ipc
                     .send_request(iota_ipc::LocalRequest::RotateIotaIdentity)
                     .await
@@ -400,327 +944,234 @@ impl UI {
                     }
                     Err(error) => Err(format!("Cannot regenerate keys: {error}")),
                 };
-                let _ = sender.send(UiEvent::App(AppEvent::KeysRegenerated(result)));
-            });
-            return;
-        }
-        if let UiEvent::Key(key) = &event {
-            let header_is_focused = self
-                .header_focus
-                .lock()
-                .map(|focus| focus.is_some())
-                .unwrap_or(false);
-            if key.code == KeyCode::F(6) {
-                if let Ok(mut focus) = self.header_focus.lock() {
-                    *focus = if focus.is_some() { None } else { Some(0) };
-                }
-                self.invalidate();
-                return;
+                AppEvent::KeysRegenerated(result)
             }
-            if key.code == KeyCode::Char('?') {
-                let has_help_overlay = self
-                    .screen_stack
-                    .read()
+            IotaEffect::RefreshUsers => AppEvent::UsersLoaded(list_users(&ipc).await),
+            IotaEffect::LoadNewestTerms { kind } => {
+                let result = iota_terms::get_terms(kind)
                     .await
-                    .iter()
-                    .any(|s| s.as_any().downcast_ref::<HelpOverlay>().is_some());
-                if !has_help_overlay {
-                    self.set_screen(Box::new(HelpOverlay::new())).await;
-                }
-                return;
+                    .ok_or_else(|| "Could not fetch the legal document.".to_owned());
+                AppEvent::TermsLoaded { kind, result }
             }
-            if header_is_focused {
-                let mut action = None;
-                if let Ok(mut focus) = self.header_focus.lock() {
-                    let index = focus.unwrap_or(0).min(HEADER_ITEMS.len().saturating_sub(1));
-                    match key.code {
-                        KeyCode::Left | KeyCode::BackTab => {
-                            *focus = Some((index + HEADER_ITEMS.len() - 1) % HEADER_ITEMS.len())
-                        }
-                        KeyCode::Right | KeyCode::Tab => {
-                            *focus = Some((index + 1) % HEADER_ITEMS.len())
-                        }
-                        KeyCode::Enter | KeyCode::Char(' ') => {
-                            action = HEADER_ITEMS.get(index).map(|item| item.action);
-                            *focus = None;
-                        }
-                        KeyCode::Esc => *focus = None,
-                        _ => {}
-                    }
-                }
-                if let Some(action) = action {
-                    self.dispatch_action(action).await;
-                } else {
-                    self.invalidate();
-                }
-                return;
-            }
-        }
-        if let UiEvent::Mouse(mouse) = &event {
-            if matches!(
-                mouse.kind,
-                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            ) {
-                let action = self
-                    .hits
-                    .lock()
-                    .ok()
-                    .and_then(|hits| hits.action_at(mouse.column, mouse.row));
-                if action == Some(AppAction::FocusLogs) {
-                    self.dispatch_action(AppAction::FocusLogs).await;
-                    let key = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
-                        KeyCode::Up
-                    } else {
-                        KeyCode::Down
-                    };
-                    // Log scrolling is a local, handled interaction; route it
-                    // directly rather than recursively constructing another
-                    // async UI event future.
-                    if let Some(screen) = self.screen_stack.write().await.last_mut() {
-                        let _ = screen.handle_event(UiEvent::Key(KeyEvent::from(key)));
-                    }
-                    self.invalidate();
-                    return;
-                }
-            }
-            if matches!(
-                mouse.kind,
-                MouseEventKind::Down(crossterm::event::MouseButton::Left)
-            ) {
-                if let Some(action) = self
-                    .hits
-                    .lock()
-                    .ok()
-                    .and_then(|hits| hits.action_at(mouse.column, mouse.row))
+            IotaEffect::InspectTu { credential } => {
+                let result = match ipc
+                    .send_request(iota_ipc::LocalRequest::InspectTuCredential { credential })
+                    .await
                 {
-                    self.dispatch_action(action).await;
-                    return;
-                }
-            }
-        }
-        let result = {
-            let mut stack = self.screen_stack.write().await;
-            if let Some(screen) = stack.last_mut() {
-                screen.handle_event(event)
-            } else {
-                return;
-            }
-        };
-        match result {
-            InteractionResult::OpenScreen { screen } => {
-                self.set_screen(screen).await;
-            }
-            InteractionResult::OpenFutureScreen { screen: fut } => {
-                let ui = self.clone();
-                tokio::select! {
-                    screen = fut => ui.set_screen(screen).await,
-                    _ = ui.cancellation.cancelled() => return,
-                }
-            }
-            InteractionResult::AppTask { task } => {
-                let sender = self.app_event_tx.clone();
-                tokio::spawn(async move {
-                    let event = task.await;
-                    let _ = sender.send(event);
-                });
-            }
-            InteractionResult::CloseScreen => {
-                let mut stack = self.screen_stack.write().await;
-                stack.pop();
-
-                if stack.is_empty() && self.shutdown_on_empty {
-                    self.request_shutdown();
-                }
-            }
-            InteractionResult::Handled => {}
-            InteractionResult::Unhandled => {}
-        }
-        self.invalidate();
-    }
-
-    async fn dispatch_action(self: &Arc<Self>, action: AppAction) {
-        match action {
-            AppAction::Quit => self.request_shutdown(),
-            AppAction::OpenMain => {
-                let mut stack = self.screen_stack.write().await;
-                if stack.len() > 1 {
-                    stack.truncate(1);
-                }
-                drop(stack);
-                self.invalidate();
-            }
-            AppAction::OpenOverview => {
-                let status = {
-                    let stack = self.screen_stack.read().await;
-                    stack
-                        .iter()
-                        .rev()
-                        .find_map(|s| s.as_any().downcast_ref::<MainScreen>())
-                        .map(|main| (main.connection_status(), main.daemon_status()))
+                    Ok(iota_ipc::ResponseResult::Ok(
+                        iota_ipc::ResponsePayload::TuCredentialPreview(preview),
+                    )) => Ok(preview),
+                    Ok(iota_ipc::ResponseResult::Error(error)) => {
+                        Err(format!("Credential inspection failed: {error}"))
+                    }
+                    Ok(_) => Err(
+                        "Credential inspection failed: daemon returned an unexpected response."
+                            .into(),
+                    ),
+                    Err(error) => Err(format!("Credential inspection failed: {error}")),
                 };
-                if let Some((connection, daemon)) = status {
-                    self.set_screen(Box::new(OverviewScreen::new(connection, daemon)))
-                        .await;
-                }
+                AppEvent::TuInspected(result)
             }
-            AppAction::OpenUsers => self.open_users().await,
-            AppAction::OpenSettings => {
-                let current = self.theme_name().await;
-                self.set_screen(Box::new(SettingsScreen::new(current)))
-                    .await;
-            }
-            AppAction::OpenMetrics => {
-                if let Some(screen) = MetricsScreen::new(self.clone()).await {
-                    self.set_screen(Box::new(screen)).await;
-                }
-            }
-            action => {
-                let result = {
-                    let mut stack = self.screen_stack.write().await;
-                    stack.last_mut().map(|screen| screen.handle_action(action))
+            IotaEffect::AttachUserFromTu { credential } => {
+                let result = match ipc
+                    .send_request(iota_ipc::LocalRequest::AttachUserFromTu { credential })
+                    .await
+                {
+                    Ok(iota_ipc::ResponseResult::Ok(_)) => Ok("Attached existing user.".into()),
+                    Ok(iota_ipc::ResponseResult::Error(error)) => {
+                        Err(format!("Attach existing user failed: {error}"))
+                    }
+                    Err(error) => Err(format!("Attach existing user failed: {error}")),
                 };
-                if matches!(result, Some(InteractionResult::CloseScreen)) {
-                    let mut stack = self.screen_stack.write().await;
-                    stack.pop();
-                }
-                self.invalidate();
+                AppEvent::UserOperationFinished(result)
             }
-        }
-    }
-    async fn open_users(self: &Arc<Self>) {
-        let Some(ipc) = self.ipc().await else { return };
-        self.set_screen(Box::new(UsersScreen::loading(ipc.clone())))
-            .await;
-        let sender = self.app_event_tx.clone();
-        let ui = self.clone();
-        tokio::spawn(async move {
-            let load = async {
-                match ipc.send_request(iota_ipc::LocalRequest::ListUsers).await {
-                    Ok(iota_ipc::ResponseResult::Ok(iota_ipc::ResponsePayload::Users(users))) => {
-                        Ok(users
-                            .into_iter()
-                            .map(|u| UserEntry {
-                                user_id: u.user_id,
-                                username: u.username,
-                                state: u.state,
-                                data_present: u.data_present,
-                                credential_status: u.credential_status,
-                                pending_operation: u.pending_operation,
-                            })
-                            .collect())
+            IotaEffect::RunUserOperation { action, user_id } => {
+                let response = match action {
+                    UserAction::Release => {
+                        ipc.send_request(iota_ipc::LocalRequest::ReleaseUser { user_id })
+                            .await
+                    }
+                    UserAction::PurgeData => {
+                        ipc.send_request(iota_ipc::LocalRequest::PurgeUserData { user_id })
+                            .await
+                    }
+                    UserAction::ExportTu => {
+                        let event = AppEvent::UserOperationFinished(Err(
+                            "Credential export requires a destination path.".into(),
+                        ));
+                        let _ = tx.send(IotaMessage::Event(event)).await;
+                        return;
+                    }
+                    UserAction::DeleteAccount => {
+                        ipc.send_request(iota_ipc::LocalRequest::CompleteDeleteUser {
+                            user_id,
+                            credential: None,
+                        })
+                        .await
+                    }
+                    UserAction::Reconcile => {
+                        ipc.send_request(iota_ipc::LocalRequest::ReconcileUser { user_id })
+                            .await
+                    }
+                    UserAction::Diagnostics => {
+                        ipc.send_request(iota_ipc::LocalRequest::GetUserDiagnostics { user_id })
+                            .await
+                    }
+                    UserAction::ForceDetach => {
+                        ipc.send_request(iota_ipc::LocalRequest::ForceDetachUser { user_id })
+                            .await
+                    }
+                    UserAction::ForgetResidency => {
+                        ipc.send_request(iota_ipc::LocalRequest::ForgetReleasedUser { user_id })
+                            .await
+                    }
+                };
+                let result = match response {
+                    Ok(iota_ipc::ResponseResult::Ok(
+                        iota_ipc::ResponsePayload::UserDiagnostics(diagnostics),
+                    )) => Ok(format!(
+                        "Diagnostics: state={:?}, data={}, credential={}, trusted apps={}, pending={}",
+                        diagnostics.local_state,
+                        if diagnostics.data_present {
+                            "present"
+                        } else {
+                            "empty"
+                        },
+                        credential_status_label(diagnostics.credential_status),
+                        diagnostics.trusted_app_count,
+                        diagnostics
+                            .pending_operation
+                            .unwrap_or_else(|| "none".into()),
+                    )),
+                    Ok(iota_ipc::ResponseResult::Ok(
+                        iota_ipc::ResponsePayload::UserReconciled(result),
+                    )) => Ok(format!("Reconciliation result: {:?}.", result.action)),
+                    Ok(iota_ipc::ResponseResult::Ok(_)) => {
+                        Ok(format!("{} completed.", action.label()))
                     }
                     Ok(iota_ipc::ResponseResult::Error(error)) => {
-                        Err(format!("Cannot load users: {error}"))
+                        Err(format!("{} failed: {error}", action.label()))
+                    }
+                    Err(error) => Err(format!("{} failed: {error}", action.label())),
+                };
+                AppEvent::UserOperationFinished(result)
+            }
+            IotaEffect::ExportCredential {
+                user_id,
+                destination,
+            } => {
+                let result = match ipc
+                    .send_request(iota_ipc::LocalRequest::ExportUserCredential { user_id })
+                    .await
+                {
+                    Ok(iota_ipc::ResponseResult::Ok(
+                        iota_ipc::ResponsePayload::UserCredentialExport {
+                            user_id: response_user_id,
+                            username,
+                            credential,
+                        },
+                    )) if response_user_id == user_id => {
+                        write_private_export(&destination, credential.0.as_bytes())
+                            .map(|()| {
+                                format!(
+                                    "Exported credential for {username} to {}.",
+                                    destination.display()
+                                )
+                            })
+                            .map_err(|error| {
+                                format!(
+                                    "Credential export failed for {}: {error}",
+                                    destination.display()
+                                )
+                            })
+                    }
+                    Ok(iota_ipc::ResponseResult::Ok(_)) => Err(
+                        "Credential export failed: daemon returned an unexpected response.".into(),
+                    ),
+                    Ok(iota_ipc::ResponseResult::Error(error)) => {
+                        Err(format!("Credential export failed: {error}"))
+                    }
+                    Err(error) => Err(format!("Credential export failed: {error}")),
+                };
+                AppEvent::CredentialExportFinished(result)
+            }
+            IotaEffect::CreateUser { username } => {
+                let result = match ipc
+                    .send_request(iota_ipc::LocalRequest::CreateUser { username })
+                    .await
+                {
+                    Ok(iota_ipc::ResponseResult::Ok(iota_ipc::ResponsePayload::UserCreated {
+                        username,
+                        user_id,
+                    })) => Ok(format!("Created user {username} ({user_id}).")),
+                    Ok(iota_ipc::ResponseResult::Error(error)) => {
+                        Err(format!("Create user failed: {error}"))
                     }
                     Ok(_) => {
-                        Err("Daemon returned an unexpected response while loading users.".into())
+                        Err("Create user failed: daemon returned an unexpected response.".into())
                     }
-                    Err(error) => Err(format!("Cannot load users: {error}")),
-                }
-            };
-            tokio::pin!(load);
-            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let result = loop {
-                tokio::select! {
-                    result = &mut load => break result,
-                    _ = ticker.tick() => {
-                        ui.invalidate();
-                    }
-                }
-            };
-            let _ = sender.send(UiEvent::App(AppEvent::UsersLoaded(result)));
-        });
-    }
-
-    pub async fn render(&self) -> io::Result<()> {
-        self.clear_expired_notifications().await;
-        let theme = self.theme.read().await.clone();
-        let context = RenderContext {
-            theme: theme.as_ref(),
-        };
-        // The renderer is the only task that takes the terminal lock.  Screen
-        // mutations use the stack lock briefly before invalidating a frame.
-        let stack_guard = self.screen_stack.read().await;
-        let (connection, daemon) = stack_guard
-            .iter()
-            .find_map(|item| item.as_any().downcast_ref::<MainScreen>())
-            .map(|main| {
-                (
-                    main.connection_status().borrow().clone(),
-                    main.daemon_status().borrow().clone(),
-                )
-            })
-            .unwrap_or_else(|| (IpcConnectionState::Disconnected, DaemonStatus::default()));
-        if let Some(screen) = stack_guard.last() {
-            let mut terminal = self
-                .terminal
-                .lock()
-                .map_err(|_| io::Error::other("terminal mutex poisoned"))?;
-            let mut hits = HitMap::default();
-            terminal.draw(|f| {
-                let rows = Layout::vertical([
-                    Constraint::Length(2),
-                    Constraint::Min(1),
-                    Constraint::Length(1),
-                ])
-                .split(f.area());
-                let header_focus = self.header_focus.lock().ok().and_then(|focus| *focus);
-                render_header(
-                    f,
-                    rows[0],
-                    &connection,
-                    &daemon,
-                    context.theme,
-                    &mut hits,
-                    header_focus,
-                );
-                let hints = if header_focus.is_some() {
-                    " Left/Right: choose   Enter: activate   Esc/F6: screen".to_owned()
-                } else {
-                    let mut screen_hints: Vec<String> = screen
-                        .key_hints()
-                        .into_iter()
-                        .map(|hint| format!("{}: {}", hint.keys, hint.action))
-                        .collect();
-                    if !screen_hints.iter().any(|h| h.contains("?")) {
-                        screen_hints.push("?: Help".to_owned());
-                    }
-                    screen_hints.join("   ")
+                    Err(error) => Err(format!("Create user failed: {error}")),
                 };
-                f.render_widget(
-                    ratatui::widgets::Paragraph::new(format!(" {hints}")).style(
-                        context
-                            .theme
-                            .surfaces
-                            .footer
-                            .patch(context.theme.text.muted),
-                    ),
-                    rows[2],
-                );
-                screen.render(f, rows[1], &context, &mut hits);
-
-                if let Ok(notifications) = self.notifications.try_lock() {
-                    if !notifications.is_empty() {
-                        let notification_area = Rect {
-                            x: rows[1].x + rows[1].width.saturating_sub(40),
-                            y: rows[1].y,
-                            width: 40.min(rows[1].width),
-                            height: 3.min(rows[1].height),
-                        };
-                        render_notification_area(
-                            f,
-                            notification_area,
-                            &notifications,
-                            context.theme,
-                        );
+                AppEvent::UserOperationFinished(result)
+            }
+            IotaEffect::CreateInvitation { authority } => {
+                let result = match ipc
+                    .send_request(iota_ipc::LocalRequest::CreateInvitation {
+                        authority,
+                        lifetime_seconds: 7 * 24 * 60 * 60,
+                        password: None,
+                        label: None,
+                    })
+                    .await
+                {
+                    Ok(iota_ipc::ResponseResult::Ok(
+                        iota_ipc::ResponsePayload::InvitationCreated(invitation),
+                    )) => Ok(format!(
+                        "Invitation {} created. Token: {}  Link: {}{}",
+                        invitation.invitation_id,
+                        invitation.raw_token.0,
+                        invitation.short_url.as_deref().unwrap_or("unavailable"),
+                        if invitation.mirror_synced {
+                            ""
+                        } else {
+                            "  Local metadata is still synchronizing."
+                        },
+                    )),
+                    Ok(iota_ipc::ResponseResult::Error(error)) => {
+                        Err(format!("Create invitation failed: {error}"))
                     }
-                }
-            })?;
-            if let Ok(mut current) = self.hits.lock() {
-                *current = hits;
+                    Ok(_) => Err(
+                        "Create invitation failed: daemon returned an unexpected response.".into(),
+                    ),
+                    Err(error) => Err(format!("Create invitation failed: {error}")),
+                };
+                AppEvent::UserOperationFinished(result)
+            }
+            IotaEffect::OpenUsers
+            | IotaEffect::OpenMetrics
+            | IotaEffect::OpenOverview
+            | IotaEffect::ApplyTheme { .. }
+            | IotaEffect::SaveSettings { .. } => return,
+        };
+        let _ = tx.send(IotaMessage::Event(event)).await;
+    });
+    Ok(())
+}
+
+fn bridge_daemon_updates(ipc: Arc<IpcClient>, tx: mpsc::Sender<IotaMessage>) {
+    let mut connection = ipc.connection_status();
+    let mut status = ipc.daemon_status();
+    let mut updates = ipc.ui_updates();
+    tokio::spawn(async move {
+        loop {
+            let changed = tokio::select! {
+                result = connection.changed() => result,
+                result = status.changed() => result,
+                result = updates.changed() => result,
+            };
+            if changed.is_err() || tx.send(IotaMessage::Invalidate).await.is_err() {
+                break;
             }
         }
-        Ok(())
-    }
+    });
 }

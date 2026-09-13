@@ -1,9 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use iota_cli::{
-    interaction_result::InteractionResult,
-    render_context::RenderContext,
     screens::{
-        screens::{AppEvent, HitMap, Screen, UiEvent},
+        screens::{HitMap, IotaEffect, IotaInteraction, IotaScreen, UiEvent},
         settings::SettingsScreen,
     },
     theme::{ThemeName, resolve},
@@ -20,35 +18,21 @@ fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         .collect()
 }
 
-#[tokio::test]
-async fn settings_preview_and_save_emit_typed_application_events() {
+#[test]
+fn settings_preview_and_save_emit_typed_effects() {
     let mut screen = SettingsScreen::new(ThemeName::Ansi);
-    let preview = screen.handle_event(UiEvent::Key(KeyEvent::from(KeyCode::Right)));
-    let InteractionResult::AppTask { task } = preview else {
-        panic!("theme preview should emit an application task");
+    let preview = screen.handle_event(&UiEvent::Key(KeyEvent::from(KeyCode::Right)));
+    let IotaInteraction::Effect(IotaEffect::ApplyTheme { theme, persist }) = preview else {
+        panic!("theme preview should emit an effect");
     };
-    assert!(matches!(
-        task.await,
-        UiEvent::App(AppEvent::ApplyTheme {
-            theme: ThemeName::Surface,
-            persist: false
-        })
-    ));
+    assert_eq!(theme, ThemeName::Surface);
+    assert!(!persist);
 
-    let save = screen.handle_event(UiEvent::Key(KeyEvent::from(KeyCode::Enter)));
-    let InteractionResult::AppTask { task } = save else {
-        panic!("theme save should emit an application task");
+    let save = screen.handle_event(&UiEvent::Key(KeyEvent::from(KeyCode::Enter)));
+    let IotaInteraction::Effect(IotaEffect::SaveSettings { theme, .. }) = save else {
+        panic!("theme save should emit an effect");
     };
-    assert!(matches!(
-        task.await,
-        UiEvent::App(AppEvent::SaveSettings {
-            theme: ThemeName::Surface,
-            color: _,
-            unicode: _,
-            cli_output: _,
-            cli_require_confirmation: _
-        })
-    ));
+    assert_eq!(theme, ThemeName::Surface);
 }
 
 #[test]
@@ -60,12 +44,7 @@ fn settings_is_readable_in_every_theme_and_layout() {
             let screen = SettingsScreen::new(theme_name);
             terminal
                 .draw(|frame| {
-                    screen.render(
-                        frame,
-                        frame.area(),
-                        &RenderContext { theme: &theme },
-                        &mut HitMap::default(),
-                    );
+                    screen.render_legacy(frame, frame.area(), &theme, &mut HitMap::new());
                 })
                 .unwrap();
             let rendered = buffer_text(&terminal);

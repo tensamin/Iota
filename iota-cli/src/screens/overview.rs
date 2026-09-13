@@ -1,9 +1,10 @@
+use crate::theme::ResolvedTheme;
 use crate::{
     controls::button::{ActionButton, ButtonIntent, render_button},
-    interaction_result::InteractionResult,
     ipc_client::{DaemonStatus, IpcConnectionState},
-    render_context::RenderContext,
-    screens::screens::{AppAction, HitMap, KeyHint, Screen, UiEvent},
+    screens::screens::{
+        AppAction, HitMap, IotaInteraction, IotaMessage, IotaScreen, KeyHint, UiEvent,
+    },
 };
 use crossterm::event::KeyCode;
 use ratatui::{
@@ -12,10 +13,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use std::{
-    any::Any,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::watch;
 
 pub struct OverviewScreen {
@@ -175,22 +173,15 @@ fn truncate_id(id: &str) -> String {
     }
 }
 
-impl Screen for OverviewScreen {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn render(&self, f: &mut Frame, rect: Rect, context: &RenderContext<'_>, _hits: &mut HitMap) {
+impl IotaScreen for OverviewScreen {
+    fn render_legacy(&self, f: &mut Frame, rect: Rect, theme: &ResolvedTheme, _hits: &mut HitMap) {
         let block = Block::default()
             .title(" Overview ")
             .borders(Borders::ALL)
-            .border_style(context.theme.borders.normal)
-            .title_style(context.theme.borders.title);
-        let inner = if matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) {
-            crate::controls::panel::render_panel(f, rect, "Overview", false, context.theme)
+            .border_style(theme.borders.normal)
+            .title_style(theme.borders.title);
+        let inner = if matches!(theme.chrome, crate::theme::ChromeMode::Surfaces) {
+            crate::controls::panel::render_panel(f, rect, "Overview", false, theme)
         } else {
             let inner = block.inner(rect);
             f.render_widget(block, rect);
@@ -202,7 +193,7 @@ impl Screen for OverviewScreen {
         ])
         .split(inner);
 
-        let lines = self.build_lines(context.theme);
+        let lines = self.build_lines(theme);
         self.content_height.store(lines.len(), Ordering::Relaxed);
         self.viewport_height
             .store(rows[0].height as usize, Ordering::Relaxed);
@@ -219,30 +210,29 @@ impl Screen for OverviewScreen {
                 focused: self._focus == Focus::Back,
                 enabled: true,
             },
-            context.theme,
+            theme,
         );
-        _hits.register(rows[1], AppAction::Back);
+        _hits.register(rows[1], IotaMessage::Action(AppAction::Back));
     }
 
-    fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
+    fn handle_event(&mut self, event: &UiEvent) -> IotaInteraction {
+        let event = event.clone();
         let UiEvent::Key(event) = event else {
-            return InteractionResult::Unhandled;
+            return IotaInteraction::Unhandled;
         };
         match event.code {
-            KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => {
-                InteractionResult::CloseScreen
-            }
+            KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => IotaInteraction::Pop,
             KeyCode::Down | KeyCode::Char('j') => {
                 let max = self
                     .content_height
                     .load(Ordering::Relaxed)
                     .saturating_sub(self.viewport_height.load(Ordering::Relaxed));
                 self.scroll_offset = self.scroll_offset.saturating_add(1).min(max);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::PageDown => {
                 let page = self.viewport_height.load(Ordering::Relaxed).max(1);
@@ -251,32 +241,32 @@ impl Screen for OverviewScreen {
                     .load(Ordering::Relaxed)
                     .saturating_sub(page);
                 self.scroll_offset = self.scroll_offset.saturating_add(page).min(max);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::PageUp => {
                 let page = self.viewport_height.load(Ordering::Relaxed).max(1);
                 self.scroll_offset = self.scroll_offset.saturating_sub(page);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Home => {
                 self.scroll_offset = 0;
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::End => {
                 self.scroll_offset = self
                     .content_height
                     .load(Ordering::Relaxed)
                     .saturating_sub(self.viewport_height.load(Ordering::Relaxed));
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
-            _ => InteractionResult::Unhandled,
+            _ => IotaInteraction::Unhandled,
         }
     }
-    fn handle_action(&mut self, action: AppAction) -> InteractionResult {
+    fn handle_action(&mut self, action: AppAction) -> IotaInteraction {
         if action == AppAction::Back {
-            InteractionResult::CloseScreen
+            IotaInteraction::Pop
         } else {
-            InteractionResult::Unhandled
+            IotaInteraction::Unhandled
         }
     }
     fn key_hints(&self) -> Vec<KeyHint> {

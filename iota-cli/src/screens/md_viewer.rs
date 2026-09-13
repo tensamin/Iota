@@ -1,17 +1,12 @@
-use crossterm::event::{self, Event, KeyCode};
+use crate::{
+    screens::screens::{HitMap, IotaInteraction, IotaScreen, UiEvent},
+    theme::{ResolvedTheme, TextSemantics},
+};
+use crossterm::event::KeyCode;
 use ratatui::{
-    DefaultTerminal,
     prelude::*,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
-};
-use std::{any::Any, time::Duration};
-
-use crate::{
-    interaction_result::InteractionResult,
-    render_context::RenderContext,
-    screens::screens::{HitMap, Screen, UiEvent},
-    theme::{ResolvedTheme, TextSemantics, ThemeName},
 };
 
 pub struct FileViewer {
@@ -21,25 +16,19 @@ pub struct FileViewer {
     scroll_x: u16,
 }
 
-impl Screen for FileViewer {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
+impl IotaScreen for FileViewer {
+    fn render_legacy(&self, f: &mut Frame, rect: Rect, theme: &ResolvedTheme, _hits: &mut HitMap) {
+        self.draw(f, rect, theme);
     }
 
-    fn render(&self, f: &mut Frame, rect: Rect, context: &RenderContext<'_>, _hits: &mut HitMap) {
-        self.draw(f, rect, context.theme);
-    }
-
-    fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
+    fn handle_event(&mut self, event: &UiEvent) -> IotaInteraction {
+        let event = event.clone();
         let UiEvent::Key(event) = event else {
-            return InteractionResult::Unhandled;
+            return IotaInteraction::Unhandled;
         };
         match event.code {
             KeyCode::Char('q') | KeyCode::Esc => {
-                return InteractionResult::CloseScreen;
+                return IotaInteraction::Pop;
             }
 
             KeyCode::Down => self.scroll = self.scroll.saturating_add(1),
@@ -52,7 +41,7 @@ impl Screen for FileViewer {
             _ => {}
         }
 
-        InteractionResult::Unhandled
+        IotaInteraction::Unhandled
     }
 }
 
@@ -64,26 +53,6 @@ impl FileViewer {
             scroll: 0,
             scroll_x: 0,
         }
-    }
-    pub fn force_popup(mut self, mut terminal: DefaultTerminal) -> DefaultTerminal {
-        loop {
-            terminal
-                .draw(|f| {
-                    let area = f.area();
-                    self.draw(f, area, &crate::theme::resolve(ThemeName::Ansi));
-                })
-                .unwrap();
-
-            if event::poll(Duration::from_millis(100)).unwrap() {
-                let ev = event::read().unwrap();
-                self.handle_event(&ev);
-
-                if matches!(ev, Event::Key(k) if k.code == KeyCode::Char('q')) {
-                    break;
-                }
-            }
-        }
-        terminal
     }
     fn draw(&self, f: &mut Frame, area: Rect, theme: &ResolvedTheme) {
         use ratatui::text::Text;
@@ -146,20 +115,6 @@ impl FileViewer {
             .scroll((self.scroll, 0));
 
         f.render_widget(paragraph, area);
-    }
-
-    pub fn handle_event(&mut self, event: &Event) {
-        if let Event::Key(key) = event {
-            match key.code {
-                KeyCode::Down => self.scroll = self.scroll.saturating_add(1),
-                KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
-                KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
-                KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
-                KeyCode::Right => self.scroll_x = self.scroll_x.saturating_add(2),
-                KeyCode::Left => self.scroll_x = self.scroll_x.saturating_sub(2),
-                _ => {}
-            }
-        }
     }
 }
 fn parse_document(input: &str, theme: &ResolvedTheme) -> Vec<DisplayLine> {

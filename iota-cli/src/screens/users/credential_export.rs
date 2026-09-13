@@ -1,5 +1,5 @@
 use super::UserEntry;
-use crate::controls::text_input::TextInput;
+use ratatool::TextInputState;
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -9,7 +9,7 @@ use std::{
 #[derive(Clone, Debug)]
 pub struct CredentialExportState {
     pub user: UserEntry,
-    pub destination: TextInput,
+    pub destination: TextInputState,
     pub error: Option<String>,
 }
 
@@ -17,7 +17,7 @@ impl CredentialExportState {
     pub fn new(user: UserEntry) -> Self {
         Self {
             user,
-            destination: TextInput::new("Destination"),
+            destination: TextInputState::default(),
             error: None,
         }
     }

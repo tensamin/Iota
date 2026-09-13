@@ -6,7 +6,7 @@ use iota_cli::{
         LaunchOption,
     },
     theme::UiConfig,
-    ui::UI,
+    ui::UiHandle,
 };
 use iota_process_manager::ProcessManager;
 use std::{
@@ -61,7 +61,7 @@ impl Capabilities {
     }
 }
 pub async fn run(
-    ui: Arc<UI>,
+    ui: Arc<UiHandle>,
     endpoints: &DaemonEndpoints,
     caps: Capabilities,
 ) -> Result<ConnectionContext, StartupError> {
@@ -175,17 +175,17 @@ fn map_process_manager_error(error: iota_process_manager::ProcessManagerError) -
     }
 }
 async fn start_local_with_ui(
-    ui: Arc<UI>,
+    ui: Arc<UiHandle>,
     exe: &Path,
     path: &Path,
 ) -> Result<ConnectionContext, StartupError> {
     tokio::select! {
-            result = crate::local_daemon::launch(ui.clone(), exe, path) => result.map(|ipc| ConnectionContext { ipc }),
+            result = crate::local_daemon::launch(ui.cancellation_token(), exe, path) => result.map(|ipc| ConnectionContext { ipc }),
         _ = ui.wait_for_shutdown() => Err(StartupError::Cancelled),
     }
 }
 async fn show(
-    ui: Arc<UI>,
+    ui: Arc<UiHandle>,
     options: Vec<LaunchOption>,
     message: impl Into<String>,
 ) -> Result<DaemonSetupDecision, StartupError> {

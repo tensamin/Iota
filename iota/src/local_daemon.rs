@@ -1,5 +1,5 @@
 use crate::startup_error::StartupError;
-use iota_cli::{ipc_client::IpcClient, ui::UI};
+use iota_cli::ipc_client::IpcClient;
 use std::process::Stdio;
 use std::{
     collections::VecDeque,
@@ -12,6 +12,7 @@ use tokio::{
     process::{Child, Command},
     time::Instant,
 };
+use tokio_util::sync::CancellationToken;
 
 struct LocalDaemonGuard {
     child: Option<Child>,
@@ -43,7 +44,7 @@ impl Drop for LocalDaemonGuard {
 }
 
 pub async fn launch(
-    ui: Arc<UI>,
+    cancellation: CancellationToken,
     executable: &Path,
     socket: &Path,
 ) -> Result<Arc<IpcClient>, StartupError> {
@@ -73,7 +74,6 @@ pub async fn launch(
     }
     let mut guard = LocalDaemonGuard::new(child);
     let deadline = Instant::now() + Duration::from_secs(20);
-    let cancellation = ui.cancellation_token();
     loop {
         let result = tokio::select! {
             status = guard.child.as_mut().expect("child").wait() => {

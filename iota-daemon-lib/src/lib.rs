@@ -1,3 +1,4 @@
+pub mod accounts;
 pub mod command_router;
 pub mod daemon_state;
 pub mod deployment;
@@ -7,8 +8,9 @@ pub mod log_buffer;
 pub mod services;
 pub mod task_registry;
 
+pub use accounts::{AccountAuthority, LocalIotaAccountAuthority, OmegaAccountAuthority};
 pub use command_router::{CommandRouter, IpcRole, PeerContext};
 pub use daemon_state::{DaemonRuntime, ShutdownReason, StartupPhase};
 pub use ipc_server::IpcServer;
-pub use services::DaemonServices;
+pub use services::{DaemonServiceComponents, DaemonServices};
 pub use task_registry::TaskRegistry;

@@ -1,4 +1,5 @@
 pub mod atomic_file;
+pub mod authority_discovery;
 pub mod crypto_helper;
 pub mod crypto_util;
 pub mod file_util;

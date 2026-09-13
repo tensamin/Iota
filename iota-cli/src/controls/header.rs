@@ -2,7 +2,7 @@ use crate::ipc_client::{DaemonStatus, IpcConnectionState};
 use crate::theme::ResolvedTheme;
 use crate::{
     controls::button::ButtonIntent,
-    screens::screens::{AppAction, HitMap},
+    screens::screens::{AppAction, HitMap, IotaMessage},
 };
 use ratatui::{
     Frame,
@@ -119,7 +119,7 @@ pub fn render_header(
         Paragraph::new(vec![brand_line1, brand_line2]).style(theme.surfaces.toolbar),
         brand_area,
     );
-    hits.register(brand_area, AppAction::OpenMain);
+    hits.register(brand_area, IotaMessage::Action(AppAction::OpenMain));
 
     for (index, item) in HEADER_ITEMS.iter().enumerate() {
         let top = cells[index + 1];
@@ -150,6 +150,6 @@ pub fn render_header(
             ]),
             button_area,
         );
-        hits.register(button_area, item.action);
+        hits.register(button_area, IotaMessage::Action(item.action));
     }
 }

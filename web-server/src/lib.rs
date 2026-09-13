@@ -1,4 +1,6 @@
 use bytes::Bytes;
+use http::Method;
+use iota_identity::{LocalDescriptorPublisher, LocalUserId, LocalUserStore, SignedNodeDescriptor};
 use iota_logger::log;
 use mtp::host::HostConfig;
 use mtp::webserver::{HttpRequest, HttpResponse, MTPWebServer, WebServerConfig};
@@ -6,6 +8,16 @@ use std::{net::IpAddr, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+#[async_trait::async_trait]
+pub trait ClientPublicKeyResolver: Send + Sync {
+    async fn public_key(&self, client_id: u64) -> Option<mtp::crypto::PublicKeyBundle>;
+}
+
+#[async_trait::async_trait]
+pub trait MtpConnectionHandler: Send + Sync {
+    async fn accept(&self, connection: mtp::webserver::WebMTPConnection);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WebMode {
@@ -20,7 +32,7 @@ pub struct TlsConfig {
     pub key: PathBuf,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WebConfig {
     pub mode: WebMode,
     pub bind: IpAddr,
@@ -28,6 +40,13 @@ pub struct WebConfig {
     pub asset_dir: PathBuf,
     pub tls: Option<TlsConfig>,
     pub required: bool,
+    pub authority_discovery: iota_identity::AuthorityDiscoveryDocument,
+    pub local_users: Arc<dyn LocalUserStore>,
+    pub descriptor_publisher: Arc<dyn LocalDescriptorPublisher>,
+    pub node_descriptor: SignedNodeDescriptor,
+    pub node_identity: iota_identity::LocalNodeIdentity,
+    pub client_keys: Arc<dyn ClientPublicKeyResolver>,
+    pub mtp_handler: Arc<dyn MtpConnectionHandler>,
 }
 
 #[derive(Debug)]
@@ -62,6 +81,33 @@ impl WebServerHandle {
 
 async fn root(asset_dir: PathBuf, _request: HttpRequest, response: HttpResponse) -> HttpResponse {
     static_file(asset_dir, "index.html".into(), response).await
+}
+async fn authority_discovery(body: Bytes, _: HttpRequest, response: HttpResponse) -> HttpResponse {
+    response
+        .status(http::StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(body)
+}
+
+fn json_response<T: serde::Serialize>(value: &T, response: HttpResponse) -> HttpResponse {
+    match serde_json::to_vec(value) {
+        Ok(body) => response
+            .status(http::StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Bytes::from(body)),
+        Err(_) => response
+            .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+            .body("descriptor encoding failed"),
+    }
+}
+
+fn descriptor_error(error: iota_identity::IdentityError, response: HttpResponse) -> HttpResponse {
+    let status = match error {
+        iota_identity::IdentityError::NotFound => http::StatusCode::NOT_FOUND,
+        iota_identity::IdentityError::InvalidIdentifier(_) => http::StatusCode::BAD_REQUEST,
+        _ => http::StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    response.status(status).body(error.to_string())
 }
 async fn static_file(asset_dir: PathBuf, path: String, response: HttpResponse) -> HttpResponse {
     let file = path.trim_start_matches('/');
@@ -123,11 +169,113 @@ pub async fn start(
     let key = tokio::fs::read(&tls.key)
         .await
         .map_err(|e| WebServerError::Io(e.to_string()))?;
-    let host_config = HostConfig::new(config.bind, config.port, certificate, key);
+    let node_keyring = config.node_identity.keyring();
+    let node_keyring = node_keyring
+        .try_to_bytes()
+        .map_err(|error| WebServerError::Startup(error.to_string()))
+        .and_then(|bytes| {
+            mtp::crypto::Keyring::from_bytes(&bytes)
+                .map_err(|error| WebServerError::Startup(error.to_string()))
+        })?;
+    let client_keys = config.client_keys.clone();
+    let host_config = HostConfig::new(config.bind, config.port, certificate, key)
+        .with_authentication(
+            node_keyring,
+            Box::new(move |client_id, _| {
+                let client_keys = client_keys.clone();
+                Box::pin(async move { client_keys.public_key(client_id).await })
+            }),
+            Box::new(|_, _| Box::pin(async { 0 })),
+        )
+        .with_authentication_policy(mtp::host::AuthenticationPolicy::AllowAuthentication);
     let assets = config.asset_dir.clone();
+    let discovery = serde_json::to_vec(&config.authority_discovery)
+        .map(Bytes::from)
+        .map_err(|error| WebServerError::Startup(error.to_string()))?;
+    let node_descriptor = config
+        .node_descriptor
+        .to_wire_v1()
+        .map_err(|error| WebServerError::Startup(error.to_string()))?;
+    let local_users = config.local_users.clone();
+    let descriptor_publisher = config.descriptor_publisher.clone();
+    let mtp_handler = config.mtp_handler.clone();
     let web_config = WebServerConfig::new()
         .route("/", move |request, response| {
             root(assets.clone(), request, response)
+        })
+        .and_then(|web_config| {
+            web_config.route("/.well-known/tensamin", move |request, response| {
+                authority_discovery(discovery.clone(), request, response)
+            })
+        })
+        .and_then(|web_config| {
+            let descriptor = node_descriptor.clone();
+            web_config.route_method(Method::GET, "/federation/v1/node", move |_, response| {
+                let descriptor = descriptor.clone();
+                async move { json_response(&descriptor, response) }
+            })
+        })
+        .and_then(|web_config| {
+            let publisher = descriptor_publisher.clone();
+            web_config.route_pattern_method(
+                Method::GET,
+                "/federation/v1/users/id/{user_id}",
+                move |_, response, params| {
+                    let publisher = publisher.clone();
+                    async move {
+                        let user = params
+                            .get("user_id")
+                            .ok_or_else(|| {
+                                iota_identity::IdentityError::InvalidIdentifier(
+                                    "missing user ID".into(),
+                                )
+                            })
+                            .and_then(|user| {
+                                user.parse::<i64>().map(LocalUserId).map_err(|_| {
+                                    iota_identity::IdentityError::InvalidIdentifier(
+                                        "invalid user ID".into(),
+                                    )
+                                })
+                            });
+                        match user
+                            .and_then(|user| publisher.principal_descriptor(user))
+                            .and_then(|descriptor| descriptor.to_wire_v1())
+                        {
+                            Ok(descriptor) => json_response(&descriptor, response),
+                            Err(error) => descriptor_error(error, response),
+                        }
+                    }
+                },
+            )
+        })
+        .and_then(|web_config| {
+            let local_users = local_users.clone();
+            let publisher = descriptor_publisher.clone();
+            web_config.route_pattern_method(
+                Method::GET,
+                "/federation/v1/users/name/{username}",
+                move |_, response, params| {
+                    let local_users = local_users.clone();
+                    let publisher = publisher.clone();
+                    async move {
+                        let descriptor = params
+                            .get("username")
+                            .ok_or_else(|| {
+                                iota_identity::IdentityError::InvalidIdentifier(
+                                    "missing username".into(),
+                                )
+                            })
+                            .and_then(|username| local_users.get_local_user_by_username(username))
+                            .and_then(|user| user.ok_or(iota_identity::IdentityError::NotFound))
+                            .and_then(|user| publisher.principal_descriptor(user.id))
+                            .and_then(|descriptor| descriptor.to_wire_v1());
+                        match descriptor {
+                            Ok(descriptor) => json_response(&descriptor, response),
+                            Err(error) => descriptor_error(error, response),
+                        }
+                    }
+                },
+            )
         })
         .and_then(|web_config| {
             let assets = config.asset_dir.clone();
@@ -144,7 +292,17 @@ pub async fn start(
     let task_cancellation = cancellation.clone();
     let join = tokio::spawn(async move {
         loop {
-            tokio::select! { result = server.accept() => match result { Ok(Some(_)) => {}, Ok(None) => break, Err(error) => log!("MTP webserver connection failed: {}", error) }, _ = task_cancellation.cancelled() => { server.shutdown().await; break; } }
+            tokio::select! {
+                result = server.accept() => match result {
+                    Ok(Some(connection)) => {
+                        let handler = mtp_handler.clone();
+                        tokio::spawn(async move { handler.accept(connection).await; });
+                    }
+                    Ok(None) => break,
+                    Err(error) => log!("MTP webserver connection failed: {}", error),
+                },
+                _ = task_cancellation.cancelled() => { server.shutdown().await; break; }
+            }
         }
     });
     Ok(Some(Arc::new(WebServerHandle {

@@ -1,5 +1,3 @@
-use std::any::Any;
-
 use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
@@ -8,11 +6,13 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+use crate::theme::ResolvedTheme;
 use crate::{
     controls::button::{ActionButton, ButtonIntent, render_button},
-    interaction_result::InteractionResult,
-    render_context::RenderContext,
-    screens::screens::{AppAction, AppEvent, HitMap, KeyHint, Screen, UiEvent},
+    screens::screens::{
+        AppAction, AppEvent, HitMap, IotaEffect, IotaInteraction, IotaMessage, IotaScreen, KeyHint,
+        UiEvent,
+    },
     theme::{CliOutputFormat, TerminalPolicy, ThemeName, UiConfig},
 };
 
@@ -68,11 +68,9 @@ impl SettingsScreen {
         ThemeName::ALL[self.selected]
     }
 
-    fn apply(&self, persist: bool) -> InteractionResult {
+    fn apply(&self, persist: bool) -> IotaInteraction {
         let theme = self.selected_theme();
-        InteractionResult::AppTask {
-            task: Box::pin(async move { UiEvent::App(AppEvent::ApplyTheme { theme, persist }) }),
-        }
+        IotaInteraction::Effect(IotaEffect::ApplyTheme { theme, persist })
     }
 
     fn next_policy(policy: TerminalPolicy) -> TerminalPolicy {
@@ -103,18 +101,16 @@ impl SettingsScreen {
         };
     }
 
-    fn activate(&mut self) -> InteractionResult {
+    fn activate(&mut self) -> IotaInteraction {
         if self.pending {
-            return InteractionResult::Handled;
+            return IotaInteraction::Changed;
         }
         if let Some(dialog) = self.dialog.take() {
             match dialog {
                 Dialog::ConfirmRegenerateKeys => {
                     self.pending = true;
                     self.message = "Regenerating keys…".into();
-                    return InteractionResult::AppTask {
-                        task: Box::pin(async { UiEvent::App(AppEvent::RegenerateKeysRequested) }),
-                    };
+                    return IotaInteraction::Effect(IotaEffect::RegenerateKeys);
                 }
             }
         }
@@ -124,7 +120,7 @@ impl SettingsScreen {
             }
             Focus::CliOutput => {
                 self.message = "Output format updated.".into();
-                return InteractionResult::Handled;
+                return IotaInteraction::Changed;
             }
             Focus::CliConfirm => {
                 self.cli_require_confirmation = !self.cli_require_confirmation;
@@ -136,53 +132,41 @@ impl SettingsScreen {
                         "Off"
                     },
                 );
-                return InteractionResult::Handled;
+                return IotaInteraction::Changed;
             }
             Focus::RegenerateKeys => {
                 self.dialog = Some(Dialog::ConfirmRegenerateKeys);
-                return InteractionResult::Handled;
+                return IotaInteraction::Changed;
             }
-            Focus::Back => return InteractionResult::CloseScreen,
+            Focus::Back => return IotaInteraction::Pop,
         }
         let theme = self.selected_theme();
         let color = self.color;
         let unicode = self.unicode;
         let cli_output = self.cli_output;
         let cli_require_confirmation = self.cli_require_confirmation;
-        InteractionResult::AppTask {
-            task: Box::pin(async move {
-                UiEvent::App(AppEvent::SaveSettings {
-                    theme,
-                    color,
-                    unicode,
-                    cli_output,
-                    cli_require_confirmation,
-                })
-            }),
-        }
+        IotaInteraction::Effect(IotaEffect::SaveSettings {
+            theme,
+            color,
+            unicode,
+            cli_output,
+            cli_require_confirmation,
+        })
     }
 }
 
-impl Screen for SettingsScreen {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn render(
+impl IotaScreen for SettingsScreen {
+    fn render_legacy(
         &self,
         frame: &mut Frame,
         area: Rect,
-        context: &RenderContext<'_>,
+        theme: &ResolvedTheme,
         hits: &mut HitMap,
     ) {
         let header_block = Block::default()
             .title(" Settings ")
             .borders(Borders::ALL)
-            .border_style(context.theme.borders.focused);
+            .border_style(theme.borders.focused);
         let inner = header_block.inner(area);
         frame.render_widget(header_block, area);
 
@@ -200,7 +184,7 @@ impl Screen for SettingsScreen {
                 self.color,
                 self.unicode,
             ))
-            .style(context.theme.text.heading),
+            .style(theme.text.heading),
             sections[0],
         );
 
@@ -218,8 +202,8 @@ impl Screen for SettingsScreen {
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(sections[1]);
 
         let lines = vec![
-            Line::from(Span::styled(&self.message, context.theme.text.normal)),
-            Line::from(Span::styled(&cli_line, context.theme.text.normal)),
+            Line::from(Span::styled(&self.message, theme.text.normal)),
+            Line::from(Span::styled(&cli_line, theme.text.normal)),
             Line::from("Preview"),
             Line::from("[OK] Healthy"),
             Line::from("[WARN] Degraded"),
@@ -227,7 +211,7 @@ impl Screen for SettingsScreen {
             Line::from("> Focused action <"),
         ];
         frame.render_widget(
-            Paragraph::new(lines).style(context.theme.text.normal),
+            Paragraph::new(lines).style(theme.text.normal),
             bottom_rows[0],
         );
 
@@ -247,9 +231,9 @@ impl Screen for SettingsScreen {
                 focused: self.focus == Focus::Back && self.dialog.is_none(),
                 enabled: true,
             },
-            context.theme,
+            theme,
         );
-        hits.register(buttons_area[0], AppAction::Back);
+        hits.register(buttons_area[0], IotaMessage::Action(AppAction::Back));
 
         render_button(
             frame,
@@ -260,15 +244,18 @@ impl Screen for SettingsScreen {
                 focused: self.focus == Focus::RegenerateKeys && self.dialog.is_none(),
                 enabled: !self.pending,
             },
-            context.theme,
+            theme,
         );
-        hits.register(buttons_area[1], AppAction::RegenerateKeys);
+        hits.register(
+            buttons_area[1],
+            IotaMessage::Action(AppAction::RegenerateKeys),
+        );
 
         if self.dialog.is_some() {
-            frame.render_widget(Block::default().style(context.theme.surfaces.overlay), area);
-            let popup = crate::layout::fit::centered_rect(
+            frame.render_widget(Block::default().style(theme.surfaces.overlay), area);
+            let popup = ratatool::layout::centered_rect(
                 area,
-                crate::layout::fit::RequiredSize {
+                ratatool::layout::RequiredSize {
                     width: 42,
                     height: 7,
                 },
@@ -276,14 +263,14 @@ impl Screen for SettingsScreen {
             let block = Block::default()
                 .title(" Confirm ")
                 .borders(Borders::ALL)
-                .border_style(context.theme.borders.focused)
-                .style(context.theme.surfaces.overlay);
+                .border_style(theme.borders.focused)
+                .style(theme.surfaces.overlay);
             let popup_inner = block.inner(popup);
             frame.render_widget(block, popup);
             let dialog_rows =
                 Layout::vertical([Constraint::Min(2), Constraint::Length(1)]).split(popup_inner);
             frame.render_widget(
-                Paragraph::new("Regenerate the identity key pair?\nThis will rotate keys and reconnect to Omikron.").style(context.theme.text.normal),
+                Paragraph::new("Regenerate the identity key pair?\nThis will rotate keys and reconnect to Omikron.").style(theme.text.normal),
                 dialog_rows[0],
             );
             let dialog_buttons =
@@ -298,7 +285,7 @@ impl Screen for SettingsScreen {
                     focused: false,
                     enabled: true,
                 },
-                context.theme,
+                theme,
             );
             render_button(
                 frame,
@@ -309,16 +296,23 @@ impl Screen for SettingsScreen {
                     focused: true,
                     enabled: true,
                 },
-                context.theme,
+                theme,
             );
-            hits.register(dialog_buttons[0], AppAction::CancelDialog);
-            hits.register(dialog_buttons[1], AppAction::ConfirmDialog);
+            hits.register(
+                dialog_buttons[0],
+                IotaMessage::Action(AppAction::CancelDialog),
+            );
+            hits.register(
+                dialog_buttons[1],
+                IotaMessage::Action(AppAction::ConfirmDialog),
+            );
         }
     }
 
-    fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
+    fn handle_event(&mut self, event: &UiEvent) -> IotaInteraction {
+        let event = event.clone();
         let event = match event {
-            UiEvent::App(AppEvent::ThemeSaved(result)) => {
+            UiEvent::Message(IotaMessage::Event(AppEvent::ThemeSaved(result))) => {
                 match result {
                     Ok(()) => {
                         self.saved = self.selected_theme();
@@ -326,36 +320,36 @@ impl Screen for SettingsScreen {
                     }
                     Err(error) => self.message = error,
                 }
-                return InteractionResult::Handled;
+                return IotaInteraction::Changed;
             }
-            UiEvent::App(AppEvent::KeysRegenerated(result)) => {
+            UiEvent::Message(IotaMessage::Event(AppEvent::KeysRegenerated(result))) => {
                 self.pending = false;
                 self.dialog = None;
                 match result {
                     Ok(()) => self.message = "Keys regenerated successfully.".into(),
                     Err(error) => self.message = error,
                 }
-                return InteractionResult::Handled;
+                return IotaInteraction::Changed;
             }
             event => event,
         };
 
         if self.dialog.is_some() {
             let UiEvent::Key(key) = event else {
-                return InteractionResult::Unhandled;
+                return IotaInteraction::Unhandled;
             };
             return match key.code {
                 KeyCode::Esc => {
                     self.dialog = None;
-                    InteractionResult::Handled
+                    IotaInteraction::Changed
                 }
                 KeyCode::Enter => self.activate(),
-                _ => InteractionResult::Handled,
+                _ => IotaInteraction::Changed,
             };
         }
 
         let UiEvent::Key(key) = event else {
-            return InteractionResult::Unhandled;
+            return IotaInteraction::Unhandled;
         };
         match key.code {
             KeyCode::Left => {
@@ -363,7 +357,7 @@ impl Screen for SettingsScreen {
                     self.selected = self.selected.saturating_sub(1);
                     self.apply(false)
                 } else {
-                    InteractionResult::Handled
+                    IotaInteraction::Changed
                 }
             }
             KeyCode::Right => {
@@ -371,30 +365,30 @@ impl Screen for SettingsScreen {
                     self.selected = (self.selected + 1).min(ThemeName::ALL.len() - 1);
                     self.apply(false)
                 } else {
-                    InteractionResult::Handled
+                    IotaInteraction::Changed
                 }
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.activate(),
             KeyCode::Tab => {
                 self.next_focus();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::BackTab => {
                 self.prev_focus();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 self.color = Self::next_policy(self.color);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Char('u') | KeyCode::Char('U') => {
                 self.unicode = Self::next_policy(self.unicode);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Char('l') | KeyCode::Char('L') => {
                 self.cli_output = self.cli_output.next();
                 self.message = format!("CLI output: {:?}", self.cli_output);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Char('k') | KeyCode::Char('K') => {
                 self.cli_require_confirmation = !self.cli_require_confirmation;
@@ -406,18 +400,16 @@ impl Screen for SettingsScreen {
                         "Off"
                     },
                 );
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
-            KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => {
-                InteractionResult::CloseScreen
-            }
-            _ => InteractionResult::Unhandled,
+            KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => IotaInteraction::Pop,
+            _ => IotaInteraction::Unhandled,
         }
     }
 
-    fn handle_action(&mut self, action: AppAction) -> InteractionResult {
+    fn handle_action(&mut self, action: AppAction) -> IotaInteraction {
         match action {
-            AppAction::Back => InteractionResult::CloseScreen,
+            AppAction::Back => IotaInteraction::Pop,
             AppAction::RegenerateKeys => {
                 self.focus = Focus::RegenerateKeys;
                 self.activate()
@@ -425,9 +417,9 @@ impl Screen for SettingsScreen {
             AppAction::ConfirmDialog if self.dialog.is_some() => self.activate(),
             AppAction::CancelDialog if self.dialog.is_some() => {
                 self.dialog = None;
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
-            _ => InteractionResult::Unhandled,
+            _ => IotaInteraction::Unhandled,
         }
     }
 

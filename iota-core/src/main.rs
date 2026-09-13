@@ -35,7 +35,7 @@ async fn main() {
         let ipc = IpcClient::connect(socket)
             .await
             .expect("iota-daemon must be running before starting iota-core");
-        let session = start_tui(ipc).expect("interactive terminal initialization failed");
+        let session = start_tui(ipc.clone()).expect("interactive terminal initialization failed");
         let ui = session.ui();
 
         let consent = match consent_state::check(ui.clone()).await {
@@ -83,7 +83,7 @@ async fn main() {
         check_update();
         iota_state::setup(&state);
 
-        let main_screen = MainScreen::new(ui.clone()).await;
+        let main_screen = MainScreen::new(ipc);
         ui.set_screen(Box::new(main_screen)).await;
 
         // LANGUAGE PACK

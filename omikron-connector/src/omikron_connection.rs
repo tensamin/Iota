@@ -3,9 +3,7 @@ use iota_logger::{log, log_cv_in, log_cv_out, log_t};
 use iota_state::AppState;
 use iota_storage::util::config_util::{CONFIG, modify_config};
 use iota_storage::util::relay_replay;
-use iota_storage::util::{
-    chat_files, chats_util, client_relay_delivery, outgoing_relay, relay_queue,
-};
+use iota_storage::util::{chat_files, client_relay_delivery, relay_queue};
 use iota_util::crypto_helper::{self, keyring_from_base64};
 use iota_util::crypto_util::{self};
 use mtp::client::{Client, ClientConfig, MTPConnection, Policy, SendMode, Sender};
@@ -13,10 +11,9 @@ use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, Da
 use mtp::crypto::{Keyring, PublicKeyBundle};
 use rand_core::RngCore;
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -33,7 +30,6 @@ use iota_connection::relay::{
     RelayValidationError, forward_verified_relay, open_verified_relay_content,
     verify_relay_metadata,
 };
-use iota_util::route_target::RouteTarget;
 
 // ============================================================================
 // Configuration
@@ -42,26 +38,6 @@ use iota_util::route_target::RouteTarget;
 const IOTA_KEYRING_PATH: &str = "iota.mk";
 static IDENTITY_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 static OMIKRON_TRUST_DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-static NEXT_CLIENT_EVENT_ID: AtomicU32 = AtomicU32::new(1);
-
-fn next_client_event_id() -> u32 {
-    NEXT_CLIENT_EVENT_ID.fetch_add(1, Ordering::Relaxed).max(1)
-}
-
-fn record_origin_delivery_failure(signer_id: u64, relay_message_id: &str, failure: &str) {
-    let Ok(storage_owner) = i64::try_from(signer_id) else {
-        return;
-    };
-    if let Err(error) = chat_files::record_delivery_failure(
-        storage_owner,
-        storage_owner,
-        relay_message_id,
-        failure,
-        now_millis_i64(),
-    ) {
-        log!("Relay delivery failure storage failed: {error}");
-    }
-}
 
 /*
  * Keeps identity and pinned Omikron key files independent from the process
@@ -282,29 +258,6 @@ fn next_invitation_retry_delay(current: Duration) -> Duration {
     (current * 2).min(Duration::from_secs(300))
 }
 
-#[derive(Debug)]
-pub enum IdentityError {
-    Storage(mtp::files::FileError),
-    Directory(std::io::Error),
-    InvalidLegacyIdentity,
-    Verification(String),
-}
-
-impl std::fmt::Display for IdentityError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Storage(error) => write!(f, "identity storage error: {error}"),
-            Self::Directory(error) => write!(f, "unable to create identity directory: {error}"),
-            Self::InvalidLegacyIdentity => f.write_str("legacy identity is invalid"),
-            Self::Verification(error) => {
-                write!(f, "persisted identity could not be verified: {error}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for IdentityError {}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConnectionAttemptResult {
     became_healthy: bool,
@@ -343,59 +296,22 @@ fn wire_user_id(user_id: i64) -> u64 {
     u64::try_from(user_id).expect("validated user ID is non-negative")
 }
 
-/*
- * The identity is stored in the Iota state directory as raw keyring bytes so
- * daemon restarts do not depend on a separately managed passphrase.
- */
-fn save_keyring_verified(keyring: &Keyring, path: &Path) -> Result<(), IdentityError> {
-    mtp::files::save_keyring_raw(keyring, path).map_err(IdentityError::Storage)?;
-    let persisted = mtp::files::load_keyring_raw(path).map_err(IdentityError::Storage)?;
-    let expected = keyring
-        .try_to_bytes()
-        .map_err(|error| IdentityError::Verification(error.to_string()))?;
-    let actual = persisted
-        .try_to_bytes()
-        .map_err(|error| IdentityError::Verification(error.to_string()))?;
-    if expected != actual {
-        return Err(IdentityError::Verification(
-            "persisted keyring differs from the requested identity".into(),
-        ));
-    }
-    Ok(())
-}
-
 fn load_or_migrate_keyring_at(
     path: &Path,
     legacy: Option<String>,
-) -> Result<Keyring, IdentityError> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(IdentityError::Directory)?;
-    }
-
-    match mtp::files::load_keyring_raw(path) {
-        Ok(keyring) => return Ok(keyring),
-        Err(mtp::files::FileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(IdentityError::Storage(error)),
-    }
-
-    let keyring = match legacy {
-        Some(encoded) => {
-            keyring_from_base64(&encoded).ok_or(IdentityError::InvalidLegacyIdentity)?
-        }
-        None => {
-            log!(
-                "No existing Iota identity found at {}; generating a new identity",
-                path.display()
-            );
-            crypto_helper::generate_keyring()
-        }
-    };
-
-    save_keyring_verified(&keyring, path)?;
-    Ok(keyring)
+) -> Result<iota_identity::LocalNodeIdentity, iota_identity::LocalNodeIdentityError> {
+    let legacy = legacy
+        .map(|encoded| {
+            keyring_from_base64(&encoded).ok_or_else(|| {
+                iota_identity::LocalNodeIdentityError::InvalidIdentity(
+                    iota_identity::IdentityError::InvalidIdentifier(
+                        "legacy Iota keyring is invalid".into(),
+                    ),
+                )
+            })
+        })
+        .transpose()?;
+    iota_identity::LocalNodeIdentity::load_or_create(path, legacy)
 }
 
 // ============================================================================
@@ -429,6 +345,19 @@ pub enum ConnectionState {
     Connected { identified: bool },
 }
 
+#[derive(Clone)]
+struct PendingAppChallenge {
+    challenge: String,
+    user_id: i64,
+    app_identifier: String,
+}
+
+#[derive(Clone)]
+struct AppSession {
+    connection_id: Uuid,
+    app_identifier: String,
+}
+
 impl ConnectionState {
     pub fn is_connected(&self) -> bool {
         matches!(self, ConnectionState::Connected { .. })
@@ -456,13 +385,15 @@ pub struct OmikronConnection {
     reconnect_on_close: Arc<RwLock<bool>>,
     auth_failure: Arc<RwLock<Option<String>>>,
     keyring: Arc<RwLock<Option<Arc<Keyring>>>>,
-    pub app_challenges: Arc<DashMap<u64, String>>,
-    pub app_sessions: Arc<DashMap<u64, (i64, String)>>,
+    app_challenges: Arc<DashMap<u64, PendingAppChallenge>>,
+    app_sessions: Arc<DashMap<u64, AppSession>>,
+    session_manager: Arc<iota_auth::SessionManager>,
     handler_semaphore: Arc<Semaphore>,
     cancellation: CancellationToken,
     pub(crate) active_tasks: Arc<DashSet<String>>,
     pub(crate) app: Arc<std::sync::Mutex<AppState>>,
     invitation_sync: Arc<InvitationSyncRuntime>,
+    relay_service: Arc<OnceLock<Arc<iota_connection::relay_service::RelayService>>>,
 }
 
 impl OmikronConnection {
@@ -492,11 +423,58 @@ impl OmikronConnection {
             keyring: Arc::new(RwLock::new(None)),
             app_challenges: Arc::new(DashMap::new()),
             app_sessions: Arc::new(DashMap::new()),
+            session_manager: Arc::new(iota_auth::SessionManager::default()),
             handler_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS)),
             cancellation,
             active_tasks,
             app,
             invitation_sync: Arc::new(InvitationSyncRuntime::new()),
+            relay_service: Arc::new(OnceLock::new()),
+        }
+    }
+
+    pub fn install_relay_service(
+        &self,
+        relay: Arc<iota_connection::relay_service::RelayService>,
+    ) -> Result<(), Arc<iota_connection::relay_service::RelayService>> {
+        self.relay_service.set(relay)
+    }
+
+    pub fn relay_service(&self) -> Option<Arc<iota_connection::relay_service::RelayService>> {
+        self.relay_service.get().cloned()
+    }
+
+    pub fn session_manager(&self) -> Arc<iota_auth::SessionManager> {
+        self.session_manager.clone()
+    }
+
+    async fn dispatch_relay(self: Arc<Self>, frame: CommunicationValue) {
+        let Some(relay) = self.relay_service() else {
+            log!("Rejecting Omikron Relay because the daemon relay service is unavailable");
+            return;
+        };
+        match relay
+            .accept_relay(
+                iota_connection::relay_service::IngressSource::Omikron {
+                    connection_id: self.connection_id.to_string(),
+                },
+                frame,
+            )
+            .await
+        {
+            Ok(outcome) => {
+                let (ingress_response, local_deliveries) = outcome.into_parts();
+                for response in ingress_response
+                    .into_iter()
+                    .chain(local_deliveries.into_iter().map(|delivery| delivery.frame))
+                {
+                    if let Err(error) = self.send_message(&response).await {
+                        log!("Relay outcome delivery failed: {error}");
+                        break;
+                    }
+                }
+            }
+            Err(error) => log!("Relay service rejected Omikron ingress: {error:?}"),
         }
     }
 
@@ -616,11 +594,11 @@ impl OmikronConnection {
         self.set_state(ConnectionState::Connecting).await;
         log_t!("omikron_connecting");
 
-        let keyring = Arc::new(
-            self.load_or_migrate_keyring()
-                .await
-                .map_err(|error| format!("Iota identity initialization failed: {error}"))?,
-        );
+        let identity = self
+            .load_or_migrate_keyring()
+            .await
+            .map_err(|error| format!("Iota identity initialization failed: {error}"))?;
+        let keyring = identity.keyring();
         *self.keyring.write().await = Some(keyring.clone());
 
         let existing_iota_id = CONFIG.load().iota_id;
@@ -732,7 +710,9 @@ impl OmikronConnection {
     // Identity (own Keyring, migrated from the legacy base64-in-config format)
     // -------------------------------------------------------------------------
 
-    async fn load_or_migrate_keyring(&self) -> Result<Keyring, IdentityError> {
+    async fn load_or_migrate_keyring(
+        &self,
+    ) -> Result<iota_identity::LocalNodeIdentity, iota_identity::LocalNodeIdentityError> {
         load_or_migrate_keyring_at(identity_path(), CONFIG.load().keyring.clone())
     }
 
@@ -1058,7 +1038,7 @@ impl OmikronConnection {
                         let self_clone = self.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
-                            self_clone.handle_relay(cv).await;
+                            self_clone.dispatch_relay(cv).await;
                         });
                         continue;
                     }
@@ -1143,1041 +1123,60 @@ impl OmikronConnection {
         &self,
         signer_id: u64,
     ) -> Result<Vec<PublicKeyBundle>, RelayValidationError> {
-        let signer_id_i64 = i64::try_from(signer_id).map_err(|_| {
-            RelayValidationError::KeyLookup("signer ID exceeds local storage range".into())
-        })?;
-        let local_user = iota_storage::users::user_manager::get_user(signer_id_i64)
-            .map_err(|error| RelayValidationError::KeyLookup(error.to_string()))?;
-        if let Some(user) = local_user {
-            let key = iota_util::crypto_helper::public_key_bundle_from_base64(&user.public_key)
-                .ok_or_else(|| {
-                    RelayValidationError::KeyLookup("stored user key is invalid".into())
-                })?;
-            return Ok(vec![key]);
-        }
-
-        let request = CommunicationValue::new(CommunicationType::GetUserData).add_typed_default(
-            DataType::UserId,
-            DataValue::UnsignedNumber(u128::from(signer_id)),
-        );
-        let response = self
-            .await_response(&request, Some(Duration::from_secs(10)))
+        self.resolve_relay_principal(signer_id)
             .await
-            .map_err(RelayValidationError::KeyLookup)?;
-        if !response.is_type(CommunicationType::GetUserData) {
-            return Err(RelayValidationError::KeyLookup(
-                "Omega returned an unexpected user lookup response".into(),
-            ));
-        }
-        let public_key = response
-            .get_data(DataType::PublicKey)
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| RelayValidationError::KeyLookup("Omega returned no user key".into()))?;
-        let key = iota_util::crypto_helper::public_key_bundle_from_base64(public_key).ok_or_else(
-            || RelayValidationError::KeyLookup("Omega returned an invalid user key".into()),
-        )?;
-        Ok(vec![key])
+            .map(|principal| principal.public_keys)
     }
 
-    pub async fn hosting_iota_for_user(&self, user_id: u64) -> Result<u64, String> {
-        let user_id_i64 = i64::try_from(user_id)
-            .map_err(|_| "user ID exceeds local storage range".to_string())?;
-        if iota_storage::users::user_manager::get_user(user_id_i64)
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            return CONFIG
-                .load()
-                .iota_id
-                .ok_or_else(|| "Iota identity is not configured".into());
-        }
-
-        let request = CommunicationValue::new(CommunicationType::GetUserData).add_typed_default(
-            DataType::UserId,
-            DataValue::UnsignedNumber(u128::from(user_id)),
-        );
-        let response = self
-            .await_response(&request, Some(Duration::from_secs(10)))
-            .await?;
-        response
-            .get_data(DataType::IotaId)
-            .and_then(|value| value.as_number())
-            .and_then(|value| u64::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .ok_or_else(|| "Omega returned no hosting Iota for the user".into())
-    }
-
-    async fn send_relay_response(&self, frame_id: Option<u32>, response_type: CommunicationType) {
-        if let Some(frame_id) = frame_id {
-            let response = CommunicationValue::new(response_type).with_id(frame_id);
-            if let Err(error) = self.send_message(&response).await {
-                log!("Relay response could not be sent: {}", error);
-            }
-        }
-    }
-
-    async fn send_relay_success(
+    async fn resolve_relay_principal(
         &self,
-        frame_id: Option<u32>,
-        iota_id: u64,
-        relay_message_id: &str,
-        accepted_at: i64,
-        include_origin_timestamp: bool,
-    ) {
-        let Some(frame_id) = frame_id else { return };
-        let response = CommunicationValue::new(CommunicationType::Success)
-            .with_id(frame_id)
-            .add_typed_default(DataType::IotaId, DataValue::UnsignedNumber(iota_id.into()))
-            .add_typed_default(
-                DataType::RelayMessageId,
-                DataValue::Str(relay_message_id.to_string()),
-            )
-            .add_typed_default(
-                DataType::RelayAcceptedAt,
-                DataValue::SignedNumber(accepted_at.into()),
-            );
-        let response = if include_origin_timestamp {
-            response
-                .add_typed_default(
-                    DataType::OriginIotaReceivedAt,
-                    DataValue::SignedNumber(accepted_at.into()),
-                )
-                .add_typed_default(
-                    DataType::DestinationIotaReceivedAt,
-                    DataValue::SignedNumber(accepted_at.into()),
-                )
-        } else {
-            response
-        };
-        if let Err(error) = self.send_message(&response).await {
-            log!("Relay response could not be sent: {}", error);
-        }
-    }
-
-    fn client_event_from_relay(
-        message_type: CommunicationType,
-        payload: &DataValue,
         signer_id: u64,
-        recipient_id: u64,
-        relay_message_id: &str,
-        accepted_at: i64,
-    ) -> Option<CommunicationValue> {
-        let sender = DataValue::UnsignedNumber(u128::from(signer_id));
-        let receiver = recipient_id;
-        let event_id = next_client_event_id();
-
-        match message_type {
-            CommunicationType::MessageSend => {
-                let frame = CommunicationValue::new(CommunicationType::MessageSend)
-                    .with_payload(payload.clone());
-                let content = frame.get_data(DataType::Content)?.clone();
-                let send_time = frame.get_data(DataType::SendTime)?.clone();
-                let version = frame.get_data(DataType::VersionNumber)?.clone();
-                let mut message = vec![
-                    (DataType::Content, content),
-                    (DataType::SendTime, send_time),
-                    (DataType::VersionNumber, version),
-                    (
-                        DataType::RelayMessageId,
-                        DataValue::Str(relay_message_id.to_string()),
-                    ),
-                    (DataType::MessageState, DataValue::Str("sent".to_string())),
-                ];
-                if let Some(reply_id) = frame.get_data(DataType::ReplyId) {
-                    message.push((DataType::ReplyId, reply_id.clone()));
-                }
-                let mut event = CommunicationValue::new(CommunicationType::MessageLive)
-                    .with_id(event_id)
-                    .with_sender(signer_id)
-                    .with_receiver(receiver)
-                    .add_typed_default(DataType::SenderId, sender)
-                    .add_typed_default(DataType::Message, typed_container(message))
-                    .add_typed_default(
-                        DataType::LastMessageAt,
-                        DataValue::SignedNumber(accepted_at.into()),
-                    );
-                if let (Ok(owner), Ok(partner)) =
-                    (i64::try_from(recipient_id), i64::try_from(signer_id))
-                    && let Ok(Some(contact)) = chats_util::get_user(owner, partner)
-                {
-                    event = event.add_typed_default(
-                        DataType::Notifications,
-                        DataValue::SignedNumber(contact.notifications.into()),
-                    );
-                    if let Some(last_message_at) = contact.last_message_at {
-                        event = event.add_typed_default(
-                            DataType::LastMessageAt,
-                            DataValue::SignedNumber(last_message_at.into()),
-                        );
-                    }
-                }
-                Some(event)
-            }
-            CommunicationType::SetChatSecret => {
-                let frame = CommunicationValue::new(CommunicationType::SetChatSecret)
-                    .with_payload(payload.clone());
-                let chat_id = frame.get_data(DataType::ChatId)?.clone();
-                let secret_id = frame.get_data(DataType::SecretId)?.clone();
-                let version = frame.get_data(DataType::VersionNumber)?.clone();
-                Some(
-                    CommunicationValue::new(CommunicationType::ChatSecretForward)
-                        .with_id(event_id)
-                        .with_sender(signer_id)
-                        .with_receiver(receiver)
-                        .add_typed_default(DataType::ChatId, chat_id)
-                        .add_typed_default(
-                            DataType::SenderUserId,
-                            DataValue::Str(signer_id.to_string()),
-                        )
-                        .add_typed_default(
-                            DataType::RecipientUserId,
-                            DataValue::Str(recipient_id.to_string()),
-                        )
-                        .add_typed_default(DataType::SecretId, secret_id)
-                        .add_typed_default(DataType::VersionNumber, version)
-                        .add_typed_default(
-                            DataType::Payload,
-                            DataValue::Str("available".to_string()),
-                        ),
-                )
-            }
-            CommunicationType::MessageEdit => {
-                let frame = CommunicationValue::new(CommunicationType::MessageEdit)
-                    .with_payload(payload.clone());
-                Some(
-                    CommunicationValue::new(CommunicationType::MessageEditLive)
-                        .with_id(event_id)
-                        .with_sender(signer_id)
-                        .with_receiver(receiver)
-                        .add_typed_default(
-                            DataType::Content,
-                            frame.get_data(DataType::Content)?.clone(),
-                        )
-                        .add_typed_default(
-                            DataType::SendTime,
-                            frame.get_data(DataType::SendTime)?.clone(),
-                        )
-                        .add_typed_default(
-                            DataType::VersionNumber,
-                            frame.get_data(DataType::VersionNumber)?.clone(),
-                        )
-                        .add_typed_default(DataType::ChatPartnerId, sender.clone()),
-                )
-            }
-            CommunicationType::MessageReactionAdd | CommunicationType::MessageReactionRemove => {
-                let frame = CommunicationValue::new(message_type).with_payload(payload.clone());
-                Some(
-                    CommunicationValue::new(CommunicationType::MessageReactionLive)
-                        .with_id(event_id)
-                        .with_sender(signer_id)
-                        .with_receiver(receiver)
-                        .add_typed_default(
-                            DataType::Reaction,
-                            frame.get_data(DataType::Reaction)?.clone(),
-                        )
-                        .add_typed_default(
-                            DataType::SendTime,
-                            frame.get_data(DataType::SendTime)?.clone(),
-                        )
-                        .add_typed_default(DataType::ChatPartnerId, sender.clone())
-                        .add_typed_default(DataType::SenderId, sender)
-                        .add_typed_default(
-                            DataType::Accepted,
-                            DataValue::Bool(message_type == CommunicationType::MessageReactionAdd),
-                        ),
-                )
-            }
-            CommunicationType::MessageDelete | CommunicationType::MessageDeleteLive => {
-                let frame = CommunicationValue::new(CommunicationType::MessageDelete)
-                    .with_payload(payload.clone());
-                Some(
-                    CommunicationValue::new(CommunicationType::MessageDeleteLive)
-                        .with_id(event_id)
-                        .with_sender(signer_id)
-                        .with_receiver(receiver)
-                        .add_typed_default(
-                            DataType::SendTime,
-                            frame.get_data(DataType::SendTime)?.clone(),
-                        )
-                        .add_typed_default(DataType::ChatPartnerId, sender),
-                )
-            }
-            CommunicationType::AddConversation if recipient_id < signer_id => {
-                let chat_id = format!("{recipient_id}:{signer_id}");
-                Some(
-                    CommunicationValue::new(CommunicationType::ChatSecretForward)
-                        .with_id(event_id)
-                        .with_sender(signer_id)
-                        .with_receiver(receiver)
-                        .add_typed_default(DataType::ChatId, DataValue::Str(chat_id.clone()))
-                        .add_typed_default(
-                            DataType::SenderUserId,
-                            DataValue::Str(signer_id.to_string()),
-                        )
-                        .add_typed_default(
-                            DataType::RecipientUserId,
-                            DataValue::Str(recipient_id.to_string()),
-                        )
-                        .add_typed_default(
-                            DataType::SecretId,
-                            DataValue::Str(format!("chat:{chat_id}:main")),
-                        )
-                        .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(1))
-                        .add_typed_default(DataType::Payload, DataValue::Str("init".to_string())),
-                )
-            }
-            _ => None,
-        }
-    }
-
-    async fn handle_relay(self: Arc<Self>, frame: CommunicationValue) {
-        let Some(incoming_frame_id) = frame.id() else {
-            log!("Rejecting Relay without a message id");
-            return;
+    ) -> Result<iota_identity::ResolvedPrincipal, RelayValidationError> {
+        use iota_identity::{
+            AuthorityId, AuthorityLocator, IdentityResolver, PrincipalId, UserSelector,
         };
-        let Some(local_iota_id) = CONFIG.load().iota_id else {
-            log!("Rejecting Relay because this Iota has no registered identity");
-            self.send_relay_response(Some(incoming_frame_id), CommunicationType::ErrorInvalidData)
-                .await;
-            return;
+        let authority = AuthorityId::omega_legacy(&omega_discovery::omega_host())
+            .map_err(|error| RelayValidationError::KeyLookup(error.to_string()))?;
+        let locator = AuthorityLocator::new(omega_discovery::omega_host())
+            .map_err(|error| RelayValidationError::KeyLookup(error.to_string()))?;
+        let principals = Arc::new(iota_storage::identity::SqlitePrincipalStore);
+        let local_users = Arc::new(iota_storage::identity::SqliteLocalUserStore);
+        let local = iota_storage::identity::LocalIdentityResolver::new(
+            authority.clone(),
+            iota_identity::AuthorityKind::Omega,
+            iota_identity::PrincipalHome::Omega(locator.clone()),
+            local_users,
+            principals.clone(),
+        );
+        let principal = PrincipalId {
+            authority: authority.clone(),
+            user_id: signer_id,
         };
-        let Some(keyring) = self.keyring.read().await.as_ref().cloned() else {
-            log!("Rejecting Relay because the Iota keyring is unavailable");
-            self.send_relay_response(Some(incoming_frame_id), CommunicationType::ErrorInternal)
-                .await;
-            return;
-        };
-
-        let resolver_connection = self.clone();
-        let verified = verify_relay_metadata(
-            &frame,
-            local_iota_id,
-            &keyring,
-            move |signer_id| async move {
-                resolver_connection
-                    .resolve_relay_signing_keys(signer_id)
-                    .await
-            },
-        )
-        .await;
-
-        let verified = match verified {
-            Ok(value) => value,
-            Err(error) => {
-                log!("Relay metadata verification failed: {}", error);
-                self.send_relay_response(
-                    Some(incoming_frame_id),
-                    CommunicationType::ErrorInvalidData,
-                )
-                .await;
-                return;
-            }
-        };
-        let accepted_at = now_millis_i64();
-        let signer_id = match i64::try_from(verified.context.signer_id) {
-            Ok(id) => id,
-            Err(_) => {
-                self.send_relay_response(
-                    Some(incoming_frame_id),
-                    CommunicationType::ErrorInvalidData,
-                )
-                .await;
-                return;
-            }
-        };
-        let recipient_id = match i64::try_from(verified.context.final_recipient_id) {
-            Ok(id) => id,
-            Err(_) => {
-                self.send_relay_response(
-                    Some(incoming_frame_id),
-                    CommunicationType::ErrorInvalidData,
-                )
-                .await;
-                return;
-            }
-        };
-        let signer_is_local = match iota_storage::users::user_manager::get_user(signer_id) {
-            Ok(user) => user.is_some(),
-            Err(error) => {
-                log!(
-                    "Relay locality lookup failed for signer {}: {}",
-                    signer_id,
-                    error
-                );
-                self.send_relay_response(Some(incoming_frame_id), CommunicationType::ErrorInternal)
-                    .await;
-                return;
-            }
-        };
-        let recipient_is_local = match iota_storage::users::user_manager::get_user(recipient_id) {
-            Ok(user) => user.is_some(),
-            Err(error) => {
-                log!(
-                    "Relay locality lookup failed for recipient {}: {}",
-                    recipient_id,
-                    error
-                );
-                self.send_relay_response(Some(incoming_frame_id), CommunicationType::ErrorInternal)
-                    .await;
-                return;
-            }
-        };
-        if !signer_is_local && !recipient_is_local {
-            log!(
-                "Rejecting Relay with no local origin or destination: signer {}, recipient {}",
-                verified.context.signer_id,
-                verified.context.final_recipient_id,
-            );
-            self.send_relay_response(Some(incoming_frame_id), CommunicationType::ErrorInvalidData)
-                .await;
-            return;
-        }
-
-        /* Evaluate recipient policy before reserving relay replay state or
-         * persisting the frame, so blocked traffic leaves no durable trace. */
-        if recipient_block_policy_applies(recipient_is_local, recipient_id, signer_id) {
-            match iota_storage::util::blocked_users::is_blocked(recipient_id, signer_id) {
-                Ok(true) => {
-                    log!(
-                        "Rejecting Relay from blocked signer {} to recipient {}",
-                        signer_id,
-                        recipient_id
-                    );
-                    self.send_relay_response(
-                        Some(incoming_frame_id),
-                        CommunicationType::ErrorNotAuthenticated,
-                    )
-                    .await;
-                    return;
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    log!(
-                        "Relay block policy lookup failed for recipient {}: {}",
-                        recipient_id,
-                        error
-                    );
-                    self.send_relay_response(
-                        Some(incoming_frame_id),
-                        CommunicationType::ErrorInternal,
-                    )
-                    .await;
-                    return;
-                }
-            }
-        }
-
-        /* An origin Iota is authoritative for receipt disclosure. Inspect
-         * local-origin relay content before reserving or queuing the frame. */
-        if signer_is_local {
-            let content = match open_verified_relay_content(&verified, &[&keyring]) {
-                Ok(content) => content,
-                Err(error) => {
-                    log!("Relay origin content verification failed: {}", error);
-                    self.send_relay_response(
-                        Some(incoming_frame_id),
-                        CommunicationType::ErrorInvalidData,
-                    )
-                    .await;
-                    return;
-                }
-            };
-            if let Err(error) = message_handlers::validate_outgoing_receipt_policy(
-                signer_id,
-                &verified.context,
-                &content,
-            ) {
-                log!("Rejecting local receipt relay: {}", error);
-                self.send_relay_response(
-                    Some(incoming_frame_id),
-                    CommunicationType::ErrorInvalidData,
-                )
-                .await;
-                return;
-            }
-        }
-
-        let frame_bytes = match frame.clone().without_id().to_bytes() {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                log!(
-                    "Relay could not be serialized for durable acceptance: {}",
-                    error
-                );
-                self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
-                    .await;
-                return;
-            }
-        };
-        let type_map_version = verified.context.type_map.version.to_string();
-        let frame_id = incoming_frame_id;
-        let reservation = match relay_replay::reserve(
-            verified.context.signer_id,
-            &verified.context.message_id,
-            verified.context.created_at,
-            accepted_at,
-            verified.context.final_recipient_id,
-            &frame_bytes,
-            frame_id,
-            &type_map_version,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                log!("Relay durable acceptance failed: {}", error);
-                self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
-                    .await;
-                return;
-            }
-        };
-        let already_applied = match reservation {
-            relay_replay::RelayReservation::New => false,
-            relay_replay::RelayReservation::Existing {
-                frame_matches: false,
-                ..
-            } => {
-                log!(
-                    "Rejecting Relay identity collision for signer {} and message {}",
-                    verified.context.signer_id,
-                    verified.context.message_id
-                );
-                self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                    .await;
-                return;
-            }
-            relay_replay::RelayReservation::Existing { ref state, .. } if state == "delivered" => {
-                self.send_relay_response(frame.id(), CommunicationType::Success)
-                    .await;
-                return;
-            }
-            relay_replay::RelayReservation::Existing { ref state, .. }
-                if state == "applied" || state == "queued" =>
-            {
-                true
-            }
-            relay_replay::RelayReservation::Existing { ref state, .. } if state == "rejected" => {
-                self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                    .await;
-                return;
-            }
-            relay_replay::RelayReservation::Existing { .. } => false,
-        };
-
-        /* A shared Iota owns both independent replicas before delivering to its
-         * local recipient. The destination path below writes the recipient copy. */
-        if signer_is_local && recipient_is_local && !already_applied {
-            let content = match open_verified_relay_content(&verified, &[&keyring]) {
-                Ok(value) => value,
-                Err(error) => {
-                    log!(
-                        "Relay shared-Iota origin content verification failed: {}",
-                        error
-                    );
-                    let _ = relay_replay::mark_rejected(
-                        verified.context.signer_id,
-                        &verified.context.message_id,
-                    );
-                    self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                        .await;
-                    return;
-                }
-            };
-            let owner = match i64::try_from(verified.context.signer_id) {
-                Ok(value) => value,
-                Err(_) => {
-                    self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                        .await;
-                    return;
-                }
-            };
-            if let Err(error) = message_handlers::apply_verified_relay_content(
-                &verified.context,
-                &content,
-                accepted_at,
-                owner,
-                true,
-            ) {
-                log!("Relay shared-Iota origin application failed: {}", error);
-                let _ = relay_replay::mark_rejected(
-                    verified.context.signer_id,
-                    &verified.context.message_id,
-                );
-                self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                    .await;
-                return;
-            }
-            if let Err(error) = chat_files::record_destination_iota_received(
-                owner,
-                owner,
-                &verified.context.message_id,
-                accepted_at,
-            ) {
-                log!(
-                    "Relay shared-Iota destination timestamp storage failed: {}",
-                    error
-                );
-                self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
-                    .await;
-                return;
-            }
-        }
-
-        if signer_is_local && !recipient_is_local {
-            /* Chat-secret versions are immutable. Apply them locally only after
-             * the peer has accepted the same relay, so a peer conflict cannot
-             * leave a newly generated origin version behind. */
-            let defer_chat_secret_commit = frame.is_type(CommunicationType::SetChatSecret);
-            if !already_applied {
-                if !defer_chat_secret_commit {
-                    let content = match open_verified_relay_content(&verified, &[&keyring]) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            log!("Relay origin content verification failed: {}", error);
-                            let _ = relay_replay::mark_rejected(
-                                verified.context.signer_id,
-                                &verified.context.message_id,
-                            );
-                            self.send_relay_response(
-                                frame.id(),
-                                CommunicationType::ErrorInvalidData,
-                            )
-                            .await;
-                            return;
-                        }
-                    };
-                    if let Err(error) = message_handlers::apply_verified_relay_content(
-                        &verified.context,
-                        &content,
-                        accepted_at,
-                        i64::try_from(verified.context.signer_id).unwrap_or_default(),
-                        true,
-                    ) {
-                        log!("Relay origin application failed: {}", error);
-                        let _ = relay_replay::mark_rejected(
-                            verified.context.signer_id,
-                            &verified.context.message_id,
-                        );
-                        self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                            .await;
-                        return;
-                    }
-                }
-            }
-            let router = match self
-                .hosting_iota_for_user(verified.context.final_recipient_id)
-                .await
-            {
-                Ok(destination_iota) => destination_iota,
-                Err(error) => {
-                    log!("Relay origin route lookup failed: {}", error);
-                    record_origin_delivery_failure(
-                        verified.context.signer_id,
-                        &verified.context.message_id,
-                        "destination_iota_not_found",
-                    );
-                    self.send_relay_response(frame.id(), CommunicationType::ErrorNoIota)
-                        .await;
-                    return;
-                }
-            };
-            let forwarded = match forward_verified_relay(&frame, RouteTarget::Iota(router)) {
-                Ok(value) => value,
-                Err(error) => {
-                    log!("Relay origin forwarding validation failed: {}", error);
-                    record_origin_delivery_failure(
-                        verified.context.signer_id,
-                        &verified.context.message_id,
-                        "forwarding_validation_failed",
-                    );
-                    self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                        .await;
-                    return;
-                }
-            };
-            let bytes = match forwarded.to_bytes() {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    log!("Relay origin retry could not be serialized: {}", error);
-                    record_origin_delivery_failure(
-                        verified.context.signer_id,
-                        &verified.context.message_id,
-                        "serialization_failed",
-                    );
-                    self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
-                        .await;
-                    return;
-                }
-            };
-            let relay_identity = match (
-                i64::try_from(verified.context.signer_id),
-                i64::try_from(verified.context.final_recipient_id),
-            ) {
-                (Ok(signer_id), Ok(destination_user_id)) => relay_queue::RelayIdentity {
-                    signer_id,
-                    destination_user_id,
-                    message_id: verified.context.message_id.clone(),
-                },
-                _ => {
-                    log!("Relay identity exceeds the storage range");
-                    self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                        .await;
-                    return;
-                }
-            };
-            if let Err(error) =
-                outgoing_relay::commit_outgoing_relay(outgoing_relay::OutgoingRelay {
-                    target: RouteTarget::Iota(router),
-                    identity: &relay_identity,
-                    frame: &bytes,
-                    created_at: now_millis_i64(),
-                    frame_id,
-                    type_map_version: &type_map_version,
-                })
-            {
-                log!("Relay origin retry queue failed: {}", error);
-                record_origin_delivery_failure(
-                    verified.context.signer_id,
-                    &verified.context.message_id,
-                    "queue_failed",
-                );
-                self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
-                    .await;
-                return;
-            }
-            match self
-                .await_relay_response(&forwarded, Duration::from_secs(20))
-                .await
-            {
-                Ok(response) if response.is_type(CommunicationType::Success) => {
-                    let returned_id = response.get_data(DataType::RelayMessageId).as_str();
-                    let destination_accepted_at = response
-                        .get_data(DataType::RelayAcceptedAt)
-                        .as_number()
-                        .and_then(|value| i64::try_from(value).ok());
-                    if returned_id != Some(verified.context.message_id.as_str()) {
-                        log!("Relay acknowledgement returned a different RelayMessageId");
-                        self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                            .await;
-                        return;
-                    }
-                    let Some(destination_accepted_at) = destination_accepted_at else {
-                        log!("Relay acknowledgement is missing RelayAcceptedAt");
-                        self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                            .await;
-                        return;
-                    };
-                    let Ok(signer_id) = i64::try_from(verified.context.signer_id) else {
-                        self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                            .await;
-                        return;
-                    };
-                    if defer_chat_secret_commit && !already_applied {
-                        let content = match open_verified_relay_content(&verified, &[&keyring]) {
-                            Ok(value) => value,
-                            Err(error) => {
-                                log!("Relay origin content verification failed: {}", error);
-                                self.send_relay_response(
-                                    frame.id(),
-                                    CommunicationType::ErrorInvalidData,
-                                )
-                                .await;
-                                return;
-                            }
-                        };
-                        let Ok(origin_id) = i64::try_from(verified.context.signer_id) else {
-                            self.send_relay_response(
-                                frame.id(),
-                                CommunicationType::ErrorInvalidData,
-                            )
-                            .await;
-                            return;
-                        };
-                        if let Err(error) = message_handlers::apply_verified_relay_content(
-                            &verified.context,
-                            &content,
-                            accepted_at,
-                            origin_id,
-                            true,
-                        ) {
-                            log!("Relay origin chat-secret application failed: {}", error);
-                            self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
-                                .await;
-                            return;
-                        }
-                    }
-                    if let Err(error) =
-                        iota_storage::util::downstream_relay::acknowledge_iota_delivery(
-                            router,
-                            frame_id,
-                            signer_id,
-                            &verified.context.message_id,
-                            destination_accepted_at,
-                        )
-                    {
-                        log!(
-                            "Relay destination acknowledgement storage failed: {}",
-                            error
-                        );
-                        self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
-                            .await;
-                        return;
-                    }
-                    let response = response
-                        .add_typed_default(
-                            DataType::OriginIotaReceivedAt,
-                            DataValue::SignedNumber(accepted_at.into()),
-                        )
-                        .add_typed_default(
-                            DataType::DestinationIotaReceivedAt,
-                            DataValue::SignedNumber(destination_accepted_at.into()),
-                        )
-                        .with_id(frame_id);
-                    if let Err(error) = self.send_message(&response).await {
-                        log!("Relay response could not be sent: {}", error);
-                    }
-                }
-                Ok(response) => {
-                    log!("Relay origin route returned {}", response.get_type());
-                    if response.is_type(CommunicationType::ErrorInternal)
-                        && !defer_chat_secret_commit
-                    {
-                        record_origin_delivery_failure(
-                            verified.context.signer_id,
-                            &verified.context.message_id,
-                            "destination_internal_error",
-                        );
-                        self.send_relay_success(
-                            frame.id(),
-                            local_iota_id,
-                            &verified.context.message_id,
-                            accepted_at,
-                            true,
-                        )
-                        .await;
-                        return;
-                    } else if let Ok(signer_id) = i64::try_from(verified.context.signer_id) {
-                        if let Err(error) =
-                            iota_storage::util::downstream_relay::reject_iota_delivery(
-                                router,
-                                frame_id,
-                                signer_id,
-                                &verified.context.message_id,
-                                "destination_rejected",
-                            )
-                        {
-                            log!("Relay rejection cleanup failed: {}", error);
-                        }
-                        record_origin_delivery_failure(
-                            verified.context.signer_id,
-                            &verified.context.message_id,
-                            "destination_rejected",
-                        );
-                    }
-                    self.send_relay_response(
-                        frame.id(),
-                        response
-                            .get_comm_type_enum()
-                            .unwrap_or(CommunicationType::ErrorInternal),
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    log!("Relay origin forwarding failed: {}", error);
-                    record_origin_delivery_failure(
-                        verified.context.signer_id,
-                        &verified.context.message_id,
-                        "destination_unreachable",
-                    );
-                    if defer_chat_secret_commit {
-                        if let Ok(signer_id) = i64::try_from(verified.context.signer_id) {
-                            if let Err(queue_error) =
-                                iota_storage::util::downstream_relay::reject_iota_delivery(
-                                    router,
-                                    frame_id,
-                                    signer_id,
-                                    &verified.context.message_id,
-                                    "destination_unreachable",
-                                )
-                            {
-                                log!("Chat-secret relay retry cleanup failed: {}", queue_error);
-                            }
-                        }
-                        self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
-                            .await;
-                        return;
-                    }
-                    self.send_relay_success(
-                        frame.id(),
-                        local_iota_id,
-                        &verified.context.message_id,
-                        accepted_at,
-                        true,
-                    )
-                    .await;
-                }
-            }
-            return;
-        }
-
-        let destination = verified.context.final_recipient_id;
-        let forwarded = match forward_verified_relay(&frame, RouteTarget::User(destination)) {
-            Ok(value) => value,
-            Err(error) => {
-                log!("Relay forwarding validation failed: {}", error);
-                self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                    .await;
-                return;
-            }
-        };
-        let bytes = match forwarded.to_bytes() {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                log!(
-                    "Relay could not be serialized for client delivery: {}",
-                    error
-                );
-                self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
-                    .await;
-                return;
-            }
-        };
-        let relay_identity = match (
-            i64::try_from(verified.context.signer_id),
-            i64::try_from(verified.context.final_recipient_id),
-        ) {
-            (Ok(signer_id), Ok(destination_user_id)) => relay_queue::RelayIdentity {
-                signer_id,
-                destination_user_id,
-                message_id: verified.context.message_id.clone(),
-            },
-            _ => {
-                log!("Relay identity exceeds the storage range");
-                self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                    .await;
-                return;
-            }
-        };
-        if let Err(error) = relay_queue::enqueue(
-            RouteTarget::User(destination),
-            &relay_identity,
-            &bytes,
-            now_millis_i64(),
-            frame_id,
-            &type_map_version,
-        ) {
-            log!("Relay could not be queued for client delivery: {}", error);
-            self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
-                .await;
-            return;
-        }
-
-        let mut client_event = None;
-        if !already_applied {
-            let content = match open_verified_relay_content(&verified, &[&keyring]) {
-                Ok(value) => value,
-                Err(error) => {
-                    log!("Relay content verification failed: {}", error);
-                    if let Err(queue_error) =
-                        relay_queue::remove_for_frame(RouteTarget::User(destination), frame_id)
-                    {
-                        log!(
-                            "Relay invalid-content queue cleanup failed: {}",
-                            queue_error
-                        );
-                    }
-                    let _ = relay_replay::mark_rejected(
-                        verified.context.signer_id,
-                        &verified.context.message_id,
-                    );
-                    self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                        .await;
-                    return;
-                }
-            };
-            if let Err(error) = message_handlers::apply_verified_relay_content(
-                &verified.context,
-                &content,
-                accepted_at,
-                match i64::try_from(destination) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        log!("Relay destination ID exceeds storage range");
-                        self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                            .await;
-                        return;
-                    }
-                },
-                false,
-            ) {
-                log!("Relay application dispatch failed: {}", error);
-                if let Err(queue_error) =
-                    relay_queue::remove_for_frame(RouteTarget::User(destination), frame_id)
-                {
-                    log!("Relay application queue cleanup failed: {}", queue_error);
-                }
-                let _ = relay_replay::mark_rejected(
-                    verified.context.signer_id,
-                    &verified.context.message_id,
-                );
-                self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                    .await;
-                return;
-            }
-            client_event = Self::client_event_from_relay(
-                content.message_type,
-                &content.content,
-                verified.context.signer_id,
-                destination,
-                &verified.context.message_id,
-                accepted_at,
-            );
-            if let Err(error) =
-                relay_replay::mark_applied(verified.context.signer_id, &verified.context.message_id)
-            {
-                log!("Relay application state update failed: {}", error);
-                self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
-                    .await;
-                return;
-            }
-        }
-
-        if signer_is_local && recipient_is_local {
-            let Ok(owner) = i64::try_from(verified.context.signer_id) else {
-                self.send_relay_response(frame.id(), CommunicationType::ErrorInvalidData)
-                    .await;
-                return;
-            };
-            if let Err(error) = outgoing_relay::apply_outgoing_history_policy(
-                owner,
-                owner,
-                &verified.context.message_id,
-            ) {
-                log!("Shared-Iota outgoing history policy failed: {}", error);
-                self.send_relay_response(frame.id(), CommunicationType::ErrorInternal)
-                    .await;
-                return;
-            }
-        }
-
-        if let Err(error) =
-            relay_replay::mark_queued(verified.context.signer_id, &verified.context.message_id)
+        match local
+            .signing_keys(&principal, &iota_identity::ResolutionContext::default())
+            .await
         {
-            log!("Relay queue state update failed: {}", error);
-        }
-        self.send_relay_success(
-            frame.id(),
-            local_iota_id,
-            &verified.context.message_id,
-            accepted_at,
-            signer_is_local,
-        )
-        .await;
-        if let Some(event) = client_event {
-            if let Err(error) = self.send_message(&event).await {
-                log!("Relay client event delivery failed: {}", error);
+            Ok(_) => local
+                .resolve_principal(&principal)
+                .await
+                .map_err(|error| RelayValidationError::KeyLookup(error.to_string())),
+            Err(iota_identity::IdentityError::NotFound) => {
+                crate::identity::resolve_omega_principal(
+                    self,
+                    principals.as_ref(),
+                    &authority,
+                    &locator,
+                    &UserSelector::UserId(signer_id),
+                )
+                .await
+                .map_err(|error| RelayValidationError::KeyLookup(error.to_string()))
             }
+            Err(error) => Err(RelayValidationError::KeyLookup(error.to_string())),
         }
     }
+}
 
+impl OmikronConnection {
     async fn classify_legacy_pending_relays(&self) {
         let mut after_id = 0;
         loop {
@@ -2253,17 +1252,33 @@ impl OmikronConnection {
                     i64::try_from(verified.context.signer_id),
                     i64::try_from(verified.context.final_recipient_id),
                 ) {
-                    (Ok(signer_id), Ok(destination_user_id)) => relay_queue::RelayIdentity {
-                        signer_id,
-                        destination_user_id,
-                        message_id: verified.context.message_id,
-                    },
+                    (Ok(signer_id), Ok(destination_user_id)) => {
+                        let Ok(signer) = self
+                            .resolve_relay_principal(verified.context.signer_id)
+                            .await
+                        else {
+                            continue;
+                        };
+                        let Ok(recipient) = self
+                            .resolve_relay_principal(verified.context.final_recipient_id)
+                            .await
+                        else {
+                            continue;
+                        };
+                        relay_queue::RelayIdentity {
+                            signer: signer.handle,
+                            recipient: recipient.handle,
+                            message_id: verified.context.message_id,
+                            legacy_signer_id: Some(signer_id),
+                            legacy_recipient_id: Some(destination_user_id),
+                        }
+                    }
                     _ => {
                         let _ = relay_queue::delete(record.id);
                         continue;
                     }
                 };
-                if matches!(record.target, RouteTarget::User(destination) if i64::try_from(destination).ok() != Some(identity.destination_user_id))
+                if matches!(record.target, relay_queue::RelayTarget::User(destination) if i64::try_from(destination).ok() != identity.legacy_recipient_id)
                 {
                     log!(
                         "Quarantining pending Relay {} with a target-recipient mismatch",
@@ -2293,12 +1308,14 @@ impl OmikronConnection {
         };
         for record in records.into_iter().filter(|record| {
             destination_user_id.is_none_or(|user_id| {
-                matches!(record.target, RouteTarget::User(destination) if i64::try_from(destination).ok() == Some(user_id))
+                matches!(record.target, relay_queue::RelayTarget::User(destination) if i64::try_from(destination).ok() == Some(user_id))
             })
         }) {
             if record.relay_signer_id.is_none()
                 || record.relay_destination_user_id.is_none()
                 || record.relay_message_id.is_none()
+                || record.signer_principal.is_none()
+                || record.destination_principal.is_none()
             {
                 log!(
                     "Skipping pending Relay {} until ownership is classified",
@@ -2306,6 +1323,9 @@ impl OmikronConnection {
                 );
                 continue;
             }
+            let Some(signer_principal) = record.signer_principal else {
+                continue;
+            };
             let Some(version) = mtp::type_map::Version::parse(&record.type_map_version) else {
                 log!(
                     "Retaining pending Relay {} with invalid type-map version {}",
@@ -2360,11 +1380,21 @@ impl OmikronConnection {
                     i64::try_from(verified.context.signer_id),
                     i64::try_from(verified.context.final_recipient_id),
                 ) {
-                    (Ok(signer_id), Ok(destination_user_id)) => relay_queue::RelayIdentity {
-                        signer_id,
-                        destination_user_id,
-                        message_id: verified.context.message_id,
-                    },
+                    (Ok(signer_id), Ok(destination_user_id)) => {
+                        let Ok(signer) = self.resolve_relay_principal(verified.context.signer_id).await else {
+                            continue;
+                        };
+                        let Ok(recipient) = self.resolve_relay_principal(verified.context.final_recipient_id).await else {
+                            continue;
+                        };
+                        relay_queue::RelayIdentity {
+                            signer: signer.handle,
+                            recipient: recipient.handle,
+                            message_id: verified.context.message_id,
+                            legacy_signer_id: Some(signer_id),
+                            legacy_recipient_id: Some(destination_user_id),
+                        }
+                    }
                     _ => {
                         log!(
                             "Deleting pending Relay {} with an out-of-range identity",
@@ -2385,7 +1415,10 @@ impl OmikronConnection {
                     continue;
                 }
             }
-            let Ok(forwarded) = forward_verified_relay(&frame, record.target) else {
+            let Some(wire_target) = record.target.legacy_wire_target() else {
+                continue;
+            };
+            let Ok(forwarded) = forward_verified_relay(&frame, wire_target) else {
                 log!(
                     "Retaining pending Relay {} with invalid route target",
                     record.id
@@ -2393,7 +1426,7 @@ impl OmikronConnection {
                 continue;
             };
             match record.target {
-                RouteTarget::Iota(destination_iota) => {
+                relay_queue::RelayTarget::LegacyOmegaIota { iota_id: destination_iota, .. } => {
                     match self
                         .await_relay_response(&forwarded, Duration::from_secs(20))
                         .await
@@ -2456,10 +1489,31 @@ impl OmikronConnection {
                                             continue;
                                         }
                                     };
+                                    let recipient_principal = match record.destination_principal {
+                                        Some(principal) => principal,
+                                        None => match self
+                                            .resolve_relay_principal(
+                                                verified.context.final_recipient_id,
+                                            )
+                                            .await
+                                        {
+                                            Ok(principal) => principal.handle,
+                                            Err(error) => {
+                                                log!(
+                                                    "Retaining pending chat-secret Relay {} after recipient resolution failure: {}",
+                                                    record.id,
+                                                    error
+                                                );
+                                                continue;
+                                            }
+                                        },
+                                    };
                                     if let Err(error) =
                                         message_handlers::apply_verified_relay_content(
                                             &verified.context,
                                             &content,
+                                            signer_principal,
+                                            recipient_principal,
                                             now_millis_i64(),
                                             signer_id,
                                             true,
@@ -2475,9 +1529,9 @@ impl OmikronConnection {
                                 }
                                 if let Err(error) =
                                     iota_storage::util::downstream_relay::acknowledge_iota_delivery(
-                                        destination_iota,
                                         record.frame_id,
-                                        signer_id,
+                                        signer_principal,
+                                        Some(signer_id),
                                         message_id,
                                         accepted_at,
                                     )
@@ -2498,9 +1552,9 @@ impl OmikronConnection {
                             {
                                 if let Err(error) =
                                     iota_storage::util::downstream_relay::reject_iota_delivery(
-                                        destination_iota,
                                         record.frame_id,
-                                        signer_id,
+                                        signer_principal,
+                                        Some(signer_id),
                                         message_id,
                                         "destination_rejected",
                                     )
@@ -2523,11 +1577,12 @@ impl OmikronConnection {
                         }
                     }
                 }
-                RouteTarget::User(_) => {
+                relay_queue::RelayTarget::User(_) => {
                     if let Err(error) = self.send_message(&forwarded).await {
                         log!("Pending Relay {} delivery failed: {}", record.id, error);
                     }
                 }
+                relay_queue::RelayTarget::Iota(_) => {}
             }
         }
     }
@@ -2590,7 +1645,7 @@ impl OmikronConnection {
 
     async fn handle_message_impl(self: Arc<Self>, cv: CommunicationValue) {
         if cv.is_type(CommunicationType::Relay) {
-            self.handle_relay(cv).await;
+            self.dispatch_relay(cv).await;
             return;
         }
         if cv.require_id().is_err() {
@@ -2864,9 +1919,14 @@ impl OmikronConnection {
         if trusted {
             let challenge = Uuid::new_v4().to_string();
 
-            self.app_challenges.insert(sender_id, challenge.clone());
-            self.app_sessions
-                .insert(sender_id, (user_id, app_identifier.clone()));
+            self.app_challenges.insert(
+                sender_id,
+                PendingAppChallenge {
+                    challenge: challenge.clone(),
+                    user_id,
+                    app_identifier: app_identifier.clone(),
+                },
+            );
 
             if let Some(app_pub_bundle) =
                 iota_util::crypto_helper::public_key_bundle_from_base64(&app_public_key)
@@ -2911,9 +1971,59 @@ impl OmikronConnection {
                 return;
             }
         };
-        if let Some((_, expected_challenge)) = self.app_challenges.remove(&sender_id) {
+        if let Some((_, pending)) = self.app_challenges.remove(&sender_id) {
             if let Some(DataValue::Str(response)) = cv.get_data(DataType::Challenge) {
-                if expected_challenge == *response {
+                if pending.challenge == *response {
+                    let authority = match iota_identity::AuthorityId::omega_legacy(
+                        &omega_discovery::omega_host(),
+                    ) {
+                        Ok(authority) => authority,
+                        Err(_) => {
+                            let _ = self
+                                .send_message(&error_response(cv, CommunicationType::ErrorInternal))
+                                .await;
+                            return;
+                        }
+                    };
+                    let user_id = match u64::try_from(pending.user_id) {
+                        Ok(user_id) => user_id,
+                        Err(_) => {
+                            let _ = self
+                                .send_message(&error_response(
+                                    cv,
+                                    CommunicationType::ErrorInvalidData,
+                                ))
+                                .await;
+                            return;
+                        }
+                    };
+                    let principal = iota_identity::PrincipalId { authority, user_id };
+                    let principal = match iota_identity::PrincipalStore::get_by_canonical_id(
+                        &iota_storage::identity::SqlitePrincipalStore,
+                        &principal,
+                    ) {
+                        Ok(Some(principal)) => principal,
+                        _ => {
+                            let _ = self
+                                .send_message(&error_response(cv, CommunicationType::ErrorInternal))
+                                .await;
+                            return;
+                        }
+                    };
+                    let connection_id = Uuid::new_v4();
+                    iota_auth::HostedSessionRegistrar::new(self.session_manager.clone())
+                        .authenticate(
+                            connection_id,
+                            iota_identity::LocalUserId(pending.user_id),
+                            principal.handle,
+                        );
+                    self.app_sessions.insert(
+                        sender_id,
+                        AppSession {
+                            connection_id,
+                            app_identifier: pending.app_identifier,
+                        },
+                    );
                     let res = CommunicationValue::new(CommunicationType::AppIdentificationResponse)
                         .with_request_id(cv)
                         .with_receiver(sender_id);
@@ -2944,9 +2054,18 @@ impl OmikronConnection {
             .unwrap_or("")
             .to_string();
 
-        if let Some(session) = self.app_sessions.get(&sender_id) {
-            let (user_id, app_identifier) = session.value();
-            iota_storage::users::user_manager::save_app_data(*user_id, app_identifier, &app_data);
+        if let Some(session) = self.app_sessions.get(&sender_id)
+            && let Ok(authenticated) = self.session_manager.authorize(
+                session.connection_id,
+                &iota_auth::SessionCapability::LocalStorage,
+            )
+            && let iota_auth::SessionIdentity::Hosted { local_user, .. } = authenticated.identity
+        {
+            iota_storage::users::user_manager::save_app_data(
+                local_user.0,
+                &session.app_identifier,
+                &app_data,
+            );
         }
 
         let res = CommunicationValue::new(CommunicationType::SaveAppData)
@@ -2967,9 +2086,17 @@ impl OmikronConnection {
         };
         let mut app_data = String::new();
 
-        if let Some(session) = self.app_sessions.get(&sender_id) {
-            let (user_id, app_identifier) = session.value();
-            app_data = iota_storage::users::user_manager::load_app_data(*user_id, app_identifier);
+        if let Some(session) = self.app_sessions.get(&sender_id)
+            && let Ok(authenticated) = self.session_manager.authorize(
+                session.connection_id,
+                &iota_auth::SessionCapability::LocalStorage,
+            )
+            && let iota_auth::SessionIdentity::Hosted { local_user, .. } = authenticated.identity
+        {
+            app_data = iota_storage::users::user_manager::load_app_data(
+                local_user.0,
+                &session.app_identifier,
+            );
         }
 
         let res = CommunicationValue::new(CommunicationType::LoadAppData)
@@ -3806,12 +2933,14 @@ impl OmikronConnection {
                 ))
             })?;
         }
-        save_keyring_verified(&keyring, path).map_err(|error| {
-            OmikronError::Internal(format!(
-                "could not save new identity {}: {error}",
-                path.display()
-            ))
-        })?;
+        iota_identity::LocalNodeIdentity::save_keyring_verified(&keyring, path).map_err(
+            |error| {
+                OmikronError::Internal(format!(
+                    "could not save new identity {}: {error}",
+                    path.display()
+                ))
+            },
+        )?;
         modify_config(|config| {
             config.iota_id = None;
             config.keyring = None;
@@ -3844,14 +2973,6 @@ impl OmikronConnection {
     }
 }
 
-fn recipient_block_policy_applies(
-    recipient_is_local: bool,
-    recipient_id: i64,
-    signer_id: i64,
-) -> bool {
-    recipient_is_local && recipient_id != signer_id
-}
-
 // ============================================================================
 // Global Instance
 // ============================================================================
@@ -3878,17 +2999,31 @@ pub async fn connect_initial(
     }
 }
 
+#[async_trait::async_trait]
 impl iota_connection::connection_handler::ConnectionHandler for OmikronConnection {
-    async fn send_message(&self, cv: &CommunicationValue) -> Result<(), String> {
-        OmikronConnection::send_message(self, cv).await
+    async fn send_message(
+        &self,
+        cv: &CommunicationValue,
+    ) -> Result<(), iota_connection::connection_handler::ConnectionError> {
+        OmikronConnection::send_message(self, cv)
+            .await
+            .map_err(iota_connection::connection_handler::ConnectionError::Disconnected)
     }
 
     async fn await_response(
         &self,
         cv: &CommunicationValue,
         timeout: Option<Duration>,
-    ) -> Result<CommunicationValue, String> {
-        OmikronConnection::await_response(self, cv, timeout).await
+    ) -> Result<CommunicationValue, iota_connection::connection_handler::ConnectionError> {
+        OmikronConnection::await_response(self, cv, timeout)
+            .await
+            .map_err(|error| {
+                if error.contains("timed out") {
+                    iota_connection::connection_handler::ConnectionError::Timeout(error)
+                } else {
+                    iota_connection::connection_handler::ConnectionError::Disconnected(error)
+                }
+            })
     }
 
     async fn is_connected(&self) -> bool {
@@ -3901,6 +3036,29 @@ impl iota_connection::connection_handler::ConnectionHandler for OmikronConnectio
 
     async fn stop(&self) {
         OmikronConnection::stop(self).await
+    }
+}
+
+#[async_trait::async_trait]
+impl iota_connection::relay_service::RelayNodeIdentity for OmikronConnection {
+    async fn keyring(&self) -> Option<Arc<Keyring>> {
+        self.keyring.read().await.as_ref().cloned()
+    }
+
+    fn node_id(&self) -> Option<iota_identity::IotaNodeId> {
+        self.keyring
+            .try_read()
+            .ok()
+            .and_then(|keyring| keyring.as_ref().cloned())
+            .and_then(|keyring| {
+                iota_identity::IotaNodeId::from_public_keys(&keyring.public_key_bundle()).ok()
+            })
+    }
+}
+
+impl iota_connection::relay_service::LegacyRelayIdentity for OmikronConnection {
+    fn legacy_iota_id(&self) -> Option<u64> {
+        CONFIG.load().iota_id
     }
 }
 
@@ -3945,11 +3103,13 @@ impl OmikronClient for OmikronConnection {
             keyring: self.keyring.clone(),
             app_challenges: self.app_challenges.clone(),
             app_sessions: self.app_sessions.clone(),
+            session_manager: self.session_manager.clone(),
             handler_semaphore: self.handler_semaphore.clone(),
             cancellation: self.cancellation.clone(),
             active_tasks: self.active_tasks.clone(),
             app: self.app.clone(),
             invitation_sync: self.invitation_sync.clone(),
+            relay_service: self.relay_service.clone(),
         });
         Self::reconnect(&this).await;
         Ok(())
@@ -3970,11 +3130,13 @@ impl OmikronClient for OmikronConnection {
             keyring: self.keyring.clone(),
             app_challenges: self.app_challenges.clone(),
             app_sessions: self.app_sessions.clone(),
+            session_manager: self.session_manager.clone(),
             handler_semaphore: self.handler_semaphore.clone(),
             cancellation: self.cancellation.clone(),
             active_tasks: self.active_tasks.clone(),
             app: self.app.clone(),
             invitation_sync: self.invitation_sync.clone(),
+            relay_service: self.relay_service.clone(),
         });
         Self::rotate_identity(&this).await
     }
@@ -3987,6 +3149,7 @@ impl OmikronClient for OmikronConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn test_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -3999,11 +3162,17 @@ mod tests {
     #[test]
     fn generated_identity_is_unprotected_and_survives_reload() {
         let path = test_path("reload");
-        let keyring = load_or_migrate_keyring_at(&path, None).expect("identity saves");
+        let identity = load_or_migrate_keyring_at(&path, None).expect("identity saves");
         let reloaded = load_or_migrate_keyring_at(&path, None).expect("identity loads");
         assert_eq!(
-            keyring.try_to_bytes().expect("keyring serializes"),
-            reloaded.try_to_bytes().expect("keyring serializes")
+            identity
+                .keyring()
+                .try_to_bytes()
+                .expect("keyring serializes"),
+            reloaded
+                .keyring()
+                .try_to_bytes()
+                .expect("keyring serializes")
         );
         assert!(mtp::files::load_keyring_raw(&path).is_ok());
         let _ = fs::remove_file(path);
@@ -4015,7 +3184,10 @@ mod tests {
         fs::write(&path, b"not a keyring").expect("corrupt fixture writes");
         let error =
             load_or_migrate_keyring_at(&path, None).expect_err("corrupt identity must fail");
-        assert!(matches!(error, IdentityError::Storage(_)));
+        assert!(matches!(
+            error,
+            iota_identity::LocalNodeIdentityError::Storage { .. }
+        ));
         let _ = fs::remove_file(path);
     }
 
@@ -4030,7 +3202,10 @@ mod tests {
 
         let migrated = load_or_migrate_keyring_at(&path, None).expect("legacy identity loads");
         assert_eq!(
-            migrated.try_to_bytes().expect("keyring serializes"),
+            migrated
+                .keyring()
+                .try_to_bytes()
+                .expect("keyring serializes"),
             keyring.try_to_bytes().expect("keyring serializes")
         );
         let _ = fs::remove_file(path);
@@ -4043,7 +3218,10 @@ mod tests {
         let path = parent.join("iota.mk");
         let error = load_or_migrate_keyring_at(&path, None)
             .expect_err("directory failure must be returned");
-        assert!(matches!(error, IdentityError::Directory(_)));
+        assert!(matches!(
+            error,
+            iota_identity::LocalNodeIdentityError::Directory { .. }
+        ));
         let _ = fs::remove_file(parent);
     }
 
@@ -4073,13 +3251,6 @@ mod tests {
             error,
             OmikronError::Rejected(CommunicationType::ErrorNotFound, _)
         ));
-    }
-
-    #[test]
-    fn recipient_block_policy_skips_self_delivery() {
-        assert!(!recipient_block_policy_applies(true, 42, 42));
-        assert!(recipient_block_policy_applies(true, 42, 43));
-        assert!(!recipient_block_policy_applies(false, 42, 43));
     }
 
     #[test]

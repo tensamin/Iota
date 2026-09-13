@@ -1,6 +1,6 @@
 use iota_cli::{
     ipc_client::IpcClient, screens::main_screen::MainScreen, theme,
-    ui::start_bootstrap_tui_with_theme,
+    ui::start_bootstrap_tui_with_config,
 };
 use iota_ipc::{LocalRequest, ResponsePayload, ResponseResult};
 use iota_process_manager::detect;
@@ -250,37 +250,16 @@ async fn run_dashboard(
         },
         policy => policy,
     };
-    let color_enabled = match color_policy {
-        CapabilityPolicy::Always => true,
-        CapabilityPolicy::Never => false,
-        CapabilityPolicy::Auto => {
-            std::env::var_os("NO_COLOR").is_none() && std::env::var("TERM").as_deref() != Ok("dumb")
-        }
+    let to_terminal_policy = |policy| match policy {
+        CapabilityPolicy::Auto => theme::TerminalPolicy::Auto,
+        CapabilityPolicy::Always => theme::TerminalPolicy::Always,
+        CapabilityPolicy::Never => theme::TerminalPolicy::Never,
     };
-    let unicode_enabled = match unicode_policy {
-        CapabilityPolicy::Always => true,
-        CapabilityPolicy::Never => false,
-        CapabilityPolicy::Auto => std::env::var("LC_ALL")
-            .or_else(|_| std::env::var("LC_CTYPE"))
-            .or_else(|_| std::env::var("LANG"))
-            .map(|locale| {
-                let locale = locale.to_ascii_lowercase();
-                locale.contains("utf-8") || locale.contains("utf8")
-            })
-            .unwrap_or(false),
-    };
-    let truecolor_enabled = std::env::var("COLORTERM")
-        .map(|value| {
-            let value = value.to_ascii_lowercase();
-            value.contains("truecolor") || value.contains("24bit")
-        })
-        .unwrap_or(false);
-    let session = start_bootstrap_tui_with_theme(theme::resolve_with_terminal_profile(
+    let session = start_bootstrap_tui_with_config(
         theme::UiConfig::resolve_theme(theme_override),
-        color_enabled,
-        unicode_enabled,
-        truecolor_enabled,
-    ))
+        to_terminal_policy(color_policy),
+        to_terminal_policy(unicode_policy),
+    )
     .map_err(|error| StartupError::Terminal(error.to_string()))?;
     let ui = session.ui();
     let result = async {
@@ -319,8 +298,8 @@ async fn run_dashboard(
         };
         let ipc = context.ipc.clone();
         ipc.spawn_reconnector();
-        ui.attach_daemon(ipc).await;
-        let main_screen = MainScreen::new(ui.clone()).await;
+        ui.attach_daemon(ipc.clone()).await;
+        let main_screen = MainScreen::new(ipc.clone());
         ui.set_root_screen(Box::new(main_screen)).await;
         ui.render().await.map_err(|error| StartupError::Terminal(error.to_string()))?;
         ui.wait_for_shutdown().await;

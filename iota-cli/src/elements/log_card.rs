@@ -1,6 +1,6 @@
 use crate::elements::elements::{Element, InteractableElement, JoinableElement};
 use crate::util::borders::draw_block_joins;
-use crate::{interaction_result::InteractionResult, render_context::RenderContext};
+use crate::{screens::screens::IotaInteraction, theme::ResolvedTheme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use iota_state::{ClientState, UiLogEntry};
 use ratatui::{
@@ -270,7 +270,7 @@ impl LogCard {
         }
     }
 
-    fn scroll_up(&mut self) {
+    pub fn scroll_older(&mut self) {
         let max_offset = self
             .last_total_lines
             .load(Ordering::Relaxed)
@@ -278,7 +278,7 @@ impl LogCard {
         self.scroll_offset = (self.scroll_offset + 1).min(max_offset);
     }
 
-    fn scroll_down(&mut self) {
+    pub fn scroll_newer(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
     }
 
@@ -318,25 +318,19 @@ impl Element for LogCard {
         self
     }
 
-    fn render(&self, f: &mut Frame, area: Rect, context: &RenderContext<'_>) {
+    fn render(&self, f: &mut Frame, area: Rect, theme: &ResolvedTheme) {
         let entries = self.get_logs();
 
-        let inner_area = if matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) {
-            crate::controls::panel::render_panel(
-                f,
-                area,
-                &self.build_title(),
-                self.focused,
-                context.theme,
-            )
+        let inner_area = if matches!(theme.chrome, crate::theme::ChromeMode::Surfaces) {
+            crate::controls::panel::render_panel(f, area, &self.build_title(), self.focused, theme)
         } else {
             let block = Block::default()
                 .title(self.build_title())
                 .borders(self.borders)
                 .border_style(if self.focused {
-                    context.theme.logs.focused_border
+                    theme.logs.focused_border
                 } else {
-                    context.theme.logs.border
+                    theme.logs.border
                 });
             let inner = block.inner(area);
             f.render_widget(block, area);
@@ -350,9 +344,9 @@ impl Element for LogCard {
                 self.borders,
                 self.joins,
                 if self.focused {
-                    context.theme.borders.focused
+                    theme.borders.focused
                 } else {
-                    context.theme.borders.normal
+                    theme.borders.normal
                 },
             );
             return;
@@ -376,24 +370,21 @@ impl Element for LogCard {
                 let mut spans = Vec::new();
 
                 let (prefix, rest) = Self::split_line_prefix(line);
-                let prefix = if matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) {
+                let prefix = if matches!(theme.chrome, crate::theme::ChromeMode::Surfaces) {
                     ""
                 } else {
                     prefix
                 };
 
                 if !prefix.is_empty() {
-                    spans.push(Span::styled(
-                        prefix.to_string(),
-                        source.style(context.theme),
-                    ));
+                    spans.push(Span::styled(prefix.to_string(), source.style(theme)));
                 }
 
                 let (content, timestamp) = Self::split_timestamp_suffix(rest);
                 let text_style = if *is_error {
-                    context.theme.logs.error
+                    theme.logs.error
                 } else {
-                    context.theme.logs.text
+                    theme.logs.text
                 };
 
                 if !content.is_empty() {
@@ -401,10 +392,7 @@ impl Element for LogCard {
                 }
 
                 if !timestamp.is_empty() {
-                    spans.push(Span::styled(
-                        timestamp.to_string(),
-                        context.theme.logs.timestamp,
-                    ));
+                    spans.push(Span::styled(timestamp.to_string(), theme.logs.timestamp));
                 }
 
                 Line::from(spans)
@@ -421,16 +409,16 @@ impl Element for LogCard {
             f.render_widget(Paragraph::new(line.clone()), line_area);
         }
 
-        if !matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) {
+        if !matches!(theme.chrome, crate::theme::ChromeMode::Surfaces) {
             draw_block_joins(
                 f,
                 area,
                 self.borders,
                 self.joins,
                 if self.focused {
-                    context.theme.borders.focused
+                    theme.borders.focused
                 } else {
-                    context.theme.borders.normal
+                    theme.borders.normal
                 },
             );
         }
@@ -480,7 +468,7 @@ impl InteractableElement for LogCard {
         &mut *self
     }
 
-    fn interact(&mut self, key: KeyEvent) -> InteractionResult {
+    fn interact(&mut self, key: KeyEvent) -> IotaInteraction {
         if self.filtering {
             match key.code {
                 KeyCode::Esc => {
@@ -501,7 +489,7 @@ impl InteractableElement for LogCard {
                 _ => {}
             }
             self.scroll_offset = 0;
-            return InteractionResult::Handled;
+            return IotaInteraction::Changed;
         }
         let entries = self.get_logs();
         let width = self.last_width.load(Ordering::Relaxed).max(1);
@@ -517,51 +505,51 @@ impl InteractableElement for LogCard {
                 self.filtering = true;
                 self.filter.clear();
                 self.scroll_offset = 0;
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 self.selected = !self.selected;
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Char('j') | KeyCode::Char('J') => {
                 let (can_up, _) = self.get_title_hints();
                 if can_up {
-                    self.scroll_up();
+                    self.scroll_older();
                 }
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Char('k') | KeyCode::Char('K') => {
                 let (_, can_down) = self.get_title_hints();
                 if can_down {
-                    self.scroll_down();
+                    self.scroll_newer();
                 }
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Up if self.selected => {
                 let (can_up, _) = self.get_title_hints();
                 if can_up {
-                    self.scroll_up();
+                    self.scroll_older();
                 }
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Down if self.selected => {
                 let (_, can_down) = self.get_title_hints();
                 if can_down {
-                    self.scroll_down();
+                    self.scroll_newer();
                 }
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Home => {
                 if total_lines > visible_height {
                     self.scroll_offset = total_lines - visible_height;
                 }
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::End => {
                 self.scroll_offset = 0;
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
-            _ => InteractionResult::Unhandled,
+            _ => IotaInteraction::Unhandled,
         }
     }
 

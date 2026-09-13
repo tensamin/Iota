@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iota_cli::screens::terms_checker::{TermsCheckerScreen, UserChoice};
-use iota_cli::ui::UI;
+use iota_cli::ui::UiHandle;
 use iota_terms::{Doc, LegalDocument, TermsType as Type, get_current_docs};
 use iota_util::file_util::{load_file, save_file};
 use tokio::sync::oneshot;
@@ -13,7 +13,7 @@ pub struct ConsentCheck {
     pub documents: [LegalDocument; 3],
 }
 
-pub async fn check(ui: Arc<UI>) -> Result<ConsentCheck, String> {
+pub async fn check(ui: Arc<UiHandle>) -> Result<ConsentCheck, String> {
     let mut state = ConsentState::load_state();
 
     let documents = ensure_initial_consent(ui.clone(), &mut state).await?;
@@ -49,7 +49,7 @@ pub fn non_interactive_consent() -> NonInteractiveConsent {
 }
 
 async fn ensure_initial_consent(
-    ui: Arc<UI>,
+    ui: Arc<UiHandle>,
     state: &mut ConsentState,
 ) -> Result<[LegalDocument; 3], String> {
     let (current_eula, current_tos, current_privacy) = get_current_docs().await.ok_or_else(|| {
@@ -99,7 +99,7 @@ async fn ensure_initial_consent(
     }
 }
 /*
-async fn ensure_updates(ui: Arc<UI>, state: &mut ConsentState) -> Result<(), String> {
+async fn ensure_updates(ui: Arc<UiHandle>, state: &mut ConsentState) -> Result<(), String> {
     let Some((eula_update, tos_update, privacy_update)) = get_updates().await else {
         return Ok(());
     };

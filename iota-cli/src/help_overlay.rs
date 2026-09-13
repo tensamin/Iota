@@ -7,9 +7,7 @@ use ratatui::{
 };
 
 use crate::{
-    interaction_result::InteractionResult,
-    render_context::RenderContext,
-    screens::screens::{HitMap, Screen, UiEvent},
+    screens::screens::{HitMap, IotaInteraction, IotaScreen, UiEvent},
     theme::ResolvedTheme,
 };
 
@@ -139,19 +137,11 @@ impl HelpOverlay {
     }
 }
 
-impl Screen for HelpOverlay {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn render(&self, f: &mut Frame, rect: Rect, context: &RenderContext<'_>, _hits: &mut HitMap) {
-        let area = crate::layout::fit::centered_rect(
+impl IotaScreen for HelpOverlay {
+    fn render_legacy(&self, f: &mut Frame, rect: Rect, theme: &ResolvedTheme, _hits: &mut HitMap) {
+        let area = ratatool::layout::centered_rect(
             rect,
-            crate::layout::fit::RequiredSize {
+            ratatool::layout::RequiredSize {
                 width: 52,
                 height: 40,
             },
@@ -161,44 +151,43 @@ impl Screen for HelpOverlay {
         let block = Block::default()
             .title(" Keyboard Shortcuts (?) ")
             .borders(Borders::ALL)
-            .border_style(context.theme.borders.focused)
-            .style(context.theme.surfaces.overlay);
+            .border_style(theme.borders.focused)
+            .style(theme.surfaces.overlay);
 
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        let lines = self.build_lines(context.theme);
+        let lines = self.build_lines(theme);
         let paragraph = Paragraph::new(lines)
             .scroll((self.scroll as u16, 0))
-            .style(context.theme.text.normal);
+            .style(theme.text.normal);
         f.render_widget(paragraph, inner);
     }
 
-    fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
+    fn handle_event(&mut self, event: &UiEvent) -> IotaInteraction {
+        let event = event.clone();
         let UiEvent::Key(key) = event else {
-            return InteractionResult::Unhandled;
+            return IotaInteraction::Unhandled;
         };
         match key.code {
-            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
-                InteractionResult::CloseScreen
-            }
+            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => IotaInteraction::Pop,
             KeyCode::Down | KeyCode::Char('j') => {
                 self.scroll = self.scroll.saturating_add(1);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.scroll = self.scroll.saturating_sub(1);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::PageDown => {
                 self.scroll = self.scroll.saturating_add(10);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             KeyCode::PageUp => {
                 self.scroll = self.scroll.saturating_sub(10);
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
-            _ => InteractionResult::Unhandled,
+            _ => IotaInteraction::Unhandled,
         }
     }
 
@@ -215,5 +204,3 @@ impl Screen for HelpOverlay {
         ]
     }
 }
-
-use std::any::Any;

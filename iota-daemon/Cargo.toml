@@ -4,13 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+client = { path = "../client" }
 iota-daemon-lib = { path = "../iota-daemon-lib" }
+iota-connection = { path = "../iota-connection" }
 iota-ipc = { path = "../iota-ipc" }
 iota-logger = { path = "../iota-logger" }
+iota-identity = { path = "../iota-identity" }
 iota-paths = { path = "../iota-paths" }
 iota-storage = { path = "../iota-storage" }
 iota-util = { path = "../iota-util" }
 iota-terms = { path = "../iota-terms" }
 omikron-connector = { path = "../omikron-connector" }
+other-iota = { path = "../other-iota" }
 web-server = { path = "../web-server" }
 tokio = { version = "1.50.0", features = ["full"] }

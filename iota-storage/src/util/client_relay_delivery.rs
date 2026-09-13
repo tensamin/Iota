@@ -25,8 +25,8 @@ pub fn acknowledge_client_delivery(
             == message_storage_policy::MessageHistoryMode::DeleteAfterClientDelivery
         {
             let message_id = tx.query_row(
-                "SELECT id FROM messages WHERE storage_owner = ?1 AND relay_signer_id = ?2 AND relay_message_id = ?3",
-                rusqlite::params![destination_id, relay.signer_id, relay.message_id],
+                "SELECT id FROM messages WHERE storage_owner = ?1 AND relay_signer_principal = ?2 AND relay_message_id = ?3",
+                rusqlite::params![destination_id, relay.signer.0, relay.message_id],
                 |row| row.get::<_, i64>(0),
             ).optional()?;
             if let Some(message_id) = message_id {

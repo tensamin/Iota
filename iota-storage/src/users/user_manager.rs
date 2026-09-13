@@ -41,6 +41,31 @@ pub fn try_add_user(user: UserProfile) -> Result<(), crate::storage_error::Stora
     try_add_user_with_credential_origin(user, CredentialOrigin::Local)
 }
 
+/* Reserve a local identity before account creation. The counter never moves
+ * backward, so a removed account cannot be assigned its old canonical ID. */
+pub fn allocate_local_user_id(maximum: i64) -> Result<i64, crate::storage_error::StorageError> {
+    db::with_immediate_transaction(|tx| {
+        let next = tx.query_row(
+            "SELECT next_user_id FROM local_identity_allocator WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if next < 1 || next > maximum {
+            return Err(crate::storage_error::StorageError::Other(
+                "local user ID space is exhausted".into(),
+            ));
+        }
+        let following = next.checked_add(1).ok_or_else(|| {
+            crate::storage_error::StorageError::Other("local user ID space is exhausted".into())
+        })?;
+        tx.execute(
+            "UPDATE local_identity_allocator SET next_user_id = ?1 WHERE singleton = 1",
+            params![following],
+        )?;
+        Ok(next)
+    })
+}
+
 pub fn try_add_user_with_credential_origin(
     user: UserProfile,
     credential_origin: CredentialOrigin,
@@ -457,15 +482,15 @@ fn purge_database_rows(user_id: i64) -> Result<(), crate::storage_error::Storage
             params![user_id],
         )?;
         tx.execute(
-            "DELETE FROM pending_relays WHERE relay_signer_id = ?1 OR relay_destination_user_id = ?1",
+            "DELETE FROM pending_relays WHERE relay_signer_id = ?1 OR relay_destination_user_id = ?1 OR signer_principal = (SELECT principal_handle FROM hosted_principals WHERE local_user_id = ?1) OR destination_principal = (SELECT principal_handle FROM hosted_principals WHERE local_user_id = ?1)",
             params![user_id],
         )?;
         tx.execute(
-            "DELETE FROM relay_replay WHERE EXISTS (SELECT 1 FROM relay_inbox WHERE relay_inbox.signer_id = relay_replay.signer_id AND relay_inbox.message_id = relay_replay.message_id AND (relay_inbox.signer_id = ?1 OR relay_inbox.destination_id = ?1))",
+            "DELETE FROM relay_replay WHERE EXISTS (SELECT 1 FROM relay_inbox WHERE relay_inbox.signer_principal = relay_replay.signer_principal AND relay_inbox.message_id = relay_replay.message_id AND (relay_inbox.signer_principal = (SELECT principal_handle FROM hosted_principals WHERE local_user_id = ?1) OR relay_inbox.destination_id = ?1))",
             params![user_id],
         )?;
         tx.execute(
-            "DELETE FROM relay_inbox WHERE signer_id = ?1 OR destination_id = ?1",
+            "DELETE FROM relay_inbox WHERE signer_principal = (SELECT principal_handle FROM hosted_principals WHERE local_user_id = ?1) OR destination_id = ?1",
             params![user_id],
         )?;
         tx.commit()?;

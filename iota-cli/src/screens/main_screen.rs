@@ -1,3 +1,4 @@
+use crate::theme::ResolvedTheme;
 use crate::{
     controls::button::{ActionButton, ButtonIntent, render_button},
     elements::{
@@ -6,97 +7,97 @@ use crate::{
         graph_card::{GRAPHS, GraphCard},
         log_card::LogCard,
     },
-    interaction_result::InteractionResult,
-    ipc_client::{DaemonStatus, IpcConnectionState},
-    render_context::RenderContext,
-    screens::{
-        overview::OverviewScreen,
-        screens::{AppAction, HitMap, KeyHint, NavDirection, Screen, UiEvent},
+    screens::screens::{
+        AppAction, HitMap, IotaEffect, IotaInteraction, IotaMessage, IotaScreen, KeyHint,
+        NavDirection, UiEvent,
     },
-    ui::UI,
 };
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, MouseEventKind};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     widgets::Borders,
 };
-use tokio::sync::watch;
-
-use std::{
-    any::Any,
-    sync::{
-        Arc,
-        atomic::{AtomicU16, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicU16, Ordering},
 };
 
 pub struct MainScreen {
     elements: Vec<Box<dyn InteractableElement>>,
-    nav_grid: Vec<Vec<Option<usize>>>,
-    selected_coords: (usize, usize),
+    focus_graph: ratatool::FocusGraph<MainFocus>,
+    focus: MainFocus,
     graphs_open: bool,
-    connection_status_rx: watch::Receiver<IpcConnectionState>,
-    daemon_status_rx: watch::Receiver<DaemonStatus>,
     layout_width: AtomicU16,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+enum MainFocus {
+    #[default]
+    Logs,
+    Console,
+    Ram,
+    Cpu,
+    Ping,
+}
+
+impl MainFocus {
+    const ORDER: [Self; 5] = [Self::Logs, Self::Ram, Self::Cpu, Self::Console, Self::Ping];
+
+    const fn element_index(self) -> usize {
+        match self {
+            Self::Logs => 0,
+            Self::Console => 1,
+            Self::Ram => 2,
+            Self::Cpu => 3,
+            Self::Ping => 4,
+        }
+    }
+
+    const fn is_metric(self) -> bool {
+        matches!(self, Self::Ram | Self::Cpu | Self::Ping)
+    }
+}
+
 impl MainScreen {
-    pub fn connection_status(&self) -> watch::Receiver<IpcConnectionState> {
-        self.connection_status_rx.clone()
-    }
-    pub fn daemon_status(&self) -> watch::Receiver<DaemonStatus> {
-        self.daemon_status_rx.clone()
-    }
-    pub async fn new(ui: Arc<UI>) -> Self {
+    pub fn new(ipc: Arc<crate::ipc_client::IpcClient>) -> Self {
         let mut elements: Vec<Box<dyn InteractableElement>> = Vec::new();
 
-        let nav_grid = vec![
-            vec![Some(0), Some(2)],
-            vec![Some(0), Some(3)],
-            vec![Some(1), Some(4)],
-        ];
+        let mut focus_graph = ratatool::FocusGraph::default();
+        focus_graph.connect_bidirectional(MainFocus::Logs, NavDirection::Down, MainFocus::Console);
+        focus_graph.connect_bidirectional(MainFocus::Logs, NavDirection::Right, MainFocus::Ram);
+        focus_graph.connect_bidirectional(MainFocus::Ram, NavDirection::Down, MainFocus::Cpu);
+        focus_graph.connect_bidirectional(MainFocus::Cpu, NavDirection::Down, MainFocus::Ping);
+        focus_graph.connect_bidirectional(MainFocus::Console, NavDirection::Right, MainFocus::Ping);
 
-        let state = ui
-            .client_state()
-            .await
-            .expect("MainScreen requires an attached daemon");
+        let state = ipc.state();
         let mut log_card = LogCard::new(state.clone());
         log_card.set_borders(Borders::TOP.union(Borders::RIGHT).union(Borders::LEFT));
-        let ipc = ui
-            .ipc()
-            .await
-            .expect("MainScreen requires an attached daemon");
         let mut console_card = ConsoleCard::new("Console", "", ipc.clone());
         console_card.set_joins(Borders::TOP);
 
         elements.push(Box::new(log_card));
         elements.push(Box::new(console_card));
 
-        let mut ram_graph = GraphCard::new(ui.clone(), state.clone(), GRAPHS::Ram, "RAM".into());
+        let mut ram_graph = GraphCard::new(state.clone(), GRAPHS::Ram, "RAM".into());
         ram_graph.set_borders(Borders::TOP.union(Borders::LEFT).union(Borders::RIGHT));
         elements.push(Box::new(ram_graph));
-        let mut cpu_graph = GraphCard::new(ui.clone(), state.clone(), GRAPHS::Cpu, "CPU".into());
+        let mut cpu_graph = GraphCard::new(state.clone(), GRAPHS::Cpu, "CPU".into());
         cpu_graph.set_borders(Borders::TOP.union(Borders::LEFT).union(Borders::RIGHT));
         cpu_graph.set_joins(Borders::TOP);
         elements.push(Box::new(cpu_graph));
-        let mut ping_graph = GraphCard::new(ui.clone(), state, GRAPHS::Ping, "Ping".into());
+        let mut ping_graph = GraphCard::new(state, GRAPHS::Ping, "Ping".into());
         ping_graph.set_joins(Borders::TOP);
         elements.push(Box::new(ping_graph));
 
         let graphs_open = true;
 
-        let connection_status_rx = ipc.connection_status();
-        let daemon_status_rx = ipc.daemon_status();
-
         let mut screen = MainScreen {
             elements,
-            nav_grid,
-            selected_coords: (1, 0),
+            focus_graph,
+            focus: MainFocus::Logs,
             graphs_open,
-            connection_status_rx,
-            daemon_status_rx,
             layout_width: AtomicU16::new(0),
         };
         screen.focus_current();
@@ -104,106 +105,43 @@ impl MainScreen {
     }
 
     fn focus_current(&mut self) {
-        let (y, x) = self.selected_coords;
-        if let Some(Some(index)) = self.nav_grid.get(y).and_then(|row| row.get(x)) {
-            if let Some(element) = self.elements.get_mut(*index) {
-                if element.can_focus() {
-                    element.focus(true);
-                }
-            }
+        if let Some(element) = self.elements.get_mut(self.focus.element_index())
+            && element.can_focus()
+        {
+            element.focus(true);
         }
     }
 
-    fn unfocus_current(&mut self, y: usize, x: usize) {
-        if let Some(Some(index)) = self.nav_grid.get(y).and_then(|row| row.get(x)) {
-            if let Some(element) = self.elements.get_mut(*index) {
-                element.focus(false);
-            }
+    fn unfocus_current(&mut self) {
+        if let Some(element) = self.elements.get_mut(self.focus.element_index()) {
+            element.focus(false);
         }
     }
 
     fn navigate(&mut self, direction: NavDirection) {
-        let (current_row, current_col) = self.selected_coords;
-        let current_element = self.nav_grid[current_row][current_col];
-
-        self.unfocus_current(current_row, current_col);
-
-        let (delta_row, delta_col) = match direction {
-            NavDirection::Up => (-1isize, 0),
-            NavDirection::Down => (1, 0),
-            NavDirection::Left => (0, -1),
-            NavDirection::Right => (0, 1),
-            _ => (0, 0),
+        let Some(target) = self.focus_graph.target(&self.focus, direction).copied() else {
+            return;
         };
-
-        let mut next_row = current_row as isize;
-        let mut next_col = current_col as isize;
-
-        loop {
-            next_row += delta_row;
-            next_col += delta_col;
-
-            if next_row < 0 || next_col < 0 {
-                self.selected_coords = (
-                    (next_row - delta_row) as usize,
-                    (next_col - delta_col) as usize,
-                );
-                break;
-            }
-            let next_row_u = next_row as usize;
-            let next_col_u = next_col as usize;
-
-            if next_row_u >= self.nav_grid.len() {
-                self.selected_coords = (
-                    (next_row - delta_row) as usize,
-                    (next_col - delta_col) as usize,
-                );
-                break;
-            }
-
-            if let Some(row) = self.nav_grid.get(next_row_u) {
-                if next_col_u >= row.len() {
-                    self.selected_coords = (
-                        (next_row - delta_row) as usize,
-                        (next_col - delta_col) as usize,
-                    );
-                    break;
-                }
-
-                if let Some(next_element) = row[next_col_u] {
-                    if Some(next_element) != current_element {
-                        self.selected_coords = (next_row_u, next_col_u);
-                        self.focus_current();
-                        return;
-                    }
-                }
-            }
+        if target.is_metric()
+            && (!self.graphs_open || self.layout_width.load(Ordering::Relaxed) < 70)
+        {
+            return;
         }
-
+        self.unfocus_current();
+        self.focus = target;
         self.focus_current();
     }
 
     /// Cycle focus between unique elements in the navigation grid.
     fn navigate_focus(&mut self, forward: bool) {
-        // Collect unique elements in grid order.
-        let mut positions: Vec<(usize, usize)> = Vec::new(); // (row, col)
-        let mut seen: Vec<Option<usize>> = Vec::new();
-        for (y, row) in self.nav_grid.iter().enumerate() {
-            for (x, elem_opt) in row.iter().enumerate() {
-                if x == 1 && (!self.graphs_open || self.layout_width.load(Ordering::Relaxed) < 70) {
-                    continue;
-                }
-                if elem_opt.is_some() && !seen.contains(elem_opt) {
-                    seen.push(*elem_opt);
-                    positions.push((y, x));
-                }
-            }
-        }
-
-        let current = self.selected_coords;
-        let current_pos = positions
-            .iter()
-            .position(|&(r, c)| r == current.0 && c == current.1);
+        let positions = MainFocus::ORDER
+            .into_iter()
+            .filter(|focus| {
+                !focus.is_metric()
+                    || (self.graphs_open && self.layout_width.load(Ordering::Relaxed) >= 70)
+            })
+            .collect::<Vec<_>>();
+        let current_pos = positions.iter().position(|focus| *focus == self.focus);
 
         let next_pos = if let Some(idx) = current_pos {
             if forward {
@@ -215,25 +153,17 @@ impl MainScreen {
             0
         };
 
-        self.unfocus_current(self.selected_coords.0, self.selected_coords.1);
-        self.selected_coords = positions[next_pos];
+        self.unfocus_current();
+        self.focus = positions[next_pos];
         self.focus_current();
     }
 }
 
-impl Screen for MainScreen {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn render(&self, f: &mut Frame, rect: Rect, context: &RenderContext<'_>, hits: &mut HitMap) {
+impl IotaScreen for MainScreen {
+    fn render_legacy(&self, f: &mut Frame, rect: Rect, theme: &ResolvedTheme, hits: &mut HitMap) {
         self.layout_width.store(rect.width, Ordering::Relaxed);
         f.render_widget(
-            ratatui::widgets::Block::default().style(context.theme.surfaces.canvas),
+            ratatui::widgets::Block::default().style(theme.surfaces.canvas),
             rect,
         );
         let inner = rect;
@@ -252,9 +182,9 @@ impl Screen for MainScreen {
 
         let left_area = horizontal_chunks[0];
         let right_area = horizontal_chunks[1];
-        hits.register(left_area, AppAction::FocusLogs);
+        hits.register(left_area, IotaMessage::Action(AppAction::FocusLogs));
         if metrics_visible {
-            hits.register(right_area, AppAction::FocusMetrics);
+            hits.register(right_area, IotaMessage::Action(AppAction::FocusMetrics));
         }
 
         if inner.width >= 70 {
@@ -277,21 +207,24 @@ impl Screen for MainScreen {
                     focused: false,
                     enabled: true,
                 },
-                context.theme,
+                theme,
             );
-            hits.register(metrics_button, AppAction::ToggleMetrics);
+            hits.register(
+                metrics_button,
+                IotaMessage::Action(AppAction::ToggleMetrics),
+            );
         }
 
         let left_rows =
             Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).split(left_area);
-        hits.register(left_rows[1], AppAction::FocusConsole);
+        hits.register(left_rows[1], IotaMessage::Action(AppAction::FocusConsole));
 
-        if let Some(log) = self.elements.get(0) {
-            log.as_element().render(f, left_rows[0], context);
+        if let Some(log) = self.elements.first() {
+            log.as_element().render(f, left_rows[0], theme);
         }
 
         if let Some(console) = self.elements.get(1) {
-            console.as_element().render(f, left_rows[1], context);
+            console.as_element().render(f, left_rows[1], theme);
         }
 
         let graph_elements: Vec<_> = self
@@ -310,107 +243,114 @@ impl Screen for MainScreen {
             .split(right_area);
 
             for (el, area) in graph_elements.iter().zip(graph_chunks.iter()) {
-                el.as_element().render(f, *area, context);
+                el.as_element().render(f, *area, theme);
             }
         }
     }
 
-    fn handle_event(&mut self, event: UiEvent) -> InteractionResult {
+    fn handle_event(&mut self, event: &UiEvent) -> IotaInteraction {
+        let event = event.clone();
+        if let UiEvent::Pointer {
+            event,
+            hit: Some(IotaMessage::Action(AppAction::FocusLogs)),
+        } = &event
+        {
+            let Some(log) = self
+                .elements
+                .get_mut(0)
+                .and_then(|element| element.as_any_mut().downcast_mut::<LogCard>())
+            else {
+                return IotaInteraction::Unhandled;
+            };
+            match event.kind {
+                MouseEventKind::ScrollUp => log.scroll_older(),
+                MouseEventKind::ScrollDown => log.scroll_newer(),
+                _ => return IotaInteraction::Unhandled,
+            }
+            self.unfocus_current();
+            self.focus = MainFocus::Logs;
+            self.focus_current();
+            return IotaInteraction::Changed;
+        }
         if let UiEvent::Paste(text) = &event {
-            if self.selected_coords == (2, 0) {
-                if let Some(console) = self
+            if self.focus == MainFocus::Console
+                && let Some(console) = self
                     .elements
                     .get_mut(1)
                     .and_then(|element| element.as_any_mut().downcast_mut::<ConsoleCard>())
-                {
-                    console.handle_paste(text);
-                    return InteractionResult::Handled;
-                }
+            {
+                console.handle_paste(text);
+                return IotaInteraction::Changed;
             }
-            return InteractionResult::Unhandled;
+            return IotaInteraction::Unhandled;
         }
-        if let UiEvent::Resize(width, _) = &event {
+        if let UiEvent::Resize { width, .. } = &event {
             self.layout_width.store(*width, Ordering::Relaxed);
-            if *width < 70 && self.selected_coords.1 == 1 {
-                self.unfocus_current(self.selected_coords.0, self.selected_coords.1);
-                self.selected_coords = (0, 0);
+            if *width < 70 && self.focus.is_metric() {
+                self.unfocus_current();
+                self.focus = MainFocus::Logs;
                 self.focus_current();
             }
-            return InteractionResult::Handled;
+            return IotaInteraction::Changed;
         }
         let UiEvent::Key(event) = event else {
-            return InteractionResult::Unhandled;
+            return IotaInteraction::Unhandled;
         };
         // A focused console consumes text and cursor keys before dashboard
         // shortcuts; commands such as `users` must remain typeable.
-        if self.selected_coords == (2, 0) && !matches!(event.code, KeyCode::Tab | KeyCode::BackTab)
+        if self.focus == MainFocus::Console
+            && !matches!(event.code, KeyCode::Tab | KeyCode::BackTab)
+            && let Some(console) = self.elements.get_mut(1)
         {
-            if let Some(console) = self.elements.get_mut(1) {
-                return console.interact(event);
-            }
+            return console.interact(event);
         }
         match event.code {
             KeyCode::Tab => {
                 self.navigate_focus(true);
-                return InteractionResult::Handled;
+                return IotaInteraction::Changed;
             }
             KeyCode::BackTab => {
                 self.navigate_focus(false);
-                return InteractionResult::Handled;
+                return IotaInteraction::Changed;
             }
             KeyCode::Char('o') | KeyCode::Char('O') => {
-                let conn_rx = self.connection_status_rx.clone();
-                let daemon_rx = self.daemon_status_rx.clone();
-                return InteractionResult::OpenScreen {
-                    screen: Box::new(OverviewScreen::new(conn_rx, daemon_rx)),
-                };
+                return IotaInteraction::Effect(IotaEffect::OpenOverview);
             }
             KeyCode::Char('u') | KeyCode::Char('U') => {
-                return InteractionResult::AppTask {
-                    task: Box::pin(async {
-                        UiEvent::App(crate::screens::screens::AppEvent::OpenUsers)
-                    }),
-                };
+                return IotaInteraction::Effect(IotaEffect::OpenUsers);
             }
             KeyCode::Char('m') | KeyCode::Char('M') => {
-                return InteractionResult::AppTask {
-                    task: Box::pin(async {
-                        UiEvent::App(crate::screens::screens::AppEvent::OpenMetrics)
-                    }),
-                };
+                return IotaInteraction::Effect(IotaEffect::OpenMetrics);
             }
-            KeyCode::Enter | KeyCode::Char(' ') if self.selected_coords.1 == 1 => {
+            KeyCode::Enter | KeyCode::Char(' ') if self.focus.is_metric() => {
                 self.graphs_open = !self.graphs_open;
                 for element in self.elements.iter_mut() {
                     if let Some(graph) = element.as_any_mut().downcast_mut::<GraphCard>() {
                         graph.set_open(self.graphs_open);
                     }
                 }
-                return InteractionResult::Handled;
+                return IotaInteraction::Changed;
             }
             _ => {
-                let (y, x) = self.selected_coords;
-                if let Some(Some(index)) = self.nav_grid.get(y).and_then(|r| r.get(x)) {
-                    if let Some(el) = self.elements.get_mut(*index) {
-                        let result = el.interact(event);
-                        if matches!(result, InteractionResult::Unhandled) {
-                            match event.code {
-                                KeyCode::Up => self.navigate(NavDirection::Up),
-                                KeyCode::Down => self.navigate(NavDirection::Down),
-                                KeyCode::Left => self.navigate(NavDirection::Left),
-                                KeyCode::Right => self.navigate(NavDirection::Right),
-                                _ => {}
-                            }
+                if let Some(el) = self.elements.get_mut(self.focus.element_index()) {
+                    let result = el.interact(event);
+                    if matches!(result, IotaInteraction::Unhandled) {
+                        match event.code {
+                            KeyCode::Up => self.navigate(NavDirection::Up),
+                            KeyCode::Down => self.navigate(NavDirection::Down),
+                            KeyCode::Left => self.navigate(NavDirection::Left),
+                            KeyCode::Right => self.navigate(NavDirection::Right),
+                            _ => {}
                         }
-                        return result;
                     }
+                    return result;
                 }
             }
         }
 
-        InteractionResult::Handled
+        IotaInteraction::Changed
     }
-    fn handle_action(&mut self, action: AppAction) -> InteractionResult {
+    fn handle_action(&mut self, action: AppAction) -> IotaInteraction {
         match action {
             AppAction::ToggleMetrics => {
                 self.graphs_open = !self.graphs_open;
@@ -419,37 +359,33 @@ impl Screen for MainScreen {
                         graph.set_open(self.graphs_open);
                     }
                 }
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
-            AppAction::OpenOverview => {
-                self.handle_event(UiEvent::Key(KeyEvent::from(KeyCode::Char('o'))))
-            }
-            AppAction::OpenUsers => {
-                self.handle_event(UiEvent::Key(KeyEvent::from(KeyCode::Char('u'))))
-            }
+            AppAction::OpenOverview => IotaInteraction::Effect(IotaEffect::OpenOverview),
+            AppAction::OpenUsers => IotaInteraction::Effect(IotaEffect::OpenUsers),
             AppAction::FocusLogs => {
-                self.unfocus_current(self.selected_coords.0, self.selected_coords.1);
-                self.selected_coords = (0, 0);
+                self.unfocus_current();
+                self.focus = MainFocus::Logs;
                 self.focus_current();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             AppAction::FocusConsole => {
-                self.unfocus_current(self.selected_coords.0, self.selected_coords.1);
-                self.selected_coords = (2, 0);
+                self.unfocus_current();
+                self.focus = MainFocus::Console;
                 self.focus_current();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
             AppAction::FocusMetrics => {
-                self.unfocus_current(self.selected_coords.0, self.selected_coords.1);
-                self.selected_coords = (0, 1);
+                self.unfocus_current();
+                self.focus = MainFocus::Ram;
                 self.focus_current();
-                InteractionResult::Handled
+                IotaInteraction::Changed
             }
-            _ => InteractionResult::Unhandled,
+            _ => IotaInteraction::Unhandled,
         }
     }
     fn key_hints(&self) -> Vec<KeyHint> {
-        if self.selected_coords == (2, 0) {
+        if self.focus == MainFocus::Console {
             vec![
                 KeyHint {
                     keys: "Enter",
@@ -468,7 +404,7 @@ impl Screen for MainScreen {
                     action: "Header",
                 },
             ]
-        } else if self.selected_coords == (0, 0) {
+        } else if self.focus == MainFocus::Logs {
             vec![
                 KeyHint {
                     keys: "J/K",

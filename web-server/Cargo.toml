@@ -5,9 +5,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "a135d0f0c2b35147011905f8ee0fc37050f69a6c", features = ["web-server"] }
+async-trait = "0.1.89"
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "1f19a0d897c265d1e3f590a876f95e766ff99318", features = ["web-server", "crypto", "pipes"] }
 bytes = "1"
 http = "1"
 iota-logger = { path = "../iota-logger" }
+iota-identity = { path = "../iota-identity" }
+serde = "1"
+serde_json = "1"
 tokio = { version = "1.50.0", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }

@@ -1,7 +1,4 @@
-use crate::controls::{
-    menu::{MenuItem, MenuState},
-    text_input::TextInput,
-};
+use ratatool::{MenuItem, MenuState, TextInputState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddUserMethod {
@@ -26,8 +23,8 @@ pub struct AddUserFlow {
     pub phase: AddUserPhase,
     pub methods: MenuState<AddUserMethod>,
     pub invitation_authorities: MenuState<iota_ipc::InvitationAuthority>,
-    pub username: TextInput,
-    pub import_path: TextInput,
+    pub username: TextInputState,
+    pub import_path: TextInputState,
     pub credential: Option<iota_ipc::SecretString>,
     pub preview: Option<iota_ipc::TuCredentialPreview>,
     pub error: Option<String>,
@@ -77,8 +74,8 @@ impl AddUserFlow {
                     disabled_reason: Some("Local invitations are not implemented yet".into()),
                 },
             ]),
-            username: TextInput::new("Username"),
-            import_path: TextInput::new("TU path"),
+            username: TextInputState::default(),
+            import_path: TextInputState::default(),
             credential: None,
             preview: None,
             error: None,

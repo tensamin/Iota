@@ -4,11 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "a135d0f0c2b35147011905f8ee0fc37050f69a6c", features = ["client", "crypto"] }
+async-trait = "0.1.89"
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "1f19a0d897c265d1e3f590a876f95e766ff99318", features = ["client", "crypto", "pipes", "web-server"] }
+iota-auth = { path = "../iota-auth" }
+iota-identity = { path = "../iota-identity" }
 iota-connection = { path = "../iota-connection" }
 iota-logger = { path = "../iota-logger" }
 iota-util = { path = "../iota-util" }
 iota-storage = { path = "../iota-storage" }
+other-iota = { path = "../other-iota" }
+web-server = { path = "../web-server" }
 dashmap = "6.1.0"
 tokio = { version = "1.50.0", features = ["full"] }
 uuid = { version = "*", features = ["v4"] }
+
+[dev-dependencies]
+rcgen = "0.14"
+tempfile = "3"

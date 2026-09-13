@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "iota-identity",
     "iota-storage",
     "iota-connection",
     "client",

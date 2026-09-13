@@ -30,6 +30,16 @@ pub enum ConfigError {
         #[source]
         source: std::net::AddrParseError,
     },
+    #[error("invalid federation endpoint {endpoint:?}: {source}")]
+    InvalidFederationEndpoint {
+        endpoint: String,
+        #[source]
+        source: iota_identity::IdentityError,
+    },
+    #[error("invalid relay router public key: {0}")]
+    InvalidRelayRouterKey(String),
+    #[error("relay router certificate path must not be empty")]
+    MissingRelayRouterCertificate,
     #[error("max_ipc_clients must be greater than zero")]
     InvalidMaxIpcClients,
 }
@@ -43,6 +53,8 @@ pub struct IotaConfig {
     pub port: u16,
     #[serde(default)]
     pub web: WebSettings,
+    #[serde(default)]
+    pub relay_routers: Vec<RelayRouterSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub omikron_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -59,6 +71,14 @@ pub struct IotaConfig {
     pub read_receipts_enabled: bool,
     #[serde(default = "default_max_ipc_clients")]
     pub max_ipc_clients: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayRouterSettings {
+    pub endpoint: String,
+    pub public_key: String,
+    pub certificate: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +109,10 @@ pub struct WebSettings {
     pub key: Option<String>,
     #[serde(default)]
     pub required: bool,
+    #[serde(default)]
+    pub direct_endpoints: Vec<String>,
+    #[serde(default)]
+    pub relay_hints: Vec<String>,
 }
 fn default_web_bind() -> String {
     "127.0.0.1".into()
@@ -106,6 +130,8 @@ impl Default for WebSettings {
             certificate: None,
             key: None,
             required: false,
+            direct_endpoints: Vec::new(),
+            relay_hints: Vec::new(),
         }
     }
 }
@@ -128,6 +154,7 @@ impl Default for IotaConfig {
             iota_id: None,
             port: default_port(),
             web: WebSettings::default(),
+            relay_routers: Vec::new(),
             omikron_host: None,
             omikron_port: None,
             omikron_id: None,
@@ -186,6 +213,32 @@ pub fn validate_config(config: &IotaConfig) -> Result<(), ConfigError> {
         })?;
     if config.max_ipc_clients == 0 {
         return Err(ConfigError::InvalidMaxIpcClients);
+    }
+    for endpoint in config
+        .web
+        .direct_endpoints
+        .iter()
+        .chain(&config.web.relay_hints)
+    {
+        iota_identity::AuthorityLocator::new(endpoint.clone()).map_err(|source| {
+            ConfigError::InvalidFederationEndpoint {
+                endpoint: endpoint.clone(),
+                source,
+            }
+        })?;
+    }
+    for router in &config.relay_routers {
+        iota_identity::AuthorityLocator::new(router.endpoint.clone()).map_err(|source| {
+            ConfigError::InvalidFederationEndpoint {
+                endpoint: router.endpoint.clone(),
+                source,
+            }
+        })?;
+        iota_identity::PublicKeyBundle::from_base64(&router.public_key)
+            .map_err(|error| ConfigError::InvalidRelayRouterKey(error.to_string()))?;
+        if router.certificate.trim().is_empty() {
+            return Err(ConfigError::MissingRelayRouterCertificate);
+        }
     }
     Ok(())
 }
@@ -301,7 +354,7 @@ pub fn configure_config_path(path: PathBuf) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigError, IotaConfig, parse_config, validate_config};
+    use super::{ConfigError, IotaConfig, RelayRouterSettings, parse_config, validate_config};
     use std::path::Path;
 
     #[test]
@@ -338,5 +391,35 @@ mod tests {
             validate_config(&config),
             Err(ConfigError::InvalidMaxIpcClients)
         ));
+    }
+
+    #[test]
+    fn relay_router_requires_valid_explicit_trust_pins() {
+        let mut config = IotaConfig::default();
+        config.relay_routers.push(RelayRouterSettings {
+            endpoint: "router.example:1984".into(),
+            public_key: "invalid".into(),
+            certificate: "router.pem".into(),
+        });
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigError::InvalidRelayRouterKey(_))
+        ));
+    }
+
+    #[test]
+    fn relay_router_configuration_parses_with_all_trust_material() {
+        let public_key = mtp::crypto::Keyring::generate()
+            .public_key_bundle()
+            .try_to_base64()
+            .unwrap();
+        let config = parse_config(
+            Path::new("config.yaml"),
+            &format!(
+                "relay_routers:\n  - endpoint: router.example:1984\n    public_key: {public_key}\n    certificate: router.pem\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(config.relay_routers.len(), 1);
     }
 }

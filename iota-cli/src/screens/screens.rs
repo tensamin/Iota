@@ -1,45 +1,21 @@
-use std::any::Any;
+use std::{fmt, path::PathBuf};
 
-use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::{Frame, layout::Rect};
 
-use crate::{interaction_result::InteractionResult, render_context::RenderContext};
+use crate::theme::{CliOutputFormat, ResolvedTheme, TerminalPolicy, ThemeName};
 
-/// All terminal input that can affect the UI. Keeping this as one type makes
-/// it impossible for screens to accidentally ignore a newly supported event.
-#[derive(Debug, Clone)]
-pub enum UiEvent {
-    Key(KeyEvent),
-    Mouse(MouseEvent),
-    Paste(String),
-    Resize(u16, u16),
-    App(AppEvent),
-}
-
-/// Completion of background UI work. Keeping it in the regular event stream
-/// gives screens an explicit success/failure path instead of detached tasks.
 #[derive(Debug, Clone)]
 pub enum AppEvent {
-    OpenUsers,
-    OpenMetrics,
-    ApplyTheme {
-        theme: crate::theme::ThemeName,
-        persist: bool,
-    },
-    SaveSettings {
-        theme: crate::theme::ThemeName,
-        color: crate::theme::TerminalPolicy,
-        unicode: crate::theme::TerminalPolicy,
-        cli_output: crate::theme::CliOutputFormat,
-        cli_require_confirmation: bool,
-    },
     ThemeSaved(Result<(), String>),
     UsersLoaded(Result<Vec<crate::screens::users::UserEntry>, String>),
     TuInspected(Result<iota_ipc::TuCredentialPreview, String>),
     UserOperationFinished(Result<String, String>),
     CredentialExportFinished(Result<String, String>),
-    RegenerateKeysRequested,
     KeysRegenerated(Result<(), String>),
+    TermsLoaded {
+        kind: iota_terms::TermsType,
+        result: Result<String, String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,61 +41,122 @@ pub enum AppAction {
     RegenerateKeys,
 }
 
+#[derive(Clone, Debug)]
+pub enum IotaEffect {
+    OpenUsers,
+    OpenMetrics,
+    OpenOverview,
+    ApplyTheme {
+        theme: ThemeName,
+        persist: bool,
+    },
+    SaveSettings {
+        theme: ThemeName,
+        color: TerminalPolicy,
+        unicode: TerminalPolicy,
+        cli_output: CliOutputFormat,
+        cli_require_confirmation: bool,
+    },
+    RegenerateKeys,
+    InspectTu {
+        credential: iota_ipc::SecretString,
+    },
+    AttachUserFromTu {
+        credential: iota_ipc::SecretString,
+    },
+    RunUserOperation {
+        action: crate::screens::users::model::UserAction,
+        user_id: i64,
+    },
+    ExportCredential {
+        user_id: i64,
+        destination: PathBuf,
+    },
+    CreateUser {
+        username: String,
+    },
+    CreateInvitation {
+        authority: iota_ipc::InvitationAuthority,
+    },
+    RefreshUsers,
+    LoadNewestTerms {
+        kind: iota_terms::TermsType,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum IotaMessage {
+    Action(AppAction),
+    Effect(IotaEffect),
+    Event(AppEvent),
+    Invalidate,
+}
+
+pub type UiEvent = ratatool::UiEvent<IotaMessage>;
+pub type HitMap = ratatool::HitMap<IotaMessage>;
+pub type NavDirection = ratatool::Direction;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyHint {
     pub keys: &'static str,
     pub action: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HitRegion {
-    pub area: Rect,
-    pub action: AppAction,
+pub enum IotaInteraction {
+    Unhandled,
+    Changed,
+    Push {
+        screen: Box<dyn IotaScreen>,
+        presentation: ratatool::ScreenPresentation,
+    },
+    Pop,
+    Effect(IotaEffect),
+    Exit,
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct HitMap {
-    regions: Vec<HitRegion>,
-}
-
-impl HitMap {
-    pub fn register(&mut self, area: Rect, action: AppAction) {
-        self.regions.push(HitRegion { area, action });
-    }
-    pub fn action_at(&self, column: u16, row: u16) -> Option<AppAction> {
-        self.regions
-            .iter()
-            .rev()
-            .find(|region| {
-                column >= region.area.x
-                    && column < region.area.x.saturating_add(region.area.width)
-                    && row >= region.area.y
-                    && row < region.area.y.saturating_add(region.area.height)
-            })
-            .map(|region| region.action)
+impl fmt::Debug for IotaInteraction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unhandled => formatter.write_str("Unhandled"),
+            Self::Changed => formatter.write_str("Changed"),
+            Self::Push { presentation, .. } => {
+                formatter.debug_tuple("Push").field(presentation).finish()
+            }
+            Self::Pop => formatter.write_str("Pop"),
+            Self::Effect(effect) => formatter.debug_tuple("Effect").field(effect).finish(),
+            Self::Exit => formatter.write_str("Exit"),
+        }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NavDirection {
-    Up,
-    Down,
-    Left,
-    Right,
-
-    Next,
-    Prev,
-}
-
-pub trait Screen: Send + Sync + Any {
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-
-    fn render(&self, f: &mut Frame, rect: Rect, context: &RenderContext<'_>, hits: &mut HitMap);
-    fn handle_event(&mut self, event: UiEvent) -> InteractionResult;
-    fn handle_action(&mut self, _action: AppAction) -> InteractionResult {
-        InteractionResult::Unhandled
+pub trait IotaScreen: Send {
+    fn render(
+        &mut self,
+        ui: &mut ratatool::UiFrame<'_, '_, IotaMessage>,
+        area: Rect,
+        theme: &ResolvedTheme,
+    ) {
+        let mut hits = HitMap::new();
+        self.render_legacy(ui.frame(), area, theme, &mut hits);
+        for region in hits.regions() {
+            ui.hit_map().register(region.area, region.action.clone());
+        }
     }
+
+    fn render_legacy(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &ResolvedTheme,
+        hits: &mut HitMap,
+    );
+
+    fn handle_event(&mut self, event: &UiEvent) -> IotaInteraction;
+
+    fn handle_action(&mut self, _action: AppAction) -> IotaInteraction {
+        IotaInteraction::Unhandled
+    }
+
     fn key_hints(&self) -> Vec<KeyHint> {
         vec![
             KeyHint {
@@ -140,4 +177,8 @@ pub trait Screen: Send + Sync + Any {
             },
         ]
     }
+}
+
+pub fn action_message(action: AppAction) -> IotaMessage {
+    IotaMessage::Action(action)
 }

@@ -92,7 +92,7 @@ async fn inspect_credential_account(
     connection: &dyn OmikronClient,
     credential: &TuCredential,
 ) -> Result<(String, String, i64), LifecycleUserError> {
-    if credential.omega_host != omega_discovery::omega_host() {
+    if credential.omega_host() != Some(omega_discovery::omega_host().as_str()) {
         return Err(LifecycleUserError::OmegaHostMismatch);
     }
     let request = CommunicationValue::new(CommunicationType::GetUserData).add_typed_default(
@@ -773,7 +773,7 @@ mod tests {
     async fn inspection_returns_verified_identity_without_lifecycle_requests() {
         let credential = TuCredential {
             user_id: 42,
-            omega_host: crate::omega_discovery::omega_host(),
+            authority: iota_util::tu::TuAuthority::Omega(crate::omega_discovery::omega_host()),
             keyring: generate_keyring(),
         };
         let client = InspectionClient {

@@ -25,6 +25,68 @@ pub struct ChatSecretQuery {
     pub version: Option<i64>,
 }
 
+pub fn principal_chat_id(
+    first: iota_identity::PrincipalHandle,
+    second: iota_identity::PrincipalHandle,
+) -> Option<String> {
+    if first.0 <= 0 || second.0 <= 0 || first == second {
+        return None;
+    }
+    let (first, second) = if first.0 < second.0 {
+        (first.0, second.0)
+    } else {
+        (second.0, first.0)
+    };
+    Some(format!("principal:{first}:{second}"))
+}
+
+pub fn principal_secret_id(chat_id: &str) -> String {
+    format!("chat:{chat_id}:main")
+}
+
+pub fn migrate_chat_secret_namespace(
+    user_id: &str,
+    legacy_chat_id: &str,
+    legacy_secret_id: &str,
+    principal_chat_id: &str,
+    principal_secret_id: &str,
+) -> Result<(), StorageError> {
+    if [
+        user_id,
+        legacy_chat_id,
+        legacy_secret_id,
+        principal_chat_id,
+        principal_secret_id,
+    ]
+    .iter()
+    .any(|value| value.is_empty())
+    {
+        return Err("chat secret namespace is incomplete".into());
+    }
+    db::with_conn(&E2EE_DB, |conn| {
+        conn.execute(
+            r#"
+            INSERT OR IGNORE INTO chat_secrets (
+                user_id, chat_id, secret_id, version, encrypted_secret,
+                kem_ciphertext, wrapping_scheme, created_at, updated_at
+            )
+            SELECT user_id, ?4, ?5, version, encrypted_secret,
+                   kem_ciphertext, wrapping_scheme, created_at, updated_at
+            FROM chat_secrets
+            WHERE user_id = ?1 AND chat_id = ?2 AND secret_id = ?3
+            "#,
+            params![
+                user_id,
+                legacy_chat_id,
+                legacy_secret_id,
+                principal_chat_id,
+                principal_secret_id
+            ],
+        )?;
+        Ok(())
+    })
+}
+
 static E2EE_DB: LazyLock<Arc<Mutex<rusqlite::Connection>>> = LazyLock::new(|| {
     let database = db::create_shared_connection(
         "e2ee",
@@ -185,4 +247,35 @@ fn chat_secret_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChatS
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{principal_chat_id, principal_secret_id};
+    use iota_identity::PrincipalHandle;
+
+    #[test]
+    fn chat_secret_namespace_uses_principals() {
+        let first = principal_chat_id(PrincipalHandle(3), PrincipalHandle(9));
+        let second = principal_chat_id(PrincipalHandle(9), PrincipalHandle(3));
+
+        assert_eq!(first, Some("principal:3:9".to_string()));
+        assert_eq!(first, second);
+        assert_eq!(
+            principal_secret_id("principal:3:9"),
+            "chat:principal:3:9:main"
+        );
+    }
+
+    #[test]
+    fn equal_or_invalid_principals_have_no_chat_namespace() {
+        assert_eq!(
+            principal_chat_id(PrincipalHandle(7), PrincipalHandle(7)),
+            None
+        );
+        assert_eq!(
+            principal_chat_id(PrincipalHandle(0), PrincipalHandle(7)),
+            None
+        );
+    }
 }

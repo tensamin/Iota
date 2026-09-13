@@ -3,16 +3,15 @@ use std::any::Any;
 use crossterm::event::KeyEvent;
 use ratatui::{Frame, layout::Rect, widgets::Borders};
 
-use crate::{
-    interaction_result::InteractionResult, render_context::RenderContext, screens::screens::Screen,
-};
+use crate::screens::screens::{IotaInteraction, IotaScreen};
+use crate::theme::ResolvedTheme;
 
 #[allow(unused)]
 pub trait Element: Send + Sync + Any {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
-    fn render(&self, f: &mut Frame, r: Rect, context: &RenderContext<'_>);
+    fn render(&self, f: &mut Frame, r: Rect, theme: &ResolvedTheme);
 }
 
 #[allow(unused)]
@@ -33,7 +32,7 @@ pub trait InfoElement: Send + Sync + Any {
     fn as_element(&self) -> &dyn Element;
     fn as_element_mut(&mut self) -> &mut dyn Element;
 
-    fn get_info_screen(&self) -> Box<dyn Screen>;
+    fn get_info_screen(&self) -> Box<dyn IotaScreen>;
 }
 
 #[allow(unused)]
@@ -43,7 +42,7 @@ pub trait InteractableElement: Send + Sync + Any {
     fn as_element(&self) -> &dyn Element;
     fn as_element_mut(&mut self) -> &mut dyn Element;
 
-    fn interact(&mut self, key: KeyEvent) -> InteractionResult;
+    fn interact(&mut self, key: KeyEvent) -> IotaInteraction;
 
     fn can_focus(&self) -> bool;
     fn is_focused(&self) -> bool;

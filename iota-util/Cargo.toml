@@ -5,11 +5,12 @@ edition = "2024"
 
 [dependencies]
 iota-paths = { path = "../iota-paths" }
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "a135d0f0c2b35147011905f8ee0fc37050f69a6c", features = [
+iota-identity = { path = "../iota-identity" }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "1f19a0d897c265d1e3f590a876f95e766ff99318", features = [
     "crypto"
 ] }
 
-reqwest = "0.13.2"
+reqwest = { version = "0.13.2", features = ["json"] }
 tokio = { version = "1.50.0", features = ["full"] }
 sysinfo = "0.38.0"
 uuid = { version = "*", features = ["v4"] }

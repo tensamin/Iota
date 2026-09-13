@@ -6,13 +6,17 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1.89"
 iota-ipc = { path = "../iota-ipc" }
+iota-auth = { path = "../iota-auth" }
+iota-connection = { path = "../iota-connection" }
+iota-identity = { path = "../iota-identity" }
 iota-logger = { path = "../iota-logger" }
 iota-state = { path = "../iota-state" }
 iota-storage = { path = "../iota-storage" }
 iota-updater = { path = "../iota-updater" }
 iota-util = { path = "../iota-util" }
 omikron-connector = { path = "../omikron-connector" }
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "a135d0f0c2b35147011905f8ee0fc37050f69a6c" }
+other-iota = { path = "../other-iota" }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "1f19a0d897c265d1e3f590a876f95e766ff99318" }
 libc = "0.2"
 sysinfo = "0.38.0"
 serde_yaml = "0.9"

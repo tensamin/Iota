@@ -182,12 +182,7 @@ impl OmikronClient for TestOmikron {
 }
 
 fn active_services() -> Arc<DaemonServices> {
-    Arc::new(DaemonServices {
-        omikron: Arc::new(TestOmikron),
-        users: Default::default(),
-        config: Default::default(),
-        active: true,
-    })
+    DaemonServices::with_centralized_client(Arc::new(TestOmikron))
 }
 
 #[tokio::test]

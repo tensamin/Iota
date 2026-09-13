@@ -4,3 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-trait = "0.1.89"
+iota-connection = { path = "../iota-connection" }
+iota-identity = { path = "../iota-identity" }
+iota-util = { path = "../iota-util" }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "1f19a0d897c265d1e3f590a876f95e766ff99318", features = ["client", "crypto", "pipes", "web-server"] }
+reqwest = { version = "0.13", features = ["json"] }
+serde = "1"
+tokio = { version = "1.50.0", features = ["full"] }
+web-server = { path = "../web-server" }
+
+[dev-dependencies]
+iota-storage = { path = "../iota-storage" }
+rcgen = "0.14"
+tempfile = "3"

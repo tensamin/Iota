@@ -1,4 +1,4 @@
-use std::{any::Any, sync::Arc};
+use std::any::Any;
 
 use crossterm::event::KeyEvent;
 use iota_state::ClientState;
@@ -11,11 +11,10 @@ use ratatui::{
     },
 };
 
+use crate::theme::ResolvedTheme;
 use crate::{
     elements::elements::{Element, InteractableElement, JoinableElement},
-    interaction_result::InteractionResult,
-    render_context::RenderContext,
-    ui::UI,
+    screens::screens::IotaInteraction,
     util::borders::draw_block_joins,
 };
 
@@ -67,7 +66,6 @@ impl GRAPHS {
 
 #[allow(unused)]
 pub struct GraphCard {
-    ui: Arc<UI>,
     state: ClientState,
     graph_type: GRAPHS,
 
@@ -82,9 +80,8 @@ pub struct GraphCard {
 }
 
 impl GraphCard {
-    pub fn new(ui: Arc<UI>, state: ClientState, graph_type: GRAPHS, title: String) -> Self {
+    pub fn new(state: ClientState, graph_type: GRAPHS, title: String) -> Self {
         Self {
-            ui,
             state,
             graph_type,
             focused: false,
@@ -113,7 +110,7 @@ impl Element for GraphCard {
         self
     }
 
-    fn render(&self, f: &mut Frame, r: Rect, context: &RenderContext<'_>) {
+    fn render(&self, f: &mut Frame, r: Rect, theme: &ResolvedTheme) {
         if self.open {
             let graph = self.graph_type.get_graph(&self.state, self.sample_width);
             if graph.is_empty() {
@@ -121,13 +118,13 @@ impl Element for GraphCard {
                     .title(format!(" {} ", self.title))
                     .borders(self.borders)
                     .border_style(if self.focused {
-                        context.theme.graphs.focused_border
+                        theme.graphs.focused_border
                     } else {
-                        context.theme.graphs.border
+                        theme.graphs.border
                     });
                 f.render_widget(
                     ratatui::widgets::Paragraph::new("No metric samples yet.")
-                        .style(context.theme.text.muted)
+                        .style(theme.text.muted)
                         .block(block),
                     r,
                 );
@@ -149,7 +146,7 @@ impl Element for GraphCard {
                 GRAPHS::Ping => (max_y * 1.2).max(10.0),
             };
 
-            let surface = matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces);
+            let surface = matches!(theme.chrome, crate::theme::ChromeMode::Surfaces);
             let title = format!(
                 "{}: {}{}  {}min/{}max",
                 self.title,
@@ -159,7 +156,7 @@ impl Element for GraphCard {
                 max_y as i64
             );
             let plot_area = if surface {
-                crate::controls::panel::render_panel(f, r, &title, self.focused, context.theme)
+                crate::controls::panel::render_panel(f, r, &title, self.focused, theme)
             } else {
                 r
             };
@@ -178,9 +175,9 @@ impl Element for GraphCard {
                 })
                 .borders(if surface { Borders::NONE } else { self.borders })
                 .border_style(if self.focused {
-                    context.theme.graphs.focused_border
+                    theme.graphs.focused_border
                 } else {
-                    context.theme.graphs.border
+                    theme.graphs.border
                 });
 
             let canvas = Canvas::default()
@@ -194,7 +191,7 @@ impl Element for GraphCard {
                             y1: 0.0,
                             x2: *x,
                             y2: *y,
-                            color: self.graph_type.get_color(context.theme),
+                            color: self.graph_type.get_color(theme),
                         });
                     }
                 });
@@ -204,22 +201,22 @@ impl Element for GraphCard {
                 .title("")
                 .borders(self.borders)
                 .border_style(if self.focused {
-                    context.theme.graphs.focused_border
+                    theme.graphs.focused_border
                 } else {
-                    context.theme.graphs.border
+                    theme.graphs.border
                 });
             f.render_widget(block, r);
         }
-        if !matches!(context.theme.chrome, crate::theme::ChromeMode::Surfaces) {
+        if !matches!(theme.chrome, crate::theme::ChromeMode::Surfaces) {
             draw_block_joins(
                 f,
                 r,
                 self.borders,
                 self.joins,
                 if self.focused {
-                    context.theme.borders.focused
+                    theme.borders.focused
                 } else {
-                    context.theme.borders.normal
+                    theme.borders.normal
                 },
             );
         }
@@ -269,8 +266,8 @@ impl InteractableElement for GraphCard {
         self
     }
 
-    fn interact(&mut self, _key: KeyEvent) -> InteractionResult {
-        InteractionResult::Handled
+    fn interact(&mut self, _key: KeyEvent) -> IotaInteraction {
+        IotaInteraction::Changed
     }
 
     fn can_focus(&self) -> bool {
