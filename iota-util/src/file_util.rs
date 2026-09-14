@@ -56,6 +56,35 @@ fn credential_filename(username: &str) -> io::Result<String> {
     Ok(format!("{username}.tu"))
 }
 
+pub fn tauth_credential_path(app_id: &str) -> io::Result<PathBuf> {
+    if app_id.len() != 64 || !app_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid TAuth app ID",
+        ));
+    }
+    Ok(storage_directory()
+        .join("credentials")
+        .join("apps")
+        .join(format!("{}.ta", app_id.to_ascii_lowercase())))
+}
+
+pub fn read_tauth_credential(app_id: &str) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(tauth_credential_path(app_id)?) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn remove_tauth_credential(app_id: &str) -> io::Result<()> {
+    match fs::remove_file(tauth_credential_path(app_id)?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn credential_path(username: &str) -> io::Result<PathBuf> {
     credential_path_in(&storage_directory(), username)
 }

@@ -15,6 +15,11 @@ pub const COMMANDS: &[&str] = &[
     "users forget ",
     "users apps revoke ",
     "users apps revoke-all ",
+    "apps list",
+    "apps show ",
+    "apps create hosted ",
+    "apps create forced-omikron ",
+    "apps delete ",
     "omikron status",
     "reconnect",
     "identity rotate",
@@ -97,16 +102,61 @@ pub fn parse(line: &str) -> Option<LocalRequest> {
             user_id: id_str.parse::<i64>().ok()?,
         }),
         ["user" | "users", "apps", "revoke", id_str, app_id] => {
-            Some(LocalRequest::RevokeTrustedApp {
+            Some(LocalRequest::RevokeTAuthGrant {
                 user_id: id_str.parse::<i64>().ok()?,
                 app_id: app_id.to_string(),
             })
         }
         ["user" | "users", "apps", "revoke-all", id_str] => {
-            Some(LocalRequest::RevokeAllTrustedApps {
+            Some(LocalRequest::RevokeAllTAuthGrants {
                 user_id: id_str.parse::<i64>().ok()?,
             })
         }
+        ["apps", "list"] => Some(LocalRequest::ListTAuthApps),
+        ["apps", "show", app_id] => Some(LocalRequest::GetTAuthApp {
+            app_id: app_id.to_string(),
+        }),
+        [
+            "apps",
+            "create",
+            "hosted",
+            owner,
+            domain,
+            name,
+            redirect,
+            omega_url,
+        ] => Some(LocalRequest::CreateTAuthApp {
+            owner_user_id: owner.parse().ok()?,
+            domain: domain.to_string(),
+            name: name.to_string(),
+            redirects: vec![redirect.to_string()],
+            connection: crate::TAuthConnectionInput::Hosted {
+                omega_url: omega_url.to_string(),
+            },
+        }),
+        [
+            "apps",
+            "create",
+            "forced-omikron",
+            owner,
+            domain,
+            name,
+            redirect,
+            omikron_url,
+            omikron_public_key,
+        ] => Some(LocalRequest::CreateTAuthApp {
+            owner_user_id: owner.parse().ok()?,
+            domain: domain.to_string(),
+            name: name.to_string(),
+            redirects: vec![redirect.to_string()],
+            connection: crate::TAuthConnectionInput::ForcedOmikron {
+                omikron_url: omikron_url.to_string(),
+                omikron_public_key: omikron_public_key.to_string(),
+            },
+        }),
+        ["apps", "delete", app_id, "confirm"] => Some(LocalRequest::DeleteTAuthApp {
+            app_id: app_id.to_string(),
+        }),
         ["reconnect"] => Some(LocalRequest::ReconnectOmikron),
         ["regenerate", "keys"] | ["identity", "rotate"] => Some(LocalRequest::RotateIotaIdentity),
         ["reload"] | ["restart"] => Some(LocalRequest::RequestProcessExit {
@@ -174,11 +224,11 @@ mod tests {
         ));
         assert!(matches!(
             parse("users apps revoke 42 desktop"),
-            Some(LocalRequest::RevokeTrustedApp { user_id: 42, .. })
+            Some(LocalRequest::RevokeTAuthGrant { user_id: 42, .. })
         ));
         assert!(matches!(
             parse("users apps revoke-all 42"),
-            Some(LocalRequest::RevokeAllTrustedApps { user_id: 42 })
+            Some(LocalRequest::RevokeAllTAuthGrants { user_id: 42 })
         ));
         assert!(matches!(
             parse("identity rotate"),

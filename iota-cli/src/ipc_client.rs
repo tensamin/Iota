@@ -491,6 +491,21 @@ impl IpcClient {
                         .join("\n")
                 }
             }
+            ResponsePayload::TAuthApps(apps) => apps
+                .iter()
+                .map(|app| format!("{} {} {}", app.app_id, app.domain, app.connection_mode))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            ResponsePayload::TAuthApp(app) => format!(
+                "TAuth app {}: domain={}, owner={}, mode={}, endpoint={}",
+                app.app_id, app.domain, app.owner_user_id, app.connection_mode, app.endpoint_url
+            ),
+            ResponsePayload::TAuthAppCreated { app, .. } => {
+                format!("Created TAuth app {} for {}", app.app_id, app.domain)
+            }
+            ResponsePayload::TAuthAppCredentialExport { .. } => {
+                "TAuth credential export payload withheld.".into()
+            }
             ResponsePayload::InvitationCreated(invitation) => format!(
                 "Created {:?} invitation {}\nToken: {}\nExpires: {}{}{}",
                 invitation.authority,
@@ -538,12 +553,12 @@ impl IpcClient {
                 format!("Reconciled user {}: {:?}", result.user_id, result.action)
             }
             ResponsePayload::UserDiagnostics(diagnostics) => format!(
-                "User {}: state={:?}, data={}, credential={:?}, trusted_apps={}",
+                "User {}: state={:?}, data={}, credential={:?}, tauth_grants={}",
                 diagnostics.user_id,
                 diagnostics.local_state,
                 diagnostics.data_present,
                 diagnostics.credential_status,
-                diagnostics.trusted_app_count,
+                diagnostics.tauth_grant_count,
             ),
             ResponsePayload::UserCredentialExport { .. } => {
                 "Credential export payload withheld.".into()
@@ -588,8 +603,8 @@ impl IpcClient {
                     msg.push_str(&format!("\nDisplay Name: {name}"));
                 }
                 msg.push_str(&format!("\nCreated At: {}", user.created_at));
-                if !user.trusted_apps.is_empty() {
-                    msg.push_str(&format!("\nTrusted Apps: {}", user.trusted_apps.join(", ")));
+                if !user.tauth_grants.is_empty() {
+                    msg.push_str(&format!("\nTAuth grants: {}", user.tauth_grants.join(", ")));
                 }
                 msg
             }

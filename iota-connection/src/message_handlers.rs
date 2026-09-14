@@ -941,66 +941,6 @@ pub fn handle_get_chat_secret(cv: &CommunicationValue) -> CommunicationValue {
     }
 }
 
-pub fn handle_create_app(cv: &CommunicationValue) -> CommunicationValue {
-    let sender_id = match required_sender_id(cv) {
-        Ok(sender_id) => sender_id,
-        Err(response) => return response,
-    };
-    let app_identifier = cv
-        .get_data(DataType::AppIdentifier)
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-    let app_public_key = cv
-        .get_data(DataType::AppPublicKey)
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-
-    if !app_identifier.is_empty() && !app_public_key.is_empty() {
-        let user = match iota_storage::users::user_manager::get_user(sender_id) {
-            Ok(user) => user,
-            Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
-        };
-        if let Some(mut user) = user {
-            if !user.trusted_apps.contains_key(&app_identifier) {
-                user.trusted_apps.insert(app_identifier, app_public_key);
-                if iota_storage::users::user_manager::update_user(user).is_err() {
-                    return error_response(cv, CommunicationType::ErrorInternal);
-                }
-            }
-        }
-    }
-
-    CommunicationValue::new(CommunicationType::CreateApp)
-        .with_request_id(cv)
-        .with_receiver(sender_wire_id(sender_id))
-}
-
-pub fn handle_delete_app(cv: &CommunicationValue) -> CommunicationValue {
-    let sender_id = match required_sender_id(cv) {
-        Ok(sender_id) => sender_id,
-        Err(response) => return response,
-    };
-    let app_identifier = cv
-        .get_data(DataType::AppIdentifier)
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-
-    if !app_identifier.is_empty() {
-        if iota_storage::users::user_manager::revoke_trusted_app(sender_id, &app_identifier)
-            .is_err()
-        {
-            return error_response(cv, CommunicationType::ErrorInternal);
-        }
-    }
-
-    CommunicationValue::new(CommunicationType::DeleteApp)
-        .with_request_id(cv)
-        .with_receiver(sender_wire_id(sender_id))
-}
-
 fn contact_value(
     contact: &iota_storage::users::contact::Contact,
     messages: &[chat_files::StoredMessage],

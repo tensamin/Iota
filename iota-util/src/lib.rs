@@ -5,4 +5,5 @@ pub mod crypto_util;
 pub mod file_util;
 pub mod mtp_compat;
 pub mod route_target;
+pub mod ta;
 pub mod tu;

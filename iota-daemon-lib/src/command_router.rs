@@ -280,6 +280,67 @@ impl CommandRouter {
                 };
                 ResponseResult::Ok(ResponsePayload::Users(users))
             }
+            LocalRequest::ListTAuthApps => match crate::tauth_apps::list() {
+                Ok(apps) => ResponseResult::Ok(ResponsePayload::TAuthApps(apps)),
+                Err(error) => {
+                    log!("TAuth app listing failed: {error}");
+                    ResponseResult::Error(IpcErrorCode::StorageFailure)
+                }
+            },
+            LocalRequest::GetTAuthApp { app_id } => match crate::tauth_apps::get(&app_id) {
+                Ok(Some(app)) => ResponseResult::Ok(ResponsePayload::TAuthApp(app)),
+                Ok(None) => ResponseResult::Error(IpcErrorCode::NotFound),
+                Err(error) => {
+                    log!("TAuth app lookup failed: {error}");
+                    ResponseResult::Error(IpcErrorCode::StorageFailure)
+                }
+            },
+            LocalRequest::CreateTAuthApp {
+                owner_user_id,
+                domain,
+                name,
+                redirects,
+                connection,
+            } => {
+                match crate::tauth_apps::create(owner_user_id, domain, name, redirects, connection)
+                {
+                    Ok(created) => ResponseResult::Ok(ResponsePayload::TAuthAppCreated {
+                        app: created.app,
+                        credential: created.credential,
+                        txt_record: created.txt_record,
+                        manifest_template: created.manifest_template,
+                    }),
+                    Err(error) => {
+                        log!("TAuth app creation failed: {error}");
+                        ResponseResult::Error(IpcErrorCode::InvalidRequest)
+                    }
+                }
+            }
+            LocalRequest::ExportTAuthApp { app_id } => match crate::tauth_apps::export(&app_id) {
+                Ok(Some(credential)) => {
+                    ResponseResult::Ok(ResponsePayload::TAuthAppCredentialExport {
+                        app_id,
+                        credential,
+                    })
+                }
+                Ok(None) => ResponseResult::Error(IpcErrorCode::NotFound),
+                Err(error) => {
+                    log!("TAuth app export failed: {error}");
+                    ResponseResult::Error(IpcErrorCode::StorageFailure)
+                }
+            },
+            LocalRequest::DeleteTAuthApp { app_id } => match crate::tauth_apps::delete(&app_id) {
+                Ok(true) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                    message: format!(
+                        "Deleted TAuth app {app_id}. Remove its DNS TXT record and HTTPS manifest."
+                    ),
+                }),
+                Ok(false) => ResponseResult::Error(IpcErrorCode::NotFound),
+                Err(error) => {
+                    log!("TAuth app deletion failed: {error}");
+                    ResponseResult::Error(IpcErrorCode::StorageFailure)
+                }
+            },
             LocalRequest::CreateInvitation {
                 authority,
                 lifetime_seconds,
@@ -730,33 +791,30 @@ impl CommandRouter {
                     },
                     data_present: residency.data_present,
                     credential_status,
-                    trusted_app_count: profile
-                        .as_ref()
-                        .map_or(0, |profile| profile.trusted_apps.len()),
+                    tauth_grant_count: iota_storage::tauth::list_grants(user_id)
+                        .map_or(0, |grants| grants.len()),
                     pending_operation,
                 }))
             }
-            LocalRequest::RevokeTrustedApp { user_id, app_id } => {
-                match user_manager::revoke_trusted_app(user_id, &app_id) {
+            LocalRequest::RevokeTAuthGrant { user_id, app_id } => {
+                match user_manager::revoke_tauth_grant(user_id, &app_id) {
                     Ok(true) => ResponseResult::Ok(ResponsePayload::Acknowledged {
-                        message: format!("Revoked trusted application {app_id} for user {user_id}"),
+                        message: format!("Revoked TAuth grant {app_id} for user {user_id}"),
                     }),
                     Ok(false) => ResponseResult::Error(IpcErrorCode::NotFound),
                     Err(error) => {
-                        log!("Trusted application revocation failed for {user_id}: {error}");
+                        log!("TAuth grant revocation failed for {user_id}: {error}");
                         ResponseResult::Error(IpcErrorCode::StorageFailure)
                     }
                 }
             }
-            LocalRequest::RevokeAllTrustedApps { user_id } => {
-                match user_manager::revoke_all_trusted_apps(user_id) {
+            LocalRequest::RevokeAllTAuthGrants { user_id } => {
+                match user_manager::revoke_all_tauth_grants(user_id) {
                     Ok(removed) => ResponseResult::Ok(ResponsePayload::Acknowledged {
-                        message: format!(
-                            "Revoked {removed} trusted applications for user {user_id}"
-                        ),
+                        message: format!("Revoked {removed} TAuth grants for user {user_id}"),
                     }),
                     Err(error) => {
-                        log!("Trusted application revocation failed for {user_id}: {error}");
+                        log!("TAuth grant revocation failed for {user_id}: {error}");
                         ResponseResult::Error(IpcErrorCode::StorageFailure)
                     }
                 }
@@ -935,7 +993,11 @@ impl CommandRouter {
                             username: user.username,
                             display_name: user.display_name,
                             created_at: user.created_at,
-                            trusted_apps: user.trusted_apps.keys().cloned().collect(),
+                            tauth_grants: iota_storage::tauth::list_grants(user_id)
+                                .map(|grants| {
+                                    grants.into_iter().map(|grant| grant.app_id).collect()
+                                })
+                                .unwrap_or_default(),
                             state: iota_ipc::LocalUserState::Managed,
                             data_present: residency.data_present,
                             credential_status,
@@ -947,7 +1009,7 @@ impl CommandRouter {
                             username: residency.username,
                             display_name: None,
                             created_at: 0,
-                            trusted_apps: Vec::new(),
+                            tauth_grants: Vec::new(),
                             state: iota_ipc::LocalUserState::Released,
                             data_present: residency.data_present,
                             credential_status: iota_ipc::CredentialStatus::None,
@@ -1055,11 +1117,11 @@ mod tests {
             LocalRequest::ForceDetachUser { user_id: 1 },
             LocalRequest::ForgetReleasedUser { user_id: 1 },
             LocalRequest::GetUserDiagnostics { user_id: 1 },
-            LocalRequest::RevokeTrustedApp {
+            LocalRequest::RevokeTAuthGrant {
                 user_id: 1,
                 app_id: "desktop".into(),
             },
-            LocalRequest::RevokeAllTrustedApps { user_id: 1 },
+            LocalRequest::RevokeAllTAuthGrants { user_id: 1 },
             LocalRequest::ExportUserCredential { user_id: 1 },
             LocalRequest::PurgeUserData { user_id: 1 },
             LocalRequest::ReleaseUser { user_id: 1 },

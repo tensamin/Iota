@@ -1898,6 +1898,67 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         conn.pragma_update(None, "user_version", 43)?;
     }
 
+    if current_version < 44 {
+        conn.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS trusted_apps;
+            CREATE TABLE tauth_owner_apps (
+                app_id TEXT PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL,
+                domain TEXT NOT NULL,
+                public_key TEXT NOT NULL,
+                owner_certificate TEXT NOT NULL,
+                connection_mode TEXT NOT NULL CHECK (connection_mode IN ('hosted', 'forced_omikron')),
+                endpoint_url TEXT NOT NULL,
+                omikron_public_key TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE tauth_grants (
+                local_user_id INTEGER NOT NULL,
+                app_id TEXT NOT NULL,
+                app_name TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                redirect_uri TEXT NOT NULL,
+                scopes TEXT NOT NULL,
+                app_public_key TEXT NOT NULL,
+                manifest_hash TEXT NOT NULL,
+                security_state TEXT NOT NULL CHECK (security_state IN ('secure', 'insecure')),
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (local_user_id, app_id)
+            );
+            CREATE TABLE tauth_codes (
+                code_hash BLOB PRIMARY KEY,
+                local_user_id INTEGER NOT NULL,
+                app_id TEXT NOT NULL,
+                redirect_uri TEXT NOT NULL,
+                scopes TEXT NOT NULL,
+                pkce_challenge TEXT NOT NULL,
+                authorization_request TEXT NOT NULL,
+                locator TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX tauth_codes_expiry ON tauth_codes (expires_at);
+            CREATE TABLE tauth_sessions (
+                token_hash BLOB PRIMARY KEY,
+                local_user_id INTEGER NOT NULL,
+                app_id TEXT NOT NULL,
+                scopes TEXT NOT NULL,
+                locator TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX tauth_sessions_grant ON tauth_sessions (local_user_id, app_id);
+            CREATE TABLE tauth_metadata (
+                local_user_id INTEGER NOT NULL,
+                app_id TEXT NOT NULL,
+                json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (local_user_id, app_id)
+            );
+            PRAGMA user_version = 44;
+            "#,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1972,7 +2033,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 43);
+        assert_eq!(version, 44);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -1991,7 +2052,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 43);
+        assert_eq!(version, 44);
         for table in [
             "sync_heads",
             "sync_events",
@@ -2072,7 +2133,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 43);
+        assert_eq!(version, 44);
         for column in [
             "id",
             "user_id",
@@ -2167,7 +2228,7 @@ mod tests {
         )?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         assert_eq!(preserved, "remote_committed");
-        assert_eq!(version, 43);
+        assert_eq!(version, 44);
         Ok(())
     }
 
@@ -2205,7 +2266,7 @@ mod tests {
         })?;
         assert_eq!(count, 0);
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 43);
+        assert_eq!(version, 44);
         Ok(())
     }
 

@@ -157,59 +157,6 @@ impl ClientConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::SaveAppData) {
-            let sender_id = match cv.require_sender() {
-                Ok(sender_id) => sender_id,
-                Err(_) => {
-                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
-                        .await;
-                    return;
-                }
-            };
-            let _app_data = cv
-                .get_data(DataType::AppData)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-
-            let res = CommunicationValue::new(CommunicationType::SaveAppData)
-                .with_request_id(&cv)
-                .with_receiver(sender_id);
-            self.send_message(&res).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::LoadAppData) {
-            let sender_id = match cv.require_sender() {
-                Ok(sender_id) => sender_id,
-                Err(_) => {
-                    self.send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
-                        .await;
-                    return;
-                }
-            };
-            let app_data = String::new();
-
-            let res = CommunicationValue::new(CommunicationType::LoadAppData)
-                .with_request_id(&cv)
-                .with_receiver(sender_id)
-                .add_typed_default(DataType::AppData, DataValue::Str(app_data));
-            self.send_message(&res).await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::CreateApp) {
-            self.send_message(&message_handlers::handle_create_app(&cv))
-                .await;
-            return;
-        }
-
-        if cv.is_type(CommunicationType::DeleteApp) {
-            self.send_message(&message_handlers::handle_delete_app(&cv))
-                .await;
-            return;
-        }
-
         if cv.is_type(CommunicationType::AccountStateRequest) {
             // Account initialization is routed through Omikron.
             self.send_message(

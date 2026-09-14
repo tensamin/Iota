@@ -16,7 +16,6 @@ pub struct UserProfile {
     pub reset_token: Option<String>,
     pub created_at: i64,
     pub display_name: Option<String>,
-    pub trusted_apps: std::collections::HashMap<String, String>,
 }
 
 impl UserProfile {
@@ -59,7 +58,6 @@ impl UserProfile {
             private_key_hash,
             created_at,
             reset_token,
-            trusted_apps: std::collections::HashMap::new(),
         }
     }
 
@@ -92,15 +90,6 @@ impl UserProfile {
         let created_at = j["created_at"].as_i64()?;
         let display_name = j["display_name"].as_str().map(|s| s.to_string());
 
-        let mut trusted_apps = std::collections::HashMap::new();
-        if j["trusted_apps"].is_object() {
-            for (key, value) in j["trusted_apps"].entries() {
-                if let Some(s) = value.as_str() {
-                    trusted_apps.insert(key.to_string(), s.to_string());
-                }
-            }
-        }
-
         Some(UserProfile {
             user_id,
             username,
@@ -109,7 +98,6 @@ impl UserProfile {
             private_key_hash,
             created_at,
             reset_token,
-            trusted_apps,
         })
     }
 

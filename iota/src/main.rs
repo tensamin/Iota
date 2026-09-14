@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use iota_cli::{
     ipc_client::IpcClient, screens::main_screen::MainScreen, theme,
     ui::start_bootstrap_tui_with_config,
@@ -388,8 +389,13 @@ fn print_help() {
     println!("  users repair force-detach <ID> Remove local management (requires --yes)");
     println!("  users forget <ID>      Forget an empty released residency (requires --yes)");
     println!("  users apps revoke <ID> <APP> Revoke a trusted app (requires --yes)");
-    println!("  users apps revoke-all <ID> Revoke all trusted apps (requires --yes)");
+    println!("  users apps revoke-all <ID> Revoke all TAuth grants (requires --yes)");
     println!("  users credential export <ID> --output <PATH> Export the local TU");
+    println!("  apps list              List owned TAuth apps");
+    println!("  apps show <APP_ID>     Show an owned TAuth app");
+    println!("  apps create ...        Create and export a TAuth app");
+    println!("  apps export <APP_ID> --output <PATH> Export an existing .ta");
+    println!("  apps delete <APP_ID>   Delete app key and registration (requires --yes)");
     println!("  omikron status         Show Omikron connection status");
     println!("  omikron reconnect      Reconnect to Omikron");
     println!("  identity rotate        Rotate identity keys (requires --yes)");
@@ -536,6 +542,8 @@ async fn run_command(
 ) -> Result<(), StartupError> {
     let color = ColorConfig::new();
     let mut credential_output = None;
+    let mut tauth_credential_output = None;
+    let mut tauth_manifest_output = None;
     let request = match command {
         Command::Status => LocalRequest::GetStatus,
         Command::Tasks => LocalRequest::ListTasks,
@@ -623,11 +631,11 @@ async fn run_command(
             user_id,
             app_id,
             confirmed: true,
-        } => LocalRequest::RevokeTrustedApp { user_id, app_id },
+        } => LocalRequest::RevokeTAuthGrant { user_id, app_id },
         Command::UsersRevokeAllApps {
             user_id,
             confirmed: true,
-        } => LocalRequest::RevokeAllTrustedApps { user_id },
+        } => LocalRequest::RevokeAllTAuthGrants { user_id },
         Command::UsersExportCredential { user_id, output } => {
             let daemon_status = ipc.daemon_status();
             if !daemon_status
@@ -643,6 +651,54 @@ async fn run_command(
             credential_output = Some(output);
             LocalRequest::ExportUserCredential { user_id }
         }
+        Command::AppsList => LocalRequest::ListTAuthApps,
+        Command::AppsShow { app_id } => LocalRequest::GetTAuthApp { app_id },
+        Command::AppsCreate {
+            owner_user_id,
+            domain,
+            name,
+            redirects,
+            connection,
+            output,
+            manifest_output,
+        } => {
+            if output == manifest_output {
+                return Err(StartupError::InvalidCommand(
+                    ".ta and manifest outputs must use different paths.".into(),
+                ));
+            }
+            for path in [&output, &manifest_output] {
+                if path.exists() {
+                    return Err(StartupError::InvalidCommand(format!(
+                        "Refusing to overwrite {}.",
+                        path.display()
+                    )));
+                }
+            }
+            tauth_credential_output = Some(output);
+            tauth_manifest_output = Some(manifest_output);
+            LocalRequest::CreateTAuthApp {
+                owner_user_id,
+                domain,
+                name,
+                redirects,
+                connection,
+            }
+        }
+        Command::AppsExport { app_id, output } => {
+            if output.exists() {
+                return Err(StartupError::InvalidCommand(format!(
+                    "Refusing to overwrite {}.",
+                    output.display()
+                )));
+            }
+            tauth_credential_output = Some(output);
+            LocalRequest::ExportTAuthApp { app_id }
+        }
+        Command::AppsDelete {
+            app_id,
+            confirmed: true,
+        } => LocalRequest::DeleteTAuthApp { app_id },
         Command::OmikronReconnect => LocalRequest::ReconnectOmikron,
         Command::IdentityRotate { confirmed: true } => LocalRequest::RotateIotaIdentity,
         Command::RegenerateKeys { confirmed: true } => LocalRequest::RotateIotaIdentity,
@@ -681,6 +737,9 @@ async fn run_command(
             confirmed: false, ..
         }
         | Command::UsersRevokeAllApps {
+            confirmed: false, ..
+        }
+        | Command::AppsDelete {
             confirmed: false, ..
         }
         | Command::IdentityRotate { confirmed: false }
@@ -745,7 +804,63 @@ async fn run_command(
                 );
                 return Ok(());
             }
-            if credential_output.is_some() {
+            if let ResponsePayload::TAuthAppCreated {
+                app,
+                credential,
+                txt_record,
+                manifest_template,
+            } = &payload
+            {
+                let credential_path = tauth_credential_output.as_deref().ok_or_else(|| {
+                    StartupError::Other("Missing TAuth credential export destination.".into())
+                })?;
+                let manifest_path = tauth_manifest_output.as_deref().ok_or_else(|| {
+                    StartupError::Other("Missing TAuth manifest export destination.".into())
+                })?;
+                let bytes = STANDARD.decode(&credential.0).map_err(|error| {
+                    StartupError::Other(format!("Daemon returned invalid .ta data: {error}"))
+                })?;
+                iota_util::atomic_file::create_private(credential_path, &bytes).map_err(
+                    |error| {
+                        StartupError::Other(format!(
+                            "Cannot export credential to {}: {error}",
+                            credential_path.display()
+                        ))
+                    },
+                )?;
+                if let Err(error) = iota_util::atomic_file::create_private(
+                    manifest_path,
+                    manifest_template.as_bytes(),
+                ) {
+                    let _ = std::fs::remove_file(credential_path);
+                    return Err(StartupError::Other(format!(
+                        "Cannot export manifest template to {}: {error}",
+                        manifest_path.display()
+                    )));
+                }
+                println!("Created TAuth app {} for {}.", app.app_id, app.domain);
+                println!(".ta: {}", credential_path.display());
+                println!("TXT _tauth.{}: {}", app.domain, txt_record);
+                println!("Manifest: {}", manifest_path.display());
+                return Ok(());
+            }
+            if let ResponsePayload::TAuthAppCredentialExport { app_id, credential } = &payload {
+                let path = tauth_credential_output.as_deref().ok_or_else(|| {
+                    StartupError::Other("Missing TAuth credential export destination.".into())
+                })?;
+                let bytes = STANDARD.decode(&credential.0).map_err(|error| {
+                    StartupError::Other(format!("Daemon returned invalid .ta data: {error}"))
+                })?;
+                iota_util::atomic_file::create_private(path, &bytes).map_err(|error| {
+                    StartupError::Other(format!(
+                        "Cannot export credential to {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                println!("Exported TAuth app {app_id} to {}.", path.display());
+                return Ok(());
+            }
+            if credential_output.is_some() || tauth_credential_output.is_some() {
                 return Err(StartupError::Other(
                     "The daemon returned an unexpected credential export response.".into(),
                 ));
@@ -821,6 +936,28 @@ async fn run_command(
                             );
                         }
                     }
+                }
+                ResponsePayload::TAuthApps(apps) => {
+                    if apps.is_empty() {
+                        println!("{}", cli_color::muted(&color, "No TAuth apps."));
+                    } else {
+                        for app in apps {
+                            println!("{} {} {}", app.app_id, app.domain, app.connection_mode);
+                        }
+                    }
+                }
+                ResponsePayload::TAuthApp(app) => {
+                    println!("App ID: {}", app.app_id);
+                    println!("Domain: {}", app.domain);
+                    println!("Owner user: {}", app.owner_user_id);
+                    println!("Mode: {}", app.connection_mode);
+                    println!("Endpoint: {}", app.endpoint_url);
+                }
+                ResponsePayload::TAuthAppCreated { .. }
+                | ResponsePayload::TAuthAppCredentialExport { .. } => {
+                    return Err(StartupError::Other(
+                        "Refusing to display TAuth credential material.".into(),
+                    ));
                 }
                 ResponsePayload::InvitationCreated(invitation) => {
                     println!("Invitation: {}", invitation.invitation_id);
@@ -928,8 +1065,8 @@ async fn run_command(
                         println!("Display Name: {name}");
                     }
                     println!("Created At: {}", user.created_at);
-                    if !user.trusted_apps.is_empty() {
-                        println!("Trusted Apps: {}", user.trusted_apps.join(", "));
+                    if !user.tauth_grants.is_empty() {
+                        println!("TAuth grants: {}", user.tauth_grants.join(", "));
                     }
                 }
                 ResponsePayload::TuCredentialPreview(preview) => {
@@ -950,7 +1087,7 @@ async fn run_command(
                     println!("Local state: {:?}", diagnostics.local_state);
                     println!("Hosted data: {}", diagnostics.data_present);
                     println!("Credential: {:?}", diagnostics.credential_status);
-                    println!("Trusted applications: {}", diagnostics.trusted_app_count);
+                    println!("TAuth grants: {}", diagnostics.tauth_grant_count);
                     if let Some(operation) = &diagnostics.pending_operation {
                         println!("Pending operation: {operation}");
                     }
@@ -1005,7 +1142,12 @@ async fn run_command(
 /// Text remains an operator-oriented presentation; JSON and YAML must never
 /// require consumers to parse it.
 fn render_structured(payload: &ResponsePayload, output: OutputFormat) -> Result<(), StartupError> {
-    if matches!(payload, ResponsePayload::UserCredentialExport { .. }) {
+    if matches!(
+        payload,
+        ResponsePayload::UserCredentialExport { .. }
+            | ResponsePayload::TAuthAppCreated { .. }
+            | ResponsePayload::TAuthAppCredentialExport { .. }
+    ) {
         return Err(StartupError::Other(
             "Refusing to encode credential material as ordinary output.".into(),
         ));
@@ -1095,6 +1237,31 @@ fn render_table(payload: &ResponsePayload) {
                         .unwrap_or_else(|| "-".into())
                 );
             }
+        }
+        ResponsePayload::TAuthApps(apps) => {
+            if apps.is_empty() {
+                println!("No TAuth apps.");
+                return;
+            }
+            println!("{:<66} {:<28} MODE", "APP ID", "DOMAIN");
+            for app in apps {
+                println!(
+                    "{:<66} {:<28} {}",
+                    app.app_id, app.domain, app.connection_mode
+                );
+            }
+        }
+        ResponsePayload::TAuthApp(app) => {
+            println!("{:<18} {}", "App ID", app.app_id);
+            println!("{:<18} {}", "Domain", app.domain);
+            println!("{:<18} {}", "Owner user", app.owner_user_id);
+            println!("{:<18} {}", "Public key", app.public_key);
+            println!("{:<18} {}", "Mode", app.connection_mode);
+            println!("{:<18} {}", "Endpoint", app.endpoint_url);
+        }
+        ResponsePayload::TAuthAppCreated { .. }
+        | ResponsePayload::TAuthAppCredentialExport { .. } => {
+            println!("TAuth credential material withheld.");
         }
         ResponsePayload::Tasks(tasks) => {
             if tasks.is_empty() {
@@ -1216,7 +1383,7 @@ fn render_table(payload: &ResponsePayload) {
             println!("{:<15} {:?}", "Local state", diagnostics.local_state);
             println!("{:<15} {}", "Hosted data", diagnostics.data_present);
             println!("{:<15} {:?}", "Credential", diagnostics.credential_status);
-            println!("{:<15} {}", "Trusted apps", diagnostics.trusted_app_count);
+            println!("{:<15} {}", "TAuth grants", diagnostics.tauth_grant_count);
         }
         ResponsePayload::UserCredentialExport { .. } => {
             println!("Credential export payload withheld.");
@@ -1239,8 +1406,8 @@ fn render_table(payload: &ResponsePayload) {
                 println!("{:<15} {}", "Display Name", name);
             }
             println!("{:<15} {}", "Created At", user.created_at);
-            if !user.trusted_apps.is_empty() {
-                println!("{:<15} {}", "Trusted Apps", user.trusted_apps.join(", "));
+            if !user.tauth_grants.is_empty() {
+                println!("{:<15} {}", "TAuth grants", user.tauth_grants.join(", "));
             }
         }
     }

@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dashmap::{DashMap, DashSet};
 use iota_logger::{log, log_cv_in, log_cv_out, log_t};
 use iota_state::AppState;
@@ -5,11 +6,11 @@ use iota_storage::util::config_util::{CONFIG, modify_config};
 use iota_storage::util::relay_replay;
 use iota_storage::util::{chat_files, client_relay_delivery, relay_queue};
 use iota_util::crypto_helper::{self, keyring_from_base64};
-use iota_util::crypto_util::{self};
 use mtp::client::{Client, ClientConfig, MTPConnection, Policy, SendMode, Sender};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, DataValue, TypeMap};
-use mtp::crypto::{Keyring, PublicKeyBundle};
+use mtp::crypto::{Ed25519Signer, Keyring, PublicKeyBundle, SignatureScheme};
 use rand_core::RngCore;
+use serde::Serialize;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +31,7 @@ use iota_connection::relay::{
     RelayValidationError, forward_verified_relay, open_verified_relay_content,
     verify_relay_metadata,
 };
+use iota_identity::AuthorityLocator;
 
 // ============================================================================
 // Configuration
@@ -345,17 +347,31 @@ pub enum ConnectionState {
     Connected { identified: bool },
 }
 
-#[derive(Clone)]
-struct PendingAppChallenge {
-    challenge: String,
-    user_id: i64,
-    app_identifier: String,
+#[derive(Serialize)]
+struct TAuthLocatorUnsigned<'a> {
+    version: u16,
+    principal: &'a str,
+    omikron_url: &'a str,
+    omikron_public_key: &'a str,
+    target_iota_id: u64,
+    iota_public_key: &'a str,
+    issued_at: i64,
 }
 
-#[derive(Clone)]
-struct AppSession {
-    connection_id: Uuid,
-    app_identifier: String,
+#[derive(Serialize)]
+struct TAuthLocator<'a> {
+    version: u16,
+    principal: &'a str,
+    omikron_url: &'a str,
+    omikron_public_key: &'a str,
+    target_iota_id: u64,
+    iota_public_key: &'a str,
+    issued_at: i64,
+    signature: String,
+}
+
+fn string_array(values: &[String]) -> DataValue {
+    DataValue::Array(values.iter().cloned().map(DataValue::Str).collect())
 }
 
 impl ConnectionState {
@@ -385,8 +401,7 @@ pub struct OmikronConnection {
     reconnect_on_close: Arc<RwLock<bool>>,
     auth_failure: Arc<RwLock<Option<String>>>,
     keyring: Arc<RwLock<Option<Arc<Keyring>>>>,
-    app_challenges: Arc<DashMap<u64, PendingAppChallenge>>,
-    app_sessions: Arc<DashMap<u64, AppSession>>,
+    http_client: reqwest::Client,
     session_manager: Arc<iota_auth::SessionManager>,
     handler_semaphore: Arc<Semaphore>,
     cancellation: CancellationToken,
@@ -421,8 +436,7 @@ impl OmikronConnection {
             reconnect_on_close: Arc::new(RwLock::new(true)),
             auth_failure: Arc::new(RwLock::new(None)),
             keyring: Arc::new(RwLock::new(None)),
-            app_challenges: Arc::new(DashMap::new()),
-            app_sessions: Arc::new(DashMap::new()),
+            http_client: reqwest::Client::new(),
             session_manager: Arc::new(iota_auth::SessionManager::default()),
             handler_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS)),
             cancellation,
@@ -1676,12 +1690,18 @@ impl OmikronConnection {
         }
 
         dispatch!(GetChatSecret, handle_get_chat_secret);
-        dispatch!(AppIdentification, handle_app_identification);
-        dispatch!(AppChallengeResponse, handle_app_challenge_response);
-        dispatch!(SaveAppData, handle_save_app_data);
-        dispatch!(LoadAppData, handle_load_app_data);
-        dispatch!(CreateApp, handle_create_app);
-        dispatch!(DeleteApp, handle_delete_app);
+        dispatch!(TAuthAuthorize, handle_tauth_authorize);
+        dispatch!(TAuthExchangeCode, handle_tauth_exchange_code);
+        dispatch!(TAuthUser, handle_tauth_user);
+        dispatch!(TAuthContacts, handle_tauth_contacts);
+        dispatch!(TAuthPublicLookup, handle_tauth_public_lookup);
+        dispatch!(TAuthMetadataGet, handle_tauth_metadata_get);
+        dispatch!(TAuthMetadataSet, handle_tauth_metadata_set);
+        dispatch!(TAuthMetadataDelete, handle_tauth_metadata_delete);
+        dispatch!(TAuthDisconnectDelete, handle_tauth_disconnect_delete);
+        dispatch!(TAuthGrantList, handle_tauth_grant_list);
+        dispatch!(TAuthGrantRevoke, handle_tauth_grant_revoke);
+        dispatch!(TAuthGrantMetadataSet, handle_tauth_grant_metadata_set);
         dispatch!(AccountStateRequest, handle_account_state_request);
         dispatch!(AccountStateApplied, handle_account_state_applied);
         dispatch!(ReadNotification, handle_read_notification);
@@ -1871,251 +1891,513 @@ impl OmikronConnection {
             .await;
     }
 
-    async fn handle_app_identification(self: Arc<Self>, cv: &CommunicationValue) {
-        let sender_id = match cv.require_sender() {
-            Ok(sender_id) => sender_id,
-            Err(_) => {
-                let _ = self
-                    .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
-                    .await;
-                return;
-            }
-        };
-        let app_identifier = cv
-            .get_data(DataType::AppIdentifier)
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        let app_public_key = cv
-            .get_data(DataType::AppPublicKey)
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        let Some(user_id) = data_i64(cv, DataType::UserId).filter(|id| *id > 0) else {
-            let _ = self
-                .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
+    async fn handle_tauth_authorize(self: Arc<Self>, cv: &CommunicationValue) {
+        let Some(user_id) = cv
+            .require_sender()
+            .ok()
+            .and_then(|value| i64::try_from(value).ok())
+        else {
+            self.send_tauth_error(cv, "missing authenticated user")
                 .await;
             return;
         };
-
-        let mut trusted = false;
-        let user = match iota_storage::users::user_manager::get_user(user_id) {
-            Ok(user) => user,
-            Err(_) => {
-                let _ = self
-                    .send_message(&error_response(cv, CommunicationType::ErrorInternal))
-                    .await;
+        let Some(request_json) = cv.get_data(DataType::AuthorizationRequest).as_str() else {
+            self.send_tauth_error(cv, "missing authorization request")
+                .await;
+            return;
+        };
+        let verified =
+            match crate::tauth::verify_authorization(&self.http_client, request_json).await {
+                Ok(verified) => verified,
+                Err(error) => {
+                    self.send_tauth_error(cv, &error.to_string()).await;
+                    return;
+                }
+            };
+        let existing = iota_storage::tauth::get_grant(user_id, &verified.request.app_id)
+            .ok()
+            .flatten();
+        let reusable = existing.as_ref().is_some_and(|grant| {
+            grant.domain == verified.request.domain
+                && grant.app_public_key == verified.manifest.public_key
+                && iota_storage::tauth::grant_covers(grant, &verified.request.scopes)
+                    .unwrap_or(false)
+        });
+        let approved = cv.get_data(DataType::Enabled) == Some(&DataValue::BoolTrue);
+        let locator = match self.signed_tauth_locator(user_id).await {
+            Ok(locator) => locator,
+            Err(error) => {
+                self.send_tauth_error(cv, &error).await;
                 return;
             }
         };
-        if let Some(user) = user {
-            if let Some(pub_k) = user.trusted_apps.get(&app_identifier) {
-                if pub_k == &app_public_key {
-                    trusted = true;
-                }
-            }
-        }
-
-        if trusted {
-            let challenge = Uuid::new_v4().to_string();
-
-            self.app_challenges.insert(
-                sender_id,
-                PendingAppChallenge {
-                    challenge: challenge.clone(),
-                    user_id,
-                    app_identifier: app_identifier.clone(),
-                },
-            );
-
-            if let Some(app_pub_bundle) =
-                iota_util::crypto_helper::public_key_bundle_from_base64(&app_public_key)
-            {
-                let keyring = self.keyring.read().await.as_ref().cloned();
-                if let Some(keyring) = keyring {
-                    if let Ok(encrypted_challenge) =
-                        crypto_util::encrypt_challenge(&challenge, &app_pub_bundle)
-                    {
-                        let bundle = keyring.public_key_bundle();
-                        let pub_k_b64 = crypto_helper::public_key_bundle_to_base64(&bundle);
-
-                        let res = CommunicationValue::new(CommunicationType::AppChallenge)
-                            .with_request_id(cv)
-                            .with_receiver(sender_id)
-                            .add_typed_default(DataType::PublicKey, DataValue::Str(pub_k_b64))
-                            .add_typed_default(
-                                DataType::Challenge,
-                                DataValue::Str(encrypted_challenge),
-                            );
-
-                        let _ = self.send_message(&res).await;
-                        return;
-                    }
-                }
-            }
-        }
-
-        let res = CommunicationValue::new(CommunicationType::ErrorInvalidChallenge)
+        let mut response = CommunicationValue::new(CommunicationType::TAuthAuthorizationResult)
             .with_request_id(cv)
-            .with_receiver(sender_id);
-        let _ = self.send_message(&res).await;
-    }
-
-    async fn handle_app_challenge_response(self: Arc<Self>, cv: &CommunicationValue) {
-        let sender_id = match cv.require_sender() {
-            Ok(sender_id) => sender_id,
-            Err(_) => {
-                let _ = self
-                    .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
-                    .await;
-                return;
-            }
-        };
-        if let Some((_, pending)) = self.app_challenges.remove(&sender_id) {
-            if let Some(DataValue::Str(response)) = cv.get_data(DataType::Challenge) {
-                if pending.challenge == *response {
-                    let authority = match iota_identity::AuthorityId::omega_legacy(
-                        &omega_discovery::omega_host(),
-                    ) {
-                        Ok(authority) => authority,
-                        Err(_) => {
-                            let _ = self
-                                .send_message(&error_response(cv, CommunicationType::ErrorInternal))
-                                .await;
-                            return;
-                        }
-                    };
-                    let user_id = match u64::try_from(pending.user_id) {
-                        Ok(user_id) => user_id,
-                        Err(_) => {
-                            let _ = self
-                                .send_message(&error_response(
-                                    cv,
-                                    CommunicationType::ErrorInvalidData,
-                                ))
-                                .await;
-                            return;
-                        }
-                    };
-                    let principal = iota_identity::PrincipalId { authority, user_id };
-                    let principal = match iota_identity::PrincipalStore::get_by_canonical_id(
-                        &iota_storage::identity::SqlitePrincipalStore,
-                        &principal,
-                    ) {
-                        Ok(Some(principal)) => principal,
-                        _ => {
-                            let _ = self
-                                .send_message(&error_response(cv, CommunicationType::ErrorInternal))
-                                .await;
-                            return;
-                        }
-                    };
-                    let connection_id = Uuid::new_v4();
-                    iota_auth::HostedSessionRegistrar::new(self.session_manager.clone())
-                        .authenticate(
-                            connection_id,
-                            iota_identity::LocalUserId(pending.user_id),
-                            principal.handle,
-                        );
-                    self.app_sessions.insert(
-                        sender_id,
-                        AppSession {
-                            connection_id,
-                            app_identifier: pending.app_identifier,
-                        },
-                    );
-                    let res = CommunicationValue::new(CommunicationType::AppIdentificationResponse)
-                        .with_request_id(cv)
-                        .with_receiver(sender_id);
-                    let _ = self.send_message(&res).await;
+            .with_receiver(user_id as u64)
+            .add_typed_default(
+                DataType::AppId,
+                DataValue::Str(verified.request.app_id.clone()),
+            )
+            .add_typed_default(
+                DataType::AppName,
+                DataValue::Str(verified.manifest.name.clone()),
+            )
+            .add_typed_default(
+                DataType::Domain,
+                DataValue::Str(verified.request.domain.clone()),
+            )
+            .add_typed_default(
+                DataType::RedirectUri,
+                DataValue::Str(verified.request.redirect_uri.clone()),
+            )
+            .add_typed_default(
+                DataType::State,
+                DataValue::Str(verified.request.state.clone()),
+            )
+            .add_typed_default(DataType::Scopes, string_array(&verified.request.scopes))
+            .add_typed_default(DataType::Locator, DataValue::Str(locator.clone()));
+        if approved || reusable {
+            match iota_storage::tauth::issue_code(iota_storage::tauth::AuthorizationGrant {
+                local_user_id: user_id,
+                app_id: &verified.request.app_id,
+                app_name: &verified.manifest.name,
+                domain: &verified.request.domain,
+                redirect_uri: &verified.request.redirect_uri,
+                scopes: &verified.request.scopes,
+                app_public_key: &verified.manifest.public_key,
+                manifest_hash: &verified.manifest_hash,
+                pkce_challenge: &verified.request.pkce_challenge,
+                authorization_request: request_json,
+                locator: &locator,
+            }) {
+                Ok(code) => {
+                    response = response
+                        .add_typed_default(DataType::AuthorizationCode, DataValue::Str(code))
+                }
+                Err(error) => {
+                    self.send_tauth_error(cv, &error.to_string()).await;
                     return;
                 }
             }
         }
-        let res = CommunicationValue::new(CommunicationType::ErrorInvalidChallenge)
-            .with_request_id(cv)
-            .with_receiver(sender_id);
-        let _ = self.send_message(&res).await;
+        let _ = self.send_message(&response).await;
     }
 
-    async fn handle_save_app_data(self: Arc<Self>, cv: &CommunicationValue) {
-        let sender_id = match cv.require_sender() {
-            Ok(sender_id) => sender_id,
-            Err(_) => {
-                let _ = self
-                    .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
+    async fn handle_tauth_exchange_code(self: Arc<Self>, cv: &CommunicationValue) {
+        let Some(code) = cv.get_data(DataType::AuthorizationCode).as_str() else {
+            self.send_tauth_error(cv, "missing authorization code")
+                .await;
+            return;
+        };
+        let Some(app_id) = cv.get_data(DataType::AppId).as_str() else {
+            self.send_tauth_error(cv, "missing app ID").await;
+            return;
+        };
+        let Some(redirect) = cv.get_data(DataType::RedirectUri).as_str() else {
+            self.send_tauth_error(cv, "missing redirect URI").await;
+            return;
+        };
+        let Some(verifier) = cv.get_data(DataType::CodeVerifier).as_str() else {
+            self.send_tauth_error(cv, "missing PKCE verifier").await;
+            return;
+        };
+        let request_json = match iota_storage::tauth::authorization_request_for_code(code) {
+            Ok(Some(request)) => request,
+            _ => {
+                self.send_tauth_error(cv, "authorization code is invalid, expired, or used")
                     .await;
                 return;
             }
         };
-        let app_data = cv
-            .get_data(DataType::AppData)
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-
-        if let Some(session) = self.app_sessions.get(&sender_id)
-            && let Ok(authenticated) = self.session_manager.authorize(
-                session.connection_id,
-                &iota_auth::SessionCapability::LocalStorage,
-            )
-            && let iota_auth::SessionIdentity::Hosted { local_user, .. } = authenticated.identity
-        {
-            iota_storage::users::user_manager::save_app_data(
-                local_user.0,
-                &session.app_identifier,
-                &app_data,
-            );
-        }
-
-        let res = CommunicationValue::new(CommunicationType::SaveAppData)
-            .with_request_id(cv)
-            .with_receiver(sender_id);
-        let _ = self.send_message(&res).await;
-    }
-
-    async fn handle_load_app_data(self: Arc<Self>, cv: &CommunicationValue) {
-        let sender_id = match cv.require_sender() {
-            Ok(sender_id) => sender_id,
-            Err(_) => {
-                let _ = self
-                    .send_message(&error_response(cv, CommunicationType::ErrorInvalidData))
-                    .await;
+        let verified =
+            match crate::tauth::verify_authorization(&self.http_client, &request_json).await {
+                Ok(verified)
+                    if verified.request.app_id == app_id
+                        && verified.request.redirect_uri == redirect =>
+                {
+                    verified
+                }
+                Ok(_) => {
+                    self.send_tauth_error(cv, "authorization code binding mismatch")
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    self.send_tauth_error(cv, &error.to_string()).await;
+                    return;
+                }
+            };
+        let session = match iota_storage::tauth::exchange_code(code, app_id, redirect, verifier) {
+            Ok(session) => session,
+            Err(error) => {
+                self.send_tauth_error(cv, &error.to_string()).await;
                 return;
             }
         };
-        let mut app_data = String::new();
-
-        if let Some(session) = self.app_sessions.get(&sender_id)
-            && let Ok(authenticated) = self.session_manager.authorize(
-                session.connection_id,
-                &iota_auth::SessionCapability::LocalStorage,
-            )
-            && let iota_auth::SessionIdentity::Hosted { local_user, .. } = authenticated.identity
-        {
-            app_data = iota_storage::users::user_manager::load_app_data(
-                local_user.0,
-                &session.app_identifier,
-            );
-        }
-
-        let res = CommunicationValue::new(CommunicationType::LoadAppData)
+        let principal = iota_storage::tauth::canonical_principal(session.local_user_id)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let response = CommunicationValue::new(CommunicationType::TAuthExchangeCodeResponse)
             .with_request_id(cv)
-            .with_receiver(sender_id)
-            .add_typed_default(DataType::AppData, DataValue::Str(app_data));
-        let _ = self.send_message(&res).await;
+            .add_typed_default(DataType::SessionToken, DataValue::Str(session.token))
+            .add_typed_default(DataType::AppId, DataValue::Str(verified.request.app_id))
+            .add_typed_default(DataType::Principal, DataValue::Str(principal))
+            .add_typed_default(DataType::Scopes, string_array(&session.scopes))
+            .add_typed_default(DataType::Locator, DataValue::Str(session.locator));
+        let _ = self.send_message(&response).await;
     }
 
-    async fn handle_create_app(self: Arc<Self>, cv: &CommunicationValue) {
+    async fn handle_tauth_user(self: Arc<Self>, cv: &CommunicationValue) {
+        let Some(session) = self
+            .tauth_session(cv, iota_storage::tauth::Scope::IdentityRead)
+            .await
+        else {
+            return;
+        };
+        let principal = iota_storage::tauth::canonical_principal(session.local_user_id)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        match iota_storage::tauth::public_profile(&principal) {
+            Ok(Some(mut profile)) => {
+                match self.signed_tauth_home_node().await {
+                    Ok(descriptor) => profile["home_node"] = descriptor,
+                    Err(error) => {
+                        self.send_tauth_error(cv, &error).await;
+                        return;
+                    }
+                }
+                self.send_tauth_json(cv, CommunicationType::TAuthUser, profile.to_string())
+                    .await
+            }
+            _ => {
+                self.send_tauth_error(cv, "user profile is unavailable")
+                    .await
+            }
+        }
+    }
+
+    async fn handle_tauth_contacts(self: Arc<Self>, cv: &CommunicationValue) {
+        let Some(session) = self
+            .tauth_session(cv, iota_storage::tauth::Scope::ContactsRead)
+            .await
+        else {
+            return;
+        };
+        match iota_storage::tauth::canonical_contact_ids(session.local_user_id) {
+            Ok(contacts) => {
+                self.send_tauth_json(
+                    cv,
+                    CommunicationType::TAuthContacts,
+                    serde_json::to_string(&contacts).unwrap(),
+                )
+                .await
+            }
+            Err(error) => self.send_tauth_error(cv, &error.to_string()).await,
+        }
+    }
+
+    async fn handle_tauth_public_lookup(self: Arc<Self>, cv: &CommunicationValue) {
+        if self
+            .tauth_session(cv, iota_storage::tauth::Scope::IdentityRead)
+            .await
+            .is_none()
+        {
+            return;
+        }
+        let Some(principal) = cv.get_data(DataType::Principal).as_str() else {
+            self.send_tauth_error(cv, "missing principal").await;
+            return;
+        };
+        match iota_storage::tauth::public_profile(principal) {
+            Ok(Some(mut profile)) => {
+                if iota_storage::tauth::is_local_principal(principal).unwrap_or(false) {
+                    match self.signed_tauth_home_node().await {
+                        Ok(descriptor) => profile["home_node"] = descriptor,
+                        Err(error) => {
+                            self.send_tauth_error(cv, &error).await;
+                            return;
+                        }
+                    }
+                }
+                self.send_tauth_json(
+                    cv,
+                    CommunicationType::TAuthPublicLookup,
+                    profile.to_string(),
+                )
+                .await
+            }
+            Ok(None) => self.send_tauth_error(cv, "principal was not found").await,
+            Err(error) => self.send_tauth_error(cv, &error.to_string()).await,
+        }
+    }
+
+    async fn handle_tauth_metadata_get(self: Arc<Self>, cv: &CommunicationValue) {
+        let Some(token) = cv.get_data(DataType::SessionToken).as_str() else {
+            self.send_tauth_error(cv, "missing session token").await;
+            return;
+        };
+        match iota_storage::tauth::get_metadata(token) {
+            Ok(value) => {
+                let mut response = CommunicationValue::new(CommunicationType::TAuthMetadataGet)
+                    .with_request_id(cv);
+                if let Some(value) = value {
+                    response = response.add_typed_default(DataType::Json, DataValue::Str(value));
+                }
+                let _ = self.send_message(&response).await;
+            }
+            Err(error) => self.send_tauth_error(cv, &error.to_string()).await,
+        }
+    }
+
+    async fn handle_tauth_metadata_set(self: Arc<Self>, cv: &CommunicationValue) {
+        let token = cv.get_data(DataType::SessionToken).as_str();
+        let json = cv.get_data(DataType::Json).as_str();
+        match token.zip(json) {
+            Some((token, json)) => match iota_storage::tauth::set_metadata(token, json) {
+                Ok(()) => {
+                    self.send_tauth_empty(cv, CommunicationType::TAuthMetadataSet)
+                        .await
+                }
+                Err(error) => self.send_tauth_error(cv, &error.to_string()).await,
+            },
+            None => {
+                self.send_tauth_error(cv, "missing session token or JSON")
+                    .await
+            }
+        }
+    }
+
+    async fn handle_tauth_metadata_delete(self: Arc<Self>, cv: &CommunicationValue) {
+        let Some(token) = cv.get_data(DataType::SessionToken).as_str() else {
+            self.send_tauth_error(cv, "missing session token").await;
+            return;
+        };
+        match iota_storage::tauth::delete_metadata(token) {
+            Ok(()) => {
+                self.send_tauth_empty(cv, CommunicationType::TAuthMetadataDelete)
+                    .await
+            }
+            Err(error) => self.send_tauth_error(cv, &error.to_string()).await,
+        }
+    }
+
+    async fn handle_tauth_disconnect_delete(self: Arc<Self>, cv: &CommunicationValue) {
+        let Some(token) = cv.get_data(DataType::SessionToken).as_str() else {
+            self.send_tauth_error(cv, "missing session token").await;
+            return;
+        };
+        match iota_storage::tauth::disconnect_and_delete(token) {
+            Ok(()) => {
+                self.send_tauth_empty(cv, CommunicationType::TAuthDisconnectDelete)
+                    .await
+            }
+            Err(error) => self.send_tauth_error(cv, &error.to_string()).await,
+        }
+    }
+
+    async fn handle_tauth_grant_list(self: Arc<Self>, cv: &CommunicationValue) {
+        let Some(user_id) = cv
+            .require_sender()
+            .ok()
+            .and_then(|value| i64::try_from(value).ok())
+        else {
+            self.send_tauth_error(cv, "missing authenticated user")
+                .await;
+            return;
+        };
+        match iota_storage::tauth::list_grants(user_id) {
+            Ok(grants) => {
+                self.send_tauth_json(
+                    cv,
+                    CommunicationType::TAuthGrantResponse,
+                    serde_json::to_string(&grants).unwrap(),
+                )
+                .await
+            }
+            Err(error) => self.send_tauth_error(cv, &error.to_string()).await,
+        }
+    }
+
+    async fn handle_tauth_grant_revoke(self: Arc<Self>, cv: &CommunicationValue) {
+        let user_id = cv
+            .require_sender()
+            .ok()
+            .and_then(|value| i64::try_from(value).ok());
+        let app_id = cv.get_data(DataType::AppId).as_str();
+        match user_id.zip(app_id) {
+            Some((user_id, app_id)) => match iota_storage::tauth::revoke_grant(user_id, app_id) {
+                Ok(_) => {
+                    self.send_tauth_empty(cv, CommunicationType::TAuthGrantResponse)
+                        .await
+                }
+                Err(error) => self.send_tauth_error(cv, &error.to_string()).await,
+            },
+            None => self.send_tauth_error(cv, "missing user or app ID").await,
+        }
+    }
+
+    async fn handle_tauth_grant_metadata_set(self: Arc<Self>, cv: &CommunicationValue) {
+        let user_id = cv
+            .require_sender()
+            .ok()
+            .and_then(|value| i64::try_from(value).ok());
+        let app_id = cv.get_data(DataType::AppId).as_str();
+        let json = cv.get_data(DataType::Json).as_str();
+        match user_id.zip(app_id).zip(json) {
+            Some(((user_id, app_id), json)) => {
+                match iota_storage::tauth::set_metadata_for_user(user_id, app_id, json) {
+                    Ok(()) => {
+                        self.send_tauth_empty(cv, CommunicationType::TAuthGrantResponse)
+                            .await
+                    }
+                    Err(error) => self.send_tauth_error(cv, &error.to_string()).await,
+                }
+            }
+            None => {
+                self.send_tauth_error(cv, "missing user, app ID, or JSON")
+                    .await
+            }
+        }
+    }
+
+    async fn tauth_session(
+        self: &Arc<Self>,
+        cv: &CommunicationValue,
+        scope: iota_storage::tauth::Scope,
+    ) -> Option<iota_storage::tauth::Session> {
+        let token = cv.get_data(DataType::SessionToken).as_str();
+        match token.map(|token| iota_storage::tauth::authorize_session(token, scope)) {
+            Some(Ok(session)) => Some(session),
+            Some(Err(error)) => {
+                self.clone().send_tauth_error(cv, &error.to_string()).await;
+                None
+            }
+            None => {
+                self.clone()
+                    .send_tauth_error(cv, "missing session token")
+                    .await;
+                None
+            }
+        }
+    }
+
+    async fn signed_tauth_locator(&self, user_id: i64) -> Result<String, String> {
+        let config = CONFIG.load();
+        let target_iota_id = config
+            .iota_id
+            .ok_or_else(|| "Iota ID is unavailable".to_string())?;
+        let omikron_id = config
+            .omikron_id
+            .ok_or_else(|| "Omikron ID is unavailable".to_string())?;
+        let host = config
+            .omikron_host
+            .as_deref()
+            .ok_or_else(|| "Omikron host is unavailable".to_string())?;
+        let port = config
+            .omikron_port
+            .ok_or_else(|| "Omikron port is unavailable".to_string())?;
+        let omikron_key = mtp::files::load_public_key_bundle(&omikron_public_key_path(omikron_id))
+            .map_err(|error| error.to_string())?;
+        let omikron_public_key = omikron_key
+            .try_to_base64()
+            .map_err(|error| error.to_string())?;
+        let keyring = self
+            .keyring
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Iota keyring is unavailable".to_string())?;
+        let iota_public_key = keyring
+            .public_key_bundle()
+            .try_to_base64()
+            .map_err(|error| error.to_string())?;
+        let principal = iota_storage::tauth::canonical_principal(user_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "canonical principal is unavailable".to_string())?;
+        let omikron_url = format!("https://{host}:{port}");
+        let issued_at = iota_storage::tauth::now_seconds();
+        let unsigned = TAuthLocatorUnsigned {
+            version: 1,
+            principal: &principal,
+            omikron_url: &omikron_url,
+            omikron_public_key: &omikron_public_key,
+            target_iota_id,
+            iota_public_key: &iota_public_key,
+            issued_at,
+        };
+        let signer =
+            Ed25519Signer::new(&keyring.sig_cl_secret_key).map_err(|error| error.to_string())?;
+        let signature = STANDARD.encode(
+            signer
+                .sign(&serde_json::to_vec(&unsigned).unwrap())
+                .map_err(|error| error.to_string())?,
+        );
+        serde_json::to_string(&TAuthLocator {
+            version: 1,
+            principal: &principal,
+            omikron_url: &omikron_url,
+            omikron_public_key: &omikron_public_key,
+            target_iota_id,
+            iota_public_key: &iota_public_key,
+            issued_at,
+            signature,
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    async fn signed_tauth_home_node(&self) -> Result<serde_json::Value, String> {
+        let config = CONFIG.load();
+        let host = config
+            .omikron_host
+            .as_deref()
+            .ok_or_else(|| "Omikron host is unavailable".to_string())?;
+        let port = config
+            .omikron_port
+            .ok_or_else(|| "Omikron port is unavailable".to_string())?;
+        let relay =
+            AuthorityLocator::new(format!("{host}:{port}")).map_err(|error| error.to_string())?;
+        let identity = self
+            .load_or_migrate_keyring()
+            .await
+            .map_err(|error| error.to_string())?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let descriptor = iota_storage::node_directory::SqliteNodeDirectory
+            .ensure_local_descriptor(&identity, Vec::new(), vec![relay], now)
+            .map_err(|error| error.to_string())?
+            .to_wire_v1()
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(descriptor).map_err(|error| error.to_string())
+    }
+
+    async fn send_tauth_empty(self: Arc<Self>, cv: &CommunicationValue, kind: CommunicationType) {
         let _ = self
-            .send_message(&message_handlers::handle_create_app(cv))
+            .send_message(&CommunicationValue::new(kind).with_request_id(cv))
             .await;
     }
 
-    async fn handle_delete_app(self: Arc<Self>, cv: &CommunicationValue) {
-        let _ = self
-            .send_message(&message_handlers::handle_delete_app(cv))
-            .await;
+    async fn send_tauth_json(
+        self: Arc<Self>,
+        cv: &CommunicationValue,
+        kind: CommunicationType,
+        json: String,
+    ) {
+        let response = CommunicationValue::new(kind)
+            .with_request_id(cv)
+            .add_typed_default(DataType::Json, DataValue::Str(json));
+        let _ = self.send_message(&response).await;
+    }
+
+    async fn send_tauth_error(self: Arc<Self>, cv: &CommunicationValue, message: &str) {
+        let response = error_response(cv, CommunicationType::ErrorInvalidData)
+            .add_typed_default(DataType::Message, DataValue::Str(message.to_owned()));
+        let _ = self.send_message(&response).await;
     }
 
     async fn handle_account_state_request(self: Arc<Self>, cv: &CommunicationValue) {
@@ -3101,8 +3383,7 @@ impl OmikronClient for OmikronConnection {
             reconnect_on_close: self.reconnect_on_close.clone(),
             auth_failure: self.auth_failure.clone(),
             keyring: self.keyring.clone(),
-            app_challenges: self.app_challenges.clone(),
-            app_sessions: self.app_sessions.clone(),
+            http_client: self.http_client.clone(),
             session_manager: self.session_manager.clone(),
             handler_semaphore: self.handler_semaphore.clone(),
             cancellation: self.cancellation.clone(),
@@ -3128,8 +3409,7 @@ impl OmikronClient for OmikronConnection {
             reconnect_on_close: self.reconnect_on_close.clone(),
             auth_failure: self.auth_failure.clone(),
             keyring: self.keyring.clone(),
-            app_challenges: self.app_challenges.clone(),
-            app_sessions: self.app_sessions.clone(),
+            http_client: self.http_client.clone(),
             session_manager: self.session_manager.clone(),
             handler_semaphore: self.handler_semaphore.clone(),
             cancellation: self.cancellation.clone(),

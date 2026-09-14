@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1.89"
+base64 = "0.22"
+hex = "0.4"
 iota-ipc = { path = "../iota-ipc" }
 iota-auth = { path = "../iota-auth" }
 iota-connection = { path = "../iota-connection" }
@@ -20,9 +22,11 @@ mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "1f19a0d897c2
 libc = "0.2"
 sysinfo = "0.38.0"
 serde_yaml = "0.9"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.50.0", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+url = "2"
 uuid = { version = "*", features = ["v4"] }
 
 [dev-dependencies]

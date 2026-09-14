@@ -1,7 +1,7 @@
 use crate::users::pending_operations;
 use crate::users::user_profile::UserProfile;
 use crate::util::db;
-use iota_util::file_util::{delete_user_directory, load_file, remove_user_credential, save_file};
+use iota_util::file_util::{delete_user_directory, load_file, remove_user_credential};
 use rusqlite::params;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -113,15 +113,6 @@ fn persist_user_profile(
         ],
     )?;
 
-    for (app_id, app_secret) in &user.trusted_apps {
-        tx.execute(
-            r#"
-            INSERT OR REPLACE INTO trusted_apps (user_id, app_id, app_secret)
-            VALUES (?1, ?2, ?3)
-            "#,
-            params![user.user_id, app_id, app_secret],
-        )?;
-    }
     Ok(())
 }
 
@@ -142,7 +133,6 @@ pub fn get_user_by_username(
                     private_key_hash: r.get(3)?,
                     created_at: r.get(5)?,
                     reset_token: r.get(4)?,
-                    trusted_apps: std::collections::HashMap::new(),
                 })
             },
         ) {
@@ -151,11 +141,7 @@ pub fn get_user_by_username(
             Err(e) => Err(e.into()),
         }
     })?;
-    user.map(|mut user| {
-        user.trusted_apps = load_trusted_apps(user.user_id)?;
-        Ok(user)
-    })
-    .transpose()
+    Ok(user)
 }
 
 pub fn get_user(user_id: i64) -> Result<Option<UserProfile>, crate::storage_error::StorageError> {
@@ -173,7 +159,6 @@ pub fn get_user(user_id: i64) -> Result<Option<UserProfile>, crate::storage_erro
                     private_key_hash: r.get(3)?,
                     created_at: r.get(5)?,
                     reset_token: r.get(4)?,
-                    trusted_apps: std::collections::HashMap::new(),
                 })
             },
         ) {
@@ -182,11 +167,7 @@ pub fn get_user(user_id: i64) -> Result<Option<UserProfile>, crate::storage_erro
             Err(e) => Err(e.into()),
         }
     })?;
-    user.map(|mut user| {
-        user.trusted_apps = load_trusted_apps(user_id)?;
-        Ok(user)
-    })
-    .transpose()
+    Ok(user)
 }
 
 pub fn get_users() -> Result<Vec<UserProfile>, crate::storage_error::StorageError> {
@@ -216,71 +197,51 @@ pub fn get_users() -> Result<Vec<UserProfile>, crate::storage_error::StorageErro
                 private_key_hash,
                 created_at,
                 reset_token,
-                trusted_apps: std::collections::HashMap::new(),
             })
         })?;
 
         let mut out = Vec::new();
         for row in rows {
-            let mut user = row?;
-            user.trusted_apps = load_trusted_apps_from(conn, user.user_id)?;
-            out.push(user);
+            out.push(row?);
         }
         Ok(out)
     })
 }
 
-fn load_trusted_apps(
-    user_id: i64,
-) -> Result<std::collections::HashMap<String, String>, crate::storage_error::StorageError> {
-    db::with_db(|conn| load_trusted_apps_from(conn, user_id))
-}
-
-fn load_trusted_apps_from(
-    conn: &rusqlite::Connection,
-    user_id: i64,
-) -> Result<std::collections::HashMap<String, String>, crate::storage_error::StorageError> {
-    let mut stmt =
-        conn.prepare("SELECT app_id, app_secret FROM trusted_apps WHERE user_id = ?1")?;
-    let rows = stmt.query_map(params![user_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    })?;
-
-    let mut map = std::collections::HashMap::new();
-    for row in rows {
-        let (key, value) = row?;
-        map.insert(key, value);
-    }
-    Ok(map)
-}
-
-pub fn revoke_trusted_app(
+pub fn revoke_tauth_grant(
     user_id: i64,
     app_id: &str,
 ) -> Result<bool, crate::storage_error::StorageError> {
-    db::with_immediate_transaction(|tx| {
-        let removed = tx.execute(
-            "DELETE FROM trusted_apps WHERE user_id = ?1 AND app_id = ?2",
-            params![user_id, app_id],
-        )?;
-        Ok(removed > 0)
-    })
+    crate::tauth::revoke_grant(user_id, app_id)
+        .map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))
 }
 
-pub fn revoke_all_trusted_apps(user_id: i64) -> Result<usize, crate::storage_error::StorageError> {
-    db::with_immediate_transaction(|tx| {
-        let removed = tx.execute(
-            "DELETE FROM trusted_apps WHERE user_id = ?1",
-            params![user_id],
-        )?;
-        Ok(removed)
-    })
+pub fn revoke_all_tauth_grants(user_id: i64) -> Result<usize, crate::storage_error::StorageError> {
+    let grants = crate::tauth::list_grants(user_id)
+        .map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))?;
+    for grant in &grants {
+        crate::tauth::revoke_grant(user_id, &grant.app_id)
+            .map_err(|error| crate::storage_error::StorageError::Other(error.to_string()))?;
+    }
+    Ok(grants.len())
 }
 
 pub fn remove_user(user_id: i64) -> Result<(), crate::storage_error::StorageError> {
     db::with_immediate_transaction(|conn| {
         conn.execute(
-            "DELETE FROM trusted_apps WHERE user_id = ?1",
+            "DELETE FROM tauth_codes WHERE local_user_id = ?1",
+            params![user_id],
+        )?;
+        conn.execute(
+            "DELETE FROM tauth_sessions WHERE local_user_id = ?1",
+            params![user_id],
+        )?;
+        conn.execute(
+            "DELETE FROM tauth_metadata WHERE local_user_id = ?1",
+            params![user_id],
+        )?;
+        conn.execute(
+            "DELETE FROM tauth_grants WHERE local_user_id = ?1",
             params![user_id],
         )?;
         conn.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
@@ -321,7 +282,19 @@ pub fn finalize_local_release(
     db::with_db(|conn| {
         let tx = conn.unchecked_transaction()?;
         tx.execute(
-            "DELETE FROM trusted_apps WHERE user_id = ?1",
+            "DELETE FROM tauth_codes WHERE local_user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM tauth_sessions WHERE local_user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM tauth_metadata WHERE local_user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM tauth_grants WHERE local_user_id = ?1",
             params![user_id],
         )?;
         tx.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
@@ -586,7 +559,19 @@ pub fn erase_user_locally(user_id: i64) -> Result<(), crate::storage_error::Stor
     purge_user_data(user_id)?;
     db::with_db(|conn| {
         conn.execute(
-            "DELETE FROM trusted_apps WHERE user_id = ?1",
+            "DELETE FROM tauth_codes WHERE local_user_id = ?1",
+            params![user_id],
+        )?;
+        conn.execute(
+            "DELETE FROM tauth_sessions WHERE local_user_id = ?1",
+            params![user_id],
+        )?;
+        conn.execute(
+            "DELETE FROM tauth_metadata WHERE local_user_id = ?1",
+            params![user_id],
+        )?;
+        conn.execute(
+            "DELETE FROM tauth_grants WHERE local_user_id = ?1",
             params![user_id],
         )?;
         conn.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
@@ -658,7 +643,7 @@ pub fn get_residency_by_id(
 pub fn clear() -> Result<(), crate::storage_error::StorageError> {
     db::with_immediate_transaction(|conn| {
         conn.execute_batch(
-            "DELETE FROM trusted_apps; DELETE FROM users; DELETE FROM user_residency;",
+            "DELETE FROM tauth_codes; DELETE FROM tauth_sessions; DELETE FROM tauth_metadata; DELETE FROM tauth_grants; DELETE FROM users; DELETE FROM user_residency;",
         )?;
         Ok(())
     })
@@ -778,12 +763,6 @@ mod tests {
                     created_at INTEGER NOT NULL,
                     display_name TEXT
                 );
-                CREATE TABLE trusted_apps (
-                    user_id INTEGER NOT NULL,
-                    app_id TEXT NOT NULL,
-                    app_secret TEXT NOT NULL,
-                    PRIMARY KEY (user_id, app_id)
-                );
                 CREATE TABLE user_residency (
                     user_id INTEGER PRIMARY KEY,
                     username TEXT NOT NULL,
@@ -797,7 +776,7 @@ mod tests {
                 "#,
             )
             .unwrap();
-        let mut user = UserProfile::new_with_created_at(
+        let user = UserProfile::new_with_created_at(
             1,
             "alice".into(),
             Some("Alice".into()),
@@ -806,8 +785,6 @@ mod tests {
             None,
             1,
         );
-        user.trusted_apps.insert("app".into(), "secret".into());
-
         let transaction = connection.transaction().unwrap();
         persist_user_profile(&transaction, &user).unwrap();
         transaction.commit().unwrap();
@@ -829,25 +806,5 @@ mod tests {
                 42,
             )
         );
-        let trusted_app_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM trusted_apps WHERE user_id = ?1",
-                params![1],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(trusted_app_count, 1);
     }
-}
-
-pub fn save_app_data(user_id: i64, app_identifier: &str, data: &str) {
-    let path = format!("users/{}/apps", user_id);
-    let name = format!("{}.json", app_identifier);
-    save_file(&path, &name, data);
-}
-
-pub fn load_app_data(user_id: i64, app_identifier: &str) -> String {
-    let path = format!("users/{}/apps", user_id);
-    let name = format!("{}.json", app_identifier);
-    load_file(&path, &name)
 }

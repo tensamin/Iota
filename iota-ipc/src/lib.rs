@@ -10,8 +10,9 @@ pub use protocol::{
     LocalRequest, LocalUserState, LogEntriesResponse, LogEntry, MetricSample,
     OmikronStatusResponse, ReconcileAction, RequestEnvelope, ResponseEnvelope, ResponsePayload,
     ResponseResult, SecretString, StartupPhase, StateSnapshot, StatusResponse, SupervisorKind,
-    TaskSummary, TuCredentialPreview, UpdateStatusResponse, UserDetailResponse, UserDiagnostics,
-    UserOperationKind, UserOperationSummary, UserReconcileResult, UserSummary,
+    TAuthAppSummary, TAuthConnectionInput, TaskSummary, TuCredentialPreview, UpdateStatusResponse,
+    UserDetailResponse, UserDiagnostics, UserOperationKind, UserOperationSummary,
+    UserReconcileResult, UserSummary,
 };
 pub use transport::{MAX_MESSAGE_SIZE, read_msg, write_msg};
 

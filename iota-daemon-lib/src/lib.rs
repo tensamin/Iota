@@ -7,6 +7,7 @@ pub mod log_broadcaster;
 pub mod log_buffer;
 pub mod services;
 pub mod task_registry;
+mod tauth_apps;
 
 pub use accounts::{AccountAuthority, LocalIotaAccountAuthority, OmegaAccountAuthority};
 pub use command_router::{CommandRouter, IpcRole, PeerContext};

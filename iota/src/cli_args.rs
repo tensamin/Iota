@@ -83,6 +83,7 @@ enum CliCommand {
     Status,
     Tasks,
     Users(UsersArgs),
+    Apps(AppsArgs),
     Omikron(OmikronArgs),
     Identity(IdentityArgs),
     Daemon(DaemonArgs),
@@ -109,6 +110,60 @@ enum CliCommand {
 struct UsersArgs {
     #[command(subcommand)]
     action: UsersAction,
+}
+
+#[derive(Args, Debug)]
+struct AppsArgs {
+    #[command(subcommand)]
+    action: AppsAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum AppsAction {
+    List,
+    Show {
+        app_id: String,
+    },
+    Create {
+        #[arg(long)]
+        owner_user_id: i64,
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long = "redirect", required = true)]
+        redirects: Vec<String>,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        manifest_output: PathBuf,
+        #[command(subcommand)]
+        connection: AppConnectionAction,
+    },
+    Export {
+        app_id: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    Delete {
+        app_id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AppConnectionAction {
+    Hosted {
+        #[arg(long)]
+        omega_url: String,
+    },
+    ForcedOmikron {
+        #[arg(long)]
+        omikron_url: String,
+        #[arg(long)]
+        omikron_public_key: String,
+    },
 }
 #[derive(Subcommand, Debug)]
 enum UsersAction {
@@ -412,6 +467,27 @@ pub enum Command {
         user_id: i64,
         output: PathBuf,
     },
+    AppsList,
+    AppsShow {
+        app_id: String,
+    },
+    AppsCreate {
+        owner_user_id: i64,
+        domain: String,
+        name: String,
+        redirects: Vec<String>,
+        connection: iota_ipc::TAuthConnectionInput,
+        output: PathBuf,
+        manifest_output: PathBuf,
+    },
+    AppsExport {
+        app_id: String,
+        output: PathBuf,
+    },
+    AppsDelete {
+        app_id: String,
+        confirmed: bool,
+    },
     OmikronReconnect,
     IdentityRotate {
         confirmed: bool,
@@ -576,6 +652,43 @@ impl CliInvocation {
                 UsersAction::Credential {
                     action: UserCredentialAction::Export { user_id, output },
                 } => Command::UsersExportCredential { user_id, output },
+            },
+            Some(CliCommand::Apps(apps)) => match apps.action {
+                AppsAction::List => Command::AppsList,
+                AppsAction::Show { app_id } => Command::AppsShow { app_id },
+                AppsAction::Create {
+                    owner_user_id,
+                    domain,
+                    name,
+                    redirects,
+                    output,
+                    manifest_output,
+                    connection,
+                } => Command::AppsCreate {
+                    owner_user_id,
+                    domain,
+                    name,
+                    redirects,
+                    connection: match connection {
+                        AppConnectionAction::Hosted { omega_url } => {
+                            iota_ipc::TAuthConnectionInput::Hosted { omega_url }
+                        }
+                        AppConnectionAction::ForcedOmikron {
+                            omikron_url,
+                            omikron_public_key,
+                        } => iota_ipc::TAuthConnectionInput::ForcedOmikron {
+                            omikron_url,
+                            omikron_public_key,
+                        },
+                    },
+                    output,
+                    manifest_output,
+                },
+                AppsAction::Export { app_id, output } => Command::AppsExport { app_id, output },
+                AppsAction::Delete { app_id, yes } => Command::AppsDelete {
+                    app_id,
+                    confirmed: resolve_confirmed(yes),
+                },
             },
             Some(CliCommand::Omikron(omikron)) => match omikron.action {
                 OmikronAction::Reconnect => Command::OmikronReconnect,

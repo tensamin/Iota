@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = "0.22"
 iota-cli = { path = "../iota-cli" }
 iota-ipc = { path = "../iota-ipc" }
 iota-installer = { path = "../iota-installer" }
