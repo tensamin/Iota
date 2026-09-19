@@ -66,6 +66,7 @@ mod security_tests {
             CommunicationType::SyncedSettingDelete,
             CommunicationType::SyncedSettingsList,
             CommunicationType::SyncedSettingChanged,
+            CommunicationType::UserAssetChanged,
         ] {
             assert_eq!(
                 message_security_class(&CommunicationValue::new(setting_type)),

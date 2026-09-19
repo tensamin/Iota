@@ -1959,6 +1959,46 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    if current_version < 45 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE user_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                asset_id TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                sha256 BLOB NOT NULL,
+                mime_type TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                published_upload_id TEXT NOT NULL,
+                deleted INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user_id, asset_id)
+            );
+            CREATE INDEX user_assets_owner ON user_assets (user_id, deleted);
+            CREATE TABLE user_asset_uploads (
+                upload_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                asset_id TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                sha256 BLOB NOT NULL,
+                mime_type TEXT NOT NULL,
+                received INTEGER NOT NULL DEFAULT 0,
+                state TEXT NOT NULL CHECK (state IN ('uploading', 'committed')),
+                revision INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                committed_at INTEGER
+            );
+            CREATE INDEX user_asset_uploads_owner ON user_asset_uploads (user_id, state, updated_at);
+            PRAGMA user_version = 45;
+            "#,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -2033,7 +2073,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 44);
+        assert_eq!(version, 45);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -2052,7 +2092,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 44);
+        assert_eq!(version, 45);
         for table in [
             "sync_heads",
             "sync_events",
@@ -2133,7 +2173,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 44);
+        assert_eq!(version, 45);
         for column in [
             "id",
             "user_id",
@@ -2228,7 +2268,7 @@ mod tests {
         )?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         assert_eq!(preserved, "remote_committed");
-        assert_eq!(version, 44);
+        assert_eq!(version, 45);
         Ok(())
     }
 
@@ -2266,7 +2306,7 @@ mod tests {
         })?;
         assert_eq!(count, 0);
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 44);
+        assert_eq!(version, 45);
         Ok(())
     }
 

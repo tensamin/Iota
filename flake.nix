@@ -8,6 +8,10 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    mtp-type-maps = {
+      url = "git+https://git.methanium.net/tensamin/mtp-type-maps";
+      flake = false;
+    };
   };
 
   outputs = inputs @ {
@@ -63,6 +67,7 @@
             nativeBuildInputs = commonNativeBuildInputs;
             buildInputs = commonBuildInputs;
             dontUseCmakeConfigure = true;
+            MTP_TYPE_MAPS = "${inputs.mtp-type-maps}/type-maps.yaml";
             passthru.dataDir = "/var/lib/iota";
           };
 

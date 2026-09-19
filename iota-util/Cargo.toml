@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 iota-paths = { path = "../iota-paths" }
 iota-identity = { path = "../iota-identity" }
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "1f19a0d897c265d1e3f590a876f95e766ff99318", features = [
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "bb0f682b735de5ebb36bb41dc699260578341828", features = [
     "crypto"
 ] }
 

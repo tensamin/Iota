@@ -1730,6 +1730,14 @@ impl OmikronConnection {
         dispatch!(UserBlobGet, handle_user_blob_get);
         dispatch!(UserBlobDelete, handle_user_blob_delete);
         dispatch!(UserBlobList, handle_user_blob_list);
+        dispatch!(UserAssetUploadStart, handle_user_asset_upload_start);
+        dispatch!(UserAssetUploadChunk, handle_user_asset_upload_chunk);
+        dispatch!(UserAssetUploadStatus, handle_user_asset_upload_status);
+        dispatch!(UserAssetUploadCommit, handle_user_asset_upload_commit);
+        dispatch!(UserAssetUploadAbort, handle_user_asset_upload_abort);
+        dispatch!(UserAssetGetChunk, handle_user_asset_get_chunk);
+        dispatch!(UserAssetList, handle_user_asset_list);
+        dispatch!(UserAssetDelete, handle_user_asset_delete);
         dispatch!(UserBlock, handle_user_block);
         dispatch!(UserUnblock, handle_user_unblock);
         dispatch!(BlockedUsersGet, handle_blocked_users_get);
@@ -2903,6 +2911,58 @@ impl OmikronConnection {
         let _ = self
             .send_message(&message_handlers::handle_user_blob_list(cv))
             .await;
+    }
+
+    async fn handle_user_asset_upload_start(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_user_asset_upload_start(cv))
+            .await;
+    }
+
+    async fn handle_user_asset_upload_chunk(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_user_asset_upload_chunk(cv))
+            .await;
+    }
+
+    async fn handle_user_asset_upload_status(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_user_asset_upload_status(cv))
+            .await;
+    }
+
+    async fn handle_user_asset_upload_commit(self: Arc<Self>, cv: &CommunicationValue) {
+        let mutation = message_handlers::handle_user_asset_upload_commit(cv);
+        let _ = self.send_message(&mutation.response).await;
+        if let Some(changed) = mutation.changed {
+            let _ = self.send_message(&changed).await;
+        }
+    }
+
+    async fn handle_user_asset_upload_abort(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_user_asset_upload_abort(cv))
+            .await;
+    }
+
+    async fn handle_user_asset_get_chunk(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_user_asset_get_chunk(cv))
+            .await;
+    }
+
+    async fn handle_user_asset_list(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_user_asset_list(cv))
+            .await;
+    }
+
+    async fn handle_user_asset_delete(self: Arc<Self>, cv: &CommunicationValue) {
+        let mutation = message_handlers::handle_user_asset_delete(cv);
+        let _ = self.send_message(&mutation.response).await;
+        if let Some(changed) = mutation.changed {
+            let _ = self.send_message(&changed).await;
+        }
     }
 
     async fn handle_user_block(self: Arc<Self>, cv: &CommunicationValue) {

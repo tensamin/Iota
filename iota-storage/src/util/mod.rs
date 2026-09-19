@@ -17,4 +17,5 @@ pub mod relay_replay;
 pub mod settings;
 pub mod sync;
 pub mod synced_settings;
+pub mod user_assets;
 pub mod user_blobs;

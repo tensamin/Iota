@@ -18,6 +18,22 @@
         "type": "github"
       }
     },
+    "mtp-type-maps": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1789843665,
+        "narHash": "sha256-dU7z909w1R6OAVHLf6DsNWDQxx2SDiHj3w7574a7MsA=",
+        "ref": "refs/heads/main",
+        "rev": "c1937a37393907bf610ac4f6ba303f19d3071f9b",
+        "revCount": 24,
+        "type": "git",
+        "url": "https://git.methanium.net/tensamin/mtp-type-maps"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://git.methanium.net/tensamin/mtp-type-maps"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1784497964,
@@ -52,6 +68,7 @@
     "root": {
       "inputs": {
         "flake-parts": "flake-parts",
+        "mtp-type-maps": "mtp-type-maps",
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay"
       }

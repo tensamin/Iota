@@ -393,6 +393,7 @@ fn run_purge_stages(
 }
 
 fn purge_database_rows(user_id: i64) -> Result<(), crate::storage_error::StorageError> {
+    crate::util::user_assets::purge_user(user_id)?;
     db::with_db(|conn| {
         let tx = conn.unchecked_transaction()?;
         tx.execute(

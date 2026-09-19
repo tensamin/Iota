@@ -24,5 +24,5 @@ rusqlite = "0.40.0"
 tokio = { version = "1.50.0", features = ["full"] }
 
 [dev-dependencies]
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "1f19a0d897c265d1e3f590a876f95e766ff99318", features = ["crypto"] }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "bb0f682b735de5ebb36bb41dc699260578341828", features = ["crypto"] }
 tempfile = "3"
