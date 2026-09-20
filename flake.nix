@@ -161,11 +161,12 @@
                 key = "${cfg.stateDir}/tls/key.pem";
               };
             } cfg.settings;
-            configFile =
+            sourceConfigFile =
               if cfg.settingsFile != null then
                 cfg.settingsFile
               else
                 configFormat.generate "iota-config.yaml" effectiveSettings;
+            configFile = "${cfg.stateDir}/config.yaml";
 
             descriptionText = "Tensamin Iota daemon";
           in
@@ -340,7 +341,6 @@
                     cfg.logDir
                   ];
                   ReadOnlyPaths = [
-                    configFile
                     cfg.assetDir
                   ];
                   ProtectKernelTunables = true;
@@ -361,12 +361,16 @@
                     "IOTA_DEPLOYMENT_MODE=system_socket_activated"
                     "IOTA_SUPERVISOR=systemd"
                   ];
-                }
-                // lib.optionalAttrs (cfg.certFile != null) {
-                  ExecStartPre = "+${pkgs.writeShellScript "iota-setup-tls" ''
-                    install -d -m 0700 -o iota -g iota ${cfg.stateDir}/tls
-                    install -m 0644 -o iota -g iota ${cfg.certFile} ${cfg.stateDir}/tls/cert.pem
-                    install -m 0600 -o iota -g iota ${cfg.keyFile} ${cfg.stateDir}/tls/key.pem
+                  ExecStartPre = "+${pkgs.writeShellScript "iota-setup" ''
+                    # ponytail: Preserve daemon-assigned IDs; remove config.yaml to reseed changed declarative settings.
+                    if [ ! -e ${configFile} ]; then
+                      install -m 0640 -o iota -g iota ${sourceConfigFile} ${configFile}
+                    fi
+                    ${lib.optionalString (cfg.certFile != null) ''
+                      install -d -m 0700 -o iota -g iota ${cfg.stateDir}/tls
+                      install -m 0644 -o iota -g iota ${cfg.certFile} ${cfg.stateDir}/tls/cert.pem
+                      install -m 0600 -o iota -g iota ${cfg.keyFile} ${cfg.stateDir}/tls/key.pem
+                    ''}
                   ''}";
                 }
                 // lib.optionalAttrs (cfg.environmentFiles != [ ]) {
