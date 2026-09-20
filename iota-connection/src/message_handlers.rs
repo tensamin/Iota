@@ -31,6 +31,32 @@ pub struct MessageMutation {
     pub send_time: i64,
 }
 
+#[derive(Clone, Debug)]
+pub enum AppliedMessageMutation {
+    State {
+        send_time: i64,
+        state: MessageState,
+    },
+    Edit {
+        send_time: i64,
+        content: String,
+        version: i64,
+    },
+    Reaction {
+        send_time: i64,
+        reaction: String,
+        accepted: bool,
+    },
+    Delete {
+        send_time: i64,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RelayApplicationResult {
+    pub mutation: Option<AppliedMessageMutation>,
+}
+
 #[derive(Debug)]
 pub struct SettingMutation {
     pub response: CommunicationValue,
@@ -189,7 +215,7 @@ pub fn apply_verified_relay_content(
     accepted_at: i64,
     storage_owner: i64,
     sent_by_self: bool,
-) -> Result<(), String> {
+) -> Result<RelayApplicationResult, String> {
     validate_relay_identity(context, &content.content)?;
     let sender_id = i64::try_from(context.signer_id)
         .map_err(|_| "Relay signer ID exceeds the local storage range".to_string())?;
@@ -200,7 +226,7 @@ pub fn apply_verified_relay_content(
 
     match content.message_type {
         CommunicationType::MessageState => {
-            let partner_id =
+            let _partner_id =
                 relay_number(&content.content, DataType::ChatPartnerId, &context.type_map)
                     .and_then(|value| i64::try_from(value).ok())
                     .filter(|id| *id == recipient_id)
@@ -218,31 +244,36 @@ pub fn apply_verified_relay_content(
                 .map(MessageState::from_str)
                 .filter(|state| matches!(state, MessageState::Received | MessageState::Read))
                 .ok_or_else(|| "Relay MessageState has an invalid state".to_string())?;
-            if sent_by_self {
-                return chat_files::change_message_state_by_relay_id(
+            let update = if sent_by_self {
+                chat_files::change_message_state_by_relay_id(
                     storage_owner,
                     recipient_id,
                     recipient_principal,
                     relay_message_id,
                     state,
                 )
-                .map_err(|error| error.to_string());
-            }
-            chat_files::record_message_receipt(
-                storage_owner,
-                recipient_id,
-                recipient_principal,
-                relay_message_id,
-                sender_id,
-                signer_principal,
-                &context.message_id,
-                state,
-                event_at,
-                now_millis_i64(),
-            )
-            .map_err(|error| error.to_string())?;
-            let _ = partner_id;
-            Ok(())
+                .map_err(|error| error.to_string())?
+            } else {
+                chat_files::record_message_receipt(
+                    storage_owner,
+                    recipient_id,
+                    recipient_principal,
+                    relay_message_id,
+                    sender_id,
+                    signer_principal,
+                    &context.message_id,
+                    state,
+                    event_at,
+                    now_millis_i64(),
+                )
+                .map_err(|error| error.to_string())?
+            };
+            Ok(RelayApplicationResult {
+                mutation: update.map(|update| AppliedMessageMutation::State {
+                    send_time: update.send_time,
+                    state: update.state,
+                }),
+            })
         }
         CommunicationType::MessageSend => {
             let message = relay_string(&content.content, DataType::Content, &context.type_map)
@@ -328,7 +359,7 @@ pub fn apply_verified_relay_content(
                 },
             })
             .map_err(|error| error.to_string())?;
-            Ok(())
+            Ok(RelayApplicationResult::default())
         }
         CommunicationType::MessageEdit => {
             let message = relay_string(&content.content, DataType::Content, &context.type_map)
@@ -336,6 +367,11 @@ pub fn apply_verified_relay_content(
             let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
                 .and_then(|value| i64::try_from(value).ok())
                 .ok_or_else(|| "Relay MessageEdit is missing SendTime".to_string())?;
+            let version =
+                relay_number(&content.content, DataType::VersionNumber, &context.type_map)
+                    .and_then(|value| i64::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| "Relay MessageEdit has an invalid VersionNumber".to_string())?;
             let external_user = if sent_by_self {
                 recipient_id
             } else {
@@ -365,7 +401,14 @@ pub fn apply_verified_relay_content(
                     message,
                 )
             };
-            result.map_err(|error| error.to_string())
+            result.map_err(|error| error.to_string())?;
+            Ok(RelayApplicationResult {
+                mutation: Some(AppliedMessageMutation::Edit {
+                    send_time,
+                    content: message.to_string(),
+                    version,
+                }),
+            })
         }
         CommunicationType::MessageReactionAdd | CommunicationType::MessageReactionRemove => {
             let reaction = relay_string(&content.content, DataType::Reaction, &context.type_map)
@@ -405,7 +448,14 @@ pub fn apply_verified_relay_content(
                     reaction,
                 )
             };
-            result.map_err(|error| error.to_string())
+            result.map_err(|error| error.to_string())?;
+            Ok(RelayApplicationResult {
+                mutation: Some(AppliedMessageMutation::Reaction {
+                    send_time,
+                    reaction: reaction.to_string(),
+                    accepted: content.message_type == CommunicationType::MessageReactionAdd,
+                }),
+            })
         }
         CommunicationType::MessageDelete | CommunicationType::MessageDeleteLive => {
             let send_time = relay_number(&content.content, DataType::SendTime, &context.type_map)
@@ -437,7 +487,10 @@ pub fn apply_verified_relay_content(
                     sender_id,
                 )
             };
-            result.map_err(|error| error.to_string())
+            result.map_err(|error| error.to_string())?;
+            Ok(RelayApplicationResult {
+                mutation: Some(AppliedMessageMutation::Delete { send_time }),
+            })
         }
         CommunicationType::SetChatSecret => {
             let frame = CommunicationValue::new(CommunicationType::SetChatSecret)
@@ -526,7 +579,8 @@ pub fn apply_verified_relay_content(
                 created_at,
                 updated_at: now_millis_i64(),
             })
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+            Ok(RelayApplicationResult::default())
         }
         CommunicationType::AddConversation => {
             let other_id =
@@ -560,9 +614,10 @@ pub fn apply_verified_relay_content(
                     &context.type_map,
                 ),
             )
-            .map_err(|error| format!("AddConversation persistence failed: {error}"))
+            .map_err(|error| format!("AddConversation persistence failed: {error}"))?;
+            Ok(RelayApplicationResult::default())
         }
-        _ => Ok(()),
+        _ => Ok(RelayApplicationResult::default()),
     }
 }
 
@@ -3003,7 +3058,7 @@ pub fn apply_relay_application_content(
     context: &VerifiedRelayContext,
     content: &VerifiedRelayContent,
     accepted_at: i64,
-) -> Result<(), String> {
+) -> Result<RelayApplicationResult, String> {
     if application.signer_principal.user_id != context.signer_id
         || application.recipient_principal.user_id != context.final_recipient_id
     {

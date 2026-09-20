@@ -457,6 +457,7 @@ impl RelayService {
         let signer_principal = normalized.signer;
         let recipient_principal = normalized.recipient;
         let accepted_at = crate::message_common::now_millis_i64();
+        let mut source_mutation = None;
         let signer_id = match i64::try_from(verified.context.signer_id) {
             Ok(id) => id,
             Err(_) => {
@@ -653,7 +654,7 @@ impl RelayService {
                     return Self::relay_response(frame.id(), CommunicationType::ErrorInvalidData);
                 }
             };
-            if let Err(error) = message_handlers::apply_verified_relay_content(
+            let application = match message_handlers::apply_verified_relay_content(
                 &verified.context,
                 &content,
                 signer_principal.handle,
@@ -662,13 +663,17 @@ impl RelayService {
                 owner,
                 true,
             ) {
-                log!("Relay shared-Iota origin application failed: {}", error);
-                let _ = relay_replay::mark_rejected(
-                    signer_principal.handle,
-                    &verified.context.message_id,
-                );
-                return Self::relay_response(frame.id(), CommunicationType::ErrorInvalidData);
-            }
+                Ok(application) => application,
+                Err(error) => {
+                    log!("Relay shared-Iota origin application failed: {}", error);
+                    let _ = relay_replay::mark_rejected(
+                        signer_principal.handle,
+                        &verified.context.message_id,
+                    );
+                    return Self::relay_response(frame.id(), CommunicationType::ErrorInvalidData);
+                }
+            };
+            source_mutation = application.mutation;
             if let Err(error) = chat_files::record_destination_iota_received(
                 owner,
                 signer_principal.handle,
@@ -703,22 +708,29 @@ impl RelayService {
                         );
                     }
                 };
-                if let Err(error) = message_handlers::apply_verified_relay_content(
+                let application = match message_handlers::apply_verified_relay_content(
                     &verified.context,
                     &content,
                     signer_principal.handle,
                     recipient_principal.handle,
                     accepted_at,
-                    i64::try_from(verified.context.signer_id).unwrap_or_default(),
+                    signer_id,
                     true,
                 ) {
-                    log!("Relay origin application failed: {}", error);
-                    let _ = relay_replay::mark_rejected(
-                        signer_principal.handle,
-                        &verified.context.message_id,
-                    );
-                    return Self::relay_response(frame.id(), CommunicationType::ErrorInvalidData);
-                }
+                    Ok(application) => application,
+                    Err(error) => {
+                        log!("Relay origin application failed: {}", error);
+                        let _ = relay_replay::mark_rejected(
+                            signer_principal.handle,
+                            &verified.context.message_id,
+                        );
+                        return Self::relay_response(
+                            frame.id(),
+                            CommunicationType::ErrorInvalidData,
+                        );
+                    }
+                };
+                source_mutation = application.mutation;
             }
             let Some(route) = route_destination(&recipient_principal.home) else {
                 log!("Relay recipient has no Iota route");
@@ -894,7 +906,18 @@ impl RelayService {
                         .with_id(frame_id);
                     return RelayOutcome::Accepted {
                         ingress_response: response,
-                        local_deliveries: Vec::new(),
+                        local_deliveries: source_mutation
+                            .as_ref()
+                            .map(|mutation| {
+                                vec![mutation_delivery(
+                                    mutation,
+                                    verified.context.signer_id,
+                                    verified.context.signer_id,
+                                    verified.context.final_recipient_id,
+                                    signer_principal.handle,
+                                )]
+                            })
+                            .unwrap_or_default(),
                     };
                 }
                 Ok(response) => {
@@ -914,7 +937,18 @@ impl RelayService {
                             &verified.context.message_id,
                             accepted_at,
                             true,
-                            Vec::new(),
+                            source_mutation
+                                .as_ref()
+                                .map(|mutation| {
+                                    vec![mutation_delivery(
+                                        mutation,
+                                        verified.context.signer_id,
+                                        verified.context.signer_id,
+                                        verified.context.final_recipient_id,
+                                        signer_principal.handle,
+                                    )]
+                                })
+                                .unwrap_or_default(),
                         );
                     } else if let Ok(signer_id) = i64::try_from(verified.context.signer_id) {
                         if let Err(error) =
@@ -971,7 +1005,18 @@ impl RelayService {
                         &verified.context.message_id,
                         accepted_at,
                         true,
-                        Vec::new(),
+                        source_mutation
+                            .as_ref()
+                            .map(|mutation| {
+                                vec![mutation_delivery(
+                                    mutation,
+                                    verified.context.signer_id,
+                                    verified.context.signer_id,
+                                    verified.context.final_recipient_id,
+                                    signer_principal.handle,
+                                )]
+                            })
+                            .unwrap_or_default(),
                     );
                 }
             }
@@ -1044,7 +1089,7 @@ impl RelayService {
                     return Self::relay_response(frame.id(), CommunicationType::ErrorInvalidData);
                 }
             };
-            if let Err(error) = message_handlers::apply_verified_relay_content(
+            let application = match message_handlers::apply_verified_relay_content(
                 &verified.context,
                 &content,
                 signer_principal.handle,
@@ -1062,26 +1107,42 @@ impl RelayService {
                 },
                 false,
             ) {
-                log!("Relay application dispatch failed: {}", error);
-                if let Err(queue_error) =
-                    relay_queue::remove_for_frame(RouteTarget::User(destination), frame_id)
-                {
-                    log!("Relay application queue cleanup failed: {}", queue_error);
+                Ok(application) => application,
+                Err(error) => {
+                    log!("Relay application dispatch failed: {}", error);
+                    if let Err(queue_error) =
+                        relay_queue::remove_for_frame(RouteTarget::User(destination), frame_id)
+                    {
+                        log!("Relay application queue cleanup failed: {}", queue_error);
+                    }
+                    let _ = relay_replay::mark_rejected(
+                        signer_principal.handle,
+                        &verified.context.message_id,
+                    );
+                    return Self::relay_response(frame.id(), CommunicationType::ErrorInvalidData);
                 }
-                let _ = relay_replay::mark_rejected(
-                    signer_principal.handle,
-                    &verified.context.message_id,
-                );
-                return Self::relay_response(frame.id(), CommunicationType::ErrorInvalidData);
-            }
-            client_event = client_event_from_relay(
-                content.message_type,
-                &content.content,
-                verified.context.signer_id,
-                destination,
-                &verified.context.message_id,
-                accepted_at,
-            );
+            };
+            client_event = application
+                .mutation
+                .as_ref()
+                .map(|mutation| {
+                    client_event_from_mutation(
+                        mutation,
+                        verified.context.signer_id,
+                        destination,
+                        verified.context.signer_id,
+                    )
+                })
+                .or_else(|| {
+                    client_event_from_relay(
+                        content.message_type,
+                        &content.content,
+                        verified.context.signer_id,
+                        destination,
+                        &verified.context.message_id,
+                        accepted_at,
+                    )
+                });
             if let Err(error) =
                 relay_replay::mark_applied(signer_principal.handle, &verified.context.message_id)
             {
@@ -1109,19 +1170,29 @@ impl RelayService {
         {
             log!("Relay queue state update failed: {}", error);
         }
+        let mut local_deliveries = Vec::new();
+        if let Some(mutation) = source_mutation.as_ref() {
+            local_deliveries.push(mutation_delivery(
+                mutation,
+                verified.context.signer_id,
+                verified.context.signer_id,
+                verified.context.final_recipient_id,
+                signer_principal.handle,
+            ));
+        }
+        if let Some(frame) = client_event {
+            local_deliveries.push(ClientDelivery {
+                recipient: recipient_principal.handle,
+                frame,
+            });
+        }
         Self::relay_success(
             frame.id(),
             local_iota_id,
             &verified.context.message_id,
             accepted_at,
             signer_is_local,
-            client_event
-                .into_iter()
-                .map(|frame| ClientDelivery {
-                    recipient: recipient_principal.handle,
-                    frame,
-                })
-                .collect(),
+            local_deliveries,
         )
     }
 
@@ -1239,7 +1310,12 @@ impl RelayService {
                 return Self::relay_response(Some(frame_id), CommunicationType::ErrorInvalidData);
             }
             relay_replay::RelayReservation::Existing { state, .. } if state == "delivered" => {
-                return federated_success(frame_id, &normalized.message_id, accepted_at);
+                return federated_success(
+                    frame_id,
+                    &normalized.message_id,
+                    accepted_at,
+                    Vec::new(),
+                );
             }
             relay_replay::RelayReservation::Existing { state, .. } if state == "rejected" => {
                 return Self::relay_response(Some(frame_id), CommunicationType::ErrorInvalidData);
@@ -1253,18 +1329,59 @@ impl RelayService {
         );
 
         if let Some(recipient) = recipient_local {
-            if !already_applied
-                && let Err(error) = message_handlers::apply_relay_application_content(
-                    &application,
+            let mut source_mutation = None;
+            let mut destination_mutation = None;
+            if !already_applied {
+                if let Some(sender) = signer_local {
+                    let source_application = message_handlers::apply_relay_application_content(
+                        &message_handlers::RelayApplicationContext {
+                            hosted_sender: Some(sender),
+                            hosted_recipient: None,
+                            ..application.clone()
+                        },
+                        &context,
+                        &content,
+                        accepted_at,
+                    );
+                    match source_application {
+                        Ok(application) => source_mutation = application.mutation,
+                        Err(error) => {
+                            log!("Relay V2 shared-Iota origin application failed: {error}");
+                            let _ = relay_replay::mark_rejected(
+                                normalized.signer.handle,
+                                &normalized.message_id,
+                            );
+                            return Self::relay_response(
+                                Some(frame_id),
+                                CommunicationType::ErrorInvalidData,
+                            );
+                        }
+                    }
+                }
+                let destination_application = message_handlers::apply_relay_application_content(
+                    &message_handlers::RelayApplicationContext {
+                        hosted_sender: None,
+                        hosted_recipient: Some(recipient),
+                        ..application.clone()
+                    },
                     &context,
                     &content,
                     accepted_at,
-                )
-            {
-                log!("Relay V2 destination application failed: {error}");
-                let _ =
-                    relay_replay::mark_rejected(normalized.signer.handle, &normalized.message_id);
-                return Self::relay_response(Some(frame_id), CommunicationType::ErrorInvalidData);
+                );
+                match destination_application {
+                    Ok(application) => destination_mutation = application.mutation,
+                    Err(error) => {
+                        log!("Relay V2 destination application failed: {error}");
+                        let _ = relay_replay::mark_rejected(
+                            normalized.signer.handle,
+                            &normalized.message_id,
+                        );
+                        return Self::relay_response(
+                            Some(frame_id),
+                            CommunicationType::ErrorInvalidData,
+                        );
+                    }
+                }
             }
             let relay_identity = relay_queue::RelayIdentity {
                 signer: normalized.signer.handle,
@@ -1285,45 +1402,86 @@ impl RelayService {
                 return Self::relay_response(Some(frame_id), CommunicationType::ErrorInternal);
             }
             let _ = relay_replay::mark_queued(normalized.signer.handle, &normalized.message_id);
-            let delivery = client_event_from_relay(
-                message_type,
-                &content.content,
-                normalized.signer.principal.user_id,
-                normalized.recipient.principal.user_id,
+            let destination_event = destination_mutation
+                .as_ref()
+                .map(|mutation| {
+                    client_event_from_mutation(
+                        mutation,
+                        normalized.signer.principal.user_id,
+                        normalized.recipient.principal.user_id,
+                        normalized.signer.principal.user_id,
+                    )
+                })
+                .or_else(|| {
+                    client_event_from_relay(
+                        message_type,
+                        &content.content,
+                        normalized.signer.principal.user_id,
+                        normalized.recipient.principal.user_id,
+                        &normalized.message_id,
+                        accepted_at,
+                    )
+                });
+            let mut local_deliveries = Vec::new();
+            if let Some(mutation) = source_mutation.as_ref() {
+                local_deliveries.push(mutation_delivery(
+                    mutation,
+                    normalized.signer.principal.user_id,
+                    normalized.signer.principal.user_id,
+                    normalized.recipient.principal.user_id,
+                    normalized.signer.handle,
+                ));
+            }
+            if let Some(frame) = destination_event {
+                local_deliveries.push(ClientDelivery {
+                    recipient: normalized.recipient.handle,
+                    frame,
+                });
+            }
+            return federated_success(
+                frame_id,
                 &normalized.message_id,
                 accepted_at,
+                local_deliveries,
             );
-            return match federated_success(frame_id, &normalized.message_id, accepted_at) {
-                RelayOutcome::Accepted {
-                    ingress_response, ..
-                } => RelayOutcome::Accepted {
-                    ingress_response,
-                    local_deliveries: delivery
-                        .into_iter()
-                        .map(|frame| ClientDelivery {
-                            recipient: normalized.recipient.handle,
-                            frame,
-                        })
-                        .collect(),
-                },
-                outcome => outcome,
-            };
         }
 
         let Some(signer) = signer_local else {
             return Self::relay_response(Some(frame_id), CommunicationType::ErrorInvalidData);
         };
-        if !already_applied
-            && let Err(error) = message_handlers::apply_relay_application_content(
+        let source_mutation = if already_applied {
+            None
+        } else {
+            match message_handlers::apply_relay_application_content(
                 &application,
                 &context,
                 &content,
                 accepted_at,
-            )
-        {
-            log!("Relay V2 origin application failed: {error}");
-            return Self::relay_response(Some(frame_id), CommunicationType::ErrorInvalidData);
-        }
+            ) {
+                Ok(application) => application.mutation,
+                Err(error) => {
+                    log!("Relay V2 origin application failed: {error}");
+                    return Self::relay_response(
+                        Some(frame_id),
+                        CommunicationType::ErrorInvalidData,
+                    );
+                }
+            }
+        };
+        let source_deliveries = || {
+            source_mutation
+                .as_ref()
+                .map(|mutation| {
+                    vec![mutation_delivery(
+                        mutation,
+                        normalized.signer.principal.user_id,
+                        normalized.signer.principal.user_id,
+                        normalized.recipient.principal.user_id,
+                        normalized.signer.handle,
+                    )]
+                })
+                .unwrap_or_default()
+        };
         let Some(route) = route_destination(&normalized.recipient.home) else {
             return Self::relay_response(Some(frame_id), CommunicationType::ErrorNoIota);
         };
@@ -1368,7 +1526,12 @@ impl RelayService {
                     log!("Relay V2 acknowledgement storage failed: {error}");
                     return Self::relay_response(Some(frame_id), CommunicationType::ErrorInternal);
                 }
-                federated_success(frame_id, &relay_message_id, destination_accepted_at)
+                federated_success(
+                    frame_id,
+                    &relay_message_id,
+                    destination_accepted_at,
+                    source_deliveries(),
+                )
             }
             Ok(RouteOutcome::Accepted { .. }) => {
                 let _ = iota_storage::util::relay_queue::quarantine_for_frame(
@@ -1380,9 +1543,12 @@ impl RelayService {
             Ok(RouteOutcome::Rejected { response_type }) => {
                 Self::relay_response(Some(frame_id), response_type)
             }
-            Ok(RouteOutcome::Retryable { .. }) | Err(_) => {
-                federated_success(frame_id, &normalized.message_id, accepted_at)
-            }
+            Ok(RouteOutcome::Retryable { .. }) | Err(_) => federated_success(
+                frame_id,
+                &normalized.message_id,
+                accepted_at,
+                source_deliveries(),
+            ),
         }
     }
 
@@ -1495,7 +1661,12 @@ impl RelayService {
     }
 }
 
-fn federated_success(frame_id: u32, message_id: &str, accepted_at: i64) -> RelayOutcome {
+fn federated_success(
+    frame_id: u32,
+    message_id: &str,
+    accepted_at: i64,
+    local_deliveries: Vec<ClientDelivery>,
+) -> RelayOutcome {
     RelayOutcome::Accepted {
         ingress_response: CommunicationValue::new(CommunicationType::Success)
             .with_id(frame_id)
@@ -1507,7 +1678,7 @@ fn federated_success(frame_id: u32, message_id: &str, accepted_at: i64) -> Relay
                 DataType::RelayAcceptedAt,
                 DataValue::SignedNumber(accepted_at.into()),
             ),
-        local_deliveries: Vec::new(),
+        local_deliveries,
     }
 }
 
@@ -1532,6 +1703,84 @@ fn record_origin_delivery_failure(
         crate::message_common::now_millis_i64(),
     ) {
         log!("Relay delivery failure storage failed: {error}");
+    }
+}
+
+fn client_event_from_mutation(
+    mutation: &message_handlers::AppliedMessageMutation,
+    actor_id: u64,
+    account_id: u64,
+    chat_partner_id: u64,
+) -> CommunicationValue {
+    let event = match mutation {
+        message_handlers::AppliedMessageMutation::State { send_time, state } => {
+            CommunicationValue::new(CommunicationType::MessageState)
+                .add_typed_default(
+                    DataType::SendTime,
+                    DataValue::SignedNumber((*send_time).into()),
+                )
+                .add_typed_default(
+                    DataType::MessageState,
+                    DataValue::Str(state.as_str().to_string()),
+                )
+        }
+        message_handlers::AppliedMessageMutation::Edit {
+            send_time,
+            content,
+            version,
+        } => CommunicationValue::new(CommunicationType::MessageEditLive)
+            .add_typed_default(DataType::Content, DataValue::Str(content.clone()))
+            .add_typed_default(
+                DataType::SendTime,
+                DataValue::SignedNumber((*send_time).into()),
+            )
+            .add_typed_default(
+                DataType::VersionNumber,
+                DataValue::SignedNumber((*version).into()),
+            ),
+        message_handlers::AppliedMessageMutation::Reaction {
+            send_time,
+            reaction,
+            accepted,
+        } => CommunicationValue::new(CommunicationType::MessageReactionLive)
+            .add_typed_default(DataType::Reaction, DataValue::Str(reaction.clone()))
+            .add_typed_default(
+                DataType::SendTime,
+                DataValue::SignedNumber((*send_time).into()),
+            )
+            .add_typed_default(
+                DataType::SenderId,
+                DataValue::UnsignedNumber(actor_id.into()),
+            )
+            .add_typed_default(DataType::Accepted, DataValue::Bool(*accepted)),
+        message_handlers::AppliedMessageMutation::Delete { send_time } => {
+            CommunicationValue::new(CommunicationType::MessageDeleteLive).add_typed_default(
+                DataType::SendTime,
+                DataValue::SignedNumber((*send_time).into()),
+            )
+        }
+    };
+
+    event
+        .with_id(next_client_event_id())
+        .with_sender(actor_id)
+        .with_receiver(account_id)
+        .add_typed_default(
+            DataType::ChatPartnerId,
+            DataValue::UnsignedNumber(chat_partner_id.into()),
+        )
+}
+
+fn mutation_delivery(
+    mutation: &message_handlers::AppliedMessageMutation,
+    actor_id: u64,
+    account_id: u64,
+    chat_partner_id: u64,
+    recipient: iota_identity::PrincipalHandle,
+) -> ClientDelivery {
+    ClientDelivery {
+        recipient,
+        frame: client_event_from_mutation(mutation, actor_id, account_id, chat_partner_id),
     }
 }
 
@@ -1617,67 +1866,6 @@ fn client_event_from_relay(
                     .add_typed_default(DataType::SecretId, secret_id)
                     .add_typed_default(DataType::VersionNumber, version)
                     .add_typed_default(DataType::Payload, DataValue::Str("available".to_string())),
-            )
-        }
-        CommunicationType::MessageEdit => {
-            let frame = CommunicationValue::new(CommunicationType::MessageEdit)
-                .with_payload(payload.clone());
-            Some(
-                CommunicationValue::new(CommunicationType::MessageEditLive)
-                    .with_id(event_id)
-                    .with_sender(signer_id)
-                    .with_receiver(receiver)
-                    .add_typed_default(
-                        DataType::Content,
-                        frame.get_data(DataType::Content)?.clone(),
-                    )
-                    .add_typed_default(
-                        DataType::SendTime,
-                        frame.get_data(DataType::SendTime)?.clone(),
-                    )
-                    .add_typed_default(
-                        DataType::VersionNumber,
-                        frame.get_data(DataType::VersionNumber)?.clone(),
-                    )
-                    .add_typed_default(DataType::ChatPartnerId, sender.clone()),
-            )
-        }
-        CommunicationType::MessageReactionAdd | CommunicationType::MessageReactionRemove => {
-            let frame = CommunicationValue::new(message_type).with_payload(payload.clone());
-            Some(
-                CommunicationValue::new(CommunicationType::MessageReactionLive)
-                    .with_id(event_id)
-                    .with_sender(signer_id)
-                    .with_receiver(receiver)
-                    .add_typed_default(
-                        DataType::Reaction,
-                        frame.get_data(DataType::Reaction)?.clone(),
-                    )
-                    .add_typed_default(
-                        DataType::SendTime,
-                        frame.get_data(DataType::SendTime)?.clone(),
-                    )
-                    .add_typed_default(DataType::ChatPartnerId, sender.clone())
-                    .add_typed_default(DataType::SenderId, sender)
-                    .add_typed_default(
-                        DataType::Accepted,
-                        DataValue::Bool(message_type == CommunicationType::MessageReactionAdd),
-                    ),
-            )
-        }
-        CommunicationType::MessageDelete | CommunicationType::MessageDeleteLive => {
-            let frame = CommunicationValue::new(CommunicationType::MessageDelete)
-                .with_payload(payload.clone());
-            Some(
-                CommunicationValue::new(CommunicationType::MessageDeleteLive)
-                    .with_id(event_id)
-                    .with_sender(signer_id)
-                    .with_receiver(receiver)
-                    .add_typed_default(
-                        DataType::SendTime,
-                        frame.get_data(DataType::SendTime)?.clone(),
-                    )
-                    .add_typed_default(DataType::ChatPartnerId, sender),
             )
         }
         CommunicationType::AddConversation if recipient_id < signer_id => {
@@ -1871,5 +2059,25 @@ mod tests {
         assert!(!recipient_block_policy_applies(true, 42, 42));
         assert!(recipient_block_policy_applies(true, 42, 43));
         assert!(!recipient_block_policy_applies(false, 42, 43));
+    }
+
+    #[test]
+    fn mutation_events_use_receiving_account_chat_partner() {
+        let event = client_event_from_mutation(
+            &message_handlers::AppliedMessageMutation::Reaction {
+                send_time: 12,
+                reaction: "thumbsup".into(),
+                accepted: true,
+            },
+            7,
+            8,
+            9,
+        );
+
+        assert!(event.is_type(CommunicationType::MessageReactionLive));
+        assert_eq!(event.receiver(), Some(8));
+        assert_eq!(event.sender(), Some(7));
+        assert_eq!(event.get_data(DataType::ChatPartnerId).as_number(), Some(9));
+        assert_eq!(event.get_data(DataType::SenderId).as_number(), Some(7));
     }
 }
