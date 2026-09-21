@@ -287,7 +287,6 @@
                   DirectoryMode = "0750";
                   Backlog = 5;
                   RemoveOnStop = "true";
-                  NonBlocking = true;
                 };
               };
 
@@ -312,6 +311,7 @@
                   RestartSec = "5s";
                   RuntimeDirectory = "iota";
                   RuntimeDirectoryMode = "0750";
+                  RuntimeDirectoryPreserve = "yes";
                   StateDirectory = "iota";
                   StateDirectoryMode = "0750";
                   CacheDirectory = "iota";
