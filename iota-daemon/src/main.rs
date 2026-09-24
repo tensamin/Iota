@@ -576,6 +576,7 @@ async fn main() -> ExitCode {
                 key: resolve_config_path(&paths.config_file, &key, &paths.config_dir),
             }),
         required: web.required,
+        max_mtp_sessions: web.max_mtp_sessions,
         authority_discovery: iota_identity::AuthorityDiscoveryDocument {
             version: 1,
             service: iota_identity::AuthorityKind::Iota,

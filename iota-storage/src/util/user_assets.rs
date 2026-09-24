@@ -1,5 +1,5 @@
 use crate::storage_error::StorageError;
-use crate::util::{db, sync};
+use crate::util::{config_util::CONFIG, db, sync};
 use rand::RngCore;
 use rusqlite::{OptionalExtension, Row, params};
 use sha2::{Digest, Sha256};
@@ -118,7 +118,8 @@ fn reconcile_offset(
     if status.state != "uploading" {
         return Ok(status);
     }
-    let actual = fs::metadata(asset_dir()?.join(file_name))?.len() as i64;
+    let actual = i64::try_from(fs::metadata(asset_dir()?.join(file_name))?.len())
+        .map_err(|_| StorageError::Other("upload file exceeds supported size".into()))?;
     if actual > status.size {
         return Err(StorageError::Other(
             "upload file exceeds declared size".into(),
@@ -151,6 +152,11 @@ pub fn start(
     if size < 0 || sha256.len() != 32 || mime_type.is_empty() || mime_type.len() > 255 {
         return Err(StorageError::Other("invalid asset metadata".into()));
     }
+    let config = CONFIG.load();
+    let limits = &config.storage_limits;
+    if size > limits.max_asset_bytes {
+        return Err(StorageError::AssetResourceLimit("max_asset_bytes"));
+    }
     cleanup_if_due()?;
     if let Some((status, file_name)) = load_upload(user_id, upload_id)? {
         if status.asset_id != asset_id
@@ -166,15 +172,52 @@ pub fn start(
     }
 
     let file_name = random_file_name();
-    let path = asset_dir()?.join(&file_name);
+    let directory = asset_dir()?;
+    let required_free = limits
+        .min_free_asset_storage_bytes
+        .checked_add(
+            u64::try_from(size).map_err(|_| StorageError::Other("invalid asset size".into()))?,
+        )
+        .ok_or_else(|| StorageError::Other("filesystem reservation overflow".into()))?;
+    if fs2::available_space(&directory)? < required_free {
+        return Err(StorageError::AssetResourceLimit(
+            "min_free_asset_storage_bytes",
+        ));
+    }
+    let path = directory.join(&file_name);
     OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)?
         .sync_all()?;
     let now = sync::now_millis();
-    let inserted = db::with_db(|conn| {
-        conn.execute(
+    let inserted = db::with_immediate_transaction(|tx| {
+        let committed: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(size), 0) FROM user_assets WHERE user_id = ?1 AND deleted = 0",
+            [user_id],
+            |row| row.get(0),
+        )?;
+        let (reserved, active): (i64, i64) = tx.query_row(
+            "SELECT COALESCE(SUM(size), 0), COUNT(*) FROM user_asset_uploads WHERE user_id = ?1 AND state = 'uploading'",
+            [user_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if usize::try_from(active)
+            .ok()
+            .is_none_or(|count| count >= limits.max_active_asset_uploads_per_user)
+        {
+            return Err(StorageError::AssetResourceLimit(
+                "max_active_asset_uploads_per_user",
+            ));
+        }
+        let proposed = committed
+            .checked_add(reserved)
+            .and_then(|value| value.checked_add(size))
+            .ok_or_else(|| StorageError::Other("asset quota accounting overflow".into()))?;
+        if proposed > limits.max_user_asset_bytes {
+            return Err(StorageError::AssetResourceLimit("max_user_asset_bytes"));
+        }
+        tx.execute(
             "INSERT INTO user_asset_uploads (upload_id, user_id, asset_id, file_name, size, sha256, mime_type, received, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'uploading', ?8, ?8)",
             params![upload_id, user_id, asset_id, file_name, size, sha256, mime_type, now],
         )?;
@@ -219,10 +262,12 @@ pub fn append(
         return Err(StorageError::Other("upload not found".into()));
     };
     let status = reconcile_offset(user_id, status, &file_name)?;
-    if status.state != "uploading"
-        || offset != status.offset
-        || offset + chunk.len() as i64 > status.size
-    {
+    let chunk_len = i64::try_from(chunk.len())
+        .map_err(|_| StorageError::Other("asset chunk length overflow".into()))?;
+    let end = offset
+        .checked_add(chunk_len)
+        .ok_or_else(|| StorageError::Other("asset chunk offset overflow".into()))?;
+    if status.state != "uploading" || offset != status.offset || end > status.size {
         return Err(StorageError::Other(
             "asset chunk offset does not match acknowledged offset".into(),
         ));
@@ -231,7 +276,7 @@ pub fn append(
     let mut file = OpenOptions::new().append(true).open(path)?;
     file.write_all(chunk)?;
     file.sync_data()?;
-    let received = offset + chunk.len() as i64;
+    let received = end;
     let now = sync::now_millis();
     db::with_db(|conn| {
         conn.execute(
@@ -360,6 +405,34 @@ pub fn abort(user_id: i64, upload_id: &str) -> Result<bool, StorageError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error.into()),
     }
+}
+
+pub const ASSET_PAGE_SIZE: i64 = 128;
+
+pub fn list_page(
+    user_id: i64,
+    after_id: Option<i64>,
+) -> Result<(Vec<UserAssetMetadata>, Option<i64>), StorageError> {
+    if user_id <= 0 || after_id.is_some_and(|id| id <= 0) {
+        return Err(StorageError::Other("invalid asset list cursor".into()));
+    }
+    cleanup_if_due()?;
+    db::with_db(|conn| {
+        let mut statement = conn.prepare("SELECT id, user_id, asset_id, file_name, size, sha256, mime_type, revision, created_at, updated_at FROM user_assets WHERE user_id = ?1 AND deleted = 0 AND id < ?2 ORDER BY id DESC LIMIT ?3")?;
+        let mut items = statement
+            .query_map(
+                params![user_id, after_id.unwrap_or(i64::MAX), ASSET_PAGE_SIZE + 1],
+                metadata_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let next = if items.len() > ASSET_PAGE_SIZE as usize {
+            items.pop();
+            items.last().map(|asset| asset.id)
+        } else {
+            None
+        };
+        Ok((items, next))
+    })
 }
 
 pub fn list(user_id: i64) -> Result<Vec<UserAssetMetadata>, StorageError> {

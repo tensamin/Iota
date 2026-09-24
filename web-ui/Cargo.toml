@@ -3,6 +3,9 @@ name = "web-ui"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+legacy-web-admin = []
+
 [dependencies]
 iota-storage = { path = "../iota-storage" }
 iota-state = { path = "../iota-state" }

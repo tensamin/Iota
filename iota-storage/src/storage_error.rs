@@ -14,6 +14,8 @@ pub enum StorageError {
     RevisionConflict,
     #[error("pending relay ownership is unknown")]
     PendingRelayOwnershipUnknown,
+    #[error("asset resource limit: {0}")]
+    AssetResourceLimit(&'static str),
     #[error("{0}")]
     Other(String),
 }

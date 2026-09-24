@@ -40,6 +40,7 @@ pub struct WebConfig {
     pub asset_dir: PathBuf,
     pub tls: Option<TlsConfig>,
     pub required: bool,
+    pub max_mtp_sessions: usize,
     pub authority_discovery: iota_identity::AuthorityDiscoveryDocument,
     pub local_users: Arc<dyn LocalUserStore>,
     pub descriptor_publisher: Arc<dyn LocalDescriptorPublisher>,
@@ -187,7 +188,7 @@ pub async fn start(
             }),
             Box::new(|_, _| Box::pin(async { 0 })),
         )
-        .with_authentication_policy(mtp::host::AuthenticationPolicy::AllowAuthentication);
+        .with_authentication_policy(mtp::host::AuthenticationPolicy::ForceAuthentication);
     let assets = config.asset_dir.clone();
     let discovery = serde_json::to_vec(&config.authority_discovery)
         .map(Bytes::from)
@@ -290,13 +291,21 @@ pub async fn start(
         .map_err(|e| WebServerError::Startup(e.to_string()))?;
     let cancellation = parent.child_token();
     let task_cancellation = cancellation.clone();
+    let session_limit = Arc::new(tokio::sync::Semaphore::new(config.max_mtp_sessions));
     let join = tokio::spawn(async move {
         loop {
             tokio::select! {
                 result = server.accept() => match result {
                     Ok(Some(connection)) => {
+                        let Ok(permit) = session_limit.clone().try_acquire_owned() else {
+                            log!("Rejected MTP connection: session limit reached");
+                            continue;
+                        };
                         let handler = mtp_handler.clone();
-                        tokio::spawn(async move { handler.accept(connection).await; });
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            handler.accept(connection).await;
+                        });
                     }
                     Ok(None) => break,
                     Err(error) => log!("MTP webserver connection failed: {}", error),

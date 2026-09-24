@@ -1,4 +1,5 @@
 use crate::message_common::*;
+use iota_logger::log;
 use iota_storage::util::chat_files::{self, MessageState};
 use iota_storage::util::chats_util::{self, get_user, has_user, mod_user};
 use iota_storage::util::communities_util::CommunitiesUtil;
@@ -2084,8 +2085,50 @@ fn upload_response(
 }
 
 fn asset_error(cv: &CommunicationValue, error: StorageError) -> CommunicationValue {
-    error_response(cv, CommunicationType::ErrorInternal)
-        .add_typed_default(DataType::ErrorType, DataValue::Str(error.to_string()))
+    log!(
+        "Asset request rejected sender={:?} request_id={:?}: {error}",
+        cv.sender(),
+        cv.id()
+    );
+    let (kind, category) = match error {
+        StorageError::AssetResourceLimit(_) => {
+            (CommunicationType::ErrorInvalidData, "asset_resource_limit")
+        }
+        _ => (CommunicationType::ErrorInternal, "asset_request_failed"),
+    };
+    error_response(cv, kind).add_typed_default(DataType::ErrorType, DataValue::Str(category.into()))
+}
+
+#[cfg(test)]
+mod asset_error_tests {
+    use super::*;
+
+    #[test]
+    fn storage_errors_do_not_expose_internal_paths() {
+        let request = CommunicationValue::new(CommunicationType::UserAssetUploadStart).with_id(7);
+        let internal = asset_error(
+            &request,
+            StorageError::Other("private path /srv/assets/key".into()),
+        );
+        assert!(internal.is_type(CommunicationType::ErrorInternal));
+        assert_eq!(
+            internal
+                .get_data(DataType::ErrorType)
+                .and_then(DataValue::as_str),
+            Some("asset_request_failed")
+        );
+        let limit = asset_error(
+            &request,
+            StorageError::AssetResourceLimit("max_asset_bytes"),
+        );
+        assert!(limit.is_type(CommunicationType::ErrorInvalidData));
+        assert_eq!(
+            limit
+                .get_data(DataType::ErrorType)
+                .and_then(DataValue::as_str),
+            Some("asset_resource_limit")
+        );
+    }
 }
 
 fn upload_request(cv: &CommunicationValue) -> Result<(i64, String), CommunicationValue> {
@@ -2404,10 +2447,21 @@ pub fn handle_user_blob_list(cv: &CommunicationValue) -> CommunicationValue {
     if user_id <= 0 {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     }
-    match user_blobs::list_metadata(user_id) {
-        Ok(blobs) => CommunicationValue::new(CommunicationType::UserBlobList)
+    let after_id = match cv.get_data(DataType::Offset).and_then(DataValue::as_number) {
+        Some(raw) => match i64::try_from(raw) {
+            Ok(id) if id > 0 => Some(id),
+            _ => return error_response(cv, CommunicationType::ErrorInvalidData),
+        },
+        None => None,
+    };
+    match user_blobs::list_metadata_page(user_id, after_id) {
+        Ok((blobs, next)) => CommunicationValue::new(CommunicationType::UserBlobList)
             .with_request_id(cv)
             .with_receiver(sender_wire_id(user_id))
+            .add_typed_default(
+                DataType::Offset,
+                DataValue::SignedNumber(next.unwrap_or(0).into()),
+            )
             .add_typed_default(
                 DataType::Blobs,
                 DataValue::Array(blobs.iter().map(blob_metadata_value).collect()),
@@ -2542,10 +2596,21 @@ pub fn handle_user_asset_list(cv: &CommunicationValue) -> CommunicationValue {
         Ok(id) if id > 0 => id,
         _ => return error_response(cv, CommunicationType::ErrorInvalidData),
     };
-    match user_assets::list(user_id) {
-        Ok(assets) => CommunicationValue::new(CommunicationType::UserAssetList)
+    let after_id = match cv.get_data(DataType::Offset).and_then(DataValue::as_number) {
+        Some(raw) => match i64::try_from(raw) {
+            Ok(id) if id > 0 => Some(id),
+            _ => return error_response(cv, CommunicationType::ErrorInvalidData),
+        },
+        None => None,
+    };
+    match user_assets::list_page(user_id, after_id) {
+        Ok((assets, next)) => CommunicationValue::new(CommunicationType::UserAssetList)
             .with_request_id(cv)
             .with_receiver(sender_wire_id(user_id))
+            .add_typed_default(
+                DataType::Offset,
+                DataValue::SignedNumber(next.unwrap_or(0).into()),
+            )
             .add_typed_default(
                 DataType::Assets,
                 DataValue::Array(assets.iter().map(asset_metadata_value).collect()),

@@ -1,3 +1,7 @@
+use iota_storage::util::{
+    config_util::CONFIG,
+    relay_replay::{MAX_RELAY_FUTURE_SKEW_MILLIS, RELAY_RETENTION_MILLIS},
+};
 use iota_util::route_target::RouteTarget;
 use mtp::codec::{
     CommunicationValue, ProtectionPolicy, RelayError, RelayOpenOptions, SignaturePolicy, TypeMap,
@@ -107,6 +111,9 @@ pub enum RelayValidationError {
     MissingTypeMap,
     InvalidRouteTarget(u64),
     KeyLookup(String),
+    Clock(String),
+    StaleRelay { created_at: u64, now: u64 },
+    RelayFromFuture { created_at: u64, now: u64 },
     Relay(RelayError),
 }
 
@@ -129,6 +136,14 @@ impl fmt::Display for RelayValidationError {
                 write!(formatter, "relay has invalid route target {target}")
             }
             Self::KeyLookup(error) => write!(formatter, "trusted signer lookup failed: {error}"),
+            Self::Clock(error) => write!(formatter, "relay clock failed: {error}"),
+            Self::StaleRelay { created_at, now } => {
+                write!(formatter, "relay timestamp {created_at} is stale at {now}")
+            }
+            Self::RelayFromFuture { created_at, now } => write!(
+                formatter,
+                "relay timestamp {created_at} is in the future at {now}"
+            ),
             Self::Relay(error) => error.fmt(formatter),
         }
     }
@@ -140,6 +155,23 @@ impl From<RelayError> for RelayValidationError {
     fn from(error: RelayError) -> Self {
         Self::Relay(error)
     }
+}
+
+fn validate_created_at(
+    created_at: u64,
+    now: u64,
+    max_future_skew_millis: u64,
+) -> Result<(), RelayValidationError> {
+    if created_at > now.saturating_add(max_future_skew_millis) {
+        return Err(RelayValidationError::RelayFromFuture { created_at, now });
+    }
+    let max_age = u64::try_from(RELAY_RETENTION_MILLIS)
+        .unwrap_or(0)
+        .saturating_sub(MAX_RELAY_FUTURE_SKEW_MILLIS);
+    if now.saturating_sub(created_at) > max_age {
+        return Err(RelayValidationError::StaleRelay { created_at, now });
+    }
+    Ok(())
 }
 
 /*
@@ -195,6 +227,14 @@ where
         RelayOpenOptions::new(RELAY_PROTECTION_POLICY),
     )?;
 
+    let now = mtp::common::unix_time_millis()
+        .map_err(|error| RelayValidationError::Clock(error.to_string()))?;
+    validate_created_at(
+        metadata.created_at(),
+        now,
+        CONFIG.load().max_relay_future_skew_millis,
+    )?;
+
     let context = VerifiedRelayContext {
         signer_id: metadata.signer_id(),
         final_recipient_id: metadata.final_recipient_id(),
@@ -244,6 +284,23 @@ mod tests {
     use mtp::codec::SealedRelayBuilder;
     use mtp::crypto::{DualSigner, Ed25519Signer, Keyring};
 
+    #[test]
+    fn relay_freshness_has_bounded_future_and_retention() {
+        let now = 1_000_000_000_000_u64;
+        let max_age = u64::try_from(RELAY_RETENTION_MILLIS).unwrap_or(0) - 300_000;
+        assert!(validate_created_at(now, now, 300_000).is_ok());
+        assert!(validate_created_at(now - max_age, now, 300_000).is_ok());
+        assert!(matches!(
+            validate_created_at(now - max_age - 1, now, 300_000),
+            Err(RelayValidationError::StaleRelay { .. })
+        ));
+        assert!(validate_created_at(now + 300_000, now, 300_000).is_ok());
+        assert!(matches!(
+            validate_created_at(now + 300_001, now, 300_000),
+            Err(RelayValidationError::RelayFromFuture { .. })
+        ));
+    }
+
     fn relay(message_id: u128) -> Result<(Keyring, Keyring, CommunicationValue), String> {
         let signer_keyring = Keyring::generate();
         let recipient_keyring = Keyring::generate();
@@ -264,7 +321,7 @@ mod tests {
             &signer,
         )
         .message_id(message_id)
-        .created_at(123)
+        .created_at(mtp::common::unix_time_millis().map_err(|error| error.to_string())?)
         .metadata_recipients(vec![recipient_keyring.public_key_bundle()])
         .content_recipients(vec![recipient_keyring.public_key_bundle()])
         .build()
@@ -339,7 +396,7 @@ mod tests {
             &signer,
         )
         .message_id(7_u128)
-        .created_at(123)
+        .created_at(mtp::common::unix_time_millis().map_err(|error| error.to_string())?)
         .metadata_recipients(vec![recipient_keyring.public_key_bundle()])
         .content_recipients(vec![recipient_keyring.public_key_bundle()])
         .build()

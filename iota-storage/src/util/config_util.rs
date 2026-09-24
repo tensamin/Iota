@@ -40,8 +40,14 @@ pub enum ConfigError {
     InvalidRelayRouterKey(String),
     #[error("relay router certificate path must not be empty")]
     MissingRelayRouterCertificate,
+    #[error("web.max_mtp_sessions must be greater than zero")]
+    InvalidMaxMtpSessions,
     #[error("max_ipc_clients must be greater than zero")]
     InvalidMaxIpcClients,
+    #[error("invalid storage limit: {0}")]
+    InvalidStorageLimit(&'static str),
+    #[error("invalid max_relay_future_skew_millis")]
+    InvalidRelayFutureSkew,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +77,44 @@ pub struct IotaConfig {
     pub read_receipts_enabled: bool,
     #[serde(default = "default_max_ipc_clients")]
     pub max_ipc_clients: usize,
+    #[serde(default)]
+    pub storage_limits: StorageLimits,
+    #[serde(default = "default_max_relay_future_skew_millis")]
+    pub max_relay_future_skew_millis: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageLimits {
+    pub max_asset_bytes: i64,
+    pub max_user_asset_bytes: i64,
+    #[serde(default = "default_max_user_blobs")]
+    pub max_user_blobs: i64,
+    pub max_active_asset_uploads_per_user: usize,
+    pub min_free_asset_storage_bytes: u64,
+    #[serde(default = "default_max_asset_io_workers")]
+    pub max_asset_io_workers: usize,
+}
+
+const fn default_max_user_blobs() -> i64 {
+    4096
+}
+
+const fn default_max_asset_io_workers() -> usize {
+    4
+}
+
+impl Default for StorageLimits {
+    fn default() -> Self {
+        Self {
+            max_asset_bytes: 256 * 1024 * 1024,
+            max_user_asset_bytes: 2 * 1024 * 1024 * 1024,
+            max_user_blobs: default_max_user_blobs(),
+            max_active_asset_uploads_per_user: 4,
+            min_free_asset_storage_bytes: 512 * 1024 * 1024,
+            max_asset_io_workers: default_max_asset_io_workers(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,10 +153,15 @@ pub struct WebSettings {
     pub key: Option<String>,
     #[serde(default)]
     pub required: bool,
+    #[serde(default = "default_max_mtp_sessions")]
+    pub max_mtp_sessions: usize,
     #[serde(default)]
     pub direct_endpoints: Vec<String>,
     #[serde(default)]
     pub relay_hints: Vec<String>,
+}
+const fn default_max_mtp_sessions() -> usize {
+    256
 }
 fn default_web_bind() -> String {
     "127.0.0.1".into()
@@ -130,6 +179,7 @@ impl Default for WebSettings {
             certificate: None,
             key: None,
             required: false,
+            max_mtp_sessions: default_max_mtp_sessions(),
             direct_endpoints: Vec::new(),
             relay_hints: Vec::new(),
         }
@@ -148,6 +198,10 @@ const fn default_max_ipc_clients() -> usize {
     64
 }
 
+const fn default_max_relay_future_skew_millis() -> u64 {
+    5 * 60 * 1_000
+}
+
 impl Default for IotaConfig {
     fn default() -> Self {
         Self {
@@ -163,6 +217,8 @@ impl Default for IotaConfig {
             private_key: None,
             read_receipts_enabled: default_read_receipts_enabled(),
             max_ipc_clients: default_max_ipc_clients(),
+            storage_limits: StorageLimits::default(),
+            max_relay_future_skew_millis: default_max_relay_future_skew_millis(),
         }
     }
 }
@@ -211,8 +267,32 @@ pub fn validate_config(config: &IotaConfig) -> Result<(), ConfigError> {
             bind: config.web.bind.clone(),
             source,
         })?;
+    if config.storage_limits.max_user_blobs <= 0 {
+        return Err(ConfigError::InvalidStorageLimit("max_user_blobs"));
+    }
+    if config.web.max_mtp_sessions == 0 {
+        return Err(ConfigError::InvalidMaxMtpSessions);
+    }
     if config.max_ipc_clients == 0 {
         return Err(ConfigError::InvalidMaxIpcClients);
+    }
+    if config.max_relay_future_skew_millis > super::relay_replay::MAX_RELAY_FUTURE_SKEW_MILLIS {
+        return Err(ConfigError::InvalidRelayFutureSkew);
+    }
+    let limits = &config.storage_limits;
+    if limits.max_asset_bytes <= 0 {
+        return Err(ConfigError::InvalidStorageLimit("max_asset_bytes"));
+    }
+    if limits.max_user_asset_bytes < limits.max_asset_bytes {
+        return Err(ConfigError::InvalidStorageLimit("max_user_asset_bytes"));
+    }
+    if limits.max_active_asset_uploads_per_user == 0 {
+        return Err(ConfigError::InvalidStorageLimit(
+            "max_active_asset_uploads_per_user",
+        ));
+    }
+    if limits.max_asset_io_workers == 0 {
+        return Err(ConfigError::InvalidStorageLimit("max_asset_io_workers"));
     }
     for endpoint in config
         .web
@@ -356,6 +436,30 @@ pub fn configure_config_path(path: PathBuf) {
 mod tests {
     use super::{ConfigError, IotaConfig, RelayRouterSettings, parse_config, validate_config};
     use std::path::Path;
+
+    #[test]
+    fn asset_limits_reject_invalid_quota_and_upload_count() {
+        let mut config = IotaConfig::default();
+        config.storage_limits.max_asset_bytes = 0;
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigError::InvalidStorageLimit("max_asset_bytes"))
+        ));
+        config.storage_limits.max_asset_bytes = 10;
+        config.storage_limits.max_user_asset_bytes = 9;
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigError::InvalidStorageLimit("max_user_asset_bytes"))
+        ));
+        config.storage_limits.max_user_asset_bytes = 10;
+        config.storage_limits.max_active_asset_uploads_per_user = 0;
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigError::InvalidStorageLimit(
+                "max_active_asset_uploads_per_user"
+            ))
+        ));
+    }
 
     #[test]
     fn malformed_yaml_is_rejected() {

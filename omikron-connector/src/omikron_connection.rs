@@ -38,6 +38,31 @@ use iota_identity::AuthorityLocator;
 // ============================================================================
 
 const IOTA_KEYRING_PATH: &str = "iota.mk";
+static ASSET_IO_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(
+        CONFIG.load().storage_limits.max_asset_io_workers,
+    ))
+});
+
+async fn run_asset_handler<T: Send + 'static>(
+    cv: &CommunicationValue,
+    handler: fn(&CommunicationValue) -> T,
+) -> Result<T, CommunicationValue> {
+    let permit = ASSET_IO_PERMITS
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| error_response(cv, CommunicationType::ErrorInternal))?;
+    let frame = cv.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        handler(&frame)
+    })
+    .await
+    .map_err(|error| {
+        log!("Asset I/O worker failed: {error}");
+        error_response(cv, CommunicationType::ErrorInternal)
+    })
+}
 static IDENTITY_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 static OMIKRON_TRUST_DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
@@ -231,7 +256,6 @@ fn parse_omega_invitation(
 const TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const TASK_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_HANDLERS: usize = 20;
-const RELAY_RETENTION_MILLIS: i64 = 30 * 24 * 60 * 60 * 1000;
 
 struct ResolvedOmikronEndpoint {
     id: Option<i64>,
@@ -1126,7 +1150,7 @@ impl OmikronConnection {
                 invitation_self.flush_pending_invitation_actions().await;
             });
             if let Err(error) = relay_replay::prune_completed(
-                now_millis_i64().saturating_sub(RELAY_RETENTION_MILLIS),
+                now_millis_i64().saturating_sub(relay_replay::RELAY_RETENTION_MILLIS),
             ) {
                 log!("Relay replay cleanup failed: {}", error);
             }
@@ -2914,25 +2938,51 @@ impl OmikronConnection {
     }
 
     async fn handle_user_asset_upload_start(self: Arc<Self>, cv: &CommunicationValue) {
-        let _ = self
-            .send_message(&message_handlers::handle_user_asset_upload_start(cv))
-            .await;
+        let result =
+            match run_asset_handler(cv, message_handlers::handle_user_asset_upload_start).await {
+                Ok(result) => result,
+                Err(response) => {
+                    let _ = self.send_message(&response).await;
+                    return;
+                }
+            };
+        let _ = self.send_message(&result).await;
     }
 
     async fn handle_user_asset_upload_chunk(self: Arc<Self>, cv: &CommunicationValue) {
-        let _ = self
-            .send_message(&message_handlers::handle_user_asset_upload_chunk(cv))
-            .await;
+        let result =
+            match run_asset_handler(cv, message_handlers::handle_user_asset_upload_chunk).await {
+                Ok(result) => result,
+                Err(response) => {
+                    let _ = self.send_message(&response).await;
+                    return;
+                }
+            };
+        let _ = self.send_message(&result).await;
     }
 
     async fn handle_user_asset_upload_status(self: Arc<Self>, cv: &CommunicationValue) {
-        let _ = self
-            .send_message(&message_handlers::handle_user_asset_upload_status(cv))
-            .await;
+        let result =
+            match run_asset_handler(cv, message_handlers::handle_user_asset_upload_status).await {
+                Ok(result) => result,
+                Err(response) => {
+                    let _ = self.send_message(&response).await;
+                    return;
+                }
+            };
+        let _ = self.send_message(&result).await;
     }
 
     async fn handle_user_asset_upload_commit(self: Arc<Self>, cv: &CommunicationValue) {
-        let mutation = message_handlers::handle_user_asset_upload_commit(cv);
+        let result =
+            match run_asset_handler(cv, message_handlers::handle_user_asset_upload_commit).await {
+                Ok(result) => result,
+                Err(response) => {
+                    let _ = self.send_message(&response).await;
+                    return;
+                }
+            };
+        let mutation = result;
         let _ = self.send_message(&mutation.response).await;
         if let Some(changed) = mutation.changed {
             let _ = self.send_message(&changed).await;
@@ -2940,25 +2990,49 @@ impl OmikronConnection {
     }
 
     async fn handle_user_asset_upload_abort(self: Arc<Self>, cv: &CommunicationValue) {
-        let _ = self
-            .send_message(&message_handlers::handle_user_asset_upload_abort(cv))
-            .await;
+        let result =
+            match run_asset_handler(cv, message_handlers::handle_user_asset_upload_abort).await {
+                Ok(result) => result,
+                Err(response) => {
+                    let _ = self.send_message(&response).await;
+                    return;
+                }
+            };
+        let _ = self.send_message(&result).await;
     }
 
     async fn handle_user_asset_get_chunk(self: Arc<Self>, cv: &CommunicationValue) {
-        let _ = self
-            .send_message(&message_handlers::handle_user_asset_get_chunk(cv))
-            .await;
+        let result =
+            match run_asset_handler(cv, message_handlers::handle_user_asset_get_chunk).await {
+                Ok(result) => result,
+                Err(response) => {
+                    let _ = self.send_message(&response).await;
+                    return;
+                }
+            };
+        let _ = self.send_message(&result).await;
     }
 
     async fn handle_user_asset_list(self: Arc<Self>, cv: &CommunicationValue) {
-        let _ = self
-            .send_message(&message_handlers::handle_user_asset_list(cv))
-            .await;
+        let result = match run_asset_handler(cv, message_handlers::handle_user_asset_list).await {
+            Ok(result) => result,
+            Err(response) => {
+                let _ = self.send_message(&response).await;
+                return;
+            }
+        };
+        let _ = self.send_message(&result).await;
     }
 
     async fn handle_user_asset_delete(self: Arc<Self>, cv: &CommunicationValue) {
-        let mutation = message_handlers::handle_user_asset_delete(cv);
+        let result = match run_asset_handler(cv, message_handlers::handle_user_asset_delete).await {
+            Ok(result) => result,
+            Err(response) => {
+                let _ = self.send_message(&response).await;
+                return;
+            }
+        };
+        let mutation = result;
         let _ = self.send_message(&mutation.response).await;
         if let Some(changed) = mutation.changed {
             let _ = self.send_message(&changed).await;
@@ -3539,6 +3613,12 @@ mod tests {
         raw.push(1);
         raw.extend_from_slice(&keyring.try_to_bytes().expect("keyring serializes"));
         fs::write(&path, raw).expect("legacy fixture writes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("legacy fixture is owner-only");
+        }
 
         let migrated = load_or_migrate_keyring_at(&path, None).expect("legacy identity loads");
         assert_eq!(

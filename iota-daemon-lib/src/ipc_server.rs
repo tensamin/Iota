@@ -327,11 +327,11 @@ fn peer_credentials(stream: &UnixStream) -> Result<PeerIdentity> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        Ok(PeerIdentity {
-            pid: 0,
-            uid: 0,
-            _gid: 0,
-        })
+        let _ = stream;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "IPC peer credentials are unsupported on this platform",
+        ))
     }
 }
 

@@ -66,3 +66,25 @@ usermod -aG iota-operators USER
 The user must start a new login session before supplementary group membership
 is visible. Unix per-user deployments must set `IOTA_SOCKET` to an absolute
 path; Iota does not derive its IPC socket from `XDG_RUNTIME_DIR`.
+
+## Asset storage limits
+
+`storage_limits` in Iota's configuration controls upload admission. Defaults are 256 MiB per asset, 2 GiB of committed assets plus active upload reservations per user, four active uploads per user, 512 MiB of free filesystem space reserved, four concurrent asset I/O workers, and 4096 blobs per user. Set these fields to match deployment capacity:
+
+```yaml
+storage_limits:
+  max_asset_bytes: 268435456
+  max_user_asset_bytes: 2147483648
+  max_active_asset_uploads_per_user: 4
+  min_free_asset_storage_bytes: 536870912
+  max_asset_io_workers: 4
+  max_user_blobs: 4096
+```
+
+Replacement uploads temporarily count both old and new assets until commit.
+
+## Relay freshness
+
+Signed relays expire after 30 days less five minutes; replay rows remain for 30 days. `max_relay_future_skew_millis` defaults to 300000, or five minutes, and can be reduced for deployment clock tolerance. Fixed five-minute margin keeps freshness within replay retention even if configuration changes. Timestamps use Unix milliseconds.
+
+Asset and blob list responses contain at most 128 entries. Send the returned positive `Offset` as the next request cursor; `Offset: 0` ends pagination. `web.max_mtp_sessions` defaults to 256 and limits concurrent authenticated MTP sessions. Legacy web administration requires the non-default `legacy-web-admin` feature.

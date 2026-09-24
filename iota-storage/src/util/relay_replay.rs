@@ -2,6 +2,9 @@ use crate::storage_error::StorageError;
 use crate::util::db;
 use rusqlite::{OptionalExtension, params};
 
+pub const RELAY_RETENTION_MILLIS: i64 = 30 * 24 * 60 * 60 * 1_000;
+pub const MAX_RELAY_FUTURE_SKEW_MILLIS: u64 = 5 * 60 * 1_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveredRelay {
     pub signer_id: i64,

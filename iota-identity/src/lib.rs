@@ -179,6 +179,34 @@ impl fmt::Display for LocalNodeIdentityError {
 
 impl std::error::Error for LocalNodeIdentityError {}
 
+#[cfg(unix)]
+fn verify_private_keyring(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file()
+        || metadata.mode() & 0o077 != 0
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "keyring must be a regular owner-only file owned by the service user",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_private_keyring(_: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "keyring permissions cannot be verified on this platform",
+    ))
+}
+
 #[derive(Clone)]
 pub struct LocalNodeIdentity {
     keyring: Arc<mtp::crypto::Keyring>,
@@ -210,6 +238,10 @@ impl LocalNodeIdentity {
                 source,
             })?;
         }
+        verify_private_keyring(path).map_err(|error| LocalNodeIdentityError::Storage {
+            path: path.display().to_string(),
+            source: error.to_string(),
+        })?;
         let keyring = match mtp::files::load_keyring_raw(path) {
             Ok(keyring) => keyring,
             Err(mtp::files::FileError::Io(error))
@@ -249,6 +281,10 @@ impl LocalNodeIdentity {
                 path: path.display().to_string(),
                 source: error.to_string(),
             }
+        })?;
+        verify_private_keyring(path).map_err(|error| LocalNodeIdentityError::Storage {
+            path: path.display().to_string(),
+            source: error.to_string(),
         })?;
         let persisted = mtp::files::load_keyring_raw(path).map_err(|error| {
             LocalNodeIdentityError::Storage {

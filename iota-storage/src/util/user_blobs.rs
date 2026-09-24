@@ -1,6 +1,6 @@
 /* Opaque client-owned bytes. Confidentiality is provided by the client-side blob format. */
 use crate::storage_error::StorageError;
-use crate::util::{db, sync};
+use crate::util::{config_util::CONFIG, db, sync};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
 pub const MAX_BLOB_ID_BYTES: usize = 256;
@@ -97,6 +97,16 @@ pub fn put(
             .filter(|(_, _, deleted, _)| !*deleted)
             .map(|(_, _, _, size)| size)
             .unwrap_or(0);
+        if existing.is_none_or(|(_, _, deleted, _)| deleted) {
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM user_blobs WHERE user_id = ?1 AND deleted = 0",
+                [user_id],
+                |row| row.get(0),
+            )?;
+            if count >= CONFIG.load().storage_limits.max_user_blobs {
+                return Err(StorageError::Other("user blob count quota exceeded".into()));
+            }
+        }
         let aggregate: i64 = tx.query_row("SELECT COALESCE(SUM(length(blob)), 0) FROM user_blobs WHERE user_id = ?1 AND deleted = 0", [user_id], |r| r.get(0))?;
         let proposed_size = aggregate
             .checked_sub(current_size)
@@ -143,6 +153,46 @@ pub fn list(user_id: i64) -> Result<Vec<UserBlob>, StorageError> {
         "SELECT id, user_id, blob_id, blob, revision, updated_at FROM user_blobs WHERE user_id = ?1 AND deleted = 0",
         &[],
     )
+}
+
+pub const BLOB_PAGE_SIZE: i64 = 128;
+
+pub fn list_metadata_page(
+    user_id: i64,
+    after_id: Option<i64>,
+) -> Result<(Vec<UserBlobMetadata>, Option<i64>), StorageError> {
+    if user_id <= 0 || after_id.is_some_and(|id| id <= 0) {
+        return Err(StorageError::Other("invalid blob list cursor".into()));
+    }
+    db::with_db(|conn| {
+        let mut statement = conn.prepare("SELECT id, blob_id, revision, updated_at FROM user_blobs WHERE user_id = ?1 AND deleted = 0 AND id < ?2 ORDER BY id DESC LIMIT ?3")?;
+        let mut rows = statement.query(params![
+            user_id,
+            after_id.unwrap_or(i64::MAX),
+            BLOB_PAGE_SIZE + 1
+        ])?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next()? {
+            items.push((
+                row.get::<_, i64>(0)?,
+                UserBlobMetadata {
+                    blob_id: row.get(1)?,
+                    revision: row.get(2)?,
+                    updated_at: row.get(3)?,
+                },
+            ));
+        }
+        let next = if items.len() > BLOB_PAGE_SIZE as usize {
+            items.pop();
+            items.last().map(|(id, _)| *id)
+        } else {
+            None
+        };
+        Ok((
+            items.into_iter().map(|(_, metadata)| metadata).collect(),
+            next,
+        ))
+    })
 }
 
 pub fn list_metadata(user_id: i64) -> Result<Vec<UserBlobMetadata>, StorageError> {
