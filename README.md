@@ -87,4 +87,4 @@ Replacement uploads temporarily count both old and new assets until commit.
 
 Signed relays expire after 30 days less five minutes; replay rows remain for 30 days. `max_relay_future_skew_millis` defaults to 300000, or five minutes, and can be reduced for deployment clock tolerance. Fixed five-minute margin keeps freshness within replay retention even if configuration changes. Timestamps use Unix milliseconds.
 
-Asset and blob list responses contain at most 128 entries. Send the returned positive `Offset` as the next request cursor; `Offset: 0` ends pagination. `web.max_mtp_sessions` defaults to 256 and limits concurrent authenticated MTP sessions. Legacy web administration requires the non-default `legacy-web-admin` feature.
+Asset and blob list responses contain at most 128 entries. Send the returned positive `Offset` as the next request cursor; `Offset: 0` ends pagination. `web.max_mtp_sessions` defaults to 256 and limits concurrent authenticated MTP sessions. `web.max_mtp_sessions_per_user` defaults to four sessions per hosted user. Legacy web administration requires the non-default `legacy-web-admin` feature.

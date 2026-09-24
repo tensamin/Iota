@@ -40,7 +40,7 @@ pub enum ConfigError {
     InvalidRelayRouterKey(String),
     #[error("relay router certificate path must not be empty")]
     MissingRelayRouterCertificate,
-    #[error("web.max_mtp_sessions must be greater than zero")]
+    #[error("web MTP session limits must be greater than zero")]
     InvalidMaxMtpSessions,
     #[error("max_ipc_clients must be greater than zero")]
     InvalidMaxIpcClients,
@@ -155,6 +155,8 @@ pub struct WebSettings {
     pub required: bool,
     #[serde(default = "default_max_mtp_sessions")]
     pub max_mtp_sessions: usize,
+    #[serde(default = "default_max_mtp_sessions_per_user")]
+    pub max_mtp_sessions_per_user: usize,
     #[serde(default)]
     pub direct_endpoints: Vec<String>,
     #[serde(default)]
@@ -162,6 +164,9 @@ pub struct WebSettings {
 }
 const fn default_max_mtp_sessions() -> usize {
     256
+}
+const fn default_max_mtp_sessions_per_user() -> usize {
+    4
 }
 fn default_web_bind() -> String {
     "127.0.0.1".into()
@@ -180,6 +185,7 @@ impl Default for WebSettings {
             key: None,
             required: false,
             max_mtp_sessions: default_max_mtp_sessions(),
+            max_mtp_sessions_per_user: default_max_mtp_sessions_per_user(),
             direct_endpoints: Vec::new(),
             relay_hints: Vec::new(),
         }
@@ -270,7 +276,7 @@ pub fn validate_config(config: &IotaConfig) -> Result<(), ConfigError> {
     if config.storage_limits.max_user_blobs <= 0 {
         return Err(ConfigError::InvalidStorageLimit("max_user_blobs"));
     }
-    if config.web.max_mtp_sessions == 0 {
+    if config.web.max_mtp_sessions == 0 || config.web.max_mtp_sessions_per_user == 0 {
         return Err(ConfigError::InvalidMaxMtpSessions);
     }
     if config.max_ipc_clients == 0 {

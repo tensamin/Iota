@@ -577,6 +577,7 @@ async fn main() -> ExitCode {
             }),
         required: web.required,
         max_mtp_sessions: web.max_mtp_sessions,
+        max_mtp_sessions_per_user: web.max_mtp_sessions_per_user,
         authority_discovery: iota_identity::AuthorityDiscoveryDocument {
             version: 1,
             service: iota_identity::AuthorityKind::Iota,
