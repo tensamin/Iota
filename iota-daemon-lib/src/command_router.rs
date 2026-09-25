@@ -8,7 +8,7 @@ use iota_ipc::{
     TaskSummary, UpdateStatusResponse, UserDetailResponse, UserDiagnostics, UserOperationKind,
     UserOperationSummary, UserReconcileResult, UserSummary,
 };
-use iota_logger::{log, log_command};
+use iota_logger::{LogLevel, PrintType, log, log_command, log_event};
 use iota_storage::users::pending_operations::{self, PendingUserOperationKind};
 use iota_storage::users::user_manager;
 use iota_storage::util::config_util::{self};
@@ -64,6 +64,7 @@ fn now_millis() -> i64 {
 }
 
 fn invitation_created_after_mirror(
+    request_id: u64,
     authority: InvitationAuthority,
     invitation_id: i64,
     raw_token: String,
@@ -74,8 +75,12 @@ fn invitation_created_after_mirror(
     let mirror_synced = match mirror_result {
         Ok(()) => true,
         Err(error) => {
-            log!(
-                "Invitation {} was created by Omega, but its local mirror could not be stored: {}",
+            log_event!(
+                PrintType::Command,
+                LogLevel::Error,
+                "invitation.mirror_store_failed",
+                "request_id={} invitation_id={} error={}",
+                request_id,
                 invitation_id,
                 error
             );
@@ -139,12 +144,16 @@ impl CommandRouter {
         request: LocalRequest,
     ) -> ResponseEnvelope {
         if !peer.role.allows(request.required_role()) {
-            log!(
-                "IPC authorization denied: pid={}, uid={}, role={:?}, request={:?}",
+            log_event!(
+                PrintType::Command,
+                LogLevel::Warn,
+                "ipc.authorization_denied",
+                "request_id={} pid={} uid={} role={:?} request={}",
+                request_id,
                 peer.pid,
                 peer.uid,
                 peer.role,
-                request
+                request.log_name()
             );
             return ResponseEnvelope {
                 request_id,
@@ -153,17 +162,18 @@ impl CommandRouter {
         }
 
         log_command!(
-            "pid={} uid={} role={:?} request={:?}",
+            "request_id={} pid={} uid={} role={:?} request={}",
+            request_id,
             peer.pid,
             peer.uid,
             peer.role,
-            request
+            request.log_name()
         );
-        let result = self.execute(request).await;
+        let result = self.execute(request_id, request).await;
         ResponseEnvelope { request_id, result }
     }
 
-    async fn execute(&self, request: LocalRequest) -> ResponseResult {
+    async fn execute(&self, request_id: u64, request: LocalRequest) -> ResponseResult {
         if !self.services.active
             && !matches!(
                 request,
@@ -248,11 +258,31 @@ impl CommandRouter {
                             )
                         })
                         .collect::<std::collections::HashMap<_, _>>(),
-                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.pending_operations_load_failed",
+                            "request_id={} error={}",
+                            request_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                    }
                 };
                 let users = match user_manager::get_residency() {
                     Ok(users) => users,
-                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.residency_load_failed",
+                            "request_id={} error={}",
+                            request_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                    }
                 }
                 .into_iter()
                 .map(|user| {
@@ -275,8 +305,19 @@ impl CommandRouter {
                     })
                 })
                 .collect::<Result<Vec<_>, iota_storage::storage_error::StorageError>>();
-                let Ok(users) = users else {
-                    return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                let users = match users {
+                    Ok(users) => users,
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.profile_load_failed",
+                            "request_id={} error={}",
+                            request_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                    }
                 };
                 ResponseResult::Ok(ResponsePayload::Users(users))
             }
@@ -386,7 +427,17 @@ impl CommandRouter {
                     Err(omikron_connector::OmikronError::Timeout(_)) => {
                         return ResponseResult::Error(IpcErrorCode::Timeout);
                     }
-                    Err(_) => return ResponseResult::Error(IpcErrorCode::OmikronUnavailable),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Warn,
+                            "invitation.create_failed",
+                            "request_id={} error={}",
+                            request_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::OmikronUnavailable);
+                    }
                 };
                 let invitation_id = response
                     .get_data(DataType::InvitationId)
@@ -419,6 +470,13 @@ impl CommandRouter {
                     .zip(expires_at)
                     .map(|(((id, token), created), expires)| (id, token, created, expires))
                 else {
+                    log_event!(
+                        PrintType::Command,
+                        LogLevel::Error,
+                        "invitation.invalid_response",
+                        "request_id={} reason=missing_required_fields",
+                        request_id
+                    );
                     return ResponseResult::Error(IpcErrorCode::InternalFailure);
                 };
                 let summary = iota_storage::users::invitations::InvitationSummary {
@@ -443,6 +501,7 @@ impl CommandRouter {
                     iota_storage::users::invitations::insert(&summary, None, now_millis());
                 ResponseResult::Ok(ResponsePayload::InvitationCreated(
                     invitation_created_after_mirror(
+                        request_id,
                         authority,
                         invitation_id,
                         raw_token,
@@ -471,12 +530,30 @@ impl CommandRouter {
                         Err(_) => return ResponseResult::Error(IpcErrorCode::InternalFailure),
                     }
                 }
-                if iota_storage::users::invitations::expire_pending(now_millis()).is_err() {
+                if let Err(error) = iota_storage::users::invitations::expire_pending(now_millis()) {
+                    log_event!(
+                        PrintType::Command,
+                        LogLevel::Error,
+                        "invitation.expire_failed",
+                        "request_id={} error={}",
+                        request_id,
+                        error
+                    );
                     return ResponseResult::Error(IpcErrorCode::StorageFailure);
                 }
                 let invitations = match iota_storage::users::invitations::list() {
                     Ok(invitations) => invitations,
-                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "invitation.list_failed",
+                            "request_id={} error={}",
+                            request_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                    }
                 };
                 let mut summaries = Vec::new();
                 for invitation in invitations {
@@ -875,10 +952,30 @@ impl CommandRouter {
                     Err(AccountError::Unavailable(_)) => {
                         ResponseResult::Error(IpcErrorCode::OmikronUnavailable)
                     }
-                    Err(AccountError::Storage(_)) => {
+                    Err(AccountError::Storage(error)) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.release_storage_failed",
+                            "request_id={} user_id={} error={:?}",
+                            request_id,
+                            user_id,
+                            error
+                        );
                         ResponseResult::Error(IpcErrorCode::StorageFailure)
                     }
-                    Err(_) => ResponseResult::Error(IpcErrorCode::InternalFailure),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.release_failed",
+                            "request_id={} user_id={} error={:?}",
+                            request_id,
+                            user_id,
+                            error
+                        );
+                        ResponseResult::Error(IpcErrorCode::InternalFailure)
+                    }
                 }
             }
             LocalRequest::ReconnectOmikron => match self.services.omikron() {
@@ -886,7 +983,17 @@ impl CommandRouter {
                     Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
                         message: "Reconnected to Omikron server".into(),
                     }),
-                    Err(_) => ResponseResult::Error(IpcErrorCode::OmikronUnavailable),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Warn,
+                            "ipc.omikron_reconnect_failed",
+                            "request_id={} error={}",
+                            request_id,
+                            error
+                        );
+                        ResponseResult::Error(IpcErrorCode::OmikronUnavailable)
+                    }
                 },
                 None => ResponseResult::Error(IpcErrorCode::OmikronUnavailable),
             },
@@ -943,17 +1050,48 @@ impl CommandRouter {
             }
             LocalRequest::SetConfig { key, value } => {
                 match config_util::modify_config_value(&key, &value) {
-                    Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
-                        message: format!("Set {key} = {value}"),
-                    }),
-                    Err(_e) => ResponseResult::Error(IpcErrorCode::InvalidRequest),
+                    Ok(()) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Info,
+                            "config.changed",
+                            "request_id={} key={:?}",
+                            request_id,
+                            key
+                        );
+                        ResponseResult::Ok(ResponsePayload::Acknowledged {
+                            message: format!("Set {key}"),
+                        })
+                    }
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Warn,
+                            "config.change_failed",
+                            "request_id={} key={:?} error={}",
+                            request_id,
+                            key,
+                            error
+                        );
+                        ResponseResult::Error(IpcErrorCode::InvalidRequest)
+                    }
                 }
             }
             LocalRequest::ReloadConfig => match config_util::load_config() {
                 Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
                     message: "Configuration reloaded".into(),
                 }),
-                Err(_) => ResponseResult::Error(IpcErrorCode::InvalidRequest),
+                Err(error) => {
+                    log_event!(
+                        PrintType::Command,
+                        LogLevel::Warn,
+                        "config.reload_failed",
+                        "request_id={} error={}",
+                        request_id,
+                        error
+                    );
+                    ResponseResult::Error(IpcErrorCode::InvalidRequest)
+                }
             },
             LocalRequest::GetOmikronStatus => {
                 let connected = match self.services.omikron() {
@@ -983,7 +1121,18 @@ impl CommandRouter {
                 let residency = match user_manager::get_residency_by_id(user_id) {
                     Ok(Some(residency)) => residency,
                     Ok(None) => return ResponseResult::Error(IpcErrorCode::NotFound),
-                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.residency_load_failed",
+                            "request_id={} user_id={} error={}",
+                            request_id,
+                            user_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                    }
                 };
                 match user_manager::get_user(user_id) {
                     Ok(Some(user)) => {
@@ -1016,14 +1165,36 @@ impl CommandRouter {
                         }))
                     }
                     Ok(None) => ResponseResult::Error(IpcErrorCode::StorageFailure),
-                    Err(_) => ResponseResult::Error(IpcErrorCode::StorageFailure),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.profile_load_failed",
+                            "request_id={} user_id={} error={}",
+                            request_id,
+                            user_id,
+                            error
+                        );
+                        ResponseResult::Error(IpcErrorCode::StorageFailure)
+                    }
                 }
             }
             LocalRequest::ExportUserCredential { user_id } => {
                 let residency = match user_manager::get_residency_by_id(user_id) {
                     Ok(Some(residency)) => residency,
                     Ok(None) => return ResponseResult::Error(IpcErrorCode::NotFound),
-                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.residency_load_failed",
+                            "request_id={} user_id={} error={}",
+                            request_id,
+                            user_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                    }
                 };
                 if residency.state != user_manager::LocalUserState::Managed
                     || residency.credential_origin != user_manager::CredentialOrigin::Local
@@ -1036,7 +1207,18 @@ impl CommandRouter {
                 ) {
                     Ok(Some(credential)) => credential,
                     Ok(None) => return ResponseResult::Error(IpcErrorCode::NotFound),
-                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.credential_read_failed",
+                            "request_id={} user_id={} error={}",
+                            request_id,
+                            user_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                    }
                 };
                 let parsed = match iota_util::tu::TuCredential::parse(&credential) {
                     Ok(parsed) if parsed.user_id == user_id => parsed,
@@ -1063,7 +1245,17 @@ impl CommandRouter {
                         available,
                     }))
                 }
-                Err(_e) => ResponseResult::Error(IpcErrorCode::InternalFailure),
+                Err(error) => {
+                    log_event!(
+                        PrintType::Command,
+                        LogLevel::Error,
+                        "update.check_failed",
+                        "request_id={} error={}",
+                        request_id,
+                        error
+                    );
+                    ResponseResult::Error(IpcErrorCode::InternalFailure)
+                }
             },
             LocalRequest::ListCommunities => {
                 let iota_id = config_util::CONFIG.load().iota_id;
@@ -1182,6 +1374,7 @@ mod tests {
     #[test]
     fn omega_creation_credentials_survive_a_local_mirror_failure() {
         let created = invitation_created_after_mirror(
+            1,
             InvitationAuthority::Omega,
             7,
             "raw-token".into(),

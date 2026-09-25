@@ -30,6 +30,26 @@ const DEFAULT_ACTIVATION_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_ACTIVATION_RETRY_MILLISECONDS: u64 = 250;
 const REQUIRED_HOST_ARTIFACTS: &str = include_str!("../artifacts.tsv");
 
+#[derive(Clone, Copy, Debug)]
+pub enum UpdatePhase {
+    CandidateEvaluated,
+    ArtifactsStaged,
+    ActivationStarted,
+    DaemonRestarted,
+    ActivationCommitted,
+    RollbackStarted,
+    RollbackCompleted,
+}
+
+pub trait UpdateObserver: Send + Sync {
+    fn event(&self, phase: UpdatePhase, product_version: Option<&str>);
+}
+
+pub struct NoopUpdateObserver;
+impl UpdateObserver for NoopUpdateObserver {
+    fn event(&self, _phase: UpdatePhase, _product_version: Option<&str>) {}
+}
+
 #[derive(Clone, Debug)]
 pub struct ActivationPolicy {
     pub timeout: Duration,
@@ -176,16 +196,21 @@ pub async fn check_update() -> Result<bool> {
 }
 
 pub async fn apply_update() -> Result<bool> {
+    apply_update_observed(&NoopUpdateObserver).await
+}
+
+pub async fn apply_update_observed(observer: &dyn UpdateObserver) -> Result<bool> {
     let paths = iota_paths::IotaPaths::resolve(iota_paths::Scope::System)
         .map_err(|error| anyhow::anyhow!(error))?;
     let policy = UpdatePolicy::from_environment()?;
-    apply_update_with(&paths, &SystemdSupervisor, &policy).await
+    apply_update_with_observer(&paths, &SystemdSupervisor, &policy, observer).await
 }
 
-async fn apply_update_with(
+async fn apply_update_with_observer(
     paths: &iota_paths::IotaPaths,
     supervisor: &impl DaemonSupervisor,
     policy: &UpdatePolicy,
+    observer: &dyn UpdateObserver,
 ) -> Result<bool> {
     let transaction = UpdateTransaction::from_paths(paths)?;
     let _lock = transaction.acquire()?;
@@ -209,6 +234,10 @@ async fn apply_update_with(
         &policy.signing_key_id,
         Utc::now(),
     )?;
+    observer.event(
+        UpdatePhase::CandidateEvaluated,
+        Some(&release.manifest.product_version),
+    );
     if decision == CandidateDecision::NoUpdate {
         return Ok(false);
     }
@@ -236,6 +265,10 @@ async fn apply_update_with(
         serde_json::to_vec_pretty(&release.manifest)?,
     )
     .context("write staged release manifest")?;
+    observer.event(
+        UpdatePhase::ArtifactsStaged,
+        Some(&release.manifest.product_version),
+    );
     let daemon_was_active = supervisor.is_active()?;
     begin_activation_state(
         paths,
@@ -244,6 +277,10 @@ async fn apply_update_with(
         &release.manifest,
         daemon_was_active,
     )?;
+    observer.event(
+        UpdatePhase::ActivationStarted,
+        Some(&release.manifest.product_version),
+    );
     let activation = match transaction.activate(&release.manifest.product_version) {
         Ok(activation) => activation,
         Err(error) => {
@@ -263,13 +300,25 @@ async fn apply_update_with(
                 &policy.activation,
             )
             .await?;
+            observer.event(
+                UpdatePhase::DaemonRestarted,
+                Some(&release.manifest.product_version),
+            );
         }
         commit_update_state(paths, &mut state, &release.manifest)?;
+        observer.event(
+            UpdatePhase::ActivationCommitted,
+            Some(&release.manifest.product_version),
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;
 
     if let Err(update_error) = activation_result {
+        observer.event(
+            UpdatePhase::RollbackStarted,
+            Some(&release.manifest.product_version),
+        );
         restore_previous_release(
             paths,
             &transaction,
@@ -279,6 +328,10 @@ async fn apply_update_with(
             &policy.activation,
         )
         .await?;
+        observer.event(
+            UpdatePhase::RollbackCompleted,
+            Some(&release.manifest.product_version),
+        );
         record_failed_release(paths, &mut state, &release.manifest)?;
         return Err(
             update_error.context("candidate release failed runtime activation and was rolled back")

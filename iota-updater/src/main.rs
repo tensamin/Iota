@@ -6,7 +6,18 @@ async fn main() -> Result<()> {
     match command.as_str() {
         "check" => println!("{}", iota_updater::check_update().await?),
         "status" => println!("updater ready"),
-        "apply" => println!("{}", iota_updater::apply_update().await?),
+        "apply" => {
+            struct StderrObserver;
+            impl iota_updater::UpdateObserver for StderrObserver {
+                fn event(&self, phase: iota_updater::UpdatePhase, product_version: Option<&str>) {
+                    eprintln!("update.phase phase={phase:?} product_version={product_version:?}");
+                }
+            }
+            println!(
+                "{}",
+                iota_updater::apply_update_observed(&StderrObserver).await?
+            );
+        }
         "rollback" => {
             let version = std::env::args()
                 .nth(2)

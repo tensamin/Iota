@@ -1,6 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dashmap::{DashMap, DashSet};
-use iota_logger::{log, log_cv_in, log_cv_out, log_t};
+use iota_logger::{LogLevel, PrintType, log, log_cv_in, log_cv_out, log_event, log_t};
 use iota_state::AppState;
 use iota_storage::util::config_util::{CONFIG, modify_config};
 use iota_storage::util::relay_replay;
@@ -3103,6 +3103,15 @@ impl OmikronConnection {
         let sender_guard = self.sender.read().await;
         if let Some(sender) = sender_guard.as_ref() {
             if !sender.is_open() {
+                log_event!(
+                    PrintType::Omikron,
+                    LogLevel::Warn,
+                    "omikron.send_failed",
+                    "connection_id={} message_id={:?} message_type={} reason=connection_closed",
+                    self.connection_id,
+                    cv.id(),
+                    cv.get_type_name().unwrap_or("unknown")
+                );
                 drop(sender_guard);
                 if let Some(sender) = self.sender.write().await.take() {
                     sender.close().await;
@@ -3121,6 +3130,16 @@ impl OmikronConnection {
             log_cv_out!(cv);
 
             if let Err(e) = sender_clone.send(cv).await {
+                log_event!(
+                    PrintType::Omikron,
+                    LogLevel::Error,
+                    "omikron.send_failed",
+                    "connection_id={} message_id={:?} message_type={} error={}",
+                    self.connection_id,
+                    cv.id(),
+                    cv.get_type_name().unwrap_or("unknown"),
+                    e
+                );
                 self.fail_all_waiting_tasks(format!(
                     "Send failed: {} (connection_id={})",
                     e, self.connection_id
@@ -3131,6 +3150,15 @@ impl OmikronConnection {
 
             Ok(())
         } else {
+            log_event!(
+                PrintType::Omikron,
+                LogLevel::Debug,
+                "omikron.send_skipped",
+                "connection_id={} message_id={:?} message_type={} reason=not_connected",
+                self.connection_id,
+                cv.id(),
+                cv.get_type_name().unwrap_or("unknown")
+            );
             Err("not connected".to_string())
         }
     }

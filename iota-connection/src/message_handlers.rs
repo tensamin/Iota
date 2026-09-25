@@ -1,5 +1,5 @@
 use crate::message_common::*;
-use iota_logger::log;
+use iota_logger::{LogLevel, PrintType, log_event};
 use iota_storage::util::chat_files::{self, MessageState};
 use iota_storage::util::chats_util::{self, get_user, has_user, mod_user};
 use iota_storage::util::communities_util::CommunitiesUtil;
@@ -18,6 +18,24 @@ use iota_storage::storage_error::StorageError;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static NEXT_NOTIFICATION_ID: AtomicU32 = AtomicU32::new(1);
+
+fn internal_handler_error(
+    cv: &CommunicationValue,
+    operation: &'static str,
+    error: impl std::fmt::Display,
+) -> CommunicationValue {
+    log_event!(
+        PrintType::Client,
+        LogLevel::Error,
+        "request.internal_error",
+        "operation={} message_id={:?} sender={:?} error={}",
+        operation,
+        cv.id(),
+        cv.sender(),
+        error
+    );
+    error_response(cv, CommunicationType::ErrorInternal)
+}
 
 fn next_notification_id() -> u32 {
     NEXT_NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed).max(1)
@@ -915,14 +933,14 @@ pub fn handle_get_chat_secret(cv: &CommunicationValue) -> CommunicationValue {
             None => return error_response(cv, CommunicationType::ErrorNotFound),
         },
         Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
-        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => return internal_handler_error(cv, "chat_secret.contact_get", error),
     };
     let owner_principal = match iota_storage::identity::SqlitePrincipalStore
         .principal_for_local_user(iota_identity::LocalUserId(sender_id))
     {
         Ok(Some(principal)) => principal,
         Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
-        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => return internal_handler_error(cv, "chat_secret.principal_get", error),
     };
     let Some(principal_chat_id) =
         e2ee_storage::principal_chat_id(owner_principal, partner_principal)
@@ -1131,15 +1149,15 @@ pub fn handle_account_state_request(cv: &CommunicationValue) -> CommunicationVal
     };
     let contacts = match chats_util::get_users(user_id) {
         Ok(contacts) => contacts,
-        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => return internal_handler_error(cv, "account_state.snapshot", error),
     };
     let messages = match chat_files::get_all_messages(user_id) {
         Ok(messages) => messages,
-        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => return internal_handler_error(cv, "account_state.snapshot", error),
     };
     let settings = match synced_settings::list(user_id) {
         Ok(settings) => settings,
-        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => return internal_handler_error(cv, "account_state.snapshot", error),
     };
     let message_values = messages
         .iter()
@@ -1147,23 +1165,23 @@ pub fn handle_account_state_request(cv: &CommunicationValue) -> CommunicationVal
         .collect();
     let blocked_users = match blocked_users::list(user_id) {
         Ok(users) => users,
-        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => return internal_handler_error(cv, "account_state.snapshot", error),
     };
     let receipt_policy = match receipt_policy::get(user_id) {
         Ok(policy) => policy,
-        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => return internal_handler_error(cv, "account_state.snapshot", error),
     };
     let message_storage_policy = match message_storage_policy::get(user_id) {
         Ok(policy) => policy,
-        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => return internal_handler_error(cv, "account_state.snapshot", error),
     };
     let contact_ids = match current_contact_ids(user_id) {
         Ok(contact_ids) => contact_ids,
-        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => return internal_handler_error(cv, "account_state.snapshot", error),
     };
     let communities = match community_values(user_id) {
         Ok(communities) => communities,
-        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => return internal_handler_error(cv, "account_state.snapshot", error),
     };
     let retention_duration = match message_storage_policy.retention {
         message_storage_policy::MessageRetention::Forever => None,
@@ -1284,7 +1302,7 @@ pub fn handle_messages_get(cv: &CommunicationValue) -> CommunicationValue {
     };
     let messages = match chat_files::get_messages(my_id_i64, partner_id, offset, amount) {
         Ok(messages) => messages,
-        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => return internal_handler_error(cv, "messages.get", error),
     };
     let mut msg_array: Vec<DataValue> = Vec::new();
     for m in &messages {
@@ -1312,12 +1330,12 @@ pub fn handle_message_get(cv: &CommunicationValue) -> CommunicationValue {
         {
             Ok(Some((message, offset))) => (message, Some(offset)),
             Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
-            Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+            Err(error) => return internal_handler_error(cv, "message.get", error),
         },
         None => match chat_files::get_message(owner, send_time, None, None) {
             Ok(Some(message)) => (message, None),
             Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
-            Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+            Err(error) => return internal_handler_error(cv, "message.get", error),
         },
     };
 
@@ -1344,7 +1362,7 @@ pub fn handle_get_chats(cv: &CommunicationValue) -> CommunicationValue {
     };
     let users = match chats_util::get_users(user_id_i64) {
         Ok(users) => users,
-        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => return internal_handler_error(cv, "chats.get", error),
     };
     let mut user_array = Vec::new();
     for user in users {
@@ -1554,8 +1572,8 @@ pub fn handle_global_settings_save(cv: &CommunicationValue) -> CommunicationValu
             );
     };
 
-    if settings::save_global(my_id_i64, settings_value).is_err() {
-        return error_response(cv, CommunicationType::ErrorInternal);
+    if let Err(error) = settings::save_global(my_id_i64, settings_value) {
+        return internal_handler_error(cv, "settings.global_save", error);
     }
 
     let mut response = CommunicationValue::new(CommunicationType::GlobalSettingsSave)
@@ -1702,8 +1720,8 @@ pub fn handle_settings_save(
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
 
-    if settings::save(my_id_i64, session_id_i64, settings_name, settings_value).is_err() {
-        return error_response(cv, CommunicationType::ErrorInternal);
+    if let Err(error) = settings::save(my_id_i64, session_id_i64, settings_name, settings_value) {
+        return internal_handler_error(cv, "settings.save", error);
     }
 
     CommunicationValue::new(CommunicationType::SettingsSave)
@@ -2085,17 +2103,23 @@ fn upload_response(
 }
 
 fn asset_error(cv: &CommunicationValue, error: StorageError) -> CommunicationValue {
-    log!(
-        "Asset request rejected sender={:?} request_id={:?}: {error}",
-        cv.sender(),
-        cv.id()
-    );
-    let (kind, category) = match error {
+    let (kind, category) = match &error {
         StorageError::AssetResourceLimit(_) => {
             (CommunicationType::ErrorInvalidData, "asset_resource_limit")
         }
         _ => (CommunicationType::ErrorInternal, "asset_request_failed"),
     };
+    if kind == CommunicationType::ErrorInternal {
+        log_event!(
+            PrintType::Client,
+            LogLevel::Error,
+            "request.internal_error",
+            "operation=user_assets message_id={:?} sender={:?} error={}",
+            cv.id(),
+            cv.sender(),
+            error
+        );
+    }
     error_response(cv, kind).add_typed_default(DataType::ErrorType, DataValue::Str(category.into()))
 }
 
@@ -2212,6 +2236,7 @@ fn parse_setting_locator(cv: &CommunicationValue) -> Result<SettingLocator, Comm
 }
 
 fn validate_setting_target(
+    cv: &CommunicationValue,
     user_id: i64,
     locator: &SettingLocator,
 ) -> Result<(), CommunicationType> {
@@ -2225,14 +2250,20 @@ fn validate_setting_target(
             match has_user(user_id, contact_id) {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(CommunicationType::ErrorInvalidData),
-                Err(_) => Err(CommunicationType::ErrorInternal),
+                Err(error) => {
+                    internal_handler_error(cv, "settings.validate_contact", error);
+                    Err(CommunicationType::ErrorInternal)
+                }
             }
         }
         SettingScope::Community => {
             match CommunitiesUtil::has_community(user_id, &locator.scope_key) {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(CommunicationType::ErrorInvalidData),
-                Err(_) => Err(CommunicationType::ErrorInternal),
+                Err(error) => {
+                    internal_handler_error(cv, "settings.validate_community", error);
+                    Err(CommunicationType::ErrorInternal)
+                }
             }
         }
     }
@@ -2262,7 +2293,7 @@ pub fn handle_synced_setting_set(cv: &CommunicationValue) -> SettingMutation {
             };
         }
     };
-    if let Err(error_type) = validate_setting_target(user_id, &locator) {
+    if let Err(error_type) = validate_setting_target(cv, user_id, &locator) {
         return setting_mutation_error(cv, error_type);
     }
     let Some(payload) = cv.get_data(DataType::Payload).as_str() else {
@@ -2279,7 +2310,10 @@ pub fn handle_synced_setting_set(cv: &CommunicationValue) -> SettingMutation {
             response: setting_response(cv, CommunicationType::SyncedSettingSet, &setting),
             changed: Some(setting_changed(&setting)),
         },
-        Err(_) => setting_mutation_error(cv, CommunicationType::ErrorInternal),
+        Err(error) => SettingMutation {
+            response: internal_handler_error(cv, "settings.set", error),
+            changed: None,
+        },
     }
 }
 
@@ -2292,13 +2326,13 @@ pub fn handle_synced_setting_get(cv: &CommunicationValue) -> CommunicationValue 
         Ok(locator) => locator,
         Err(response) => return response,
     };
-    if let Err(error_type) = validate_setting_target(user_id, &locator) {
+    if let Err(error_type) = validate_setting_target(cv, user_id, &locator) {
         return error_response(cv, error_type);
     }
     match synced_settings::get(user_id, locator.scope, &locator.scope_key, &locator.name) {
         Ok(Some(setting)) => setting_response(cv, CommunicationType::SyncedSettingGet, &setting),
         Ok(None) => error_response(cv, CommunicationType::ErrorNotFound),
-        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => internal_handler_error(cv, "settings.get", error),
     }
 }
 
@@ -2316,7 +2350,7 @@ pub fn handle_synced_setting_delete(cv: &CommunicationValue) -> SettingMutation 
             };
         }
     };
-    if let Err(error_type) = validate_setting_target(user_id, &locator) {
+    if let Err(error_type) = validate_setting_target(cv, user_id, &locator) {
         return setting_mutation_error(cv, error_type);
     }
     match synced_settings::delete(user_id, locator.scope, &locator.scope_key, &locator.name) {
@@ -2340,7 +2374,10 @@ pub fn handle_synced_setting_delete(cv: &CommunicationValue) -> SettingMutation 
                 .with_receiver(sender_wire_id(user_id)),
             changed: None,
         },
-        Err(_) => setting_mutation_error(cv, CommunicationType::ErrorInternal),
+        Err(error) => SettingMutation {
+            response: internal_handler_error(cv, "settings.delete", error),
+            changed: None,
+        },
     }
 }
 
@@ -2357,7 +2394,7 @@ pub fn handle_synced_settings_list(cv: &CommunicationValue) -> CommunicationValu
                 DataType::Settings,
                 DataValue::Array(settings.iter().map(synced_setting_value).collect()),
             ),
-        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => internal_handler_error(cv, "settings.list", error),
     }
 }
 
@@ -2384,8 +2421,8 @@ pub fn handle_user_blob_put(cv: &CommunicationValue) -> BlobMutation {
             response: error_response(cv, CommunicationType::ErrorInvalidData),
             changed: None,
         },
-        Err(_) => BlobMutation {
-            response: error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => BlobMutation {
+            response: internal_handler_error(cv, "user_blobs.put", error),
             changed: None,
         },
     }
@@ -2398,7 +2435,7 @@ pub fn handle_user_blob_get(cv: &CommunicationValue) -> CommunicationValue {
     match user_blobs::get(user_id, &blob_id) {
         Ok(Some(blob)) => blob_response(cv, CommunicationType::UserBlobGet, &blob),
         Ok(None) => error_response(cv, CommunicationType::ErrorNotFound),
-        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => internal_handler_error(cv, "user_blobs.get", error),
     }
 }
 
@@ -2433,8 +2470,8 @@ pub fn handle_user_blob_delete(cv: &CommunicationValue) -> BlobMutation {
             response: error_response(cv, CommunicationType::ErrorInvalidData),
             changed: None,
         },
-        Err(_) => BlobMutation {
-            response: error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => BlobMutation {
+            response: internal_handler_error(cv, "user_blobs.delete", error),
             changed: None,
         },
     }
@@ -2466,7 +2503,7 @@ pub fn handle_user_blob_list(cv: &CommunicationValue) -> CommunicationValue {
                 DataType::Blobs,
                 DataValue::Array(blobs.iter().map(blob_metadata_value).collect()),
             ),
-        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => internal_handler_error(cv, "user_blobs.list", error),
     }
 }
 
@@ -2719,8 +2756,8 @@ pub fn handle_user_block(cv: &CommunicationValue) -> PolicyMutation {
                     .add_typed_default(DataType::Deleted, DataValue::Bool(record.deleted)),
             ),
         },
-        Err(_) => PolicyMutation {
-            response: error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => PolicyMutation {
+            response: internal_handler_error(cv, "blocked_users.block", error),
             changed: None,
         },
     }
@@ -2775,8 +2812,8 @@ pub fn handle_user_unblock(cv: &CommunicationValue) -> PolicyMutation {
                     .add_typed_default(DataType::Deleted, DataValue::Bool(mutation.deleted))
             }),
         },
-        Err(_) => PolicyMutation {
-            response: error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => PolicyMutation {
+            response: internal_handler_error(cv, "blocked_users.unblock", error),
             changed: None,
         },
     }
@@ -2799,7 +2836,7 @@ pub fn handle_blocked_users_get(cv: &CommunicationValue) -> CommunicationValue {
                         .collect(),
                 ),
             ),
-        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => internal_handler_error(cv, "blocked_users.get", error),
     }
 }
 
@@ -2819,7 +2856,7 @@ pub fn handle_receipt_policy_get(cv: &CommunicationValue) -> CommunicationValue 
     };
     match receipt_policy::get(user_id) {
         Ok(policy) => receipt_response(cv, CommunicationType::ReceiptPolicyGet, policy),
-        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => internal_handler_error(cv, "receipt_policy.get", error),
     }
 }
 pub fn handle_receipt_policy_set(cv: &CommunicationValue) -> PolicyMutation {
@@ -2850,8 +2887,8 @@ pub fn handle_receipt_policy_set(cv: &CommunicationValue) -> PolicyMutation {
                 changed: Some(changed),
             }
         }
-        Err(_) => PolicyMutation {
-            response: error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => PolicyMutation {
+            response: internal_handler_error(cv, "receipt_policy.set", error),
             changed: None,
         },
     }
@@ -2900,7 +2937,7 @@ pub fn handle_message_storage_policy_get(cv: &CommunicationValue) -> Communicati
         Ok(policy) => {
             storage_policy_response(cv, CommunicationType::MessageStoragePolicyGet, policy)
         }
-        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => internal_handler_error(cv, "message_storage_policy.get", error),
     }
 }
 
@@ -2948,8 +2985,8 @@ pub fn handle_message_storage_policy_set(cv: &CommunicationValue) -> PolicyMutat
                 changed: Some(changed),
             }
         }
-        Err(_) => PolicyMutation {
-            response: error_response(cv, CommunicationType::ErrorInvalidData),
+        Err(error) => PolicyMutation {
+            response: internal_handler_error(cv, "message_storage_policy.set", error),
             changed: None,
         },
     }
@@ -2970,13 +3007,13 @@ pub fn handle_user_block_check(cv: &CommunicationValue) -> CommunicationValue {
             None => return error_response(cv, CommunicationType::ErrorNotFound),
         },
         Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
-        Err(_) => return error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => return internal_handler_error(cv, "blocked_users.check_contact", error),
     };
     match blocked_users::is_principal_blocked(receiver_id, sender_principal) {
         Ok(blocked) => CommunicationValue::new(CommunicationType::UserBlockCheck)
             .with_request_id(cv)
             .add_typed_default(DataType::IsBlocked, DataValue::Bool(blocked)),
-        Err(_) => error_response(cv, CommunicationType::ErrorInternal),
+        Err(error) => internal_handler_error(cv, "blocked_users.check", error),
     }
 }
 

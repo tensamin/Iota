@@ -171,6 +171,52 @@ impl IpcRole {
 }
 
 impl LocalRequest {
+    pub const fn log_name(&self) -> &'static str {
+        match self {
+            Self::GetStatus => "get_status",
+            Self::ListTasks => "list_tasks",
+            Self::ListUsers => "list_users",
+            Self::ListTAuthApps => "list_tauth_apps",
+            Self::GetTAuthApp { .. } => "get_tauth_app",
+            Self::CreateTAuthApp { .. } => "create_tauth_app",
+            Self::ExportTAuthApp { .. } => "export_tauth_app",
+            Self::DeleteTAuthApp { .. } => "delete_tauth_app",
+            Self::CreateInvitation { .. } => "create_invitation",
+            Self::ListInvitations { .. } => "list_invitations",
+            Self::RevokeInvitation { .. } => "revoke_invitation",
+            Self::CreateUser { .. } => "create_user",
+            Self::InspectTuCredential { .. } => "inspect_tu_credential",
+            Self::AttachUserFromTu { .. } => "attach_user_from_tu",
+            Self::ReconcileUser { .. } => "reconcile_user",
+            Self::ForceDetachUser { .. } => "force_detach_user",
+            Self::ForgetReleasedUser { .. } => "forget_released_user",
+            Self::GetUserDiagnostics { .. } => "get_user_diagnostics",
+            Self::RevokeTAuthGrant { .. } => "revoke_tauth_grant",
+            Self::RevokeAllTAuthGrants { .. } => "revoke_all_tauth_grants",
+            Self::ExportUserCredential { .. } => "export_user_credential",
+            Self::PurgeUserData { .. } => "purge_user_data",
+            Self::ReleaseUser { .. } => "release_user",
+            Self::CompleteDeleteUser { .. } => "complete_delete_user",
+            Self::RemoveUser { .. } => "remove_user",
+            Self::ReconnectOmikron => "reconnect_omikron",
+            Self::RotateIotaIdentity => "rotate_iota_identity",
+            Self::RequestProcessExit { .. } => "request_process_exit",
+            Self::GetDaemonStatus => "get_daemon_status",
+            Self::RestartDaemon => "restart_daemon",
+            Self::StopDaemon => "stop_daemon",
+            Self::GetConfig => "get_config",
+            Self::SetConfig { .. } => "set_config",
+            Self::ReloadConfig => "reload_config",
+            Self::GetOmikronStatus => "get_omikron_status",
+            Self::ListComponents => "list_components",
+            Self::GetUser { .. } => "get_user",
+            Self::ImportUser { .. } => "import_user",
+            Self::GetLogs { .. } => "get_logs",
+            Self::CheckUpdate => "check_update",
+            Self::ListCommunities => "list_communities",
+        }
+    }
+
     /// Return the minimum authenticated local role required to execute a
     /// request. New request variants must be assigned explicitly here.
     pub fn required_role(&self) -> IpcRole {
@@ -618,6 +664,16 @@ mod error_tests {
 
         assert!(!output.contains("private-tu-contents"));
         assert!(output.contains("<redacted>"));
+    }
+
+    #[test]
+    fn request_log_name_does_not_include_config_value() {
+        let request = super::LocalRequest::SetConfig {
+            key: "omikron_host".into(),
+            value: "private-config-value".into(),
+        };
+        assert_eq!(request.log_name(), "set_config");
+        assert!(!request.log_name().contains("private-config-value"));
     }
 
     #[test]
