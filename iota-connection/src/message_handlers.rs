@@ -1,5 +1,6 @@
 use crate::message_common::*;
 use iota_logger::{LogLevel, PrintType, log_event};
+use iota_storage::util::call_envelopes::{self, CallEnvelope};
 use iota_storage::util::chat_files::{self, MessageState};
 use iota_storage::util::chats_util::{self, get_user, has_user, mod_user};
 use iota_storage::util::communities_util::CommunitiesUtil;
@@ -3001,19 +3002,160 @@ pub fn handle_user_block_check(cv: &CommunicationValue) -> CommunicationValue {
     let Some(receiver_id) = data_i64(cv, DataType::ReceiverId).filter(|id| *id > 0) else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
-    let sender_principal = match chats_util::get_user(receiver_id, sender_id) {
-        Ok(Some(contact)) => match contact.principal {
-            Some(principal) => principal,
-            None => return error_response(cv, CommunicationType::ErrorNotFound),
-        },
-        Ok(None) => return error_response(cv, CommunicationType::ErrorNotFound),
-        Err(error) => return internal_handler_error(cv, "blocked_users.check_contact", error),
-    };
-    match blocked_users::is_principal_blocked(receiver_id, sender_principal) {
+    match blocked_users::is_blocked(receiver_id, sender_id) {
         Ok(blocked) => CommunicationValue::new(CommunicationType::UserBlockCheck)
             .with_request_id(cv)
             .add_typed_default(DataType::IsBlocked, DataValue::Bool(blocked)),
         Err(error) => internal_handler_error(cv, "blocked_users.check", error),
+    }
+}
+
+pub fn handle_call_contact_check(cv: &CommunicationValue) -> CommunicationValue {
+    let (Some(sender), Some(recipient)) = (
+        data_i64(cv, DataType::SenderId).filter(|id| *id > 0),
+        data_i64(cv, DataType::ReceiverId).filter(|id| *id > 0),
+    ) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    match chats_util::get_user(sender, recipient) {
+        Ok(contact) => CommunicationValue::new(CommunicationType::CallContactCheck)
+            .with_request_id(cv)
+            .add_typed_default(DataType::IsBlocked, DataValue::Bool(contact.is_some())),
+        Err(error) => internal_handler_error(cv, "call.contact_check", error),
+    }
+}
+
+pub fn handle_call_envelope_store(
+    cv: &CommunicationValue,
+    owner_omikron_id: i64,
+) -> CommunicationValue {
+    let Some(recipient_id) = data_i64(cv, DataType::ReceiverId).filter(|id| *id > 0) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let Some(inviter_id) = data_i64(cv, DataType::CallInviterId).filter(|id| *id > 0) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let Some(call_id) =
+        data_string(cv, DataType::CallId).filter(|id| uuid::Uuid::parse_str(id).is_ok())
+    else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let Some(created_at) = data_i64(cv, DataType::CreatedAt) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let secret_value = cv.get_data(DataType::CallSecret);
+    let Some(secret) = secret_value.as_ref() else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let tm = TypeMap::latest();
+    let field = |dt: DataType| secret.get_field(dt.try_to_id(&tm)?);
+    let (
+        Some(secret_id),
+        Some(version_number),
+        Some(encrypted_secret),
+        Some(kem_ciphertext),
+        Some(wrapping_scheme),
+    ) = (
+        field(DataType::SecretId).and_then(DataValue::as_str),
+        field(DataType::VersionNumber)
+            .and_then(DataValue::as_number)
+            .and_then(|n| i64::try_from(n).ok()),
+        field(DataType::EncryptedSecret).and_then(DataValue::as_bytes),
+        field(DataType::KemCiphertext).and_then(DataValue::as_bytes),
+        field(DataType::WrappingScheme).and_then(DataValue::as_str),
+    )
+    else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    let now = now_millis_i64();
+    let expires_at = created_at.saturating_add(3 * 24 * 60 * 60 * 1000);
+    if created_at > now + 60_000
+        || expires_at <= now
+        || secret_id.len() > 256
+        || encrypted_secret.len() > 1024
+        || kem_ciphertext.len() > 4096
+        || wrapping_scheme.len() > 128
+    {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    }
+    let envelope = CallEnvelope {
+        recipient_id,
+        call_id,
+        owner_omikron_id,
+        inviter_id,
+        created_at,
+        expires_at,
+        secret_id: secret_id.to_string(),
+        version_number,
+        encrypted_secret,
+        kem_ciphertext,
+        wrapping_scheme: wrapping_scheme.to_string(),
+    };
+    match call_envelopes::store(&envelope, now) {
+        Ok(true) => success_response(cv),
+        Ok(false) => error_response(cv, CommunicationType::ErrorNotFound),
+        Err(error) => internal_handler_error(cv, "call.envelope_store", error),
+    }
+}
+
+pub fn handle_call_envelope_get(
+    cv: &CommunicationValue,
+    owner_omikron_id: i64,
+) -> CommunicationValue {
+    let (Some(recipient_id), Some(call_id)) = (
+        data_i64(cv, DataType::ReceiverId).filter(|id| *id > 0),
+        data_string(cv, DataType::CallId).filter(|id| uuid::Uuid::parse_str(id).is_ok()),
+    ) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    match call_envelopes::get(recipient_id, &call_id, owner_omikron_id, now_millis_i64()) {
+        Ok(Some(envelope)) => {
+            let secret = typed_container(vec![
+                (DataType::SecretId, DataValue::Str(envelope.secret_id)),
+                (
+                    DataType::VersionNumber,
+                    DataValue::SignedNumber(envelope.version_number.into()),
+                ),
+                (
+                    DataType::EncryptedSecret,
+                    DataValue::Bytes(envelope.encrypted_secret),
+                ),
+                (
+                    DataType::KemCiphertext,
+                    DataValue::Bytes(envelope.kem_ciphertext),
+                ),
+                (
+                    DataType::WrappingScheme,
+                    DataValue::Str(envelope.wrapping_scheme),
+                ),
+            ]);
+            CommunicationValue::new(CommunicationType::CallEnvelopeGet)
+                .with_request_id(cv)
+                .add_typed_default(DataType::CallSecret, secret)
+                .add_typed_default(
+                    DataType::CallInviterId,
+                    DataValue::SignedNumber(envelope.inviter_id.into()),
+                )
+                .add_typed_default(
+                    DataType::CreatedAt,
+                    DataValue::SignedNumber(envelope.created_at.into()),
+                )
+        }
+        Ok(None) => error_response(cv, CommunicationType::ErrorNotFound),
+        Err(error) => internal_handler_error(cv, "call.envelope_get", error),
+    }
+}
+
+pub fn handle_call_contact_accept(cv: &CommunicationValue) -> CommunicationValue {
+    let (Some(recipient), Some(inviter)) = (
+        data_i64(cv, DataType::ReceiverId).filter(|id| *id > 0),
+        data_i64(cv, DataType::CallInviterId).filter(|id| *id > 0),
+    ) else {
+        return error_response(cv, CommunicationType::ErrorInvalidData);
+    };
+    match add_conversation_for_user(recipient, inviter, None) {
+        Ok(()) => success_response(cv),
+        Err(error) => internal_handler_error(cv, "call.contact_accept", error),
     }
 }
 

@@ -133,6 +133,7 @@ async fn main() -> ExitCode {
         );
     } else {
         runtime.set_component_healthy(iota_ipc::ComponentId::Storage, None);
+        iota_storage::util::call_envelopes::start_expiry_cleanup();
     }
 
     // Bind before migration and service startup: a successful bind is the

@@ -1999,6 +1999,29 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    if current_version < 46 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS call_envelopes (
+                recipient_id INTEGER NOT NULL,
+                call_id TEXT NOT NULL,
+                owner_omikron_id INTEGER NOT NULL,
+                inviter_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                secret_id TEXT NOT NULL,
+                version_number INTEGER NOT NULL,
+                encrypted_secret BLOB NOT NULL,
+                kem_ciphertext BLOB NOT NULL,
+                wrapping_scheme TEXT NOT NULL,
+                PRIMARY KEY (recipient_id, call_id)
+            );
+            CREATE INDEX IF NOT EXISTS call_envelopes_expiry ON call_envelopes (expires_at);
+            PRAGMA user_version = 46;
+            "#,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -2073,7 +2096,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 45);
+        assert_eq!(version, 46);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -2092,7 +2115,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 45);
+        assert_eq!(version, 46);
         for table in [
             "sync_heads",
             "sync_events",
@@ -2173,7 +2196,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 45);
+        assert_eq!(version, 46);
         for column in [
             "id",
             "user_id",
@@ -2268,7 +2291,7 @@ mod tests {
         )?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         assert_eq!(preserved, "remote_committed");
-        assert_eq!(version, 45);
+        assert_eq!(version, 46);
         Ok(())
     }
 
@@ -2306,7 +2329,7 @@ mod tests {
         })?;
         assert_eq!(count, 0);
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 45);
+        assert_eq!(version, 46);
         Ok(())
     }
 

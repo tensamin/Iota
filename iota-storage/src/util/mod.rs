@@ -1,4 +1,5 @@
 pub mod blocked_users;
+pub mod call_envelopes;
 pub mod chat_files;
 pub mod chats_util;
 pub mod client_message_delivery;

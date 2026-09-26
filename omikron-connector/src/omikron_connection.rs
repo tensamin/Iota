@@ -1770,6 +1770,10 @@ impl OmikronConnection {
         dispatch!(MessageStoragePolicyGet, handle_message_storage_policy_get);
         dispatch!(MessageStoragePolicySet, handle_message_storage_policy_set);
         dispatch!(UserBlockCheck, handle_user_block_check);
+        dispatch!(CallContactCheck, handle_call_contact_check);
+        dispatch!(CallEnvelopeStore, handle_call_envelope_store);
+        dispatch!(CallEnvelopeGet, handle_call_envelope_get);
+        dispatch!(CallContactAccept, handle_call_contact_accept);
         dispatch!(EraseHostedUserData, handle_erase_hosted_user_data);
         dispatch!(ProvisionIotaUser, handle_iota_user_provisioning);
     }
@@ -3092,6 +3096,42 @@ impl OmikronConnection {
     async fn handle_user_block_check(self: Arc<Self>, cv: &CommunicationValue) {
         let _ = self
             .send_message(&message_handlers::handle_user_block_check(cv))
+            .await;
+    }
+
+    async fn handle_call_contact_check(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_call_contact_check(cv))
+            .await;
+    }
+
+    async fn handle_call_envelope_store(self: Arc<Self>, cv: &CommunicationValue) {
+        let response = match CONFIG
+            .load()
+            .omikron_id
+            .and_then(|id| i64::try_from(id).ok())
+        {
+            Some(owner) => message_handlers::handle_call_envelope_store(cv, owner),
+            None => error_response(cv, CommunicationType::ErrorInternal),
+        };
+        let _ = self.send_message(&response).await;
+    }
+
+    async fn handle_call_envelope_get(self: Arc<Self>, cv: &CommunicationValue) {
+        let response = match CONFIG
+            .load()
+            .omikron_id
+            .and_then(|id| i64::try_from(id).ok())
+        {
+            Some(owner) => message_handlers::handle_call_envelope_get(cv, owner),
+            None => error_response(cv, CommunicationType::ErrorInternal),
+        };
+        let _ = self.send_message(&response).await;
+    }
+
+    async fn handle_call_contact_accept(self: Arc<Self>, cv: &CommunicationValue) {
+        let _ = self
+            .send_message(&message_handlers::handle_call_contact_accept(cv))
             .await;
     }
 

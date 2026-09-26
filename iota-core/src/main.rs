@@ -106,6 +106,7 @@ async fn main() {
             log!("Failed to initialize user storage: {}", error);
             return;
         }
+        iota_storage::util::call_envelopes::start_expiry_cleanup();
         if let Err(_) = user_manager::load_users_sync() {
             log_t!("user_load_failed");
         }
