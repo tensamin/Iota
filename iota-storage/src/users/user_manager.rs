@@ -91,6 +91,13 @@ fn persist_user_profile(
     tx: &rusqlite::Transaction<'_>,
     user: &UserProfile,
 ) -> Result<(), crate::storage_error::StorageError> {
+    // A password backup for the old account key must never restore a rotated identity.
+    tx.execute(
+        "DELETE FROM user_password_credentials WHERE user_id = ?1 AND EXISTS (
+            SELECT 1 FROM users WHERE user_id = ?1 AND public_key != ?2
+        )",
+        params![user.user_id, user.public_key],
+    )?;
     tx.execute(
         r#"
         INSERT INTO users (user_id, username, public_key, private_key_hash, reset_token, created_at, display_name)
@@ -229,6 +236,10 @@ pub fn revoke_all_tauth_grants(user_id: i64) -> Result<usize, crate::storage_err
 pub fn remove_user(user_id: i64) -> Result<(), crate::storage_error::StorageError> {
     db::with_immediate_transaction(|conn| {
         conn.execute(
+            "DELETE FROM user_password_credentials WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        conn.execute(
             "DELETE FROM tauth_codes WHERE local_user_id = ?1",
             params![user_id],
         )?;
@@ -298,6 +309,12 @@ pub fn finalize_local_release(
             params![user_id],
         )?;
         tx.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
+        // OPAQUE records cannot authenticate against another Iota's ServerSetup.
+        // Reassignment requires enrollment again from an authenticated device.
+        tx.execute(
+            "DELETE FROM user_password_credentials WHERE user_id = ?1",
+            params![user_id],
+        )?;
         tx.execute(
             "UPDATE pending_relays SET delivery_state = 'waiting_client', last_error = 'user_released' WHERE target_kind = 0 AND destination_id = ?1",
             params![user_id],
@@ -577,6 +594,10 @@ pub fn erase_user_locally(user_id: i64) -> Result<(), crate::storage_error::Stor
         )?;
         conn.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
         conn.execute(
+            "DELETE FROM user_password_credentials WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        conn.execute(
             "DELETE FROM user_residency WHERE user_id = ?1",
             params![user_id],
         )?;
@@ -644,7 +665,7 @@ pub fn get_residency_by_id(
 pub fn clear() -> Result<(), crate::storage_error::StorageError> {
     db::with_immediate_transaction(|conn| {
         conn.execute_batch(
-            "DELETE FROM tauth_codes; DELETE FROM tauth_sessions; DELETE FROM tauth_metadata; DELETE FROM tauth_grants; DELETE FROM users; DELETE FROM user_residency;",
+            "DELETE FROM tauth_codes; DELETE FROM tauth_sessions; DELETE FROM tauth_metadata; DELETE FROM tauth_grants; DELETE FROM user_password_credentials; DELETE FROM protected_command_replay; DELETE FROM users; DELETE FROM user_residency;",
         )?;
         Ok(())
     })
@@ -772,8 +793,13 @@ mod tests {
                     credential_origin TEXT NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
+                CREATE TABLE user_password_credentials (
+                    user_id INTEGER PRIMARY KEY,
+                    account_public_key_sha256 BLOB NOT NULL
+                );
                 INSERT INTO users VALUES (1, 'alice', 'old-key', NULL, NULL, 1, NULL);
                 INSERT INTO user_residency VALUES (1, 'alice', 'released', 'empty', 'external', 42);
+                INSERT INTO user_password_credentials VALUES (1, x'00');
                 "#,
             )
             .unwrap();
@@ -789,6 +815,14 @@ mod tests {
         let transaction = connection.transaction().unwrap();
         persist_user_profile(&transaction, &user).unwrap();
         transaction.commit().unwrap();
+        let password_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM user_password_credentials WHERE user_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(password_rows, 0);
 
         let residency: (String, String, String, String, i64) = connection
             .query_row(

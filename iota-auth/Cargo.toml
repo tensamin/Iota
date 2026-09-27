@@ -9,6 +9,10 @@ dashmap = "6.2.1"
 iota-identity = { path = "../iota-identity" }
 mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "bb0f682b735de5ebb36bb41dc699260578341828", features = ["crypto"] }
 rand_core = { version = "0.6", features = ["getrandom", "std"] }
+opaque-ke = { version = "4.0.1", features = ["argon2"] }
+argon2 = "0.5"
+sha2 = "0.10"
+thiserror = "2"
 uuid = { version = "*", features = ["v4"] }
 
 [dev-dependencies]

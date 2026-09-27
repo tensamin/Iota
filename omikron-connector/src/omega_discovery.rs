@@ -13,7 +13,7 @@ pub struct OmikronEndpoint {
     pub public_key: PublicKeyBundle,
 }
 
-fn api_base() -> String {
+pub(crate) fn api_base() -> String {
     env::var("OMEGA_API_URL").unwrap_or_else(|_| OMEGA_API_BASE_DEFAULT.to_string())
 }
 

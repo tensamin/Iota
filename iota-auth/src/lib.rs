@@ -1,3 +1,4 @@
+pub mod password;
 mod principal_auth;
 mod session;
 

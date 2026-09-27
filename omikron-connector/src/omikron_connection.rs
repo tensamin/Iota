@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::client::{OmikronClient, OmikronError};
 use crate::omega_discovery;
+use crate::password_provisioning::PasswordAuthRuntime;
 
 use iota_connection::message_common::*;
 use iota_connection::message_handlers;
@@ -424,9 +425,10 @@ pub struct OmikronConnection {
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     reconnect_on_close: Arc<RwLock<bool>>,
     auth_failure: Arc<RwLock<Option<String>>>,
-    keyring: Arc<RwLock<Option<Arc<Keyring>>>>,
-    http_client: reqwest::Client,
+    pub(super) keyring: Arc<RwLock<Option<Arc<Keyring>>>>,
+    pub(super) http_client: reqwest::Client,
     session_manager: Arc<iota_auth::SessionManager>,
+    pub(super) password_auth: Arc<PasswordAuthRuntime>,
     handler_semaphore: Arc<Semaphore>,
     cancellation: CancellationToken,
     pub(crate) active_tasks: Arc<DashSet<String>>,
@@ -462,6 +464,7 @@ impl OmikronConnection {
             keyring: Arc::new(RwLock::new(None)),
             http_client: reqwest::Client::new(),
             session_manager: Arc::new(iota_auth::SessionManager::default()),
+            password_auth: Arc::new(PasswordAuthRuntime::default()),
             handler_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS)),
             cancellation,
             active_tasks,
@@ -637,6 +640,7 @@ impl OmikronConnection {
             .await
             .map_err(|error| format!("Iota identity initialization failed: {error}"))?;
         let keyring = identity.keyring();
+        self.password_auth.initialize(identity_path())?;
         *self.keyring.write().await = Some(keyring.clone());
 
         let existing_iota_id = CONFIG.load().iota_id;
@@ -1154,6 +1158,12 @@ impl OmikronConnection {
             ) {
                 log!("Relay replay cleanup failed: {}", error);
             }
+            self.password_auth.prune();
+            if let Err(error) = iota_storage::util::protected_replay::prune(
+                now_millis_i64().saturating_sub(7 * 24 * 60 * 60 * 1000),
+            ) {
+                log!("Password command replay cleanup failed: {error}");
+            }
         }
     }
 
@@ -1630,7 +1640,19 @@ impl OmikronConnection {
     // -------------------------------------------------------------------------
 
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
-        log_cv_in!(&cv);
+        if !matches!(
+            cv.get_comm_type_enum(),
+            Some(
+                CommunicationType::PasswordEnrollmentStart
+                    | CommunicationType::PasswordEnrollmentFinish
+                    | CommunicationType::PasswordEnrollmentStatus
+                    | CommunicationType::PasswordEnrollmentDisable
+                    | CommunicationType::PasswordProvisioningStart
+                    | CommunicationType::PasswordProvisioningFinish
+            )
+        ) {
+            log_cv_in!(&cv);
+        }
 
         if cv.is_type(CommunicationType::Success)
             && let Some(frame_id) = cv.id()
@@ -1715,6 +1737,21 @@ impl OmikronConnection {
 
         dispatch!(GetChatSecret, handle_get_chat_secret);
         dispatch!(TAuthAuthorize, handle_tauth_authorize);
+        dispatch!(PasswordEnrollmentStart, handle_password_enrollment_start);
+        dispatch!(PasswordEnrollmentFinish, handle_password_enrollment_finish);
+        dispatch!(PasswordEnrollmentStatus, handle_password_enrollment_status);
+        dispatch!(
+            PasswordEnrollmentDisable,
+            handle_password_enrollment_disable
+        );
+        dispatch!(
+            PasswordProvisioningStart,
+            handle_password_provisioning_start
+        );
+        dispatch!(
+            PasswordProvisioningFinish,
+            handle_password_provisioning_finish
+        );
         dispatch!(TAuthExchangeCode, handle_tauth_exchange_code);
         dispatch!(TAuthUser, handle_tauth_user);
         dispatch!(TAuthContacts, handle_tauth_contacts);
@@ -3587,6 +3624,7 @@ impl OmikronClient for OmikronConnection {
             keyring: self.keyring.clone(),
             http_client: self.http_client.clone(),
             session_manager: self.session_manager.clone(),
+            password_auth: self.password_auth.clone(),
             handler_semaphore: self.handler_semaphore.clone(),
             cancellation: self.cancellation.clone(),
             active_tasks: self.active_tasks.clone(),
@@ -3613,6 +3651,7 @@ impl OmikronClient for OmikronConnection {
             keyring: self.keyring.clone(),
             http_client: self.http_client.clone(),
             session_manager: self.session_manager.clone(),
+            password_auth: self.password_auth.clone(),
             handler_semaphore: self.handler_semaphore.clone(),
             cancellation: self.cancellation.clone(),
             active_tasks: self.active_tasks.clone(),

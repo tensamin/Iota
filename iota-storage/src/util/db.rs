@@ -2022,6 +2022,32 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    if current_version < 47 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE user_password_credentials (
+                user_id INTEGER PRIMARY KEY,
+                protocol_version INTEGER NOT NULL,
+                credential_format_version INTEGER NOT NULL,
+                opaque_record BLOB NOT NULL,
+                encrypted_tu_credential BLOB NOT NULL,
+                account_public_key_sha256 BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE protected_command_replay (
+                signer_id INTEGER NOT NULL,
+                message_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (signer_id, message_id)
+            );
+            CREATE INDEX protected_command_replay_created_at
+                ON protected_command_replay (created_at);
+            PRAGMA user_version = 47;
+            "#,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -2096,7 +2122,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 46);
+        assert_eq!(version, 47);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -2115,7 +2141,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 46);
+        assert_eq!(version, 47);
         for table in [
             "sync_heads",
             "sync_events",
@@ -2135,6 +2161,8 @@ mod tests {
             "principals",
             "principal_keys",
             "identity_configuration",
+            "user_password_credentials",
+            "protected_command_replay",
         ] {
             let exists: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -2196,7 +2224,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 46);
+        assert_eq!(version, 47);
         for column in [
             "id",
             "user_id",
@@ -2291,7 +2319,7 @@ mod tests {
         )?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         assert_eq!(preserved, "remote_committed");
-        assert_eq!(version, 46);
+        assert_eq!(version, 47);
         Ok(())
     }
 
@@ -2329,7 +2357,7 @@ mod tests {
         })?;
         assert_eq!(count, 0);
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 46);
+        assert_eq!(version, 47);
         Ok(())
     }
 
