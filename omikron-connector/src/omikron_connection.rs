@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::client::{OmikronClient, OmikronError};
 use crate::omega_discovery;
-use crate::password_provisioning::PasswordAuthRuntime;
+use crate::password::PasswordAuthRuntime;
 
 use iota_connection::message_common::*;
 use iota_connection::message_handlers;
@@ -631,6 +631,12 @@ impl OmikronConnection {
         }
     }
 
+    fn initialize_password_auth(&self, identity: &Path) {
+        if let Err(error) = self.password_auth.initialize(identity) {
+            log!("Password authentication unavailable: {}", error);
+        }
+    }
+
     async fn connect_once(self: Arc<Self>) -> Result<ConnectionAttemptResult, String> {
         self.set_state(ConnectionState::Connecting).await;
         log_t!("omikron_connecting");
@@ -640,8 +646,8 @@ impl OmikronConnection {
             .await
             .map_err(|error| format!("Iota identity initialization failed: {error}"))?;
         let keyring = identity.keyring();
-        self.password_auth.initialize(identity_path())?;
         *self.keyring.write().await = Some(keyring.clone());
+        self.initialize_password_auth(identity_path());
 
         let existing_iota_id = CONFIG.load().iota_id;
 
@@ -698,6 +704,7 @@ impl OmikronConnection {
         *self.sender.write().await = Some(sender_arc.clone());
         self.set_state(ConnectionState::Connected { identified: true })
             .await;
+        self.password_auth.prune();
 
         // Start read loop
         let connection = Arc::new(connection);
@@ -3671,6 +3678,32 @@ impl OmikronClient for OmikronConnection {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[tokio::test]
+    async fn damaged_password_setup_does_not_invalidate_iota_identity() {
+        let directory = test_path("password-isolation");
+        fs::create_dir(&directory).unwrap();
+        let identity_path = directory.join("identity.keyring");
+        let identity = load_or_migrate_keyring_at(&identity_path, None).unwrap();
+        fs::write(
+            identity_path.with_file_name("password-auth.setup"),
+            b"corrupt setup",
+        )
+        .unwrap();
+        let connection = OmikronConnection::new(
+            Arc::new(DashSet::new()),
+            Arc::new(std::sync::Mutex::new(AppState::new())),
+        );
+        *connection.keyring.write().await = Some(identity.keyring());
+        connection.initialize_password_auth(&identity_path);
+        assert!(connection.keyring.read().await.is_some());
+        assert!(connection.password_auth.setup().is_err());
+        assert_eq!(
+            fs::read(identity_path.with_file_name("password-auth.setup")).unwrap(),
+            b"corrupt setup"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     fn test_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

@@ -2232,6 +2232,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "dashmap",
+ "generic-array",
  "iota-identity",
  "mtp",
  "opaque-ke",
@@ -2240,6 +2241,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -3297,6 +3299,7 @@ dependencies = [
  "iota-util",
  "json",
  "mtp",
+ "opaque-ke",
  "rand_core 0.6.4",
  "reqwest",
  "serde",
@@ -3308,6 +3311,7 @@ dependencies = [
  "trust-dns-resolver",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

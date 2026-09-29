@@ -2027,8 +2027,6 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
             r#"
             CREATE TABLE user_password_credentials (
                 user_id INTEGER PRIMARY KEY,
-                protocol_version INTEGER NOT NULL,
-                credential_format_version INTEGER NOT NULL,
                 opaque_record BLOB NOT NULL,
                 encrypted_tu_credential BLOB NOT NULL,
                 account_public_key_sha256 BLOB NOT NULL,
@@ -2044,6 +2042,49 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
             CREATE INDEX protected_command_replay_created_at
                 ON protected_command_replay (created_at);
             PRAGMA user_version = 47;
+            "#,
+        )?;
+    }
+
+    if current_version < 48 {
+        let has_version_columns: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('user_password_credentials') WHERE name = 'protocol_version')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_version_columns {
+            conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                CREATE TABLE user_password_credentials_unversioned (
+                    user_id INTEGER PRIMARY KEY,
+                    opaque_record BLOB NOT NULL,
+                    encrypted_tu_credential BLOB NOT NULL,
+                    account_public_key_sha256 BLOB NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO user_password_credentials_unversioned
+                    (user_id, opaque_record, encrypted_tu_credential, account_public_key_sha256, created_at, updated_at)
+                    SELECT user_id, opaque_record, encrypted_tu_credential, account_public_key_sha256, created_at, updated_at
+                    FROM user_password_credentials;
+                DROP TABLE user_password_credentials;
+                ALTER TABLE user_password_credentials_unversioned RENAME TO user_password_credentials;
+                PRAGMA user_version = 48;
+                COMMIT;
+                "#,
+            )?;
+        } else {
+            conn.pragma_update(None, "user_version", 48)?;
+        }
+    }
+
+    if current_version < 49 {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE user_password_credentials
+                ADD COLUMN opaque_profile INTEGER NOT NULL DEFAULT 1;
+            PRAGMA user_version = 49;
             "#,
         )?;
     }
@@ -2122,7 +2163,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 47);
+        assert_eq!(version, 49);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -2141,7 +2182,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 47);
+        assert_eq!(version, 49);
         for table in [
             "sync_heads",
             "sync_events",
@@ -2185,6 +2226,94 @@ mod tests {
                 conn.prepare("SELECT 1 FROM pragma_table_info('pending_relays') WHERE name = ?1")?;
             assert!(statement.exists([column])?);
         }
+        let password_columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('user_password_credentials')")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for required in [
+            "user_id",
+            "opaque_profile",
+            "opaque_record",
+            "encrypted_tu_credential",
+            "account_public_key_sha256",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                password_columns.iter().any(|column| column == required),
+                "missing password column {required}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn removes_password_version_columns_without_losing_credentials() -> Result<(), StorageError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE user_password_credentials (
+                user_id INTEGER PRIMARY KEY,
+                protocol_version INTEGER NOT NULL,
+                credential_format_version INTEGER NOT NULL,
+                opaque_record BLOB NOT NULL,
+                encrypted_tu_credential BLOB NOT NULL,
+                account_public_key_sha256 BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO user_password_credentials VALUES (7, 1, 1, x'0102', x'0304', x'0506', 10, 20);
+            PRAGMA user_version = 47;
+            "#,
+        )?;
+
+        run_migrations_on_connection(&conn)?;
+        run_migrations_on_connection(&conn)?;
+
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 49);
+        let credential: (i64, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64) = conn.query_row(
+            "SELECT opaque_profile, opaque_record, encrypted_tu_credential, account_public_key_sha256, created_at, updated_at FROM user_password_credentials WHERE user_id = 7",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )?;
+        assert_eq!(credential, (1, vec![1, 2], vec![3, 4], vec![5, 6], 10, 20));
+        let old_columns: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('user_password_credentials') WHERE name IN ('protocol_version', 'credential_format_version')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(old_columns, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_adds_opaque_profile_to_existing_credentials() -> Result<(), StorageError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE user_password_credentials (
+                user_id INTEGER PRIMARY KEY,
+                opaque_record BLOB NOT NULL,
+                encrypted_tu_credential BLOB NOT NULL,
+                account_public_key_sha256 BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO user_password_credentials VALUES (7, x'0102', x'0304', x'0506', 10, 20);
+            PRAGMA user_version = 48;
+            "#,
+        )?;
+        run_migrations_on_connection(&conn)?;
+        run_migrations_on_connection(&conn)?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 49);
+        let credential: (i64, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64) = conn.query_row(
+            "SELECT opaque_profile, opaque_record, encrypted_tu_credential, account_public_key_sha256, created_at, updated_at FROM user_password_credentials WHERE user_id = 7",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )?;
+        assert_eq!(credential, (1, vec![1, 2], vec![3, 4], vec![5, 6], 10, 20));
         Ok(())
     }
 
@@ -2224,7 +2353,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 47);
+        assert_eq!(version, 49);
         for column in [
             "id",
             "user_id",
@@ -2319,7 +2448,7 @@ mod tests {
         )?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         assert_eq!(preserved, "remote_committed");
-        assert_eq!(version, 47);
+        assert_eq!(version, 49);
         Ok(())
     }
 
@@ -2357,7 +2486,7 @@ mod tests {
         })?;
         assert_eq!(count, 0);
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 47);
+        assert_eq!(version, 49);
         Ok(())
     }
 
