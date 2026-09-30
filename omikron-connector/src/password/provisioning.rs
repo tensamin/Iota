@@ -4,10 +4,10 @@ use std::{
 };
 
 use dashmap::mapref::entry::Entry;
-use iota_auth::password::{self, PasswordServerSetup};
 use iota_storage::users::{password_credentials, user_manager};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::PublicKeyBundle;
+use opague_integration::opaque::{self, PasswordLoginBindingV1, PasswordServerSetup};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -15,7 +15,7 @@ use super::{
     MAX_CREDENTIAL_BYTES, MAX_OPAQUE_BYTES, OmikronConnection, PasswordFinishError, PendingLogin,
     app_protection::{PROVISIONING_CREDENTIAL_ENCRYPTION, PROVISIONING_CREDENTIAL_SIGNATURE},
     runtime::AttemptLease,
-    wire::{bytes, key_fingerprint, positive, public_key, session, typed},
+    wire::{bytes, key_fingerprint, positive, public_key, public_key_fingerprint, session, typed},
 };
 
 struct PreparedPasswordStart {
@@ -84,7 +84,7 @@ impl OmikronConnection {
         }
         let contact_key = public_key(content)?;
         let ke1 = bytes(content, DataType::OpaqueMessage, MAX_OPAQUE_BYTES)?;
-        password::validate_login_request(&ke1).map_err(|error| error.to_string())?;
+        opaque::validate_login_request(&ke1).map_err(|error| error.to_string())?;
         let setup = self
             .password_auth
             .setup()
@@ -127,27 +127,29 @@ impl OmikronConnection {
             tokio::time::sleep(delay).await;
         }
         let principal = self.password_principal(user_id).await?;
-        let context = password::login_context(&principal, iota_id, session_id, &contact_key)
-            .map_err(|error| error.to_string())?;
+        let contact_key_sha256 = public_key_fingerprint(&contact_key)?;
+        let binding = PasswordLoginBindingV1 {
+            principal: &principal,
+            iota_id,
+            session_id,
+            contact_key_sha256: &contact_key_sha256,
+        };
         let credential = password_credentials::get(user_id).map_err(|error| error.to_string())?;
         let compatible_credential = credential
             .as_ref()
-            .filter(|credential| credential.opaque_profile == password::CURRENT_OPAQUE_PROFILE);
-        let response = password::login_start(
+            .filter(|credential| credential.opaque_profile == opaque::CURRENT_OPAQUE_PROFILE);
+        let response = opaque::server_login_start(
             &setup,
             compatible_credential.map(|value| value.opaque_record.as_slice()),
             &ke1,
-            principal.as_bytes(),
-            &password::server_identifier(iota_id),
-            &context,
+            &binding,
         )
         .map_err(|error| error.to_string())?;
         let pending = PendingLogin {
             user_id,
             participant_id,
             contact_key,
-            context,
-            state: response.state,
+            state: Some(response.state),
             real_record: compatible_credential.is_some(),
             created: Instant::now(),
             attempt: Some(attempt),
@@ -250,18 +252,24 @@ impl OmikronConnection {
             .password_principal(pending.user_id)
             .await
             .map_err(|_| PasswordFinishError::CredentialUnavailable)?;
-        match password::login_finish(
-            &pending.state,
-            &ke3,
-            principal.as_bytes(),
-            &password::server_identifier(iota_id),
-            &pending.context,
-        ) {
+        let contact_key_sha256 = public_key_fingerprint(&pending.contact_key)
+            .map_err(|_| PasswordFinishError::InvalidClientMessage)?;
+        let binding = PasswordLoginBindingV1 {
+            principal: &principal,
+            iota_id,
+            session_id: id,
+            contact_key_sha256: &contact_key_sha256,
+        };
+        let state = pending
+            .state
+            .take()
+            .ok_or(PasswordFinishError::InvalidClientMessage)?;
+        match opaque::server_login_finish(state, &ke3, &binding) {
             Ok(()) => {}
-            Err(password::LoginFinishError::AuthenticationFailed) => {
+            Err(opaque::LoginFinishError::AuthenticationFailed) => {
                 return Err(PasswordFinishError::Authentication);
             }
-            Err(password::LoginFinishError::InvalidMessage) => {
+            Err(opaque::LoginFinishError::InvalidMessage) => {
                 return Err(PasswordFinishError::InvalidClientMessage);
             }
         }
@@ -271,7 +279,7 @@ impl OmikronConnection {
         let credential = password_credentials::get(pending.user_id)
             .map_err(|_| PasswordFinishError::Storage)?
             .ok_or(PasswordFinishError::CredentialUnavailable)?;
-        if credential.opaque_profile != password::CURRENT_OPAQUE_PROFILE {
+        if credential.opaque_profile != opaque::CURRENT_OPAQUE_PROFILE {
             return Err(PasswordFinishError::CredentialUnavailable);
         }
         if pending.record_hash.as_deref()
@@ -343,8 +351,6 @@ mod admission_tests {
     use dashmap::DashSet;
     use iota_storage::util::config_util::CONFIG;
     use mtp::crypto::Keyring;
-    use opaque_ke::ClientLogin;
-    use rand_core::OsRng;
     use tokio::sync::Semaphore;
 
     #[tokio::test]
@@ -366,7 +372,7 @@ mod admission_tests {
         connection
             .password_auth
             .setup
-            .set(Arc::new(password::generate_server_setup()))
+            .set(Arc::new(opaque::generate_server_setup()))
             .ok()
             .unwrap();
         let user_id = 777;
@@ -376,11 +382,7 @@ mod admission_tests {
             .unwrap()
             .0
             .failure();
-        let ke1 = ClientLogin::<password::TensaminOpaque>::start(&mut OsRng, b"password")
-            .unwrap()
-            .message
-            .serialize()
-            .to_vec();
+        let ke1 = opaque::client_login_start(b"password").unwrap().request;
         let frame = CommunicationValue::new(CommunicationType::PasswordProvisioningStart)
             .with_id(42)
             .add_typed_default(DataType::Uuid, DataValue::Str(Uuid::new_v4().to_string()))

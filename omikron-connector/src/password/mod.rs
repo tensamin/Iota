@@ -4,8 +4,6 @@ use iota_storage::users::user_manager;
 use mtp::crypto::PublicKeyBundle;
 
 #[cfg(test)]
-use iota_auth::password;
-#[cfg(test)]
 use mtp::codec::{
     CommunicationType, CommunicationValue, DataType, DataValue, ProtectedMessageBuilder,
     ProtectedOpenOptions, ProtectionPolicy, open_protected_with_checked,
@@ -13,15 +11,13 @@ use mtp::codec::{
 #[cfg(test)]
 use mtp::crypto::DualSigner;
 #[cfg(test)]
-use rand_core::OsRng;
+use opague_integration::opaque::{self, PasswordLoginBindingV1};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::time::Instant;
 #[cfg(test)]
 use uuid::Uuid;
-#[cfg(test)]
-use zeroize::Zeroizing;
 
 use crate::omikron_connection::OmikronConnection;
 
@@ -107,10 +103,6 @@ impl OmikronConnection {
 mod tests {
     use super::*;
     use mtp::{codec::InMemoryReplayGuard, crypto::Keyring};
-    use opaque_ke::{
-        ClientLogin, ClientLoginFinishParameters, ClientRegistration,
-        ClientRegistrationFinishParameters, CredentialResponse, Identifiers, RegistrationResponse,
-    };
 
     #[test]
     fn damaged_setup_stays_unavailable() {
@@ -144,8 +136,7 @@ mod tests {
             user_id,
             participant_id: 1,
             contact_key: Keyring::generate().public_key_bundle(),
-            context: vec![],
-            state: Zeroizing::new(vec![]),
+            state: None,
             real_record: false,
             record_hash: None,
             created,
@@ -275,66 +266,37 @@ mod tests {
 
     #[test]
     fn wrong_password_client_stops_after_ke2_and_expiry_consumes_budget() {
-        let setup = password::generate_server_setup();
-        let principal = b"omega-key:example#7";
-        let server = password::server_identifier(11);
-        let identifiers = Identifiers {
-            client: Some(principal),
-            server: Some(&server),
-        };
-        let registration =
-            ClientRegistration::<password::TensaminOpaque>::start(&mut OsRng, b"correct password")
-                .unwrap();
+        let setup = opaque::generate_server_setup();
+        let principal = "omega-key:example#7";
+        let registration = opaque::client_registration_start(b"correct password").unwrap();
         let response =
-            password::registration_start(&setup, &registration.message.serialize(), principal)
+            opaque::server_registration_start(&setup, &registration.request, principal.as_bytes())
                 .unwrap();
-        let upload = registration
-            .state
-            .finish(
-                &mut OsRng,
-                b"correct password",
-                RegistrationResponse::<password::TensaminOpaque>::deserialize(&response).unwrap(),
-                ClientRegistrationFinishParameters::new(identifiers, None),
-            )
-            .unwrap();
-        let record = password::registration_finish(&upload.message.serialize()).unwrap();
+        let upload = registration.state.finish(&response, principal, 11).unwrap();
+        let record = opaque::server_registration_finish(&upload.upload).unwrap();
 
         let runtime = limited_runtime();
         let id = Uuid::new_v4();
         let contact_key = Keyring::generate().public_key_bundle();
-        let context = password::login_context("omega-key:example#7", 11, id, &contact_key).unwrap();
-        let client =
-            ClientLogin::<password::TensaminOpaque>::start(&mut OsRng, b"wrong password").unwrap();
-        let ke2 = password::login_start(
-            &setup,
-            Some(&record),
-            &client.message.serialize(),
+        let fingerprint = wire::public_key_fingerprint(&contact_key).unwrap();
+        let binding = PasswordLoginBindingV1 {
             principal,
-            &server,
-            &context,
-        )
-        .unwrap();
+            iota_id: 11,
+            session_id: id,
+            contact_key_sha256: &fingerprint,
+        };
+        let client = opaque::client_login_start(b"wrong password").unwrap();
+        let ke2 =
+            opaque::server_login_start(&setup, Some(&record), &client.request, &binding).unwrap();
         let (attempt, _) = runtime.begin_attempt(7).unwrap();
-        assert!(
-            client
-                .state
-                .finish(
-                    &mut OsRng,
-                    b"wrong password",
-                    CredentialResponse::<password::TensaminOpaque>::deserialize(&ke2.response)
-                        .unwrap(),
-                    ClientLoginFinishParameters::new(Some(&context), identifiers, None),
-                )
-                .is_err()
-        );
+        assert!(client.state.finish(&ke2.response, &binding).is_err());
         runtime.logins.insert(
             id,
             PendingLogin {
                 user_id: 7,
                 participant_id: 1,
                 contact_key,
-                context,
-                state: ke2.state,
+                state: Some(ke2.state),
                 real_record: true,
                 record_hash: Some(Sha256::digest(&record).to_vec()),
                 created: Instant::now() - runtime.pending_ttl - Duration::from_secs(1),
@@ -349,68 +311,30 @@ mod tests {
 
     #[test]
     fn correct_ke3_releases_the_reserved_account_slot() {
-        let setup = password::generate_server_setup();
-        let principal = b"omega-key:example#7";
-        let server = password::server_identifier(11);
-        let identifiers = Identifiers {
-            client: Some(principal),
-            server: Some(&server),
-        };
-        let registration =
-            ClientRegistration::<password::TensaminOpaque>::start(&mut OsRng, b"correct password")
-                .unwrap();
+        let setup = opaque::generate_server_setup();
+        let principal = "omega-key:example#7";
+        let registration = opaque::client_registration_start(b"correct password").unwrap();
         let response =
-            password::registration_start(&setup, &registration.message.serialize(), principal)
+            opaque::server_registration_start(&setup, &registration.request, principal.as_bytes())
                 .unwrap();
-        let upload = registration
-            .state
-            .finish(
-                &mut OsRng,
-                b"correct password",
-                RegistrationResponse::<password::TensaminOpaque>::deserialize(&response).unwrap(),
-                ClientRegistrationFinishParameters::new(identifiers, None),
-            )
-            .unwrap();
-        let record = password::registration_finish(&upload.message.serialize()).unwrap();
+        let upload = registration.state.finish(&response, principal, 11).unwrap();
+        let record = opaque::server_registration_finish(&upload.upload).unwrap();
         let id = Uuid::new_v4();
-        let context = password::login_context(
-            "omega-key:example#7",
-            11,
-            id,
-            &Keyring::generate().public_key_bundle(),
-        )
-        .unwrap();
-        let client =
-            ClientLogin::<password::TensaminOpaque>::start(&mut OsRng, b"correct password")
-                .unwrap();
-        let ke2 = password::login_start(
-            &setup,
-            Some(&record),
-            &client.message.serialize(),
+        let fingerprint =
+            wire::public_key_fingerprint(&Keyring::generate().public_key_bundle()).unwrap();
+        let binding = PasswordLoginBindingV1 {
             principal,
-            &server,
-            &context,
-        )
-        .unwrap();
+            iota_id: 11,
+            session_id: id,
+            contact_key_sha256: &fingerprint,
+        };
+        let client = opaque::client_login_start(b"correct password").unwrap();
+        let ke2 =
+            opaque::server_login_start(&setup, Some(&record), &client.request, &binding).unwrap();
         let runtime = limited_runtime();
         let (attempt, _) = runtime.begin_attempt(7).unwrap();
-        let ke3 = client
-            .state
-            .finish(
-                &mut OsRng,
-                b"correct password",
-                CredentialResponse::<password::TensaminOpaque>::deserialize(&ke2.response).unwrap(),
-                ClientLoginFinishParameters::new(Some(&context), identifiers, None),
-            )
-            .unwrap();
-        password::login_finish(
-            &ke2.state,
-            &ke3.message.serialize(),
-            principal,
-            &server,
-            &context,
-        )
-        .unwrap();
+        let ke3 = client.state.finish(&ke2.response, &binding).unwrap();
+        opaque::server_login_finish(ke2.state, &ke3.finalization, &binding).unwrap();
         attempt.success();
         assert_eq!(runtime.begin_attempt(7).unwrap().1, Duration::ZERO);
     }

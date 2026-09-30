@@ -1,11 +1,11 @@
 use std::{sync::Arc, time::Instant};
 
-use iota_auth::password;
 use iota_storage::users::{
     password_credentials::{self, PasswordCredential},
     user_manager,
 };
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+use opague_integration::opaque;
 use uuid::Uuid;
 
 use super::{
@@ -48,7 +48,7 @@ impl OmikronConnection {
             .password_auth
             .setup()
             .map_err(|error| error.to_string())?;
-        let response = password::registration_start(&setup, &request, principal.as_bytes())
+        let response = opaque::server_registration_start(&setup, &request, principal.as_bytes())
             .map_err(|error| error.to_string())?;
         let enrollment_id = Uuid::new_v4();
         self.password_auth
@@ -108,7 +108,7 @@ impl OmikronConnection {
             MAX_CREDENTIAL_BYTES,
         )?;
         let opaque_record =
-            password::registration_finish(&upload).map_err(|error| error.to_string())?;
+            opaque::server_registration_finish(&upload).map_err(|error| error.to_string())?;
         let profile = user_manager::get_user(user_id)
             .map_err(|error| error.to_string())?
             .ok_or("account not hosted")?;
@@ -116,7 +116,7 @@ impl OmikronConnection {
         let now = now_millis() as i64;
         password_credentials::upsert(&PasswordCredential {
             user_id,
-            opaque_profile: password::CURRENT_OPAQUE_PROFILE,
+            opaque_profile: opaque::CURRENT_OPAQUE_PROFILE,
             opaque_record,
             encrypted_tu_credential: encrypted,
             account_public_key_sha256: fingerprint,
@@ -148,7 +148,7 @@ impl OmikronConnection {
             let enabled = password_credentials::get(user_id)
                 .map_err(|error| error.to_string())?
                 .is_some_and(|credential| {
-                    credential.opaque_profile == password::CURRENT_OPAQUE_PROFILE
+                    credential.opaque_profile == opaque::CURRENT_OPAQUE_PROFILE
                 });
             self.protected_response(
                 frame,

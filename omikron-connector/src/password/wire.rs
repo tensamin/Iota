@@ -75,5 +75,10 @@ pub(super) fn public_key(content: &DataValue) -> Result<PublicKeyBundle, String>
 
 pub(super) fn key_fingerprint(encoded: &str) -> Result<Vec<u8>, String> {
     let bundle = PublicKeyBundle::from_base64(encoded).map_err(|error| error.to_string())?;
-    Ok(Sha256::digest(bundle.try_as_bytes().map_err(|error| error.to_string())?).to_vec())
+    Ok(public_key_fingerprint(&bundle)?.to_vec())
+}
+
+pub(super) fn public_key_fingerprint(bundle: &PublicKeyBundle) -> Result<[u8; 32], String> {
+    let bytes = bundle.try_as_bytes().map_err(|error| error.to_string())?;
+    Ok(Sha256::digest(bytes).into())
 }

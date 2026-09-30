@@ -5,19 +5,17 @@ use std::{
 };
 
 use dashmap::DashMap;
-use iota_auth::password::{self, PasswordServerSetup};
 use iota_storage::users::password_credentials;
 use mtp::crypto::PublicKeyBundle;
+use opague_integration::opaque::{self, PasswordServerSetup, ServerLoginState};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 pub(super) struct PendingLogin {
     pub(super) user_id: i64,
     pub(super) participant_id: u64,
     pub(super) contact_key: PublicKeyBundle,
-    pub(super) context: Vec<u8>,
-    pub(super) state: password::SerializedLoginState,
+    pub(super) state: Option<ServerLoginState>,
     pub(super) real_record: bool,
     pub(super) record_hash: Option<Vec<u8>>,
     pub(super) created: Instant,
@@ -150,14 +148,15 @@ impl PasswordAuthRuntime {
         }
         let path = identity.with_file_name("password-auth.setup");
         let setup = match std::fs::read(&path) {
-            Ok(bytes) => password::deserialize_server_setup_owned(bytes)
-                .map_err(|error| error.to_string())?,
+            Ok(bytes) => {
+                opaque::deserialize_server_setup_owned(bytes).map_err(|error| error.to_string())?
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if password_credentials::any().map_err(|error| error.to_string())? {
                     return Err("OPAQUE setup is missing while password credentials exist".into());
                 }
-                let setup = password::generate_server_setup();
-                let serialized = Zeroizing::new(password::serialize_server_setup(&setup));
+                let setup = opaque::generate_server_setup();
+                let serialized = opaque::serialize_server_setup(&setup);
                 iota_util::atomic_file::replace_private(&path, &serialized, 0)
                     .map_err(|error| error.to_string())?;
                 setup
