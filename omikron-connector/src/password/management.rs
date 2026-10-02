@@ -1,16 +1,17 @@
 use std::{sync::Arc, time::Instant};
 
+use iota_opaque::{credential, opaque};
 use iota_storage::users::{
     password_credentials::{self, PasswordCredential},
     user_manager,
 };
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
-use opague_integration::opaque;
 use uuid::Uuid;
 
 use super::{
     MAX_CREDENTIAL_BYTES, MAX_OPAQUE_BYTES, OmikronConnection,
     app_protection::{PASSWORD_RESPONSE_ENCRYPTION, PASSWORD_RESPONSE_SIGNATURE},
+    runtime::PendingEnrollment,
     wire::{bytes, key_fingerprint, now_millis, session, typed},
 };
 
@@ -39,9 +40,7 @@ impl OmikronConnection {
             .open_password_command(frame, CommunicationType::PasswordEnrollmentStart)
             .await?;
         let user_id = i64::try_from(opened.signer_id()).map_err(|error| error.to_string())?;
-        if self.password_auth.enrollments.len() >= self.password_auth.max_pending {
-            return Err("too many enrollments".into());
-        }
+        let permit = self.password_auth.begin_enrollment()?;
         let principal = self.password_principal(user_id).await?;
         let request = bytes(opened.content(), DataType::OpaqueMessage, MAX_OPAQUE_BYTES)?;
         let setup = self
@@ -51,21 +50,28 @@ impl OmikronConnection {
         let response = opaque::server_registration_start(&setup, &request, principal.as_bytes())
             .map_err(|error| error.to_string())?;
         let enrollment_id = Uuid::new_v4();
-        self.password_auth
-            .enrollments
-            .insert(enrollment_id, (user_id, Instant::now()));
-        self.protected_response(
-            frame,
-            CommunicationType::PasswordEnrollmentResponse,
-            user_id,
-            DataValue::Container(vec![
-                typed(DataType::Uuid, DataValue::Str(enrollment_id.to_string()))?,
-                typed(DataType::OpaqueMessage, DataValue::Bytes(response))?,
-            ]),
-            PASSWORD_RESPONSE_SIGNATURE,
-            PASSWORD_RESPONSE_ENCRYPTION,
-        )
-        .await
+        let response = self
+            .protected_response(
+                frame,
+                CommunicationType::PasswordEnrollmentResponse,
+                user_id,
+                DataValue::Container(vec![
+                    typed(DataType::Uuid, DataValue::Str(enrollment_id.to_string()))?,
+                    typed(DataType::OpaqueMessage, DataValue::Bytes(response))?,
+                ]),
+                PASSWORD_RESPONSE_SIGNATURE,
+                PASSWORD_RESPONSE_ENCRYPTION,
+            )
+            .await?;
+        self.password_auth.enrollments.insert(
+            enrollment_id,
+            PendingEnrollment {
+                user_id,
+                created: Instant::now(),
+                _permit: permit,
+            },
+        );
+        Ok(response)
     }
 
     pub(crate) async fn handle_password_enrollment_finish(
@@ -93,12 +99,13 @@ impl OmikronConnection {
             .await?;
         let user_id = i64::try_from(opened.signer_id()).map_err(|error| error.to_string())?;
         let enrollment_id = session(opened.content())?;
-        let (_, (pending_user, started)) = self
+        let (_, pending) = self
             .password_auth
             .enrollments
             .remove(&enrollment_id)
             .ok_or("enrollment expired")?;
-        if pending_user != user_id || started.elapsed() >= self.password_auth.pending_ttl {
+        if pending.user_id != user_id || pending.created.elapsed() >= self.password_auth.pending_ttl
+        {
             return Err("enrollment mismatch".into());
         }
         let upload = bytes(opened.content(), DataType::OpaqueMessage, MAX_OPAQUE_BYTES)?;
@@ -107,6 +114,7 @@ impl OmikronConnection {
             DataType::EncryptedCredential,
             MAX_CREDENTIAL_BYTES,
         )?;
+        credential::validate_envelope(&encrypted).map_err(|error| error.to_string())?;
         let opaque_record =
             opaque::server_registration_finish(&upload).map_err(|error| error.to_string())?;
         let profile = user_manager::get_user(user_id)

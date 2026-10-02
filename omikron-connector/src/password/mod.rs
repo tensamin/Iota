@@ -1,8 +1,9 @@
 use std::time::Duration;
 
-use iota_storage::users::user_manager;
 use mtp::crypto::PublicKeyBundle;
 
+#[cfg(test)]
+use iota_opaque::opaque::{self, PasswordLoginBindingV1};
 #[cfg(test)]
 use mtp::codec::{
     CommunicationType, CommunicationValue, DataType, DataValue, ProtectedMessageBuilder,
@@ -10,8 +11,6 @@ use mtp::codec::{
 };
 #[cfg(test)]
 use mtp::crypto::DualSigner;
-#[cfg(test)]
-use opague_integration::opaque::{self, PasswordLoginBindingV1};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 #[cfg(test)]
@@ -53,12 +52,8 @@ impl OmikronConnection {
     // Password login uses Omega's key-scoped principal, including for accounts
     // whose older hosted-principal record still uses the legacy host locator.
     async fn password_principal(&self, user_id: i64) -> Result<String, String> {
-        if user_id <= 0
-            || user_manager::get_user(user_id)
-                .map_err(|error| error.to_string())?
-                .is_none()
-        {
-            return Err("account not hosted".into());
+        if user_id <= 0 {
+            return Err("invalid user ID".into());
         }
         let authority = if let Some(cached) = self.password_auth.omega_authority.get() {
             cached.clone()

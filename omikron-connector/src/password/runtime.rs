@@ -5,9 +5,9 @@ use std::{
 };
 
 use dashmap::DashMap;
+use iota_opaque::opaque::{self, PasswordServerSetup, ServerLoginState};
 use iota_storage::users::password_credentials;
 use mtp::crypto::PublicKeyBundle;
-use opague_integration::opaque::{self, PasswordServerSetup, ServerLoginState};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
@@ -20,6 +20,12 @@ pub(super) struct PendingLogin {
     pub(super) record_hash: Option<Vec<u8>>,
     pub(super) created: Instant,
     pub(super) attempt: Option<AttemptLease>,
+}
+
+pub(super) struct PendingEnrollment {
+    pub(super) user_id: i64,
+    pub(super) created: Instant,
+    pub(super) _permit: OwnedSemaphorePermit,
 }
 
 #[derive(Debug)]
@@ -85,10 +91,13 @@ pub(crate) struct PasswordAuthRuntime {
     pub(super) setup: OnceLock<Arc<PasswordServerSetup>>,
     pub(super) omega_authority: OnceLock<String>,
     pub(super) logins: DashMap<Uuid, PendingLogin>,
-    pub(super) enrollments: DashMap<Uuid, (i64, Instant)>,
+    pub(super) enrollments: DashMap<Uuid, PendingEnrollment>,
     pub(super) attempts: DashMap<i64, AccountAttemptState>,
+    #[cfg(test)]
     pub(super) max_pending: usize,
     exchange_slots: Arc<Semaphore>,
+    enrollment_slots: Arc<Semaphore>,
+    blocking_slots: Arc<Semaphore>,
     pub(super) pending_ttl: Duration,
     pub(super) throttle: PasswordThrottleConfig,
 }
@@ -104,14 +113,22 @@ fn configured_positive<T: std::str::FromStr + PartialOrd + Default>(name: &str, 
 impl Default for PasswordAuthRuntime {
     fn default() -> Self {
         let max_pending = configured_positive("PASSWORD_MAX_PENDING_EXCHANGES", 1024);
+        let blocking_workers = configured_positive(
+            "PASSWORD_MAX_BLOCKING_WORKERS",
+            std::thread::available_parallelism().map_or(1, usize::from),
+        )
+        .min(max_pending);
         Self {
             setup: OnceLock::new(),
             omega_authority: OnceLock::new(),
             logins: DashMap::new(),
             enrollments: DashMap::new(),
             attempts: DashMap::new(),
+            #[cfg(test)]
             max_pending,
             exchange_slots: Arc::new(Semaphore::new(max_pending)),
+            enrollment_slots: Arc::new(Semaphore::new(max_pending)),
+            blocking_slots: Arc::new(Semaphore::new(blocking_workers)),
             pending_ttl: Duration::from_secs(configured_positive(
                 "PASSWORD_PENDING_TTL_SECONDS",
                 180,
@@ -135,6 +152,32 @@ impl Default for PasswordAuthRuntime {
 }
 
 impl PasswordAuthRuntime {
+    pub(super) fn begin_enrollment(&self) -> Result<OwnedSemaphorePermit, String> {
+        self.enrollment_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "too many enrollments".into())
+    }
+
+    pub(super) async fn run_blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, String> {
+        let permit = self
+            .blocking_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| error.to_string())?;
+        tokio::task::spawn_blocking(move || {
+            // Keep capacity reserved even if the awaiting task is cancelled.
+            let _permit = permit;
+            work()
+        })
+        .await
+        .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn setup(&self) -> Result<Arc<PasswordServerSetup>, PasswordRuntimeError> {
         self.setup
             .get()
@@ -183,7 +226,7 @@ impl PasswordAuthRuntime {
             }
         }
         self.enrollments
-            .retain(|_, (_, created)| created.elapsed() < self.pending_ttl);
+            .retain(|_, pending| pending.created.elapsed() < self.pending_ttl);
         self.attempts.retain(|_, state| {
             state.in_flight > 0 || state.window_started.elapsed() < self.throttle.failure_window
         });

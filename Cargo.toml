@@ -23,6 +23,7 @@ members = [
     "iota-paths",
     "iota-installer",
     "iota-core",
+    "iota-opaque",
 ]
 exclude = ["communities"]
 resolver = "3"

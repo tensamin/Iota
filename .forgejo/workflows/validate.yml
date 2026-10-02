@@ -1,0 +1,34 @@
+name: Validate authentication
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  NIX_CONFIG: experimental-features = nix-command flakes
+
+jobs:
+  authentication:
+    name: Validate authentication
+    runs-on: host
+    steps:
+      - name: Set up repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check formatting
+        run: nix develop -c cargo fmt -p iota-opaque -p omikron-connector --check
+
+      - name: Check OPAQUE lints
+        run: nix develop -c cargo clippy -p iota-opaque --locked --all-targets --all-features -- -D warnings -W unreachable-pub
+
+      - name: Check connector lints
+        run: nix develop -c cargo clippy -p omikron-connector --locked --all-targets --all-features
+
+      - name: Run authentication tests
+        run: nix develop -c cargo test -p iota-opaque -p omikron-connector --locked --all-features
+
+      - name: Check release binaries
+        run: nix develop -c cargo check -p iota -p iota-daemon -p iota-updater -p iota-installer --locked

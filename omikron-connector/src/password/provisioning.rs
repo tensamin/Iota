@@ -4,10 +4,13 @@ use std::{
 };
 
 use dashmap::mapref::entry::Entry;
+use iota_opaque::{
+    credential,
+    opaque::{self, PasswordLoginBindingV1, PasswordServerSetup},
+};
 use iota_storage::users::{password_credentials, user_manager};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::PublicKeyBundle;
-use opague_integration::opaque::{self, PasswordLoginBindingV1, PasswordServerSetup};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -127,35 +130,44 @@ impl OmikronConnection {
             tokio::time::sleep(delay).await;
         }
         let principal = self.password_principal(user_id).await?;
-        let contact_key_sha256 = public_key_fingerprint(&contact_key)?;
-        let binding = PasswordLoginBindingV1 {
-            principal: &principal,
-            iota_id,
-            session_id,
-            contact_key_sha256: &contact_key_sha256,
-        };
-        let credential = password_credentials::get(user_id).map_err(|error| error.to_string())?;
-        let compatible_credential = credential
-            .as_ref()
-            .filter(|credential| credential.opaque_profile == opaque::CURRENT_OPAQUE_PROFILE);
-        let response = opaque::server_login_start(
-            &setup,
-            compatible_credential.map(|value| value.opaque_record.as_slice()),
-            &ke1,
-            &binding,
-        )
-        .map_err(|error| error.to_string())?;
-        let pending = PendingLogin {
-            user_id,
-            participant_id,
-            contact_key,
-            state: Some(response.state),
-            real_record: compatible_credential.is_some(),
-            created: Instant::now(),
-            attempt: Some(attempt),
-            record_hash: compatible_credential
-                .map(|value| Sha256::digest(&value.opaque_record).to_vec()),
-        };
+        let (response, pending) = self
+            .password_auth
+            .run_blocking(move || {
+                let contact_key_sha256 = public_key_fingerprint(&contact_key)?;
+                let binding = PasswordLoginBindingV1 {
+                    principal: &principal,
+                    iota_id,
+                    session_id,
+                    contact_key_sha256: &contact_key_sha256,
+                };
+                // Run the same lookups for every account and use a dummy record when absent.
+                let profile = user_manager::get_user(user_id).map_err(|error| error.to_string())?;
+                let credential =
+                    password_credentials::get(user_id).map_err(|error| error.to_string())?;
+                let compatible_credential = credential.as_ref().filter(|credential| {
+                    profile.is_some() && credential.opaque_profile == opaque::CURRENT_OPAQUE_PROFILE
+                });
+                let response = opaque::server_login_start(
+                    &setup,
+                    compatible_credential.map(|value| value.opaque_record.as_slice()),
+                    &ke1,
+                    &binding,
+                )
+                .map_err(|error| error.to_string())?;
+                let pending = PendingLogin {
+                    user_id,
+                    participant_id,
+                    contact_key,
+                    state: Some(response.state),
+                    real_record: compatible_credential.is_some(),
+                    created: Instant::now(),
+                    attempt: Some(attempt),
+                    record_hash: compatible_credential
+                        .map(|value| Sha256::digest(&value.opaque_record).to_vec()),
+                };
+                Ok::<_, String>((response.response, pending))
+            })
+            .await??;
         match self.password_auth.logins.entry(session_id) {
             Entry::Vacant(slot) => {
                 slot.insert(pending);
@@ -168,7 +180,7 @@ impl OmikronConnection {
             CommunicationValue::new(CommunicationType::PasswordProvisioningResponse)
                 .with_id(request_id)
                 .add_typed_default(DataType::Uuid, DataValue::Str(session_id.to_string()))
-                .add_typed_default(DataType::OpaqueMessage, DataValue::Bytes(response.response)),
+                .add_typed_default(DataType::OpaqueMessage, DataValue::Bytes(response)),
         )
     }
 
@@ -252,55 +264,71 @@ impl OmikronConnection {
             .password_principal(pending.user_id)
             .await
             .map_err(|_| PasswordFinishError::CredentialUnavailable)?;
-        let contact_key_sha256 = public_key_fingerprint(&pending.contact_key)
-            .map_err(|_| PasswordFinishError::InvalidClientMessage)?;
-        let binding = PasswordLoginBindingV1 {
-            principal: &principal,
-            iota_id,
-            session_id: id,
-            contact_key_sha256: &contact_key_sha256,
-        };
         let state = pending
             .state
             .take()
             .ok_or(PasswordFinishError::InvalidClientMessage)?;
-        match opaque::server_login_finish(state, &ke3, &binding) {
-            Ok(()) => {}
-            Err(opaque::LoginFinishError::AuthenticationFailed) => {
-                return Err(PasswordFinishError::Authentication);
-            }
-            Err(opaque::LoginFinishError::InvalidMessage) => {
-                return Err(PasswordFinishError::InvalidClientMessage);
-            }
-        }
-        if !pending.real_record {
-            return Err(PasswordFinishError::Authentication);
-        }
-        let credential = password_credentials::get(pending.user_id)
-            .map_err(|_| PasswordFinishError::Storage)?
-            .ok_or(PasswordFinishError::CredentialUnavailable)?;
-        if credential.opaque_profile != opaque::CURRENT_OPAQUE_PROFILE {
-            return Err(PasswordFinishError::CredentialUnavailable);
-        }
-        if pending.record_hash.as_deref()
-            != Some(Sha256::digest(&credential.opaque_record).as_slice())
-        {
-            return Err(PasswordFinishError::CredentialChanged);
-        }
+        let user_id = pending.user_id;
+        let contact_key = pending.contact_key.clone();
+        let real_record = pending.real_record;
+        let record_hash = pending.record_hash.clone();
+        let created = pending.created;
+        let pending_ttl = self.password_auth.pending_ttl;
+        let credential = self
+            .password_auth
+            .run_blocking(move || {
+                if created.elapsed() >= pending_ttl {
+                    return Err(PasswordFinishError::BindingMismatch);
+                }
+                let contact_key_sha256 = public_key_fingerprint(&contact_key)
+                    .map_err(|_| PasswordFinishError::InvalidClientMessage)?;
+                let binding = PasswordLoginBindingV1 {
+                    principal: &principal,
+                    iota_id,
+                    session_id: id,
+                    contact_key_sha256: &contact_key_sha256,
+                };
+                match opaque::server_login_finish(state, &ke3, &binding) {
+                    Ok(()) => {}
+                    Err(opaque::LoginFinishError::AuthenticationFailed) => {
+                        return Err(PasswordFinishError::Authentication);
+                    }
+                    Err(opaque::LoginFinishError::InvalidMessage) => {
+                        return Err(PasswordFinishError::InvalidClientMessage);
+                    }
+                }
+                if !real_record {
+                    return Err(PasswordFinishError::Authentication);
+                }
+                let credential = password_credentials::get(user_id)
+                    .map_err(|_| PasswordFinishError::Storage)?
+                    .ok_or(PasswordFinishError::CredentialUnavailable)?;
+                if credential.opaque_profile != opaque::CURRENT_OPAQUE_PROFILE {
+                    return Err(PasswordFinishError::CredentialUnavailable);
+                }
+                if record_hash.as_deref()
+                    != Some(Sha256::digest(&credential.opaque_record).as_slice())
+                {
+                    return Err(PasswordFinishError::CredentialChanged);
+                }
+                let profile = user_manager::get_user(user_id)
+                    .map_err(|_| PasswordFinishError::Storage)?
+                    .ok_or(PasswordFinishError::CredentialUnavailable)?;
+                if credential.account_public_key_sha256
+                    != key_fingerprint(&profile.public_key)
+                        .map_err(|_| PasswordFinishError::CredentialUnavailable)?
+                    || credential.encrypted_tu_credential.len() > MAX_CREDENTIAL_BYTES
+                    || credential::validate_envelope(&credential.encrypted_tu_credential).is_err()
+                {
+                    return Err(PasswordFinishError::CredentialUnavailable);
+                }
+                Ok(credential)
+            })
+            .await
+            .map_err(|_| PasswordFinishError::Storage)??;
         // Only the same registered credential can clear password pressure.
         if let Some(attempt) = pending.attempt.take() {
             attempt.success();
-        }
-        let profile = user_manager::get_user(pending.user_id)
-            .map_err(|_| PasswordFinishError::Storage)?
-            .ok_or(PasswordFinishError::CredentialUnavailable)?;
-        if credential.account_public_key_sha256
-            != key_fingerprint(&profile.public_key)
-                .map_err(|_| PasswordFinishError::CredentialUnavailable)?
-            || credential.encrypted_tu_credential.is_empty()
-            || credential.encrypted_tu_credential.len() > MAX_CREDENTIAL_BYTES
-        {
-            return Err(PasswordFinishError::CredentialUnavailable);
         }
         let wire =
             |kind, value| typed(kind, value).map_err(|_| PasswordFinishError::InvalidClientMessage);

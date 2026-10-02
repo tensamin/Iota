@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-opague-integration = { git = "https://git.methanium.net/tensamin/opaque-integration.git", rev = "d996c29366429160103e2a3f99c3e435522456f0" }
+iota-opaque = { path = "../iota-opaque" }
 async-trait = "0.1.89"
 iota-connection = { path = "../iota-connection" }
 iota-auth = { path = "../iota-auth" }

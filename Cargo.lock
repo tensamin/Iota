@@ -2393,6 +2393,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "iota-opaque"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "chacha20poly1305",
+ "generic-array",
+ "hex",
+ "hkdf 0.12.4",
+ "opaque-ke",
+ "rand_core 0.6.4",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "iota-paths"
 version = "0.1.0"
 
@@ -3288,12 +3306,12 @@ dependencies = [
  "iota-connection",
  "iota-identity",
  "iota-logger",
+ "iota-opaque",
  "iota-state",
  "iota-storage",
  "iota-util",
  "json",
  "mtp",
- "opague-integration",
  "rand_core 0.6.4",
  "reqwest",
  "serde",
@@ -3318,32 +3336,6 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
-
-[[package]]
-name = "opague-integration"
-version = "0.1.0"
-source = "git+https://git.methanium.net/tensamin/opaque-integration.git?rev=d996c29366429160103e2a3f99c3e435522456f0#d996c29366429160103e2a3f99c3e435522456f0"
-dependencies = [
- "opague-integration-core",
-]
-
-[[package]]
-name = "opague-integration-core"
-version = "0.1.0"
-source = "git+https://git.methanium.net/tensamin/opaque-integration.git?rev=d996c29366429160103e2a3f99c3e435522456f0#d996c29366429160103e2a3f99c3e435522456f0"
-dependencies = [
- "argon2",
- "chacha20poly1305",
- "generic-array",
- "getrandom 0.2.17",
- "hkdf 0.12.4",
- "opaque-ke",
- "rand_core 0.6.4",
- "sha2 0.10.9",
- "thiserror 2.0.20",
- "uuid",
- "zeroize",
-]
 
 [[package]]
 name = "opaque-debug"
