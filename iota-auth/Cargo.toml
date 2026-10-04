@@ -7,7 +7,7 @@ edition = "2024"
 async-trait = "0.1.89"
 dashmap = "6.2.1"
 iota-identity = { path = "../iota-identity" }
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "2a2f956910ccef759e950b3e3296d8e5d6b9cddf", features = ["crypto"] }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "ad489265deacadd6de52ed2129d071803a0e7247", features = ["crypto"] }
 rand_core = { version = "0.6", features = ["getrandom", "std"] }
 uuid = { version = "*", features = ["v4"] }
 
