@@ -355,6 +355,11 @@ struct UpdateArgs {
 #[derive(Subcommand, Debug)]
 enum UpdateAction {
     Check,
+    Apply,
+    Channel {
+        #[arg(value_parser = ["stable", "canary"])]
+        channel: Option<String>,
+    },
 }
 #[derive(Args, Debug)]
 struct CommunityArgs {
@@ -523,6 +528,10 @@ pub enum Command {
         limit: usize,
     },
     UpdateCheck,
+    UpdateApply,
+    UpdateChannel {
+        channel: Option<String>,
+    },
     CommunityList,
     TermsStatus {
         system: bool,
@@ -710,6 +719,8 @@ impl CliInvocation {
             Some(CliCommand::Logs { limit }) => Command::Logs { limit },
             Some(CliCommand::Update(update)) => match update.action {
                 UpdateAction::Check => Command::UpdateCheck,
+                UpdateAction::Apply => Command::UpdateApply,
+                UpdateAction::Channel { channel } => Command::UpdateChannel { channel },
             },
             Some(CliCommand::Community(community)) => match community.action {
                 CommunityAction::List => Command::CommunityList,

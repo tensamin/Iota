@@ -1,3 +1,4 @@
+pub mod config;
 pub mod manifest;
 pub mod transaction;
 
@@ -80,9 +81,10 @@ struct UpdatePolicy {
 
 impl UpdatePolicy {
     fn from_environment() -> Result<Self> {
+        let config = config::load()?;
         Ok(Self {
-            channel: required_environment(CHANNEL_ENV)?,
-            signing_key_id: required_environment(SIGNING_KEY_ID_ENV)?,
+            channel: config[CHANNEL_ENV].clone(),
+            signing_key_id: config[SIGNING_KEY_ID_ENV].clone(),
             activation: ActivationPolicy::from_environment()?,
         })
     }
@@ -105,6 +107,8 @@ struct PendingActivation {
     product_version: String,
     daemon_was_active: bool,
     selected: bool,
+    #[serde(default)]
+    existing_target: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -172,21 +176,21 @@ impl DaemonSupervisor for SystemdSupervisor {
 }
 
 pub async fn check_update() -> Result<bool> {
+    let paths = iota_paths::IotaPaths::resolve(iota_paths::Scope::System)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let transaction = UpdateTransaction::from_paths(&paths)?;
+    let _lock = transaction.acquire()?;
+    let policy = UpdatePolicy::from_environment()?;
     let Some(release) = configured_release().await? else {
         return Ok(false);
     };
-    let paths = iota_paths::IotaPaths::resolve(iota_paths::Scope::System)
-        .map_err(|error| anyhow::anyhow!(error))?;
-    let policy = UpdatePolicy::from_environment()?;
-    let transaction = UpdateTransaction::from_paths(&paths)?;
-    let _lock = transaction.acquire()?;
     let state = load_or_initialize_update_state(&paths)?;
     if state.pending_activation.is_some() {
         bail!("an interrupted update requires iota-updater apply recovery");
     }
     let decision = evaluate_candidate(
         &release.manifest,
-        current_version(&paths.install_root)?.as_deref(),
+        current_channel_version(&paths.install_root, &policy.channel)?.as_deref(),
         state.channels.get(&policy.channel),
         &policy.channel,
         &policy.signing_key_id,
@@ -214,6 +218,12 @@ async fn apply_update_with_observer(
 ) -> Result<bool> {
     let transaction = UpdateTransaction::from_paths(paths)?;
     let _lock = transaction.acquire()?;
+    let configured_policy = UpdatePolicy::from_environment()?;
+    if policy.channel != configured_policy.channel
+        || policy.signing_key_id != configured_policy.signing_key_id
+    {
+        bail!("update configuration changed; retry apply");
+    }
     let mut state = load_or_initialize_update_state(paths)?;
     recover_interrupted_activation(
         paths,
@@ -228,7 +238,7 @@ async fn apply_update_with_observer(
     };
     let decision = evaluate_candidate(
         &release.manifest,
-        current_version(&paths.install_root)?.as_deref(),
+        current_channel_version(&paths.install_root, &policy.channel)?.as_deref(),
         state.channels.get(&policy.channel),
         &policy.channel,
         &policy.signing_key_id,
@@ -281,7 +291,24 @@ async fn apply_update_with_observer(
         UpdatePhase::ActivationStarted,
         Some(&release.manifest.product_version),
     );
-    let activation = match transaction.activate(&release.manifest.product_version) {
+    let activation = match if state
+        .pending_activation
+        .as_ref()
+        .is_some_and(|pending| pending.existing_target)
+    {
+        let previous_target = transaction.current_target()?;
+        transaction
+            .rollback(&release.manifest.product_version)
+            .map(|()| Activation {
+                previous_target,
+                new_target: transaction
+                    .root
+                    .join("versions")
+                    .join(&release.manifest.product_version),
+            })
+    } else {
+        transaction.activate(&release.manifest.product_version)
+    } {
         Ok(activation) => activation,
         Err(error) => {
             remove_unselected_candidate(&state, &transaction.root)?;
@@ -395,7 +422,7 @@ fn remove_unselected_candidate(state: &UpdateState, install_root: &Path) -> Resu
         return Ok(());
     };
     validate_pending_candidate(pending, install_root)?;
-    if pending.new_target.exists() {
+    if !pending.existing_target && pending.new_target.exists() {
         fs::remove_dir_all(&pending.new_target).with_context(|| {
             format!(
                 "remove unselected candidate release {}",
@@ -430,8 +457,20 @@ fn begin_activation_state(
         .root
         .join("versions")
         .join(&manifest.product_version);
-    if new_target.exists() {
-        bail!("release version already exists: {}", new_target.display());
+    let existing_target = new_target.exists();
+    if existing_target {
+        let mut installed = read_installed_manifest(&new_target)?;
+        // Refreshing signed expiry does not change the installed release contents.
+        installed.published_at = manifest.published_at.clone();
+        installed.expires_at = manifest.expires_at.clone();
+        if manifest::canonical_bytes(&installed)? != manifest::canonical_bytes(manifest)? {
+            bail!("existing release version has different signed metadata");
+        }
+        for artifact in
+            select_host_artifacts(manifest, std::env::consts::OS, std::env::consts::ARCH)?
+        {
+            manifest::verify_artifact(&new_target.join(&artifact.path), &artifact)?;
+        }
     }
     let mut updated = state.clone();
     updated.pending_activation = Some(PendingActivation {
@@ -442,6 +481,7 @@ fn begin_activation_state(
         product_version: manifest.product_version.clone(),
         daemon_was_active,
         selected: true,
+        existing_target,
     });
     save_update_state(&paths.update_status_file(), &updated)?;
     *state = updated;
@@ -603,7 +643,11 @@ fn evaluate_candidate(
             );
         }
         if manifest.release_sequence == state.highest_accepted_sequence {
-            return Ok(CandidateDecision::NoUpdate);
+            return Ok(if current_version.is_none() {
+                CandidateDecision::Install
+            } else {
+                CandidateDecision::NoUpdate
+            });
         }
     }
     if current_version == Some(manifest.product_version.as_str()) {
@@ -754,14 +798,6 @@ fn record_failed_sequence(
     Ok(())
 }
 
-fn required_environment(name: &'static str) -> Result<String> {
-    let value = std::env::var(name).with_context(|| format!("{name} is required"))?;
-    if value.is_empty() {
-        bail!("{name} must not be empty");
-    }
-    Ok(value)
-}
-
 fn environment_u64(name: &'static str, default: u64) -> Result<u64> {
     let value = match std::env::var(name) {
         Ok(value) => value
@@ -848,22 +884,14 @@ struct ConfiguredRelease {
 }
 
 async fn configured_release() -> Result<Option<ConfiguredRelease>> {
-    let Some(manifest_location) = std::env::var_os(MANIFEST_ENV) else {
-        return Ok(None);
-    };
-    let manifest_location = manifest_location
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("{MANIFEST_ENV} must be valid UTF-8"))?;
-    if manifest_location.is_empty() {
-        bail!("{MANIFEST_ENV} must not be empty");
-    }
-    let signature_location =
-        std::env::var(SIGNATURE_ENV).unwrap_or_else(|_| format!("{manifest_location}.sig"));
-    let key_text = std::env::var(PUBLIC_KEY_ENV)
-        .with_context(|| format!("{PUBLIC_KEY_ENV} is required when {MANIFEST_ENV} is set"))?;
-    configured_release_from_locations(&manifest_location, &signature_location, &key_text)
-        .await
-        .map(Some)
+    let config = config::load()?;
+    configured_release_from_locations(
+        &config[MANIFEST_ENV],
+        &config[SIGNATURE_ENV],
+        &config[PUBLIC_KEY_ENV],
+    )
+    .await
+    .map(Some)
 }
 
 async fn configured_release_from_locations(
@@ -988,6 +1016,11 @@ fn current_version(install_root: &Path) -> Result<Option<String>> {
         .get("product_version")
         .and_then(|value| value.as_str())
         .map(str::to_owned))
+}
+
+fn current_channel_version(install_root: &Path, channel: &str) -> Result<Option<String>> {
+    let manifest = read_installed_manifest(&install_root.join("current"))?;
+    Ok((manifest.channel == channel).then_some(manifest.product_version))
 }
 
 fn read_installed_manifest(release_dir: &Path) -> Result<ReleaseManifest> {
@@ -1507,6 +1540,7 @@ mod tests {
             product_version: "1.1.0".into(),
             daemon_was_active: false,
             selected: true,
+            existing_target: false,
         });
         recover_interrupted_activation(
             &paths,

@@ -5,7 +5,15 @@ async fn main() -> Result<()> {
     let command = std::env::args().nth(1).unwrap_or_else(|| "status".into());
     match command.as_str() {
         "check" => println!("{}", iota_updater::check_update().await?),
-        "status" => println!("updater ready"),
+        "status" => println!("channel: {}", iota_updater::config::selected_channel()?),
+        "channel" => {
+            if let Some(channel) = std::env::args().nth(2) {
+                iota_updater::config::select_channel(&channel)?;
+                println!("Selected {channel}. Run check, then apply to update.");
+            } else {
+                println!("{}", iota_updater::config::selected_channel()?);
+            }
+        }
         "apply" => {
             struct StderrObserver;
             impl iota_updater::UpdateObserver for StderrObserver {
@@ -27,7 +35,7 @@ async fn main() -> Result<()> {
         }
         _ => {
             return Err(anyhow::anyhow!(
-                "usage: iota-updater check|status|apply|rollback VERSION"
+                "usage: iota-updater check|status|apply|channel [stable|canary]|rollback VERSION"
             ));
         }
     }

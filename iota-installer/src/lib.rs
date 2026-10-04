@@ -31,6 +31,14 @@ pub fn install_linux_bundle_with_operator(bundle: &Path, operator: Option<&str>)
     let product_version = product_version(staging.path())?;
     validate_update_environment(staging.path())?;
 
+    for directory in ["/usr/local/lib/systemd/system", "/etc/systemd/system"] {
+        let timer = Path::new(directory).join("iota-update.timer");
+        if timer.exists() {
+            run("systemctl", &["disable", "--now", "iota-update.timer"])?;
+            fs::remove_file(timer).context("remove legacy unattended update timer")?;
+        }
+    }
+
     render_daemon_service(&staging.path().join("systemd/iota-daemon.service"))?;
 
     let version_dir = format!(
@@ -267,6 +275,9 @@ fn validate_update_environment(staging: &Path) -> Result<()> {
     if entries.len() != 5 {
         bail!("updater environment contains unexpected variables");
     }
+    if !matches!(entries["IOTA_UPDATE_CHANNEL"], "stable" | "canary") {
+        bail!("update channel must be stable or canary");
+    }
     let public_key = entries
         .get("IOTA_UPDATE_PUBLIC_KEY")
         .context("updater environment is missing IOTA_UPDATE_PUBLIC_KEY")?;
@@ -395,10 +406,10 @@ mod tests {
     fn rejects_bundle_missing_contract_member() {
         let directory = tempfile::tempdir().unwrap();
         let bundle = directory.path().join("release.zip");
-        write_bundle(&bundle, Some("systemd/iota-update.timer"), "0.1.0");
+        write_bundle(&bundle, Some("systemd/iota-update.service"), "0.1.0");
 
         let error = validate_linux_bundle(&bundle).unwrap_err();
-        assert!(error.to_string().contains("systemd/iota-update.timer"));
+        assert!(error.to_string().contains("systemd/iota-update.service"));
     }
 
     #[test]

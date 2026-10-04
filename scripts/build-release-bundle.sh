@@ -20,6 +20,15 @@ contract="$repository_directory/iota-installer/bundle-files.txt"
 staging_directory="$(mktemp -d)"
 trap 'rm -rf "$staging_directory"' EXIT
 
+case "$update_channel" in stable|canary) ;; *) echo "channel must be stable or canary" >&2; exit 2 ;; esac
+architecture="$(jq -r '.artifacts[0].architecture' "$release_manifest")"
+case "$architecture" in x86_64|aarch64) ;; *) echo "unsupported update architecture" >&2; exit 2 ;; esac
+expected_url="https://git.methanium.net/tensamin/prod-pins/releases/download/$update_channel/iota-update-linux-$architecture.json"
+if [[ "$update_manifest_url" != "$expected_url" || "$update_signature_url" != "$expected_url.sig" ]]; then
+    echo "update URLs must match the selected prod-pins channel" >&2
+    exit 2
+fi
+
 if [[ ! "$product_version" =~ ^[0-9A-Za-z][0-9A-Za-z.+_-]*$ ]]; then
     echo "product version contains unsupported characters: $product_version" >&2
     exit 2

@@ -69,6 +69,33 @@ async fn run() -> Result<(), StartupError> {
             iota_installer::bootstrap_linux_bundle(Path::new(&bundle), operator.as_deref())
                 .map_err(|error| StartupError::Other(format!("Bootstrap failed: {error}")))
         }
+        command @ (Command::UpdateCheck | Command::UpdateApply | Command::UpdateChannel { .. }) => {
+            let mut updater = std::process::Command::new(
+                iota_paths::current_version_link().join("bin/iota-updater"),
+            );
+            match command {
+                Command::UpdateCheck => {
+                    updater.arg("check");
+                }
+                Command::UpdateApply => {
+                    updater.arg("apply");
+                }
+                Command::UpdateChannel { channel } => {
+                    updater.arg("channel");
+                    if let Some(channel) = channel {
+                        updater.arg(channel);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let status = updater
+                .status()
+                .map_err(|error| StartupError::Other(format!("Run updater: {error}")))?;
+            if !status.success() {
+                return Err(StartupError::Other(format!("Updater failed with {status}")));
+            }
+            Ok(())
+        }
         command => {
             let endpoints = resolve_endpoints()?;
             if matches!(
@@ -406,6 +433,8 @@ fn print_help() {
     println!("  components             Show component health");
     println!("  logs [--limit N]       Show recent log entries");
     println!("  update check           Check for updates");
+    println!("  update apply           Apply the selected channel's signed update");
+    println!("  update channel [stable|canary]  Show or select the update channel");
     println!("  community list         List communities");
     println!("  terms status           Show terms acceptance status");
     println!("  terms show <DOC>       Show a terms document");
@@ -717,6 +746,7 @@ async fn run_command(
         Command::Components => LocalRequest::ListComponents,
         Command::Logs { limit } => LocalRequest::GetLogs { limit },
         Command::UpdateCheck => LocalRequest::CheckUpdate,
+        Command::UpdateApply | Command::UpdateChannel { .. } => unreachable!(),
         Command::CommunityList => LocalRequest::ListCommunities,
         Command::UsersRelease {
             confirmed: false, ..

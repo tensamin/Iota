@@ -22,6 +22,16 @@ staging_directory="$(mktemp -d)"
 artifacts="$staging_directory/artifacts.jsonl"
 trap 'rm -rf "$staging_directory"' EXIT
 
+case "$channel" in stable|canary) ;; *) echo "channel must be stable or canary" >&2; exit 2 ;; esac
+case "$operating_system/$architecture" in linux/x86_64|linux/aarch64) ;; *) echo "unsupported update platform" >&2; exit 2 ;; esac
+source_sha="${IOTA_RELEASE_SOURCE_SHA:-$(git -C "$repository_directory" rev-parse HEAD)}"
+if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "IOTA_RELEASE_SOURCE_SHA must be a full source commit SHA" >&2
+    exit 2
+fi
+product_version="${product_version}-${channel}-${source_sha}"
+signing_key_id="${IOTA_RELEASE_SIGNING_KEY_ID:-primary}"
+
 if [[ ! "$release_sequence" =~ ^[1-9][0-9]*$ ]]; then
     echo "release sequence must be a positive integer" >&2
     exit 2
@@ -42,7 +52,7 @@ while IFS=$'\t' read -r role artifact_path; do
         --arg os "$operating_system" \
         --arg architecture "$architecture" \
         --arg path "$artifact_path" \
-        --arg url "$base_url/$asset_name" \
+        --arg url "$base_url/$asset_name-$operating_system-$architecture" \
         --arg sha256 "$(sha256sum "$source_path" | cut -d ' ' -f 1)" \
         --argjson size "$(stat -c %s "$source_path")" \
         '{role: $role, os: $os, architecture: $architecture, path: $path, url: $url, sha256: $sha256, size: $size}' \
@@ -56,7 +66,7 @@ jq -s \
     --argjson release_sequence "$release_sequence" \
     --arg published_at "$published_at" \
     --arg expires_at "$expires_at" \
-    --arg release_signing_key_id "primary" \
+    --arg release_signing_key_id "$signing_key_id" \
     '{
         product_version: $product_version,
         channel: $channel,

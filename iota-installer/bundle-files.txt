@@ -5,6 +5,5 @@ systemd/iota-daemon.service
 systemd/iota-daemon.socket
 systemd/sysusers.d/iota.conf
 systemd/iota-update.service
-systemd/iota-update.timer
 systemd/update.env
 manifest.json

@@ -32,3 +32,12 @@ jobs:
 
       - name: Check release binaries
         run: nix develop -c cargo check -p iota -p iota-daemon -p iota-updater -p iota-installer --locked
+
+      - name: Check updater and installer formatting
+        run: nix develop -c cargo fmt -p iota-updater -p iota-installer -p iota --check
+
+      - name: Run updater and installer tests
+        run: nix develop -c cargo test -p iota-updater -p iota-installer --locked
+
+      - name: Check release scripts
+        run: bash -n scripts/build-update-manifest.sh scripts/build-release-bundle.sh
