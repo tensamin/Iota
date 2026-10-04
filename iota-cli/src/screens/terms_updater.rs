@@ -513,7 +513,7 @@ impl IotaScreen for TermsUpdaterScreen {
         };
 
         while size.height - 5 < text_lines.len() as u16 {
-            if optional_lines.len() == 0 {
+            if optional_lines.is_empty() {
                 break;
             }
             text_lines.remove(optional_lines[0] as usize);
@@ -632,7 +632,7 @@ impl IotaScreen for TermsUpdaterScreen {
                 if let Some(sender) = self.sender.take() {
                     let _ = sender.send(UserChoice::Deny);
                 }
-                return IotaInteraction::Pop;
+                IotaInteraction::Pop
             }
             KeyCode::Enter | KeyCode::Char(' ') => match self.focus {
                 Focus::Eula => {
@@ -678,9 +678,7 @@ impl IotaScreen for TermsUpdaterScreen {
                 };
 
                 if let Some(terms_type) = terms_type {
-                    return IotaInteraction::Effect(IotaEffect::LoadNewestTerms {
-                        kind: terms_type,
-                    });
+                    IotaInteraction::Effect(IotaEffect::LoadNewestTerms { kind: terms_type })
                 } else {
                     IotaInteraction::Unhandled
                 }

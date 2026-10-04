@@ -40,6 +40,10 @@ impl RequiredCommunicationFields for CommunicationValue {
     }
 }
 
+#[allow(
+    clippy::wrong_self_convention,
+    reason = "mirror DataValue accessors on optional borrowed values"
+)]
 pub trait OptionalDataValueExt<'a> {
     fn as_bool(self) -> Option<bool>;
     fn as_str(self) -> Option<&'a str>;

@@ -386,15 +386,15 @@ pub async fn reconcile_managed_users(connection: &dyn OmikronClient) {
                     let _ = pending_operations::remove(operation.user_id);
                 }
             }
-            PendingUserOperationKind::Release if remote_iota_id != Some(local_iota_id) => {
-                if iota_storage::users::user_manager::finalize_local_release(
-                    operation.user_id,
-                    Some(&operation.username),
-                )
-                .is_ok()
-                {
-                    let _ = pending_operations::remove(operation.user_id);
-                }
+            PendingUserOperationKind::Release
+                if remote_iota_id != Some(local_iota_id)
+                    && iota_storage::users::user_manager::finalize_local_release(
+                        operation.user_id,
+                        Some(&operation.username),
+                    )
+                    .is_ok() =>
+            {
+                let _ = pending_operations::remove(operation.user_id);
             }
             _ => {}
         }
@@ -425,17 +425,17 @@ pub async fn reconcile_managed_users(connection: &dyn OmikronClient) {
                 continue;
             }
         };
-        if should_release {
-            if let Err(error) = iota_storage::users::user_manager::finalize_local_release(
+        if should_release
+            && let Err(error) = iota_storage::users::user_manager::finalize_local_release(
                 user.user_id,
                 Some(&user.username),
-            ) {
-                log!(
-                    "Could not release local user {} after Omega reconciliation: {}",
-                    user.user_id,
-                    error
-                );
-            }
+            )
+        {
+            log!(
+                "Could not release local user {} after Omega reconciliation: {}",
+                user.user_id,
+                error
+            );
         }
     }
 }
@@ -598,7 +598,7 @@ pub async fn create_user(
 
     let mut bytes = [0u8; 192];
     OsRng.fill_bytes(&mut bytes);
-    let reset_token = STANDARD.encode(&bytes);
+    let reset_token = STANDARD.encode(bytes);
 
     let user_profile = UserProfile::new(
         user_id,

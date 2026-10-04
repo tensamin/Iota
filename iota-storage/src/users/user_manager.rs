@@ -682,12 +682,12 @@ pub fn load_users_sync() -> std::io::Result<()> {
     if content.trim().is_empty() {
         return Ok(());
     }
-    if let Ok(parsed) = json::parse(&content) {
-        if let json::JsonValue::Array(arr) = parsed {
-            for j in arr.iter() {
-                if let Some(up) = UserProfile::from_json(j) {
-                    try_add_user(up).map_err(|error| std::io::Error::other(error.to_string()))?;
-                }
+    if let Ok(parsed) = json::parse(&content)
+        && let json::JsonValue::Array(arr) = parsed
+    {
+        for j in arr.iter() {
+            if let Some(up) = UserProfile::from_json(j) {
+                try_add_user(up).map_err(|error| std::io::Error::other(error.to_string()))?;
             }
         }
     }

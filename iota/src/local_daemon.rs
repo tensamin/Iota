@@ -32,13 +32,13 @@ impl LocalDaemonGuard {
 }
 impl Drop for LocalDaemonGuard {
     fn drop(&mut self) {
-        if !self.committed {
-            if let Some(mut child) = self.child.take() {
-                let _ = child.start_kill();
-                tokio::spawn(async move {
-                    let _ = child.wait().await;
-                });
-            }
+        if !self.committed
+            && let Some(mut child) = self.child.take()
+        {
+            let _ = child.start_kill();
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
         }
     }
 }

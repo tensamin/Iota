@@ -215,6 +215,12 @@ impl AppState {
     }
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(feature = "legacy-globals")]
 #[deprecated(note = "use DaemonState or ClientState")]
 pub static APP_STATE: LazyLock<Arc<Mutex<AppState>>> =
@@ -228,7 +234,7 @@ pub static SHUTDOWN: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
 pub static RELOAD: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(true));
 #[cfg(feature = "legacy-globals")]
 #[deprecated(note = "use DaemonState")]
-pub static ACTIVE_TASKS: Lazy<DashSet<String>> = Lazy::new(|| DashSet::new());
+pub static ACTIVE_TASKS: Lazy<DashSet<String>> = Lazy::new(DashSet::new);
 
 #[cfg(feature = "legacy-globals")]
 pub fn setup(state: &DaemonState) {

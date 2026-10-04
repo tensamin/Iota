@@ -121,6 +121,7 @@ impl OmikronConnection {
         )
     }
 
+    #[expect(clippy::too_many_arguments, reason = "explicit protected frame fields")]
     pub(super) fn build_protected(
         &self,
         frame: &CommunicationValue,

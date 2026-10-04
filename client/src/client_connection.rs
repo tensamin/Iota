@@ -20,6 +20,8 @@ use uuid::Uuid;
 // Waiting Task System
 // ============================================================================
 
+type WaitingTask = Box<dyn Fn(Arc<ClientConnection>, CommunicationValue) -> bool + Send + Sync>;
+
 #[allow(dead_code)]
 pub struct ClientConnection {
     sender: Arc<RwLock<Option<Arc<Sender>>>>,
@@ -27,8 +29,7 @@ pub struct ClientConnection {
     connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub connection_id: Uuid,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
-    pub waiting_tasks:
-        DashMap<u32, Box<dyn Fn(Arc<ClientConnection>, CommunicationValue) -> bool + Send + Sync>>,
+    pub waiting_tasks: DashMap<u32, WaitingTask>,
     shutdown: Arc<RwLock<bool>>,
     keyring: Arc<RwLock<Option<Arc<Keyring>>>>,
 }
@@ -40,10 +41,7 @@ impl ClientConnection {
         connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
         connection_id: Uuid,
         shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
-        waiting_tasks: DashMap<
-            u32,
-            Box<dyn Fn(Arc<ClientConnection>, CommunicationValue) -> bool + Send + Sync>,
-        >,
+        waiting_tasks: DashMap<u32, WaitingTask>,
         shutdown: Arc<RwLock<bool>>,
     ) -> Self {
         Self {
@@ -357,7 +355,6 @@ impl ClientConnection {
                 .add_typed_default(DataType::Settings, DataValue::Array(settings_json));
 
             self.send_message(&response).await;
-            return;
         }
     }
 
@@ -374,7 +371,7 @@ impl ClientConnection {
 
         if let Some(solved) = solved {
             let response = CommunicationValue::new(CommunicationType::ChallengeResponse)
-                .with_request_id(&cv)
+                .with_request_id(cv)
                 .add_typed_default(DataType::Challenge, DataValue::Str(solved));
 
             self.send_message(&response).await;

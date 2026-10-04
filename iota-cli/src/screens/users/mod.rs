@@ -698,7 +698,7 @@ impl IotaScreen for UsersScreen {
                     }
                     Err(error) => self.message = Some(error),
                 }
-                return IotaInteraction::Changed;
+                IotaInteraction::Changed
             }
             UiEvent::Message(IotaMessage::Event(AppEvent::UserOperationFinished(result))) => {
                 self.pending = false;
@@ -706,7 +706,7 @@ impl IotaScreen for UsersScreen {
                     Ok(message) => message,
                     Err(error) => error,
                 });
-                return self.refresh();
+                self.refresh()
             }
             UiEvent::Message(IotaMessage::Event(AppEvent::CredentialExportFinished(result))) => {
                 self.pending = false;
@@ -714,7 +714,7 @@ impl IotaScreen for UsersScreen {
                     Ok(message) => message,
                     Err(error) => error,
                 });
-                return IotaInteraction::Changed;
+                IotaInteraction::Changed
             }
             UiEvent::Message(IotaMessage::Event(AppEvent::TuInspected(result))) => {
                 if let Some(UsersOverlay::Add(flow)) = self.overlay.as_mut() {
@@ -727,7 +727,7 @@ impl IotaScreen for UsersScreen {
                         }
                     }
                 }
-                return IotaInteraction::Changed;
+                IotaInteraction::Changed
             }
             UiEvent::Paste(text) => {
                 if let Some(UsersOverlay::Add(flow)) = self.overlay.as_mut() {
@@ -753,7 +753,7 @@ impl IotaScreen for UsersScreen {
                     self.restore_selection();
                     return IotaInteraction::Changed;
                 }
-                return IotaInteraction::Unhandled;
+                IotaInteraction::Unhandled
             }
             UiEvent::Key(key) => {
                 if let Some(overlay) = &mut self.overlay {

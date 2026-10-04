@@ -79,10 +79,10 @@ impl AttemptLease {
 
 impl Drop for AttemptLease {
     fn drop(&mut self) {
-        if !self.settled {
-            if let Some(runtime) = self.runtime.upgrade() {
-                runtime.finish_attempt_cancel(self.user_id);
-            }
+        if !self.settled
+            && let Some(runtime) = self.runtime.upgrade()
+        {
+            runtime.finish_attempt_cancel(self.user_id);
         }
     }
 }
@@ -219,10 +219,10 @@ impl PasswordAuthRuntime {
             })
             .collect::<Vec<_>>();
         for id in expired {
-            if let Some((_, pending)) = self.logins.remove(&id) {
-                if let Some(attempt) = pending.attempt {
-                    attempt.failure();
-                }
+            if let Some((_, pending)) = self.logins.remove(&id)
+                && let Some(attempt) = pending.attempt
+            {
+                attempt.failure();
             }
         }
         self.enrollments
@@ -311,10 +311,10 @@ impl PasswordAuthRuntime {
             .filter_map(|entry| (entry.user_id == user_id).then_some(*entry.key()))
             .collect::<Vec<_>>();
         for id in ids {
-            if let Some((_, pending)) = self.logins.remove(&id) {
-                if let Some(attempt) = pending.attempt {
-                    attempt.cancel();
-                }
+            if let Some((_, pending)) = self.logins.remove(&id)
+                && let Some(attempt) = pending.attempt
+            {
+                attempt.cancel();
             }
         }
     }

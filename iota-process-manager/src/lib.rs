@@ -319,7 +319,7 @@ mod systemd {
             }
             let executor: Arc<dyn CommandExecutor> = Arc::new(RealExecutor);
             let mut manager = executor
-                .output("systemctl", &["--version", &COMMON[0], &COMMON[1]])
+                .output("systemctl", &["--version", COMMON[0], COMMON[1]])
                 .await
                 .ok()
                 .filter(|r| r.success)
@@ -573,10 +573,10 @@ mod systemd {
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             let pid = loop {
-                if let Ok(contents) = fs::read_to_string(&pid_file) {
-                    if let Ok(pid) = contents.parse::<libc::pid_t>() {
-                        break pid;
-                    }
+                if let Ok(contents) = fs::read_to_string(&pid_file)
+                    && let Ok(pid) = contents.parse::<libc::pid_t>()
+                {
+                    break pid;
                 }
                 assert!(tokio::time::Instant::now() < deadline);
                 tokio::task::yield_now().await;

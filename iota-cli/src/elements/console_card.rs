@@ -488,12 +488,11 @@ impl InteractableElement for ConsoleCard {
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && let Some(c) = key.code.as_char()
                 {
-                    if let Some(c) = key.code.as_char() {
-                        self.insert_at_cursor(c);
-                        self.message = None;
-                        return IotaInteraction::Changed;
-                    }
+                    self.insert_at_cursor(c);
+                    self.message = None;
+                    return IotaInteraction::Changed;
                 }
                 IotaInteraction::Unhandled
             }

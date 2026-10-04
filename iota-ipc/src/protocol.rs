@@ -322,6 +322,10 @@ pub struct ResponseEnvelope {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keep IPC response payloads inline"
+)]
 pub enum ResponseResult {
     Ok(ResponsePayload),
     Error(IpcErrorCode),
@@ -724,9 +728,10 @@ pub enum ConnectionStatus {
     Disconnected,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupPhase {
+    #[default]
     Starting,
     MigratingStorage,
     LoadingUsers,
@@ -791,12 +796,6 @@ pub struct ComponentHealth {
     pub status: HealthStatus,
     pub message: Option<String>,
     pub changed_at_ms: u128,
-}
-
-impl Default for StartupPhase {
-    fn default() -> Self {
-        Self::Starting
-    }
 }
 
 // ---------------------------------------------------------------------------

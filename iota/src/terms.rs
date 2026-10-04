@@ -73,11 +73,11 @@ async fn accept(system: bool) -> Result<(), StartupError> {
     for document in [&documents.0, &documents.1, &documents.2] {
         println!(
             "\n===== {} =====\nVersion: {}\nDocument hash: {}\n",
-            document.kind().to_string(),
+            document.kind(),
             document.version(),
             document.hash()
         );
-        print!("{}\n", document.content());
+        println!("{}", document.content());
         if !confirm(document)? {
             return Err(StartupError::Consent(
                 "No terms were accepted. Iota remains inactive.".into(),

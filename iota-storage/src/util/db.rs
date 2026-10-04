@@ -2116,7 +2116,7 @@ where
         let guard = shared
             .lock()
             .map_err(|e| format!("DB mutex poisoned: {:?}", e))?;
-        f(&*guard).map_err(|e| e.to_string())
+        f(&guard).map_err(|e| e.to_string())
     })
 }
 

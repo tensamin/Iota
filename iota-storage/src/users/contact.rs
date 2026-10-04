@@ -1,4 +1,4 @@
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Contact {
     pub user_id: i64,
     pub principal: Option<iota_identity::PrincipalHandle>,
@@ -7,20 +7,6 @@ pub struct Contact {
     pub last_message_at: Option<i64>,
     pub notifications: i64,
     pub notifications_read_at: i64,
-}
-
-impl Default for Contact {
-    fn default() -> Self {
-        Contact {
-            user_id: 0,
-            principal: None,
-            user_name: None,
-            created_at: 0,
-            last_message_at: None,
-            notifications: 0,
-            notifications_read_at: 0,
-        }
-    }
 }
 
 impl Contact {

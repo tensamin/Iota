@@ -8,6 +8,10 @@ use crate::{
     util::terms_focus::Focus,
 };
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit button layout and styling"
+)]
 pub fn draw_buttons(
     frame: &mut ratatui::Frame,
     area: Rect,

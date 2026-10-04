@@ -1,3 +1,8 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "return protocol error frames directly to the sender"
+)]
+
 use crate::message_common::*;
 use iota_logger::{LogLevel, PrintType, log_event};
 use iota_storage::util::call_envelopes::{self, CallEnvelope};
@@ -1582,10 +1587,8 @@ pub fn handle_global_settings_save(cv: &CommunicationValue) -> CommunicationValu
         .with_request_id(cv);
 
     if let Some(session_id) = cv.get_data(DataType::SessionId).as_number() {
-        response = response.add_typed_default(
-            DataType::SessionId,
-            DataValue::SignedNumber(session_id as i128),
-        );
+        response =
+            response.add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id));
     }
 
     response
@@ -1612,10 +1615,8 @@ pub fn handle_global_settings_load(cv: &CommunicationValue) -> CommunicationValu
             );
 
         if let Some(session_id) = cv.get_data(DataType::SessionId).as_number() {
-            response = response.add_typed_default(
-                DataType::SessionId,
-                DataValue::SignedNumber(session_id as i128),
-            );
+            response = response
+                .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id));
         }
 
         return response;
@@ -1627,10 +1628,8 @@ pub fn handle_global_settings_load(cv: &CommunicationValue) -> CommunicationValu
         .add_typed_default(DataType::Payload, DataValue::Str(settings_value_str));
 
     if let Some(session_id) = cv.get_data(DataType::SessionId).as_number() {
-        response = response.add_typed_default(
-            DataType::SessionId,
-            DataValue::SignedNumber(session_id as i128),
-        );
+        response =
+            response.add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id));
     }
 
     response
@@ -1664,10 +1663,7 @@ pub fn handle_settings_save(
                 DataType::Message,
                 DataValue::Str("Invalid session_id".to_string()),
             )
-            .add_typed_default(
-                DataType::SessionId,
-                DataValue::SignedNumber(session_id as i128),
-            );
+            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id));
     };
     let Some(settings_name) = cv.get_data(DataType::SettingsName).as_str() else {
         return CommunicationValue::new(CommunicationType::ErrorInvalidData)
@@ -1677,10 +1673,7 @@ pub fn handle_settings_save(
                 DataType::Message,
                 DataValue::Str("Missing settings_name".to_string()),
             )
-            .add_typed_default(
-                DataType::SessionId,
-                DataValue::SignedNumber(session_id as i128),
-            );
+            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id));
     };
     let Some(settings_value) = cv.get_data(DataType::Payload).as_str() else {
         return CommunicationValue::new(CommunicationType::ErrorInvalidData)
@@ -1690,10 +1683,7 @@ pub fn handle_settings_save(
                 DataType::Message,
                 DataValue::Str("Missing settings payload".to_string()),
             )
-            .add_typed_default(
-                DataType::SessionId,
-                DataValue::SignedNumber(session_id as i128),
-            );
+            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id));
     };
 
     if !settings_name
@@ -1712,10 +1702,7 @@ pub fn handle_settings_save(
                 DataType::SettingsName,
                 DataValue::Str(settings_name.to_string()),
             )
-            .add_typed_default(
-                DataType::SessionId,
-                DataValue::SignedNumber(session_id as i128),
-            );
+            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id));
     }
     let Ok(session_id_i64) = i64::try_from(session_id) else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
@@ -1732,10 +1719,7 @@ pub fn handle_settings_save(
             DataType::SettingsName,
             DataValue::Str(settings_name.to_string()),
         )
-        .add_typed_default(
-            DataType::SessionId,
-            DataValue::SignedNumber(session_id as i128),
-        )
+        .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id))
 }
 
 pub fn handle_settings_load(
@@ -1766,10 +1750,7 @@ pub fn handle_settings_load(
                 DataType::Message,
                 DataValue::Str("Invalid session_id".to_string()),
             )
-            .add_typed_default(
-                DataType::SessionId,
-                DataValue::SignedNumber(session_id as i128),
-            );
+            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id));
     }
     let Ok(session_id_i64) = i64::try_from(session_id) else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
@@ -1782,10 +1763,7 @@ pub fn handle_settings_load(
                 DataType::Message,
                 DataValue::Str("Missing settings_name".to_string()),
             )
-            .add_typed_default(
-                DataType::SessionId,
-                DataValue::SignedNumber(session_id as i128),
-            );
+            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id));
     };
 
     if !settings_name
@@ -1804,10 +1782,7 @@ pub fn handle_settings_load(
                 DataType::SettingsName,
                 DataValue::Str(settings_name.to_string()),
             )
-            .add_typed_default(
-                DataType::SessionId,
-                DataValue::SignedNumber(session_id as i128),
-            );
+            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id));
     }
 
     let Ok(settings_value) = settings::load(my_id_i64, session_id_i64, settings_name) else {
@@ -1821,10 +1796,7 @@ pub fn handle_settings_load(
                 DataType::SettingsName,
                 DataValue::Str(settings_name.to_string()),
             )
-            .add_typed_default(
-                DataType::SessionId,
-                DataValue::SignedNumber(session_id as i128),
-            );
+            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id));
     };
 
     CommunicationValue::new(CommunicationType::SettingsLoad)
@@ -1835,10 +1807,7 @@ pub fn handle_settings_load(
             DataType::SettingsName,
             DataValue::Str(settings_name.to_string()),
         )
-        .add_typed_default(
-            DataType::SessionId,
-            DataValue::SignedNumber(session_id as i128),
-        )
+        .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id))
 }
 
 pub fn handle_settings_list(
@@ -1869,10 +1838,7 @@ pub fn handle_settings_list(
                 DataType::Message,
                 DataValue::Str("Invalid session_id".to_string()),
             )
-            .add_typed_default(
-                DataType::SessionId,
-                DataValue::SignedNumber(session_id as i128),
-            );
+            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id));
     }
     let Ok(session_id_i64) = i64::try_from(session_id) else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
@@ -1886,10 +1852,7 @@ pub fn handle_settings_list(
         .with_request_id(cv)
         .with_receiver(my_id)
         .add_typed_default(DataType::Settings, DataValue::Array(settings_json))
-        .add_typed_default(
-            DataType::SessionId,
-            DataValue::SignedNumber(session_id as i128),
-        )
+        .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id))
 }
 
 fn setting_response(

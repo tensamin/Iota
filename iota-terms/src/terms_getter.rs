@@ -16,12 +16,15 @@ impl Type {
             Self::PP => "privacy-policy",
         }
     }
-    pub fn to_string(&self) -> String {
-        match self {
-            Self::EULA => "End User License Agreement".to_string(),
-            Self::TOS => "Terms of Service".to_string(),
-            Self::PP => "Privacy Policy".to_string(),
-        }
+}
+
+impl std::fmt::Display for Type {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::EULA => "End User License Agreement",
+            Self::TOS => "Terms of Service",
+            Self::PP => "Privacy Policy",
+        })
     }
 }
 

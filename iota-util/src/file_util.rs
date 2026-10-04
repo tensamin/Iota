@@ -263,10 +263,8 @@ pub fn get_children(path: &str) -> Vec<String> {
     };
     let mut children = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                children.push(entry.file_name().to_string_lossy().to_string());
-            }
+        for entry in entries.flatten() {
+            children.push(entry.file_name().to_string_lossy().to_string());
         }
     }
     children
@@ -342,11 +340,11 @@ pub fn get_directory_size(directory: &Path) -> u64 {
     let mut size = 0;
     for entry in WalkDir::new(directory).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
-        if path.is_file() {
-            if let Ok(metadata) = path.metadata() {
-                size += path.file_name().unwrap_or(OsStr::new("")).len() as u64;
-                size += metadata.len();
-            }
+        if path.is_file()
+            && let Ok(metadata) = path.metadata()
+        {
+            size += path.file_name().unwrap_or(OsStr::new("")).len() as u64;
+            size += metadata.len();
         }
     }
     size
@@ -427,10 +425,9 @@ fn extract_zip_contents_to_folder(
         let mut file = archive.by_index(i)?;
         let entry_path = staging_dir.join(file.sanitized_name());
 
-        if i == 0 {
-            if file.name().ends_with('/') || file.sanitized_name().components().count() == 1 {
-                first_item_name = Some(file.sanitized_name());
-            }
+        if i == 0 && (file.name().ends_with('/') || file.sanitized_name().components().count() == 1)
+        {
+            first_item_name = Some(file.sanitized_name());
         }
 
         if file.name().ends_with('/') {
@@ -461,7 +458,7 @@ fn extract_zip_contents_to_folder(
                     let src = entry.path();
                     let dest = target_dir.join(entry.file_name());
 
-                    if let Err(_) = fs::rename(&src, &dest) {
+                    if fs::rename(&src, &dest).is_err() {
                         if src.is_file() {
                             fs::copy(&src, &dest)?;
                         } else {

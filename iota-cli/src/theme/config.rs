@@ -129,7 +129,7 @@ impl UiConfig {
     }
 
     pub fn load() -> Result<Self, io::Error> {
-        let path = match (|| std::panic::catch_unwind(|| Self::path()))() {
+        let path = match std::panic::catch_unwind(Self::path) {
             Ok(path) => path,
             Err(_) => Self::fallback_path().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "could not determine config path")

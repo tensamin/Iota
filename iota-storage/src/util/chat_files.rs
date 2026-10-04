@@ -30,6 +30,10 @@ impl MessageState {
         }
     }
 
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "unknown stored states fall back rather than fail parsing"
+    )]
     pub fn from_str(value: &str) -> Self {
         match value.to_lowercase().as_str() {
             "read" => MessageState::Read,
@@ -1024,6 +1028,10 @@ pub fn change_message_state_by_relay_id(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit persisted receipt fields"
+)]
 pub fn record_message_receipt(
     storage_owner: i64,
     target_signer_id: i64,
@@ -1232,7 +1240,7 @@ pub fn change_message_state(
         tx.commit()?;
         Ok(())
     })
-    .map_err(|e: StorageError| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    .map_err(|e: StorageError| std::io::Error::other(e.to_string()))
 }
 
 fn load_reactions(
@@ -1275,9 +1283,8 @@ fn load_reactions(
         if reactions
             .iter()
             .any(|stored: &StoredReaction| stored.reaction == row.1.reaction)
+            || reactions.len() < MAX_UNIQUE_REACTIONS_PER_MESSAGE
         {
-            reactions.push(row.1);
-        } else if reactions.len() < MAX_UNIQUE_REACTIONS_PER_MESSAGE {
             reactions.push(row.1);
         }
     }

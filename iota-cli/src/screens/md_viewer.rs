@@ -334,7 +334,7 @@ fn table_to_lines(table: Vec<Vec<String>>, theme: &ResolvedTheme) -> Vec<Display
                     .max()
                     .unwrap_or(h_len)
             } else {
-                let max = (3 * h_len) as usize;
+                let max = 3 * h_len;
                 max.max(h_len)
             }
         })

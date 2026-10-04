@@ -198,7 +198,7 @@ impl IotaScreen for TermsCheckerScreen {
         }
 
         while size.height - 5 < text_lines.len() as u16 {
-            if optional_lines.len() == 0 {
+            if optional_lines.is_empty() {
                 break;
             }
             text_lines.remove(optional_lines[0] as usize);
@@ -232,7 +232,7 @@ impl IotaScreen for TermsCheckerScreen {
                 Line::from(vec![
                     Span::raw("Height: "),
                     Span::styled(format!("{}", size.height), height_style),
-                    Span::raw(format!(" / 13")),
+                    Span::raw(" / 13".to_string()),
                 ]),
             ]);
 
@@ -241,7 +241,7 @@ impl IotaScreen for TermsCheckerScreen {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(format!("UI Too Small [Q to Quit]")),
+                        .title("UI Too Small [Q to Quit]".to_string()),
                 );
             f.render_widget(warning, size);
             return;
@@ -249,7 +249,7 @@ impl IotaScreen for TermsCheckerScreen {
 
         let consent_block = Paragraph::new(Text::from(text_lines)).block(
             Block::default()
-                .title(format!(" Tensamin User Consent [Q to Quit] ",))
+                .title(" Tensamin User Consent [Q to Quit] ".to_string())
                 .borders(Borders::ALL),
         );
         f.render_widget(consent_block, chunks[0]);

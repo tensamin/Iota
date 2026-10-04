@@ -1208,7 +1208,7 @@ fn render_table(payload: &ResponsePayload) {
             println!(
                 "{:<15} {}",
                 "Authority",
-                format!("{:?}", invitation.authority)
+                format_args!("{:?}", invitation.authority)
             );
             println!("{:<15} {}", "Token", invitation.raw_token.0);
             println!("{:<15} {}", "Expires", invitation.expires_at);
@@ -1298,8 +1298,8 @@ fn render_table(payload: &ResponsePayload) {
                 println!("No active tasks.");
                 return;
             }
-            println!("{}", "NAME");
-            println!("{}", "--------");
+            println!("NAME");
+            println!("--------");
             for task in tasks {
                 println!("{}", task.name);
             }
@@ -1309,8 +1309,8 @@ fn render_table(payload: &ResponsePayload) {
                 println!("No component health data available.");
                 return;
             }
-            println!("{:<20} {:<10} {}", "COMPONENT", "STATUS", "MESSAGE");
-            println!("{:<20} {:<10} {}", "--------", "--------", "--------");
+            println!("{:<20} {:<10} MESSAGE", "COMPONENT", "STATUS");
+            println!("{:<20} {:<10} --------", "--------", "--------");
             for comp in components {
                 let status_str = match comp.status {
                     iota_ipc::HealthStatus::Healthy => "healthy",
@@ -1331,8 +1331,8 @@ fn render_table(payload: &ResponsePayload) {
                 println!("No communities.");
                 return;
             }
-            println!("{:<20} {}", "NAME", "TITLE");
-            println!("{:<20} {}", "--------", "--------");
+            println!("{:<20} TITLE", "NAME");
+            println!("{:<20} --------", "--------");
             for c in communities {
                 println!("{:<20} {}", c.name, c.title);
             }
@@ -1343,12 +1343,12 @@ fn render_table(payload: &ResponsePayload) {
                 return;
             }
             println!(
-                "{:<20} {:<6} {:<12} {}",
-                "TIMESTAMP", "LEVEL", "SENDER", "MESSAGE"
+                "{:<20} {:<6} {:<12} MESSAGE",
+                "TIMESTAMP", "LEVEL", "SENDER"
             );
             println!(
-                "{:<20} {:<6} {:<12} {}",
-                "--------", "--------", "--------", "--------"
+                "{:<20} {:<6} {:<12} --------",
+                "--------", "--------", "--------"
             );
             for entry in &logs.entries {
                 let level = if entry.is_error { "ERR" } else { "INF" };
@@ -1359,8 +1359,8 @@ fn render_table(payload: &ResponsePayload) {
             }
         }
         ResponsePayload::Status(status) => {
-            println!("{:<15} {}", "Field", "Value");
-            println!("{:<15} {}", "--------", "--------");
+            println!("{:<15} Value", "Field");
+            println!("{:<15} --------", "--------");
             println!("{:<15} {}", "Phase", status.phase);
             if !status.tasks.is_empty() {
                 println!("{:<15} {}", "Tasks", status.tasks.join(", "));
@@ -1376,16 +1376,16 @@ fn render_table(payload: &ResponsePayload) {
             println!("{}", config.yaml);
         }
         ResponsePayload::OmikronStatus(status) => {
-            println!("{:<15} {}", "Field", "Value");
-            println!("{:<15} {}", "--------", "--------");
+            println!("{:<15} Value", "Field");
+            println!("{:<15} --------", "--------");
             println!("{:<15} {}", "Connected", status.connected);
             if let Some(id) = &status.iota_id {
                 println!("{:<15} {}", "Iota ID", id);
             }
         }
         ResponsePayload::UpdateStatus(status) => {
-            println!("{:<15} {}", "Field", "Value");
-            println!("{:<15} {}", "--------", "--------");
+            println!("{:<15} Value", "Field");
+            println!("{:<15} --------", "--------");
             println!("{:<15} {}", "Available", status.available);
         }
         ResponsePayload::UserCreated { user_id, username } => {
@@ -1428,8 +1428,8 @@ fn render_table(payload: &ResponsePayload) {
             println!("{}", message);
         }
         ResponsePayload::UserDetail(user) => {
-            println!("{:<15} {}", "Field", "Value");
-            println!("{:<15} {}", "--------", "--------");
+            println!("{:<15} Value", "Field");
+            println!("{:<15} --------", "--------");
             println!("{:<15} {}", "Username", user.username);
             println!("{:<15} {}", "User ID", user.user_id);
             if let Some(ref name) = user.display_name {

@@ -137,6 +137,12 @@ impl HelpOverlay {
     }
 }
 
+impl Default for HelpOverlay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IotaScreen for HelpOverlay {
     fn render_legacy(&self, f: &mut Frame, rect: Rect, theme: &ResolvedTheme, _hits: &mut HitMap) {
         let area = ratatool::layout::centered_rect(

@@ -186,7 +186,7 @@ async fn get_updates() -> Option<(
     {
         let file = load_file("", "agreements");
         let accepted_state = ConsentState::from_str(&file).sanitize();
-        save_file("", "agreements", &accepted_state.to_string());
+        save_file("", "agreements", &accepted_state.serialize());
 
         let eula_update: UpdateDecision = if current_eula.equals_some(&accepted_state.eula) {
             if current_eula.equals(&newest_eula) {
@@ -293,23 +293,23 @@ impl ConsentState {
             .unwrap()
             .as_secs();
 
-        if let Some(future_eula) = self.future_eula.clone() {
-            if future_eula.get_time() < current_secs {
-                self.eula = Some(future_eula);
-                self.future_eula = None;
-            }
+        if let Some(future_eula) = self.future_eula.clone()
+            && future_eula.get_time() < current_secs
+        {
+            self.eula = Some(future_eula);
+            self.future_eula = None;
         }
-        if let Some(future_tos) = self.future_tos.clone() {
-            if future_tos.get_time() < current_secs {
-                self.tos = Some(future_tos);
-                self.future_tos = None;
-            }
+        if let Some(future_tos) = self.future_tos.clone()
+            && future_tos.get_time() < current_secs
+        {
+            self.tos = Some(future_tos);
+            self.future_tos = None;
         }
-        if let Some(future_privacy) = self.future_privacy.clone() {
-            if future_privacy.get_time() < current_secs {
-                self.privacy = Some(future_privacy);
-                self.future_privacy = None;
-            }
+        if let Some(future_privacy) = self.future_privacy.clone()
+            && future_privacy.get_time() < current_secs
+        {
+            self.privacy = Some(future_privacy);
+            self.future_privacy = None;
         }
 
         if !self.accepted_eula {
@@ -325,10 +325,10 @@ impl ConsentState {
     }
 
     pub fn save_state(&self) {
-        save_file("", "agreements", &self.to_string());
+        save_file("", "agreements", &self.serialize());
     }
 
-    fn to_string(&self) -> String {
+    fn serialize(&self) -> String {
         let current_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -487,7 +487,8 @@ impl ConsentState {
         let future_eula_time = future_eula_time.parse::<u64>().unwrap_or(0);
         let future_tos_time = future_tos_time.parse::<u64>().unwrap_or(0);
         let future_pp_time = future_pp_time.parse::<u64>().unwrap_or(0);
-        let state = Self {
+
+        Self {
             accepted_eula: eula,
             eula: Some(Doc::new(eula_version, eula_hash, Type::EULA, unix)),
             accepted_pp: pp,
@@ -525,9 +526,7 @@ impl ConsentState {
                 None
             },
         }
-        .sanitize();
-
-        state
+        .sanitize()
     }
 }
 

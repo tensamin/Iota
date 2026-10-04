@@ -3,9 +3,11 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
+type TaskOutcome = (String, Result<(), String>);
+
 #[derive(Clone, Default)]
 pub struct TaskRegistry {
-    tasks: Arc<Mutex<JoinSet<(String, Result<(), String>)>>>,
+    tasks: Arc<Mutex<JoinSet<TaskOutcome>>>,
 }
 
 impl TaskRegistry {

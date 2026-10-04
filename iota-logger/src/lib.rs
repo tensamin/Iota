@@ -189,10 +189,10 @@ pub fn startup_with_log_dir_and_capacity(log_dir: Option<PathBuf>, queue_capacit
                 format!("{prefix}{resolved_message}")
             );
 
-            if let Some(file) = file.as_mut() {
-                if let Err(error) = writeln!(file, "{line}") {
-                    eprintln!("Unable to write Iota log file: {error}");
-                }
+            if let Some(file) = file.as_mut()
+                && let Err(error) = writeln!(file, "{line}")
+            {
+                eprintln!("Unable to write Iota log file: {error}");
             }
 
             let _ = writeln!(std::io::stderr(), "{timestamp} {line}");
@@ -313,10 +313,10 @@ fn report_dropped_logs(
     let line = format!(
         "{timestamp_ms} level=ERROR component=general direction=internal sender=- event=logger.dropped message={message:?}"
     );
-    if let Some(file) = file {
-        if let Err(error) = writeln!(file, "{line}") {
-            eprintln!("Unable to write Iota log file: {error}");
-        }
+    if let Some(file) = file
+        && let Err(error) = writeln!(file, "{line}")
+    {
+        eprintln!("Unable to write Iota log file: {error}");
     }
     eprintln!("{line}");
     let _ = broadcaster.send(UiLogEntry {
@@ -632,6 +632,36 @@ fn format_data_container(data: &[(DataTypeId, DataValue)], type_map: &TypeMap) -
         .join(", ")
 }
 
+#[macro_export]
+macro_rules! log_cv {
+    ($kind:expr, $cv:expr) => {
+        $crate::log_cv_internal("", &$cv, Some($kind))
+    };
+    ($cv:expr) => {
+        $crate::log_cv_internal("", &$cv, None)
+    };
+}
+
+#[macro_export]
+macro_rules! log_cv_in {
+    ($kind:expr, $cv:expr) => {
+        $crate::log_cv_internal("> ", &$cv, Some($kind))
+    };
+    ($cv:expr) => {
+        $crate::log_cv_internal("> ", $cv, None)
+    };
+}
+
+#[macro_export]
+macro_rules! log_cv_out {
+    ($kind:expr, $cv:expr) => {
+        $crate::log_cv_internal("< ", &$cv, Some($kind))
+    };
+    ($cv:expr) => {
+        $crate::log_cv_internal("< ", $cv, None)
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::format_cv;
@@ -661,34 +691,4 @@ mod tests {
                 .contains("<opaque relay payload>")
         );
     }
-}
-
-#[macro_export]
-macro_rules! log_cv {
-    ($kind:expr, $cv:expr) => {
-        $crate::log_cv_internal("", &$cv, Some($kind))
-    };
-    ($cv:expr) => {
-        $crate::log_cv_internal("", &$cv, None)
-    };
-}
-
-#[macro_export]
-macro_rules! log_cv_in {
-    ($kind:expr, $cv:expr) => {
-        $crate::log_cv_internal("> ", &$cv, Some($kind))
-    };
-    ($cv:expr) => {
-        $crate::log_cv_internal("> ", $cv, None)
-    };
-}
-
-#[macro_export]
-macro_rules! log_cv_out {
-    ($kind:expr, $cv:expr) => {
-        $crate::log_cv_internal("< ", &$cv, Some($kind))
-    };
-    ($cv:expr) => {
-        $crate::log_cv_internal("< ", $cv, None)
-    };
 }

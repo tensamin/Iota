@@ -1,3 +1,8 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "return protocol error frames directly to the sender"
+)]
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dashmap::{DashMap, DashSet};
 use iota_logger::{LogLevel, PrintType, log, log_cv_in, log_cv_out, log_event, log_t};
@@ -350,7 +355,7 @@ pub struct WaitingTask {
     pub inserted_at: Instant,
 }
 
-pub static WAITING_TASKS: LazyLock<DashMap<u32, WaitingTask>> = LazyLock::new(|| DashMap::new());
+pub static WAITING_TASKS: LazyLock<DashMap<u32, WaitingTask>> = LazyLock::new(DashMap::new);
 
 pub fn start_task_cleanup_loop() {
     tokio::spawn(async {
@@ -960,7 +965,7 @@ impl OmikronConnection {
             let conf = CONFIG.load();
             match (&conf.omikron_id, &conf.omikron_host, conf.omikron_port) {
                 (Some(id), Some(host), Some(port)) if !host.trim().is_empty() && port != 0 => {
-                    mtp::files::load_public_key_bundle(&omikron_public_key_path(*id))
+                    mtp::files::load_public_key_bundle(omikron_public_key_path(*id))
                         .ok()
                         .map(|public_key| ResolvedOmikronEndpoint {
                             id: Some(*id),
@@ -1100,10 +1105,10 @@ impl OmikronConnection {
                         });
                         continue;
                     };
-                    if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
-                        if (task.task)(cv.clone()) {
-                            continue;
-                        }
+                    if let Some((_, task)) = WAITING_TASKS.remove(&msg_id)
+                        && (task.task)(cv.clone())
+                    {
+                        continue;
                     }
                     let permit = self.handler_semaphore.clone().acquire_owned().await;
                     let self_clone = self.clone();
@@ -1604,8 +1609,7 @@ impl OmikronConnection {
                         Ok(response) if !response.is_type(CommunicationType::ErrorInternal) => {
                             if let (Some(message_id), Some(signer_id)) =
                                 (record.relay_message_id.as_deref(), record.relay_signer_id)
-                            {
-                                if let Err(error) =
+                                && let Err(error) =
                                     iota_storage::util::downstream_relay::reject_iota_delivery(
                                         record.frame_id,
                                         signer_principal,
@@ -1620,7 +1624,6 @@ impl OmikronConnection {
                                         error
                                     );
                                 }
-                            }
                         }
                         Ok(response) => log!(
                             "Pending Relay {} route returned retryable {}",
@@ -1701,10 +1704,10 @@ impl OmikronConnection {
             return;
         };
 
-        if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
-            if (task.task)(cv.clone()) {
-                return;
-            }
+        if let Some((_, task)) = WAITING_TASKS.remove(&msg_id)
+            && (task.task)(cv.clone())
+        {
+            return;
         }
 
         self.clone().handle_message_impl(cv).await;
@@ -1916,15 +1919,14 @@ impl OmikronConnection {
         if matches!(
             result,
             Ok(iota_storage::users::invitations::ProvisioningResult::MissingInvitation)
-        ) {
-            if self.sync_omega_invitations().await.is_ok() {
-                result = iota_storage::users::invitations::apply_external_invitation_provisioning(
-                    invitation_id,
-                    invitation_revision,
-                    &profile,
-                    now,
-                );
-            }
+        ) && self.sync_omega_invitations().await.is_ok()
+        {
+            result = iota_storage::users::invitations::apply_external_invitation_provisioning(
+                invitation_id,
+                invitation_revision,
+                &profile,
+                now,
+            );
         }
         match result {
             Ok(
@@ -2378,7 +2380,7 @@ impl OmikronConnection {
         let port = config
             .omikron_port
             .ok_or_else(|| "Omikron port is unavailable".to_string())?;
-        let omikron_key = mtp::files::load_public_key_bundle(&omikron_public_key_path(omikron_id))
+        let omikron_key = mtp::files::load_public_key_bundle(omikron_public_key_path(omikron_id))
             .map_err(|error| error.to_string())?;
         let omikron_public_key = omikron_key
             .try_to_base64()
@@ -3150,11 +3152,7 @@ impl OmikronConnection {
     }
 
     async fn handle_call_envelope_store(self: Arc<Self>, cv: &CommunicationValue) {
-        let response = match CONFIG
-            .load()
-            .omikron_id
-            .and_then(|id| i64::try_from(id).ok())
-        {
+        let response = match CONFIG.load().omikron_id {
             Some(owner) => message_handlers::handle_call_envelope_store(cv, owner),
             None => error_response(cv, CommunicationType::ErrorInternal),
         };
@@ -3162,11 +3160,7 @@ impl OmikronConnection {
     }
 
     async fn handle_call_envelope_get(self: Arc<Self>, cv: &CommunicationValue) {
-        let response = match CONFIG
-            .load()
-            .omikron_id
-            .and_then(|id| i64::try_from(id).ok())
-        {
+        let response = match CONFIG.load().omikron_id {
             Some(owner) => message_handlers::handle_call_envelope_get(cv, owner),
             None => error_response(cv, CommunicationType::ErrorInternal),
         };

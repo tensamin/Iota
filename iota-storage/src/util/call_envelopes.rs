@@ -40,6 +40,7 @@ pub struct CallEnvelope {
 pub fn store(envelope: &CallEnvelope, now: i64) -> Result<bool, StorageError> {
     db::with_immediate_transaction(|tx| {
         tx.execute("DELETE FROM call_envelopes WHERE expires_at <= ?1", [now])?;
+        #[expect(clippy::type_complexity, reason = "tuple matches the selected database columns")]
         let existing: Option<(i64, i64, i64, String, i64, Vec<u8>, Vec<u8>, String)> = tx.query_row(
             "SELECT owner_omikron_id, inviter_id, created_at, secret_id, version_number, encrypted_secret, kem_ciphertext, wrapping_scheme FROM call_envelopes WHERE recipient_id = ?1 AND call_id = ?2",
             params![envelope.recipient_id, envelope.call_id],

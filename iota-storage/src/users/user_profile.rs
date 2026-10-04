@@ -67,7 +67,7 @@ impl UserProfile {
             "username" => self.username.clone(),
             "public_key" => self.public_key.clone(),
             "created_at" => self.created_at,
-            "storage" => used_dir_space(&format!("users/{}", self.user_id.to_string())),
+            "storage" => used_dir_space(&format!("users/{}", self.user_id)),
         };
         if let Some(d) = &self.display_name {
             obj["display_name"] = d.clone().into();
@@ -113,7 +113,7 @@ impl UserProfile {
     pub fn randomize_reset_token(&mut self) -> String {
         let mut bytes = [0u8; 192];
         OsRng.fill(bytes.as_mut());
-        let new_token = general_purpose::STANDARD.encode(&bytes);
+        let new_token = general_purpose::STANDARD.encode(bytes);
         self.reset_token = Some(new_token.clone());
         new_token
     }

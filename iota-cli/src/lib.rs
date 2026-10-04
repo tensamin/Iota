@@ -1,3 +1,8 @@
+#![allow(
+    clippy::module_inception,
+    reason = "preserve existing public module paths"
+)]
+
 pub mod elements {
     pub mod console_card;
     pub mod elements;

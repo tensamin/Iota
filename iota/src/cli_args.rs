@@ -557,8 +557,8 @@ impl CliInvocation {
         let parsed =
             Cli::try_parse_from(std::iter::once("iota".to_owned()).chain(args)).map_err(|error| {
                 match error.kind() {
-                    ErrorKind::DisplayHelp => return "__help__".to_owned(),
-                    ErrorKind::DisplayVersion => return "__version__".to_owned(),
+                    ErrorKind::DisplayHelp => "__help__".to_owned(),
+                    ErrorKind::DisplayVersion => "__version__".to_owned(),
                     _ => error.to_string(),
                 }
             });

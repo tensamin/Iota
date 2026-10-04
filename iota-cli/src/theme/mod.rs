@@ -129,13 +129,11 @@ pub fn resolve_with_capabilities(
     };
     theme.name = name;
     theme.unicode = unicode_enabled;
-    if !unicode_enabled {
-        if matches!(theme.console.cursor, CursorPresentation::Character { .. }) {
-            theme.console.cursor = CursorPresentation::Character {
-                glyph: "|",
-                style: theme.console.text,
-            };
-        }
+    if !unicode_enabled && matches!(theme.console.cursor, CursorPresentation::Character { .. }) {
+        theme.console.cursor = CursorPresentation::Character {
+            glyph: "|",
+            style: theme.console.text,
+        };
     }
     theme
 }

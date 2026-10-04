@@ -32,7 +32,7 @@ impl Capabilities {
         let once = self
             .executable
             .as_ref()
-            .and_then(|_| self.socket.as_ref())
+            .and(self.socket.as_ref())
             .map(|_| ())
             .map_err(ToString::to_string);
         let ui = once.clone();
@@ -72,10 +72,10 @@ pub async fn run(
     if let Ok(ipc) = IpcClient::connect(&endpoints.local).await {
         return Ok(ConnectionContext { ipc });
     }
-    if endpoints.system != endpoints.local {
-        if let Ok(ipc) = IpcClient::connect(&endpoints.system).await {
-            return Ok(ConnectionContext { ipc });
-        }
+    if endpoints.system != endpoints.local
+        && let Ok(ipc) = IpcClient::connect(&endpoints.system).await
+    {
+        return Ok(ConnectionContext { ipc });
     }
     let options = caps.options();
     if !options.iter().any(|o| o.enabled) {

@@ -39,10 +39,10 @@ fn validate(user_id: i64, blob_id: &str, blob: Option<&[u8]>) -> Result<(), Stor
     if blob_id.is_empty() || blob_id.len() > MAX_BLOB_ID_BYTES {
         return Err(StorageError::Other("invalid blob id".into()));
     }
-    if let Some(blob) = blob {
-        if blob.len() > MAX_BLOB_BYTES {
-            return Err(StorageError::Other("blob exceeds size limit".into()));
-        }
+    if let Some(blob) = blob
+        && blob.len() > MAX_BLOB_BYTES
+    {
+        return Err(StorageError::Other("blob exceeds size limit".into()));
     }
     Ok(())
 }

@@ -27,6 +27,7 @@ fn choice(
         suffix,
     }
 }
+#[expect(clippy::too_many_arguments, reason = "explicit theme styles")]
 fn base(
     name: ThemeName,
     normal: Style,

@@ -435,7 +435,7 @@ impl JoinableElement for LogCard {
     }
 
     fn as_element(&self) -> &(dyn Element + 'static) {
-        &*self
+        self
     }
 
     fn as_element_mut(&mut self) -> &mut (dyn Element + 'static) {
@@ -461,7 +461,7 @@ impl InteractableElement for LogCard {
     }
 
     fn as_element(&self) -> &(dyn Element + 'static) {
-        &*self
+        self
     }
 
     fn as_element_mut(&mut self) -> &mut (dyn Element + 'static) {

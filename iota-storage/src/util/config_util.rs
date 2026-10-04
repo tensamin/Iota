@@ -127,15 +127,12 @@ pub struct RelayRouterSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum WebMode {
+    #[default]
     Disabled,
     Loopback,
     Network,
-}
-impl Default for WebMode {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,14 +337,14 @@ pub fn save_config() {
 
 pub fn save_config_to(path: &Path) {
     if let Ok(yaml) = serde_yaml::to_string(&**CONFIG.load()) {
-        if let Some(parent) = path.parent() {
-            if let Err(error) = fs::create_dir_all(parent) {
-                eprintln!(
-                    "Cannot create configuration directory {}: {error}",
-                    parent.display()
-                );
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "Cannot create configuration directory {}: {error}",
+                parent.display()
+            );
+            return;
         }
         if let Err(error) = iota_util::atomic_file::replace(path, yaml.as_bytes(), 3) {
             eprintln!("Cannot save {}: {error}", path.display());
@@ -495,8 +492,10 @@ mod tests {
 
     #[test]
     fn zero_ipc_capacity_is_rejected() {
-        let mut config = IotaConfig::default();
-        config.max_ipc_clients = 0;
+        let config = IotaConfig {
+            max_ipc_clients: 0,
+            ..IotaConfig::default()
+        };
         assert!(matches!(
             validate_config(&config),
             Err(ConfigError::InvalidMaxIpcClients)

@@ -37,6 +37,7 @@ struct ClientSubscription {
     metric_interval_ms: u64,
 }
 
+#[expect(clippy::large_enum_variant, reason = "keep queued IPC messages inline")]
 enum WriterCommand {
     Message(DaemonMessage),
     Flush {
@@ -94,6 +95,7 @@ impl IpcServer {
                     .join("daemon.lock");
                 let lock = File::options()
                     .create(true)
+                    .truncate(false)
                     .mode(0o600)
                     .read(true)
                     .write(true)
@@ -478,15 +480,13 @@ async fn handle_client(
                             Ok(DaemonMessage::LogEntry(entry)) => {
                                 // Filter by subscribed log classes
                                 let log_classes = sub_rx.borrow().log_classes.clone();
-                                if log_classes.is_empty()
-                                    || log_classes.iter().any(|c| entry.sender == *c)
-                                {
-                                    if let Err(error) = write_client_message(&mut writer, &DaemonMessage::LogEntry(entry)).await {
+                                if (log_classes.is_empty()
+                                    || log_classes.contains(&entry.sender))
+                                    && let Err(error) = write_client_message(&mut writer, &DaemonMessage::LogEntry(entry)).await {
                                         eprintln!("IPC client writer stopped while sending log message: {error}");
                                         session_cancellation.cancel();
                                         break;
                                     }
-                                }
                             }
                             Ok(DaemonMessage::MetricSample(sample)) => {
                                 // Rate-limit metric samples based on subscription interval

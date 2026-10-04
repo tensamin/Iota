@@ -38,10 +38,10 @@ fn validate(user_id: i64, retention: MessageRetention) -> Result<(), StorageErro
             "invalid message storage policy owner".into(),
         ));
     }
-    if let MessageRetention::Duration { duration_ms } = retention {
-        if !(MIN_RETENTION_DURATION_MS..=MAX_RETENTION_DURATION_MS).contains(&duration_ms) {
-            return Err(StorageError::Other("invalid retention duration".into()));
-        }
+    if let MessageRetention::Duration { duration_ms } = retention
+        && !(MIN_RETENTION_DURATION_MS..=MAX_RETENTION_DURATION_MS).contains(&duration_ms)
+    {
+        return Err(StorageError::Other("invalid retention duration".into()));
     }
     Ok(())
 }
