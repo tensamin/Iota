@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use std::{collections::BTreeMap, fs, io::Write, path::Path};
+use std::{collections::BTreeMap, fs};
 
 const CONFIG: &str = "/etc/iota/update.env";
 const RELEASES: &str = "https://git.methanium.net/tensamin/prod-pins/releases/download";
@@ -55,29 +55,10 @@ pub fn selected_channel() -> Result<String> {
 }
 
 pub fn select_channel(channel: &str) -> Result<()> {
-    let url = manifest_url(channel, std::env::consts::ARCH)?;
-    let paths = iota_paths::IotaPaths::resolve(iota_paths::Scope::System)
-        .map_err(|error| anyhow::anyhow!(error))?;
-    let transaction = crate::transaction::UpdateTransaction::from_paths(&paths)?;
-    let _lock = transaction.acquire()?;
-    let mut entries = load()?;
-    entries.insert("IOTA_UPDATE_CHANNEL".into(), channel.into());
-    entries.insert("IOTA_UPDATE_MANIFEST".into(), url.clone());
-    entries.insert("IOTA_UPDATE_SIGNATURE".into(), format!("{url}.sig"));
-    let path = Path::new(CONFIG);
-    let parent = path.parent().context("update.env has no parent")?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary
-        .as_file()
-        .set_permissions(fs::metadata(path)?.permissions())?;
-    for (name, value) in entries {
-        writeln!(temporary, "{name}={value}")?;
+    if channel != selected_channel()? {
+        bail!(
+            "the update channel is fixed at installation; install the desired channel separately"
+        );
     }
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .context("save update channel")?;
-    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }

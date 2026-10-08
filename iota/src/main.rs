@@ -434,7 +434,7 @@ fn print_help() {
     println!("  logs [--limit N]       Show recent log entries");
     println!("  update check           Check for updates");
     println!("  update apply           Apply the selected channel's signed update");
-    println!("  update channel [stable|canary]  Show or select the update channel");
+    println!("  update channel                Show the installed update channel");
     println!("  community list         List communities");
     println!("  terms status           Show terms acceptance status");
     println!("  terms show <DOC>       Show a terms document");
