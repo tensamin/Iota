@@ -248,6 +248,15 @@
               hash = "sha256-aTIl42aoG55jdQWub5Q6Ejy/lx8kTyMG3C4U2PjEDEU=";
             };
           };
+          cli = self.packages.${system}.default.overrideAttrs {
+            pname = "iota-cli";
+            cargoBuildFlags = [ "-p" "iota" ];
+          };
+          daemon = self.packages.${system}.default.overrideAttrs {
+            pname = "iota-daemon";
+            cargoBuildFlags = [ "-p" "iota-daemon" ];
+            meta.mainProgram = "iota-daemon";
+          };
           portable = self.lib.mkPortable {
             inherit pkgs rustPlatform rust;
             iota = self.packages.${system}.default;
