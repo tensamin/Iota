@@ -7,7 +7,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     type-maps = {
-      url = "git+ssh://git@methanium.net/tensamin/mtp-type-maps?ref=main";
+      url = "github:TensaminDev/MTP-Type-Maps/main";
       flake = false;
     };
   };
@@ -245,7 +245,7 @@
               pname = "iota";
               version = "0.1.0";
               src = source;
-              hash = "sha256-aTIl42aoG55jdQWub5Q6Ejy/lx8kTyMG3C4U2PjEDEU=";
+              hash = "sha256-YH/s5uFkkfqpDlxQ8Ci5NHMLZvJMQejP6qk+i24ZPFg=";
             };
           };
           cli = self.packages.${system}.default.overrideAttrs {

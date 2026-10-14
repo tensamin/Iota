@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git"}
+mtp = { git = "https://github.com/MethaniumDev/MTP.git"}
 iota-util = { path = "../iota-util" }
 
 futures = "*"
