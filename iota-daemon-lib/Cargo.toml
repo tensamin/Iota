@@ -18,7 +18,7 @@ iota-updater = { path = "../iota-updater" }
 iota-util = { path = "../iota-util" }
 omikron-connector = { path = "../omikron-connector" }
 other-iota = { path = "../other-iota" }
-mtp = { git = "https://github.com/MethaniumDev/MTP.git", rev = "ad489265deacadd6de52ed2129d071803a0e7247" }
+mtp = { git = "https://github.com/nonanium/MTP.git", rev = "ad489265deacadd6de52ed2129d071803a0e7247" }
 libc = "0.2"
 sysinfo = "0.38.0"
 serde_yaml = "0.9"

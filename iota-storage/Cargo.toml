@@ -25,5 +25,5 @@ fs2 = "0.4.3"
 tokio = { version = "1.50.0", features = ["full"] }
 
 [dev-dependencies]
-mtp = { git = "https://github.com/MethaniumDev/MTP.git", rev = "ad489265deacadd6de52ed2129d071803a0e7247", features = ["crypto"] }
+mtp = { git = "https://github.com/nonanium/MTP.git", rev = "ad489265deacadd6de52ed2129d071803a0e7247", features = ["crypto"] }
 tempfile = "3"

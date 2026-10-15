@@ -11,7 +11,7 @@ iota-identity = { path = "../iota-identity" }
 iota-logger = { path = "../iota-logger" }
 iota-storage = { path = "../iota-storage" }
 iota-util = { path = "../iota-util" }
-mtp = { git = "https://github.com/MethaniumDev/MTP.git", rev = "ad489265deacadd6de52ed2129d071803a0e7247", features = ["crypto"] }
+mtp = { git = "https://github.com/nonanium/MTP.git", rev = "ad489265deacadd6de52ed2129d071803a0e7247", features = ["crypto"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.50.0", features = ["rt"] }

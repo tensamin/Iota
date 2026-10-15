@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1.89"
-mtp = { git = "https://github.com/MethaniumDev/MTP.git", rev = "ad489265deacadd6de52ed2129d071803a0e7247", features = ["client", "crypto", "pipes", "web-server"] }
+mtp = { git = "https://github.com/nonanium/MTP.git", rev = "ad489265deacadd6de52ed2129d071803a0e7247", features = ["client", "crypto", "pipes", "web-server"] }
 iota-auth = { path = "../iota-auth" }
 iota-identity = { path = "../iota-identity" }
 iota-connection = { path = "../iota-connection" }
