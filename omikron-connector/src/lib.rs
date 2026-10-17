@@ -8,4 +8,4 @@ pub mod tauth;
 pub mod user_ops;
 
 pub use client::{OmikronClient, OmikronError, OmikronStartupError};
-pub use omikron_connection::OmikronConnection;
+pub use omikron_connection::{OmikronConnection, ShutdownOutcome};

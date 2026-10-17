@@ -764,8 +764,12 @@ dependencies = [
  "mtp",
  "other-iota",
  "rcgen",
+ "serde_json",
+ "tau",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "uuid",
  "web-server",
 ]
@@ -1394,7 +1398,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2272,8 +2276,11 @@ dependencies = [
  "iota-storage",
  "iota-util",
  "mtp",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tau",
+ "tau-relay-protocol",
  "tokio",
  "uuid",
 ]
@@ -2352,10 +2359,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "libc",
  "mtp",
  "serde",
  "serde_json",
+ "tau",
 ]
 
 [[package]]
@@ -2503,6 +2510,7 @@ dependencies = [
  "reqwest",
  "sha2 0.10.9",
  "sysinfo",
+ "tau",
  "tempfile",
  "tokio",
  "url",
@@ -2951,7 +2959,7 @@ dependencies = [
 [[package]]
 name = "mtp"
 version = "0.4.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=ad489265deacadd6de52ed2129d071803a0e7247#ad489265deacadd6de52ed2129d071803a0e7247"
+source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "mtp-client",
  "mtp-codec",
@@ -2969,7 +2977,7 @@ dependencies = [
 [[package]]
 name = "mtp-client"
 version = "0.4.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=ad489265deacadd6de52ed2129d071803a0e7247#ad489265deacadd6de52ed2129d071803a0e7247"
+source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "mtp-codec",
  "mtp-common",
@@ -2983,7 +2991,7 @@ dependencies = [
 [[package]]
 name = "mtp-codec"
 version = "0.4.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=ad489265deacadd6de52ed2129d071803a0e7247#ad489265deacadd6de52ed2129d071803a0e7247"
+source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "base64 0.23.1",
  "byteorder",
@@ -2997,7 +3005,7 @@ dependencies = [
 [[package]]
 name = "mtp-common"
 version = "0.4.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=ad489265deacadd6de52ed2129d071803a0e7247#ad489265deacadd6de52ed2129d071803a0e7247"
+source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "js-sys",
  "rand 0.10.3",
@@ -3007,7 +3015,7 @@ dependencies = [
 [[package]]
 name = "mtp-core"
 version = "0.4.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=ad489265deacadd6de52ed2129d071803a0e7247#ad489265deacadd6de52ed2129d071803a0e7247"
+source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "async-trait",
  "mtp-codec",
@@ -3015,12 +3023,13 @@ dependencies = [
  "tokio",
  "tokio_with_wasm",
  "tracing",
+ "web-time",
 ]
 
 [[package]]
 name = "mtp-crypto"
 version = "0.4.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=ad489265deacadd6de52ed2129d071803a0e7247#ad489265deacadd6de52ed2129d071803a0e7247"
+source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -3043,7 +3052,7 @@ dependencies = [
 [[package]]
 name = "mtp-files"
 version = "0.4.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=ad489265deacadd6de52ed2129d071803a0e7247#ad489265deacadd6de52ed2129d071803a0e7247"
+source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "mtp-crypto",
  "rand 0.10.3",
@@ -3054,7 +3063,7 @@ dependencies = [
 [[package]]
 name = "mtp-h3"
 version = "0.4.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=ad489265deacadd6de52ed2129d071803a0e7247#ad489265deacadd6de52ed2129d071803a0e7247"
+source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3071,7 +3080,7 @@ dependencies = [
 [[package]]
 name = "mtp-host"
 version = "0.4.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=ad489265deacadd6de52ed2129d071803a0e7247#ad489265deacadd6de52ed2129d071803a0e7247"
+source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "mtp-codec",
  "mtp-common",
@@ -3088,7 +3097,7 @@ dependencies = [
 [[package]]
 name = "mtp-native"
 version = "0.4.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=ad489265deacadd6de52ed2129d071803a0e7247#ad489265deacadd6de52ed2129d071803a0e7247"
+source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "async-trait",
  "mtp-codec",
@@ -3109,7 +3118,7 @@ dependencies = [
 [[package]]
 name = "mtp-pipes"
 version = "0.4.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=ad489265deacadd6de52ed2129d071803a0e7247#ad489265deacadd6de52ed2129d071803a0e7247"
+source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "mtp-codec",
  "mtp-common",
@@ -3125,7 +3134,7 @@ dependencies = [
 [[package]]
 name = "mtp-type-map"
 version = "0.4.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=ad489265deacadd6de52ed2129d071803a0e7247#ad489265deacadd6de52ed2129d071803a0e7247"
+source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "serde",
  "serde_yaml",
@@ -3134,7 +3143,7 @@ dependencies = [
 [[package]]
 name = "mtp-webserver"
 version = "0.4.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=ad489265deacadd6de52ed2129d071803a0e7247#ad489265deacadd6de52ed2129d071803a0e7247"
+source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "bytes",
  "h3",
@@ -3331,11 +3340,15 @@ dependencies = [
  "iota-util",
  "json",
  "mtp",
+ "other-iota",
  "rand_core 0.6.4",
+ "rcgen",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tau",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
@@ -3418,6 +3431,7 @@ dependencies = [
  "async-trait",
  "iota-connection",
  "iota-identity",
+ "iota-logger",
  "iota-storage",
  "iota-util",
  "mtp",
@@ -3426,6 +3440,7 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+ "tokio-util",
  "web-server",
 ]
 
@@ -3871,7 +3886,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3965,7 +3980,7 @@ dependencies = [
 [[package]]
 name = "ratatool"
 version = "0.1.0"
-source = "git+https://git.methanium.net/methanium/ratatool.git#ddd0ddea7235cfc1ca27f79cf166f40d3d1fdabe"
+source = "git+https://github.com/Nonanium/ratatool.git?rev=ddd0ddea7235cfc1ca27f79cf166f40d3d1fdabe#ddd0ddea7235cfc1ca27f79cf166f40d3d1fdabe"
 dependencies = [
  "crossterm",
  "futures-util",
@@ -4254,7 +4269,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4322,7 +4337,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4865,16 +4880,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "tau"
+version = "0.1.0"
+source = "git+https://github.com/TensaminDev/Tau.git?rev=6465cd77f61e0df3316f331b6a49885864a81033#6465cd77f61e0df3316f331b6a49885864a81033"
+dependencies = [
+ "dashmap",
+ "libc",
+ "mtp",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "tau-relay-protocol"
+version = "0.1.0"
+source = "git+https://github.com/TensaminDev/Tau.git?rev=6465cd77f61e0df3316f331b6a49885864a81033#6465cd77f61e0df3316f331b6a49885864a81033"
+dependencies = [
+ "base64 0.22.1",
+ "mtp",
+ "mtp-type-map",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5107,11 +5149,10 @@ dependencies = [
 
 [[package]]
 name = "tokio_with_wasm"
-version = "0.10.1"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67952a4025dc561465d61ba68d4d0043b81d94c0ef61673164f00b90a7e6d97f"
+checksum = "4e35b31edfd5e7d495878ca8d0942d346cfea65c6b3e4fbf53d2f2934c800cbe"
 dependencies = [
- "hashbrown 0.16.1",
  "js-sys",
  "tokio",
  "tokio_with_wasm_proc",
@@ -5122,9 +5163,9 @@ dependencies = [
 
 [[package]]
 name = "tokio_with_wasm_proc"
-version = "0.10.1"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82fea9ff016ae35c66c3f49e9af0e5b334f489c761e64b02ed2d46d9520bda95"
+checksum = "84e1bd73ada62d1f66c0a894e394561e944c7bd8c5ee5df8027038c45386390b"
 dependencies = [
  "quote",
  "syn 2.0.119",
@@ -5677,7 +5718,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

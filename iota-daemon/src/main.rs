@@ -12,8 +12,25 @@ use tokio::sync::{broadcast, watch};
 
 const MESSAGE_RETENTION_INTERVAL: Duration = Duration::from_secs(60);
 const SYNC_COMPACTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("Cannot start daemon runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(run());
+    // A blocked storage closure cannot keep runtime destruction alive forever.
+    // The web supervisor has already reported any incomplete connection work.
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    result
+}
+
+async fn run() -> ExitCode {
     let scope = match std::env::var("IOTA_DEPLOYMENT_MODE").ok().as_deref() {
         Some("system_socket_activated") | Some("system_always_on") => iota_paths::Scope::System,
         _ => iota_paths::Scope::User,
@@ -151,7 +168,7 @@ async fn main() -> ExitCode {
             runtime.state.active_tasks.clone(),
             runtime.state.app.clone(),
         ));
-        let services = match DaemonServices::new(omikron.clone()) {
+        let services = match DaemonServices::new(omikron.clone(), node_identity.clone()) {
             Ok(services) => services,
             Err(error) => {
                 eprintln!("Cannot initialize daemon identity services: {error}");
@@ -193,7 +210,68 @@ async fn main() -> ExitCode {
     };
     let lifecycle_services = services.clone();
     let lifecycle_runtime = runtime.clone();
-    if omikron.is_none() {
+    let connector_shutdown = omikron.clone();
+    {
+        match services.relay.recover_incomplete(100) {
+            Ok(report) => {
+                log!("Initial relay recovery: {report:?}");
+                if report.health.blocked > 0 || report.health.receipt_backfill_blocked > 0 {
+                    runtime.set_component_degraded(
+                        iota_ipc::ComponentId::Storage,
+                        format!(
+                            "{} relay operations and {} receipt backfills blocked",
+                            report.health.blocked, report.health.receipt_backfill_blocked
+                        ),
+                    );
+                }
+            }
+            Err(error) => runtime.set_component_failed(
+                iota_ipc::ComponentId::Storage,
+                format!("Relay recovery initialization failed: {error:?}"),
+            ),
+        }
+        let relay_recovery = services.relay.clone();
+        let recovery_runtime = runtime.clone();
+        runtime
+            .tasks
+            .spawn_tracked("relay-application-recovery", async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = recovery_runtime.cancellation.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+                    }
+                    match relay_recovery.recover_incomplete(100) {
+                        Ok(report) => {
+                            log!("Relay recovery health: {report:?}");
+                            if report.health.blocked > 0
+                                || report.health.receipt_backfill_blocked > 0
+                            {
+                                recovery_runtime.set_component_degraded(
+                                    iota_ipc::ComponentId::Storage,
+                                    format!(
+                                        "{} relay operations and {} receipt backfills blocked",
+                                        report.health.blocked,
+                                        report.health.receipt_backfill_blocked
+                                    ),
+                                );
+                            } else {
+                                recovery_runtime
+                                    .set_component_healthy(iota_ipc::ComponentId::Storage, None);
+                            }
+                        }
+                        Err(error) => {
+                            log!("Relay application recovery failed: {error:?}");
+                            recovery_runtime.set_component_failed(
+                                iota_ipc::ComponentId::Storage,
+                                format!("Relay recovery unavailable: {error:?}"),
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await;
         let dispatcher =
             iota_connection::relay_service::PendingRelayDispatcher::new(services.router.clone());
         let dispatcher_runtime = runtime.clone();
@@ -201,8 +279,12 @@ async fn main() -> ExitCode {
             .tasks
             .spawn_tracked("pending-relay-dispatch", async move {
                 loop {
-                    if let Err(error) = dispatcher.dispatch_ready(100).await {
-                        log!("Pending Relay dispatch failed: {error:?}");
+                    tokio::select! {
+                        biased;
+                        _ = dispatcher_runtime.cancellation.cancelled() => break,
+                        result = dispatcher.dispatch_ready(100) => {
+                            if let Err(error) = result { log!("Pending Relay dispatch failed: {error:?}"); }
+                        }
                     }
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(2)) => {},
@@ -452,12 +534,22 @@ async fn main() -> ExitCode {
         }
     }
     let client_connections = Arc::new(client::ClientConnectionManager::new(
-        services.local_users.clone(),
-        services.principals.clone(),
+        services.identities.clone(),
         services.auth.hosted_accounts.clone(),
         services.sessions.clone(),
         services.relay.clone(),
     ));
+    let authorization_clients = client_connections.clone();
+    let authorization_shutdown = runtime.cancellation.clone();
+    runtime
+        .tasks
+        .spawn_tracked("hosted-authorization", async move {
+            authorization_clients
+                .monitor_authorization(authorization_shutdown)
+                .await;
+            Ok(())
+        })
+        .await;
     if let Some(relay_routers) = &services.relay_routers {
         for router in &relay_router_settings {
             let endpoint = match iota_identity::AuthorityLocator::new(router.endpoint.clone()) {
@@ -536,6 +628,7 @@ async fn main() -> ExitCode {
                 .await;
         }
     }
+    let mut peer_manager = None;
     let mtp_handler: Arc<dyn web_server::MtpConnectionHandler> =
         if let Some(router) = services.direct_router.clone() {
             let nodes: Arc<dyn iota_identity::NodeDirectory> =
@@ -549,7 +642,9 @@ async fn main() -> ExitCode {
                 deliveries,
             ));
             router.attach_manager(&peers);
+            peer_manager = Some(peers.clone());
             Arc::new(client::ConnectionGateway::new(
+                client::tau_gateway::admission_engine(),
                 client_connections.clone(),
                 peers,
             ))
@@ -579,6 +674,7 @@ async fn main() -> ExitCode {
         required: web.required,
         max_mtp_sessions: web.max_mtp_sessions,
         max_mtp_sessions_per_user: web.max_mtp_sessions_per_user,
+        shutdown_budget: Duration::from_secs(web.shutdown_budget_secs),
         authority_discovery: iota_identity::AuthorityDiscoveryDocument {
             version: 1,
             service: iota_identity::AuthorityKind::Iota,
@@ -607,11 +703,13 @@ async fn main() -> ExitCode {
         )),
         mtp_handler,
     };
+    let mut web_handle = None;
     match web_server::start(web_config, runtime.cancellation.clone()).await {
         Ok(None) => {
             runtime.set_component_healthy(iota_ipc::ComponentId::Web, Some("disabled".into()))
         }
         Ok(Some(handle)) => {
+            web_handle = Some(handle.clone());
             runtime.set_component_healthy(iota_ipc::ComponentId::Web, None);
             runtime
                 .tasks
@@ -715,12 +813,63 @@ async fn main() -> ExitCode {
     log!("iota-daemon shutting down (reason: {:?})", reason);
     runtime.set_startup_phase(StartupPhase::Stopping);
 
+    // Connection cleanup must finish before the generic task deadline can abort
+    // other daemon work and before the Tokio runtime terminates.
+    if let Some(peers) = peer_manager.as_ref() {
+        peers.stop();
+    }
+    let (web_shutdown, peers_clean) = tokio::join!(
+        async {
+            if let Some(handle) = web_handle {
+                handle.shutdown().await
+            } else {
+                web_server::ShutdownReport::Complete
+            }
+        },
+        async {
+            if let Some(peers) = peer_manager {
+                peers
+                    .shutdown(Duration::from_secs(web.shutdown_budget_secs))
+                    .await
+            } else {
+                true
+            }
+        },
+    );
+
+    let connector_clean = if let Some(connector) = connector_shutdown {
+        loop {
+            match connector.stop().await {
+                Ok(omikron_connector::omikron_connection::ShutdownOutcome::Complete) => break true,
+                Ok(omikron_connector::omikron_connection::ShutdownOutcome::Incomplete {
+                    pending_operations,
+                }) => {
+                    // The concrete supervisor keeps ownership. Ending Tokio here would abort its mutations.
+                    log!(
+                        "Connector shutdown is still supervised: {pending_operations} operations pending"
+                    );
+                }
+                Err(error) => {
+                    log!("Connector shutdown failed: {error}");
+                    break false;
+                }
+            }
+        }
+    } else {
+        true
+    };
+
     let _ = runtime
         .tasks
         .join_with_timeout(Duration::from_secs(5))
         .await;
 
-    let exit_code = reason.exit_code();
+    let exit_code =
+        if web_shutdown == web_server::ShutdownReport::Complete && peers_clean && connector_clean {
+            reason.exit_code()
+        } else {
+            1
+        };
     log!("iota-daemon exited (code: {})", exit_code);
     ExitCode::from(exit_code as u8)
 }

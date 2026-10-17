@@ -81,6 +81,58 @@ async fn node_directory_persists_identity_revision_endpoints_and_pins() {
     .verify(None, now)
     .unwrap();
     assert!(SqliteNodeDirectory.upsert_node_descriptor(&stale).is_err());
+    let hint = identity.node_id().mtp_authentication_hint();
+    assert!(
+        SqliteNodeDirectory
+            .key_for_authentication_hint(hint)
+            .unwrap()
+            .is_some()
+    );
+    // Inject a canonical-format collision at the storage boundary. Producing
+    // two real full-key fingerprints with the same hint is impractical in a test.
+    let mut collision = identity.node_id().as_str().to_owned();
+    let last = collision.pop().unwrap();
+    collision.push(if last == '0' { '1' } else { '0' });
+    let collision_id = iota_identity::IotaNodeId::new(&collision).unwrap();
+    assert_eq!(collision_id.mtp_authentication_hint(), hint);
+    iota_storage::util::db::with_db(|db| {
+        db.execute("INSERT INTO node_directory SELECT ?2, descriptor_revision, descriptor_valid_until, direct_endpoints, relay_hints, last_successful_endpoint, last_resolved_at, authentication_hint FROM node_directory WHERE node_id = ?1", rusqlite::params![identity.node_id().as_str(), collision])?;
+        db.execute("INSERT INTO node_keys SELECT ?2, public_key, valid_from, valid_until, source_revision FROM node_keys WHERE node_id = ?1", rusqlite::params![identity.node_id().as_str(), collision])?;
+        Ok(())
+    }).unwrap();
+    assert!(
+        SqliteNodeDirectory
+            .key_for_authentication_hint(hint)
+            .is_err()
+    );
+    iota_storage::util::db::with_db(|db| {
+        db.execute(
+            "UPDATE node_directory SET descriptor_valid_until = 0 WHERE node_id = ?1",
+            [&collision],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        SqliteNodeDirectory
+            .key_for_authentication_hint(hint)
+            .unwrap()
+            .is_some()
+    );
+    iota_storage::util::db::with_db(|db| {
+        db.execute(
+            "UPDATE node_keys SET valid_until = 0 WHERE node_id = ?1",
+            [identity.node_id().as_str()],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        SqliteNodeDirectory
+            .key_for_authentication_hint(hint)
+            .unwrap()
+            .is_none()
+    );
 
     let conflicting = SignedNodeDescriptor::sign(
         NodeDescriptor {

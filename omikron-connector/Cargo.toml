@@ -7,13 +7,14 @@ edition = "2024"
 iota-opaque = { path = "../iota-opaque" }
 async-trait = "0.1.89"
 iota-connection = { path = "../iota-connection" }
+other-iota = { path = "../other-iota" }
 iota-auth = { path = "../iota-auth" }
 iota-identity = { path = "../iota-identity" }
 iota-logger = { path = "../iota-logger" }
 iota-state = { path = "../iota-state" }
 iota-storage = { path = "../iota-storage" }
 iota-util = { path = "../iota-util" }
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "ad489265deacadd6de52ed2129d071803a0e7247", features = [
+mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "9f7f94e4cbd227610784ae47a1e7a1acf66f8584", features = [
     "client",
     "crypto",
     "files",
@@ -21,6 +22,7 @@ mtp = { git = "https://git.methanium.net/Methanium/mtp.git", rev = "ad489265deac
 ] }
 
 dashmap = "6.2.1"
+tau = { git = "https://github.com/TensaminDev/Tau.git", rev = "6465cd77f61e0df3316f331b6a49885864a81033" }
 hex = "0.4"
 json = "*"
 reqwest = "0.13.2"
@@ -35,3 +37,7 @@ base64 = "0.22.1"
 rand_core = { version = "0.6", features = ["getrandom", "std"] }
 trust-dns-resolver = { version = "0.23", features = ["tokio-runtime"] }
 url = "2"
+
+[dev-dependencies]
+rcgen = "0.14"
+rusqlite = "0.40.0"

@@ -160,7 +160,12 @@ impl OmikronConnection {
     }
 
     pub(super) async fn password_error(&self, frame: &CommunicationValue, kind: CommunicationType) {
-        let mut response = CommunicationValue::new(kind);
+        let mut response = CommunicationValue::new_with_type_map(
+            kind,
+            frame
+                .type_map()
+                .expect("handler request has a negotiated type map"),
+        );
         if let Some(id) = frame.id() {
             response = response.with_id(id);
         }

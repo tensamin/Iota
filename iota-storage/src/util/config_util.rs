@@ -154,6 +154,8 @@ pub struct WebSettings {
     pub max_mtp_sessions: usize,
     #[serde(default = "default_max_mtp_sessions_per_user")]
     pub max_mtp_sessions_per_user: usize,
+    #[serde(default = "default_shutdown_budget_secs")]
+    pub shutdown_budget_secs: u64,
     #[serde(default)]
     pub direct_endpoints: Vec<String>,
     #[serde(default)]
@@ -161,6 +163,9 @@ pub struct WebSettings {
 }
 const fn default_max_mtp_sessions() -> usize {
     256
+}
+const fn default_shutdown_budget_secs() -> u64 {
+    60
 }
 const fn default_max_mtp_sessions_per_user() -> usize {
     4
@@ -183,6 +188,7 @@ impl Default for WebSettings {
             required: false,
             max_mtp_sessions: default_max_mtp_sessions(),
             max_mtp_sessions_per_user: default_max_mtp_sessions_per_user(),
+            shutdown_budget_secs: default_shutdown_budget_secs(),
             direct_endpoints: Vec::new(),
             relay_hints: Vec::new(),
         }

@@ -4,61 +4,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use iota_util::mtp_compat::{MtpFieldError, OptionalDataValueExt, RequiredCommunicationFields};
 
-pub trait CommunicationResponseExt {
-    fn with_request_id(self, request: &CommunicationValue) -> Self;
+pub use tau::{CommunicationResponseExt, data_i64, data_string};
+
+/// Handler requests must carry the map negotiated by their transport.
+pub fn error_response(request: &CommunicationValue, kind: CommunicationType) -> CommunicationValue {
+    let type_map = request
+        .type_map()
+        .expect("handler request has a negotiated type map");
+    tau::error_response(request, kind, type_map)
 }
 
-impl CommunicationResponseExt for CommunicationValue {
-    fn with_request_id(mut self, request: &CommunicationValue) -> Self {
-        self = self.without_id();
-        if let Some(id) = request.id() {
-            self = self.with_id(id);
-        }
-        self
-    }
-}
-
-pub fn typed_container(items: Vec<(DataType, DataValue)>) -> DataValue {
-    use mtp::type_map::{DataTypeId, TypeMap};
-    let tm = TypeMap::latest();
-    DataValue::Container(
-        items
-            .into_iter()
-            .filter_map(|(dt, dv)| tm.data_id_enum(dt).map(|id| (DataTypeId(id), dv)))
-            .collect(),
-    )
-}
-
-pub fn data_string(cv: &CommunicationValue, dt: DataType) -> Option<String> {
-    cv.get_data(dt)
-        .and_then(DataValue::as_str)
-        .map(|s| s.to_string())
-        .or_else(|| {
-            cv.get_data(dt)
-                .and_then(DataValue::as_number)
-                .map(|n| n.to_string())
-        })
-        .or_else(|| {
-            cv.get_data(dt)
-                .and_then(DataValue::as_signed_number)
-                .map(|n| n.to_string())
-        })
-}
-
-pub fn data_i64(cv: &CommunicationValue, dt: DataType) -> Option<i64> {
-    cv.get_data(dt)
-        .and_then(DataValue::as_number)
-        .and_then(|n| i64::try_from(n).ok())
-        .or_else(|| {
-            cv.get_data(dt)
-                .and_then(DataValue::as_signed_number)
-                .and_then(|n| i64::try_from(n).ok())
-        })
-        .or_else(|| {
-            cv.get_data(dt)
-                .and_then(DataValue::as_str)
-                .and_then(|s| s.parse::<i64>().ok())
-        })
+/// Encode nested values for handlers that explicitly emit the latest protocol.
+/// Negotiated-map encoding uses tau::typed_container with its explicit map.
+pub fn typed_container(
+    items: Vec<(DataType, DataValue)>,
+) -> Result<DataValue, tau::ProtocolValueError> {
+    tau::typed_container(&TypeMap::latest(), items)
 }
 
 #[derive(Debug, Clone)]
@@ -68,23 +29,22 @@ pub struct ChatSecretRecipient {
     pub kem_ciphertext: Vec<u8>,
 }
 
-pub fn recipient_from_value(value: &DataValue) -> Option<ChatSecretRecipient> {
-    let tm = TypeMap::latest();
+pub fn recipient_from_value(value: &DataValue, type_map: &TypeMap) -> Option<ChatSecretRecipient> {
     let user_id = value
-        .get_field(DataType::UserId.try_to_id(&tm)?)?
+        .get_field(DataType::UserId.try_to_id(type_map)?)?
         .as_str()
         .map(|s| s.to_string())
         .or_else(|| {
             value
-                .get_field(DataType::UserId.try_to_id(&tm)?)?
+                .get_field(DataType::UserId.try_to_id(type_map)?)?
                 .as_number()
                 .map(|n| n.to_string())
         })?;
     let encrypted_secret = value
-        .get_field(DataType::EncryptedSecret.try_to_id(&tm)?)?
+        .get_field(DataType::EncryptedSecret.try_to_id(type_map)?)?
         .as_bytes()?;
     let kem_ciphertext = value
-        .get_field(DataType::KemCiphertext.try_to_id(&tm)?)?
+        .get_field(DataType::KemCiphertext.try_to_id(type_map)?)?
         .as_bytes()?;
 
     Some(ChatSecretRecipient {
@@ -95,10 +55,14 @@ pub fn recipient_from_value(value: &DataValue) -> Option<ChatSecretRecipient> {
 }
 
 pub fn chat_secret_recipients(cv: &CommunicationValue) -> Option<Vec<ChatSecretRecipient>> {
-    let recipients = cv.get_data(DataType::Recipients)?.as_array()?;
+    let type_map = cv.type_map()?;
+    let recipients = cv
+        .payload()
+        .get_field(DataType::Recipients.try_to_id(type_map)?)?
+        .as_array()?;
     let parsed = recipients
         .iter()
-        .map(recipient_from_value)
+        .map(|value| recipient_from_value(value, type_map))
         .collect::<Option<Vec<_>>>()?;
 
     if parsed.is_empty() {
@@ -114,17 +78,6 @@ pub fn now_millis_i64() -> i64 {
         .unwrap_or_default()
         .as_millis();
     i64::try_from(millis).unwrap_or(i64::MAX)
-}
-
-pub fn error_response(request: &CommunicationValue, ty: CommunicationType) -> CommunicationValue {
-    let mut response = CommunicationValue::new(ty).without_id();
-    if let Some(id) = request.id() {
-        response = response.with_id(id);
-    }
-    if let Some(sender) = request.sender() {
-        response = response.with_receiver(sender);
-    }
-    response
 }
 
 #[cfg(test)]

@@ -44,6 +44,7 @@ fn create_pool_with_timeout(
     database_path: PathBuf,
     connection_timeout: Duration,
 ) -> Result<Arc<r2d2::Pool<SqliteManager>>, StorageError> {
+    let legacy_path = database_path.with_file_name("e2ee.sqlite3");
     let manager = SqliteManager { database_path };
     let pool = r2d2::Pool::builder()
         .max_size(8)
@@ -51,6 +52,11 @@ fn create_pool_with_timeout(
         .build(manager)
         .map_err(|error| StorageError::Pool(error.to_string()))?;
     run_migrations(&pool)?;
+    let connection = pool
+        .get()
+        .map_err(|error| StorageError::Pool(error.to_string()))?;
+    crate::util::e2ee_storage::import_legacy_database(&connection, &legacy_path)?;
+    drop(connection);
     Ok(Arc::new(pool))
 }
 
@@ -92,8 +98,21 @@ where
         let pool = pool()?;
         let mut conn = pool.get().map_err(|e| StorageError::Pool(e.to_string()))?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let before: i64 = tx.query_row(
+            "SELECT sequence FROM hosted_auth_changes WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
         let value = f(&tx)?;
+        let after: i64 = tx.query_row(
+            "SELECT sequence FROM hosted_auth_changes WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
         tx.commit()?;
+        if before != after {
+            crate::hosted_auth::notify_change();
+        }
         Ok(value)
     })
 }
@@ -2089,6 +2108,157 @@ fn run_migrations_on_connection(conn: &Connection) -> Result<(), StorageError> {
         )?;
     }
 
+    if current_version < 50 {
+        let directory_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'node_directory')",
+            [], |row| row.get(0),
+        )?;
+        if directory_exists {
+            add_table_column_if_missing(
+                conn,
+                "node_directory",
+                "authentication_hint",
+                "authentication_hint INTEGER",
+            )?;
+            let nodes = {
+                let mut statement = conn.prepare("SELECT node_id FROM node_directory")?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for node in nodes {
+                let identity = iota_identity::IotaNodeId::new(&node)
+                    .map_err(|error| StorageError::Other(error.to_string()))?;
+                conn.execute(
+                    "UPDATE node_directory SET authentication_hint = ?2 WHERE node_id = ?1",
+                    rusqlite::params![node, identity.mtp_authentication_hint() as i64],
+                )?;
+            }
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_node_authentication_hint ON node_directory(authentication_hint);")?;
+        }
+        conn.pragma_update(None, "user_version", 50)?;
+    }
+
+    if current_version < 51 {
+        crate::hosted_auth::migrate(conn)?;
+    }
+
+    if current_version < 52 {
+        crate::util::relay_replay::migrate(conn)?;
+    }
+
+    if current_version < 53 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE chat_secrets (
+                user_id TEXT NOT NULL, chat_id TEXT NOT NULL, secret_id TEXT NOT NULL,
+                version INTEGER NOT NULL, encrypted_secret BLOB NOT NULL,
+                kem_ciphertext BLOB NOT NULL, wrapping_scheme TEXT NOT NULL,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, chat_id, secret_id, version)
+             );
+             CREATE INDEX idx_chat_secrets_owner ON chat_secrets (user_id, chat_id, secret_id);
+             CREATE TABLE storage_imports (name TEXT PRIMARY KEY, completed_at INTEGER NOT NULL);",
+        )?;
+        tx.pragma_update(None, "user_version", 53)?;
+        tx.commit()?;
+    }
+
+    if current_version < 54 {
+        let tx = conn.unchecked_transaction()?;
+        let inbox_exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'relay_inbox')", [], |r| r.get(0))?;
+        let queue_exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pending_relays')", [], |r| r.get(0))?;
+        if inbox_exists {
+            tx.execute_batch("ALTER TABLE relay_inbox ADD COLUMN prepared_operation BLOB;
+                ALTER TABLE relay_inbox ADD COLUMN rejection_reason TEXT CHECK(rejection_reason IN ('unauthorized', 'invalid_operation'));
+                UPDATE relay_inbox SET state = 'rejected', rejected_at = COALESCE(rejected_at, accepted_at, created_at),
+                processing_owner = NULL, processing_deadline = NULL WHERE state IN ('received', 'processing');")?;
+        }
+        if queue_exists {
+            tx.execute_batch("UPDATE pending_relays SET delivery_state = 'quarantined', last_error = 'pre_fenced_pipeline_requires_operator_review';")?;
+        }
+        tx.execute_batch(
+            "CREATE TABLE relay_deferred_secrets (
+                 signer_principal INTEGER NOT NULL, message_id TEXT NOT NULL,
+                 storage_owner INTEGER NOT NULL, owner_principal INTEGER NOT NULL,
+                 legacy_chat_id TEXT, chat_id TEXT NOT NULL, secret_id TEXT NOT NULL,
+                 version INTEGER NOT NULL CHECK(version > 0), encrypted_secret BLOB NOT NULL,
+                 kem_ciphertext BLOB NOT NULL, wrapping_scheme TEXT NOT NULL,
+                 created_at INTEGER NOT NULL, completed_at INTEGER,
+                 PRIMARY KEY(signer_principal, message_id, storage_owner)
+             );
+             CREATE TABLE relay_migration_history(name TEXT PRIMARY KEY, completed_at INTEGER NOT NULL);
+             INSERT INTO relay_migration_history(name, completed_at)
+                 VALUES ('pre_fenced_relay_quarantine', CAST(strftime('%s', 'now') AS INTEGER) * 1000);",
+        )?;
+        tx.pragma_update(None, "user_version", 54)?;
+        tx.commit()?;
+    }
+    if current_version < 55 {
+        crate::hosted_auth::migrate_server_instances(conn)?;
+        conn.pragma_update(None, "user_version", 55)?;
+    }
+    if current_version < 56 {
+        let tx = conn.unchecked_transaction()?;
+        let inbox_exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'relay_inbox' AND type = 'table')", [], |r| r.get(0))?;
+        let queue_exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'pending_relays' AND type = 'table')", [], |r| r.get(0))?;
+        if inbox_exists {
+            tx.execute_batch("ALTER TABLE relay_inbox ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0 CHECK(recovery_attempts >= 0);
+            ALTER TABLE relay_inbox ADD COLUMN recovery_next_at INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE relay_inbox ADD COLUMN recovery_status TEXT NOT NULL DEFAULT 'ready' CHECK(recovery_status IN ('ready', 'retry', 'blocked'));
+            ALTER TABLE relay_inbox ADD COLUMN recovery_error_code TEXT;
+            ALTER TABLE relay_inbox ADD COLUMN recovery_last_attempt_at INTEGER;
+            CREATE INDEX idx_relay_inbox_recovery ON relay_inbox(recovery_status, recovery_next_at, accepted_at) WHERE prepared_operation IS NOT NULL;")?;
+        }
+        if queue_exists {
+            tx.execute_batch("ALTER TABLE pending_relays ADD COLUMN dispatch_generation INTEGER NOT NULL DEFAULT 0 CHECK(dispatch_generation >= 0);
+            ALTER TABLE pending_relays ADD COLUMN dispatch_owner TEXT;
+            ALTER TABLE pending_relays ADD COLUMN dispatch_deadline INTEGER;
+            CREATE INDEX idx_pending_relays_dispatch ON pending_relays(delivery_state, next_attempt_at, dispatch_deadline, id);")?;
+        }
+        tx.pragma_update(None, "user_version", 56)?;
+        tx.commit()?;
+    }
+    if current_version < 57 {
+        let tx = conn.unchecked_transaction()?;
+        // Conversion belongs to the application codec and is resumable after schema initialization.
+        tx.execute_batch("INSERT INTO relay_migration_history(name, completed_at) VALUES ('prepared_dto_schema_ready', CAST(strftime('%s', 'now') AS INTEGER) * 1000);")?;
+        tx.pragma_update(None, "user_version", 57)?;
+        tx.commit()?;
+    }
+    if current_version < 58 {
+        let tx = conn.unchecked_transaction()?;
+        let queue_exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'pending_relays' AND type = 'table')", [], |r| r.get(0))?;
+        if queue_exists {
+            tx.execute_batch("UPDATE pending_relays SET delivery_state = 'quarantined', last_error = 'legacy_target_requires_operator_review', dispatch_owner = NULL, dispatch_deadline = NULL WHERE target_kind = 1;")?;
+        }
+        tx.execute_batch("INSERT INTO relay_migration_history(name, completed_at) VALUES ('legacy_relay_targets_quarantined', CAST(strftime('%s', 'now') AS INTEGER) * 1000);")?;
+        tx.pragma_update(None, "user_version", 58)?;
+        tx.commit()?;
+    }
+    if current_version < 59 {
+        let tx = conn.unchecked_transaction()?;
+        let source_exists: bool = tx.query_row("SELECT COUNT(*) = 3 FROM sqlite_master WHERE type = 'table' AND name IN ('relay_inbox','users','hosted_principals')", [], |r| r.get(0))?;
+        if source_exists {
+            super::relay_acceptance_receipts::migrate_on(&tx)?;
+        } else {
+            // Historical migration fixtures can contain only a subset of the old schema.
+            tx.execute_batch(super::relay_acceptance_receipts::SCHEMA)?;
+        }
+        tx.pragma_update(None, "user_version", 59)?;
+        tx.commit()?;
+    }
+    if current_version < 60 {
+        let tx = conn.unchecked_transaction()?;
+        let edits_exist: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'message_edits' AND type = 'table')", [], |r| r.get(0))?;
+        if edits_exist {
+            // Historical ciphertext epochs cannot be inferred after key rotation.
+            tx.execute_batch("ALTER TABLE message_edits ADD COLUMN content_before_key_version INTEGER CHECK(content_before_key_version > 0);
+                ALTER TABLE message_edits ADD COLUMN content_after_key_version INTEGER CHECK(content_after_key_version > 0);")?;
+        }
+        tx.pragma_update(None, "user_version", 60)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -2130,6 +2300,836 @@ mod tests {
     use super::*;
 
     #[test]
+    fn receipt_upgrade_isolates_malformed_source_column_types() -> Result<(), StorageError> {
+        use rusqlite::types::Value;
+        let conn = Connection::open_in_memory()?;
+        run_migrations_on_connection(&conn)?;
+        conn.execute_batch("DROP TABLE relay_acceptance_receipts; DROP TABLE relay_receipt_backfill_blocks;
+            ALTER TABLE message_edits DROP COLUMN content_before_key_version;
+            ALTER TABLE message_edits DROP COLUMN content_after_key_version;
+            INSERT INTO principals(principal_pk,authority_kind,authority_id,remote_user_id,last_resolved_at) VALUES(70,'omega','omega:test',7,0);
+            INSERT INTO users(user_id,username,public_key,created_at) VALUES(7,'owner','test',1);
+            INSERT INTO hosted_principals(local_user_id,principal_handle) VALUES(7,70);
+            PRAGMA user_version = 58;")?;
+        let prepared = br#"{"effects":[{"owner":7,"principal":70}],"operation":{"MessageSend":{"content":"ciphertext","send_time":100,"height":0,"version":1,"reply_to":null}}}"#.to_vec();
+        for (message, accepted, operation) in [
+            (
+                Value::Text("bad-time".into()),
+                Value::Text("corrupt".into()),
+                Value::Blob(prepared.clone()),
+            ),
+            (
+                Value::Blob(b"bad-message".to_vec()),
+                Value::Integer(1),
+                Value::Blob(prepared.clone()),
+            ),
+            (
+                Value::Text("text-operation".into()),
+                Value::Integer(1),
+                Value::Text(String::from_utf8(prepared.clone()).unwrap()),
+            ),
+            (
+                Value::Text("healthy".into()),
+                Value::Integer(1),
+                Value::Blob(prepared),
+            ),
+        ] {
+            conn.execute("INSERT INTO relay_inbox(signer_principal,signer_id,message_id,created_at,accepted_at,destination_id,frame,type_map_version,frame_id,state,prepared_operation) VALUES(70,7,?1,1,?2,8,X'01','1.0',1,'queued',?3)", rusqlite::params![message,accepted,operation])?;
+        }
+        run_migrations_on_connection(&conn)?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM relay_acceptance_receipts WHERE message_id = 'healthy'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            1
+        );
+        assert!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM relay_receipt_backfill_blocks WHERE storage_owner = 0",
+                [],
+                |r| r.get::<_, i64>(0)
+            )? > 0
+        );
+        assert!(super::super::relay_acceptance_receipts::upper_on(&conn, 7).is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT accepted_at FROM relay_inbox WHERE message_id = 'bad-time'",
+                [],
+                |r| r.get::<_, String>(0)
+            )?,
+            "corrupt"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM relay_inbox WHERE typeof(message_id) = 'blob'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            1
+        );
+        assert_eq!(conn.query_row("SELECT typeof(prepared_operation) FROM relay_inbox WHERE message_id = 'text-operation'", [], |r| r.get::<_,String>(0))?,"text");
+        Ok(())
+    }
+
+    #[test]
+    fn edit_epoch_migration_preserves_unknown_historical_versions() -> Result<(), StorageError> {
+        let conn = Connection::open_in_memory()?;
+        run_migrations_on_connection(&conn)?;
+        conn.execute_batch("ALTER TABLE message_edits DROP COLUMN content_before_key_version;
+            ALTER TABLE message_edits DROP COLUMN content_after_key_version;
+            INSERT INTO message_edits(message_id,content_before,content_after,edited_at,edited_by) VALUES(1,'old ciphertext','new ciphertext',1,1);
+            PRAGMA user_version = 59;")?;
+        run_migrations_on_connection(&conn)?;
+        let historical: (String, String, Option<i64>, Option<i64>) = conn.query_row("SELECT content_before,content_after,content_before_key_version,content_after_key_version FROM message_edits", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        assert_eq!(
+            historical,
+            ("old ciphertext".into(), "new ciphertext".into(), None, None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_target_migration_preserves_canonical_pending_work() -> Result<(), StorageError> {
+        let conn = Connection::open_in_memory()?;
+        run_migrations_on_connection(&conn)?;
+        conn.execute_batch("INSERT INTO pending_relays(destination_id,target_kind,frame,created_at,frame_id,type_map_version,delivery_state) VALUES (1,1,X'01',0,1,'1.0','ready'), (2,2,X'02',0,2,'1.0','ready');
+            DELETE FROM relay_migration_history WHERE name = 'legacy_relay_targets_quarantined';
+            DROP TABLE relay_acceptance_receipts;
+            DROP TABLE relay_receipt_backfill_blocks;
+            ALTER TABLE message_edits DROP COLUMN content_before_key_version;
+            ALTER TABLE message_edits DROP COLUMN content_after_key_version;
+            PRAGMA user_version = 57;")?;
+        run_migrations_on_connection(&conn)?;
+        let rows: Vec<(i64, String, Option<String>)> = conn.prepare("SELECT target_kind,delivery_state,last_error FROM pending_relays ORDER BY target_kind")?.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    1,
+                    "quarantined".into(),
+                    Some("legacy_target_requires_operator_review".into())
+                ),
+                (2, "ready".into(), None)
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn message_mutations_and_sync_events_use_the_callers_transaction() -> Result<(), StorageError> {
+        use crate::util::{chat_files, chats_util};
+        use iota_identity::PrincipalHandle;
+        let mut conn = Connection::open_in_memory()?;
+        run_migrations_on_connection(&conn)?;
+        conn.execute_batch(
+            "INSERT INTO principals (principal_pk, authority_kind, authority_id, remote_user_id, last_resolved_at)
+             VALUES (70, 'omega', 'omega:test', 7, 0), (71, 'omega', 'omega:test', 8, 0);",
+        )?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (owner, external, principal, sent_by_self) in [(7, 8, 71, true), (8, 7, 70, false)] {
+            chat_files::add_message_in_tx(
+                &tx,
+                chat_files::NewMessage {
+                    relay_signer_id: 7,
+                    relay_signer_principal: PrincipalHandle(70),
+                    relay_message_id: "send",
+                    authored_at: 10,
+                    send_time: 10,
+                    storage_owner: owner,
+                    external_user: external,
+                    external_principal: PrincipalHandle(principal),
+                    sent_by_self,
+                    content: "original",
+                    height: 0,
+                    key_version: 1,
+                    reply_to: None,
+                    origin_iota_received_at: Some(20),
+                    destination_iota_received_at: Some(20),
+                    initial_state: chat_files::MessageState::Sent,
+                },
+            )?;
+        }
+        tx.commit()?;
+        let baseline_events: i64 =
+            conn.query_row("SELECT count(*) FROM sync_events", [], |row| row.get(0))?;
+        conn.execute_batch(
+            "CREATE TRIGGER interrupt_destination BEFORE UPDATE ON messages
+             WHEN OLD.storage_owner = 8
+             BEGIN SELECT RAISE(ABORT, 'injected destination failure'); END;",
+        )?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        chat_files::edit_message_for_principal_in_tx(
+            &tx,
+            7,
+            8,
+            PrincipalHandle(71),
+            10,
+            7,
+            "edited",
+        )?;
+        assert!(
+            chat_files::apply_remote_edit_for_principal_in_tx(
+                &tx,
+                8,
+                7,
+                PrincipalHandle(70),
+                10,
+                7,
+                "edited"
+            )
+            .is_err()
+        );
+        tx.rollback()?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM messages WHERE content = 'original' AND edited_count = 0",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM message_edits", [], |row| row
+                .get::<_, i64>(0))?,
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM sync_events", [], |row| row
+                .get::<_, i64>(0))?,
+            baseline_events
+        );
+        conn.execute_batch("DROP TRIGGER interrupt_destination;")?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        chat_files::edit_message_for_principal_in_tx(
+            &tx,
+            7,
+            8,
+            PrincipalHandle(71),
+            10,
+            7,
+            "edited",
+        )?;
+        chat_files::apply_remote_edit_for_principal_in_tx(
+            &tx,
+            8,
+            7,
+            PrincipalHandle(70),
+            10,
+            7,
+            "edited",
+        )?;
+        chat_files::add_reaction_for_principal_in_tx(
+            &tx,
+            7,
+            8,
+            PrincipalHandle(71),
+            10,
+            7,
+            PrincipalHandle(70),
+            "a",
+        )?;
+        chat_files::remove_reaction_for_principal_in_tx(
+            &tx,
+            7,
+            8,
+            PrincipalHandle(71),
+            10,
+            7,
+            PrincipalHandle(70),
+            "a",
+        )?;
+        chat_files::delete_edit_history_in_tx(&tx, 7, 8, 10)?;
+        chats_util::add_conversation_in_tx(&tx, 7, 8, PrincipalHandle(71), Some("new name"))?;
+        chat_files::apply_remote_delete_for_principal_in_tx(&tx, 8, 7, PrincipalHandle(70), 10, 7)?;
+        chat_files::delete_message_for_principal_in_tx(&tx, 7, 8, PrincipalHandle(71), 10)?;
+        assert_eq!(
+            tx.query_row(
+                "SELECT count(*) FROM messages WHERE deleted_by_external = 0",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        tx.rollback()?;
+        assert_eq!(conn.query_row("SELECT count(*) FROM messages WHERE content = 'original' AND deleted_by_external = 0", [], |row| row.get::<_, i64>(0))?, 2);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM message_edits", [], |row| row
+                .get::<_, i64>(0))?,
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM reactions", [], |row| row
+                .get::<_, i64>(0))?,
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM contacts WHERE user_name IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM sync_events", [], |row| row
+                .get::<_, i64>(0))?,
+            baseline_events
+        );
+
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        assert!(matches!(
+            chat_files::edit_message_for_principal_in_tx(
+                &tx,
+                8,
+                7,
+                PrincipalHandle(70),
+                10,
+                8,
+                "invalid"
+            ),
+            Err(StorageError::MessageUnauthorized)
+        ));
+        assert!(matches!(
+            chat_files::apply_remote_edit_for_principal_in_tx(
+                &tx,
+                7,
+                8,
+                PrincipalHandle(71),
+                10,
+                8,
+                "invalid"
+            ),
+            Err(StorageError::MessageUnauthorized)
+        ));
+        assert!(matches!(
+            chat_files::delete_message_for_principal_in_tx(&tx, 8, 7, PrincipalHandle(70), 10),
+            Err(StorageError::MessageUnauthorized)
+        ));
+        assert!(matches!(
+            chat_files::apply_remote_delete_for_principal_in_tx(
+                &tx,
+                7,
+                8,
+                PrincipalHandle(71),
+                10,
+                8
+            ),
+            Err(StorageError::MessageUnauthorized)
+        ));
+        for index in 0..chat_files::MAX_UNIQUE_REACTIONS_PER_MESSAGE {
+            chat_files::add_reaction_for_principal_in_tx(
+                &tx,
+                7,
+                8,
+                PrincipalHandle(71),
+                10,
+                7,
+                PrincipalHandle(70),
+                &index.to_string(),
+            )?;
+        }
+        chat_files::add_reaction_for_principal_in_tx(
+            &tx,
+            7,
+            8,
+            PrincipalHandle(71),
+            10,
+            7,
+            PrincipalHandle(70),
+            "0",
+        )?;
+        assert!(matches!(
+            chat_files::add_reaction_for_principal_in_tx(
+                &tx,
+                7,
+                8,
+                PrincipalHandle(71),
+                10,
+                7,
+                PrincipalHandle(70),
+                "overflow"
+            ),
+            Err(StorageError::ReactionLimitReached)
+        ));
+        chats_util::add_conversation_in_tx(&tx, 7, 8, PrincipalHandle(71), Some("Alice"))?;
+        chats_util::add_conversation_in_tx(&tx, 7, 8, PrincipalHandle(71), None)?;
+        assert_eq!(
+            tx.query_row(
+                "SELECT user_name FROM contacts WHERE storage_owner = 7",
+                [],
+                |row| row.get::<_, String>(0)
+            )?,
+            "Alice"
+        );
+        tx.commit()?;
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM reactions", [], |row| row
+                .get::<_, i64>(0))?,
+            chat_files::MAX_UNIQUE_REACTIONS_PER_MESSAGE as i64
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn queue_conflicts_and_exact_downstream_completion_preserve_relay_states()
+    -> Result<(), StorageError> {
+        use crate::util::{downstream_relay, relay_queue, relay_replay};
+        use iota_identity::{IotaNodeId, PrincipalHandle};
+        let mut conn = Connection::open_in_memory()?;
+        run_migrations_on_connection(&conn)?;
+        conn.execute_batch(
+            "INSERT INTO principals (principal_pk, authority_kind, authority_id, remote_user_id, last_resolved_at)
+             VALUES (70, 'omega', 'omega:test', 7, 0), (71, 'omega', 'omega:test', 8, 0);",
+        )?;
+        let target = relay_queue::RelayTarget::Iota(
+            IotaNodeId::new(format!("iota:v1:{}", "01".repeat(32))).unwrap(),
+        );
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut records = Vec::new();
+        for message_id in ["first", "second"] {
+            let identity = relay_queue::RelayIdentity {
+                signer: PrincipalHandle(70),
+                recipient: PrincipalHandle(71),
+                message_id: message_id.into(),
+                legacy_signer_id: Some(7),
+                legacy_recipient_id: Some(8),
+            };
+            let frame = message_id.as_bytes();
+            let relay_replay::AcquireResult::Claimed(claim) = relay_replay::acquire_in_tx(
+                &tx,
+                relay_replay::RelayReservationRequest {
+                    signer_principal: identity.signer,
+                    signer_id: 7,
+                    message_id,
+                    created_at: 10,
+                    accepted_at: 20,
+                    destination_id: 8,
+                    frame,
+                    frame_id: 42,
+                    type_map_version: "1.0",
+                },
+                100,
+            )?
+            else {
+                panic!("missing claim")
+            };
+            relay_replay::complete_application_in_tx(&tx, &claim)?;
+            relay_replay::mark_queued_in_tx(&tx, claim.signer, message_id)?;
+            let id =
+                relay_queue::enqueue_in_tx(&tx, target.clone(), &identity, frame, 20, 42, "1.0")?;
+            assert_eq!(
+                relay_queue::enqueue_in_tx(&tx, target.clone(), &identity, frame, 30, 99, "1.0")?,
+                id
+            );
+            assert!(matches!(
+                relay_queue::enqueue_in_tx(
+                    &tx,
+                    target.clone(),
+                    &identity,
+                    b"changed",
+                    20,
+                    42,
+                    "1.0"
+                ),
+                Err(StorageError::PendingRelayConflict)
+            ));
+            let record = tx.query_row(
+                "SELECT id, destination_id, target_kind, frame, created_at, frame_id, type_map_version, relay_signer_id, relay_destination_user_id, relay_message_id, delivery_state, last_error, destination_principal, signer_principal, destination_node_id, destination_authority_id, attempt_count, last_attempt_at, next_attempt_at FROM pending_relays WHERE id = ?1",
+                [id], relay_queue::pending_relay_from_row,
+            )?;
+            records.push(record);
+        }
+        tx.commit()?;
+        conn.execute_batch(
+            "CREATE TRIGGER interrupt_ack BEFORE DELETE ON pending_relays
+             BEGIN SELECT RAISE(ABORT, 'injected acknowledgement interruption'); END;",
+        )?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        assert!(
+            downstream_relay::acknowledge_pending_delivery_in_tx(&tx, &records[0], "first", 30)
+                .is_err()
+        );
+        tx.rollback()?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM relay_inbox WHERE state = 'queued'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM pending_relays", [], |row| row
+                .get::<_, i64>(0))?,
+            2
+        );
+        conn.execute_batch("DROP TRIGGER interrupt_ack;")?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut wrong_target = records[0].clone();
+        wrong_target.target = relay_queue::RelayTarget::Iota(
+            IotaNodeId::new(format!("iota:v1:{}", "02".repeat(32))).unwrap(),
+        );
+        assert!(matches!(
+            downstream_relay::acknowledge_pending_delivery_in_tx(&tx, &wrong_target, "first", 30),
+            Err(StorageError::PendingRelayConflict)
+        ));
+        assert!(matches!(
+            downstream_relay::acknowledge_pending_delivery_in_tx(&tx, &records[0], "second", 30),
+            Err(StorageError::PendingRelayConflict)
+        ));
+        assert!(downstream_relay::acknowledge_pending_delivery_in_tx(
+            &tx,
+            &records[0],
+            "first",
+            30
+        )?);
+        assert!(!downstream_relay::acknowledge_pending_delivery_in_tx(
+            &tx,
+            &records[0],
+            "first",
+            30
+        )?);
+        assert!(downstream_relay::reject_pending_delivery_in_tx(
+            &tx,
+            &records[1],
+            "destination_rejected"
+        )?);
+        assert!(matches!(
+            downstream_relay::acknowledge_pending_delivery_in_tx(&tx, &records[1], "second", 30),
+            Err(StorageError::InvalidRelayTransition)
+        ));
+        let states = tx
+            .prepare("SELECT message_id, state FROM relay_inbox ORDER BY message_id")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            states,
+            vec![
+                ("first".into(), "delivered".into()),
+                ("second".into(), "queued".into())
+            ]
+        );
+        assert_eq!(
+            tx.query_row(
+                "SELECT last_error FROM pending_relays WHERE id = ?1",
+                [records[1].id],
+                |row| row.get::<_, String>(0)
+            )?,
+            "destination_rejected"
+        );
+        tx.commit()?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM relay_inbox WHERE state = 'delivered'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM pending_relays", [], |row| row
+                .get::<_, i64>(0))?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn secret_import_is_atomic_and_does_not_resurrect_deleted_records() -> Result<(), StorageError>
+    {
+        use crate::util::e2ee_storage;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("e2ee.sqlite3");
+        let legacy = Connection::open(&path)?;
+        legacy.execute_batch(
+            "CREATE TABLE chat_secrets (
+                user_id TEXT, chat_id TEXT, secret_id TEXT, version INTEGER,
+                encrypted_secret BLOB, kem_ciphertext BLOB, wrapping_scheme TEXT,
+                created_at INTEGER, updated_at INTEGER
+             );
+             INSERT INTO chat_secrets VALUES ('7', '7:8', 'chat:7:8:main', 5, x'01', x'02', 'scheme', 10, 20);",
+        )?;
+        let connection = Connection::open_in_memory()?;
+        run_migrations_on_connection(&connection)?;
+        // Interrupt the destination commit after copying its secret rows.
+        connection.execute_batch(
+            "CREATE TRIGGER interrupt_import BEFORE INSERT ON storage_imports
+             BEGIN SELECT RAISE(ABORT, 'injected import interruption'); END;",
+        )?;
+        assert!(e2ee_storage::import_legacy_database(&connection, &path).is_err());
+        assert_eq!(
+            connection.query_row("SELECT count(*) FROM chat_secrets", [], |row| row
+                .get::<_, i64>(0))?,
+            0
+        );
+        assert_eq!(
+            connection.query_row("SELECT count(*) FROM storage_imports", [], |row| row
+                .get::<_, i64>(0))?,
+            0
+        );
+        connection.execute_batch("DROP TRIGGER interrupt_import;")?;
+        e2ee_storage::import_legacy_database(&connection, &path)?;
+        let query = e2ee_storage::ChatSecretQuery {
+            user_id: "7".into(),
+            chat_id: "7:8".into(),
+            secret_id: Some("chat:7:8:main".into()),
+            version: Some(5),
+        };
+        let imported = e2ee_storage::get_chat_secret_on(&connection, &query)?
+            .expect("missing imported secret");
+        assert_eq!(imported.encrypted_secret, vec![1]);
+        assert_eq!((imported.created_at, imported.updated_at), (10, 20));
+        connection.execute("DELETE FROM chat_secrets", [])?;
+        e2ee_storage::import_legacy_database(&connection, &path)?;
+        assert!(e2ee_storage::get_chat_secret_on(&connection, &query)?.is_none());
+        assert_eq!(
+            legacy.query_row("SELECT count(*) FROM chat_secrets", [], |row| row
+                .get::<_, i64>(0))?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn secret_and_relay_completion_share_one_rollback_boundary() -> Result<(), StorageError> {
+        use crate::util::{e2ee_storage, relay_replay};
+        let mut connection = Connection::open_in_memory()?;
+        run_migrations_on_connection(&connection)?;
+        connection.execute("INSERT INTO principals (principal_pk, authority_kind, authority_id, remote_user_id, last_resolved_at) VALUES (70, 'omega', 'omega:test', 7, 0)", [])?;
+        let secret = e2ee_storage::StoredChatSecret {
+            user_id: "7".into(),
+            chat_id: "principal:70:71".into(),
+            secret_id: "chat:principal:70:71:main".into(),
+            version: 1,
+            encrypted_secret: vec![1],
+            kem_ciphertext: vec![2],
+            wrapping_scheme: "scheme".into(),
+            created_at: 10,
+            updated_at: 20,
+        };
+        let tx = connection.transaction()?;
+        let relay_replay::AcquireResult::Claimed(claim) = relay_replay::acquire_in_tx(
+            &tx,
+            relay_replay::RelayReservationRequest {
+                signer_principal: iota_identity::PrincipalHandle(70),
+                signer_id: 7,
+                message_id: "secret",
+                created_at: 10,
+                accepted_at: 20,
+                destination_id: 8,
+                frame: b"secret",
+                frame_id: 42,
+                type_map_version: "1.0",
+            },
+            100,
+        )?
+        else {
+            panic!("missing claim")
+        };
+        tx.commit()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        relay_replay::verify_claim_in_tx(&tx, &claim)?;
+        e2ee_storage::put_chat_secret_in_tx(&tx, &secret)?;
+        relay_replay::complete_application_in_tx(&tx, &claim)?;
+        tx.rollback()?;
+        let query = e2ee_storage::ChatSecretQuery {
+            user_id: secret.user_id.clone(),
+            chat_id: secret.chat_id.clone(),
+            secret_id: Some(secret.secret_id.clone()),
+            version: Some(1),
+        };
+        assert!(e2ee_storage::get_chat_secret_on(&connection, &query)?.is_none());
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        relay_replay::verify_claim_in_tx(&tx, &claim)?;
+        e2ee_storage::put_chat_secret_in_tx(&tx, &secret)?;
+        e2ee_storage::put_chat_secret_in_tx(&tx, &secret)?;
+        let conflicting = e2ee_storage::StoredChatSecret {
+            encrypted_secret: vec![3],
+            ..secret
+        };
+        assert!(matches!(
+            e2ee_storage::put_chat_secret_in_tx(&tx, &conflicting),
+            Err(StorageError::ChatSecretConflict)
+        ));
+        relay_replay::complete_application_in_tx(&tx, &claim)?;
+        tx.commit()?;
+        assert_eq!(
+            connection.query_row("SELECT count(*) FROM chat_secrets", [], |row| row
+                .get::<_, i64>(0))?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn client_acknowledgement_uses_canonical_identity_and_rejects_ambiguity()
+    -> Result<(), StorageError> {
+        use crate::util::{chat_files, client_relay_delivery, relay_queue, relay_replay};
+        use iota_identity::PrincipalHandle;
+        use rusqlite::params;
+
+        let mut conn = Connection::open_in_memory()?;
+        run_migrations_on_connection(&conn)?;
+        conn.execute_batch(
+            "INSERT INTO principals (principal_pk, authority_kind, authority_id, remote_user_id, last_resolved_at)
+                VALUES (70, 'omega', 'omega:test', 7, 0), (71, 'omega', 'omega:test', 8, 0), (72, 'omega', 'omega:test', 9, 0);",
+        )?;
+        conn.execute("INSERT INTO user_message_storage_policy (user_id, history_mode, retention_mode, revision, updated_at) VALUES (8, 'delete_after_client_delivery', 'forever', 1, 20)", [])?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (signer, signer_id, message_id) in [(70, 7, "first"), (72, 9, "second")] {
+            let frame = message_id.as_bytes();
+            let relay_replay::AcquireResult::Claimed(claim) = relay_replay::acquire_in_tx(
+                &tx,
+                relay_replay::RelayReservationRequest {
+                    signer_principal: PrincipalHandle(signer),
+                    signer_id,
+                    message_id,
+                    created_at: 10,
+                    accepted_at: 20,
+                    destination_id: 8,
+                    frame,
+                    frame_id: 42,
+                    type_map_version: "1.0",
+                },
+                100,
+            )?
+            else {
+                panic!("missing claim")
+            };
+            relay_replay::complete_application_in_tx(&tx, &claim)?;
+            relay_replay::mark_queued_in_tx(&tx, claim.signer, message_id)?;
+            chat_files::add_message_in_tx(
+                &tx,
+                chat_files::NewMessage {
+                    relay_signer_id: signer_id as i64,
+                    relay_signer_principal: claim.signer,
+                    relay_message_id: message_id,
+                    authored_at: 10,
+                    send_time: 10,
+                    storage_owner: 8,
+                    external_user: signer_id as i64,
+                    external_principal: claim.signer,
+                    sent_by_self: false,
+                    content: "ciphertext",
+                    height: 0,
+                    key_version: 1,
+                    reply_to: None,
+                    origin_iota_received_at: None,
+                    destination_iota_received_at: Some(20),
+                    initial_state: chat_files::MessageState::Sent,
+                },
+            )?;
+        }
+        let identity = relay_queue::RelayIdentity {
+            signer: PrincipalHandle(70),
+            recipient: PrincipalHandle(71),
+            message_id: "first".into(),
+            legacy_signer_id: Some(7),
+            legacy_recipient_id: Some(8),
+        };
+        relay_queue::enqueue_in_tx(
+            &tx,
+            relay_queue::RelayTarget::User(8),
+            &identity,
+            b"first",
+            20,
+            42,
+            "1.0",
+        )?;
+        assert_eq!(
+            client_relay_delivery::acknowledge_client_delivery_in_tx(&tx, 8, 42)?,
+            client_relay_delivery::ClientRelayDeliveryResult::Acknowledged
+        );
+        let states: Vec<(String, String)> = tx
+            .prepare("SELECT message_id, state FROM relay_inbox ORDER BY message_id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            states,
+            vec![
+                ("first".into(), "delivered".into()),
+                ("second".into(), "queued".into())
+            ]
+        );
+        let history: Vec<(String, i64)> = tx
+            .prepare(
+                "SELECT relay_message_id, history_deleted FROM messages ORDER BY relay_message_id",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(history, vec![("first".into(), 1), ("second".into(), 0)]);
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM pending_relays", [], |row| row
+                .get::<_, i64>(0))?,
+            0
+        );
+        assert_eq!(
+            client_relay_delivery::acknowledge_client_delivery_in_tx(&tx, 8, 42)?,
+            client_relay_delivery::ClientRelayDeliveryResult::NotFound
+        );
+        tx.commit()?;
+
+        let tx = conn.transaction()?;
+        for (frame, message_id) in [(b"a".as_slice(), "a"), (b"b".as_slice(), "b")] {
+            let identity = relay_queue::RelayIdentity {
+                message_id: message_id.into(),
+                ..identity.clone()
+            };
+            relay_queue::enqueue_in_tx(
+                &tx,
+                relay_queue::RelayTarget::User(8),
+                &identity,
+                frame,
+                20,
+                42,
+                "1.0",
+            )?;
+        }
+        assert!(matches!(
+            client_relay_delivery::acknowledge_client_delivery_in_tx(&tx, 8, 42),
+            Err(StorageError::AmbiguousRelayDelivery)
+        ));
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM pending_relays", [], |row| row
+                .get::<_, i64>(0))?,
+            2
+        );
+        tx.rollback()?;
+
+        let tx = conn.transaction()?;
+        let identity = relay_queue::RelayIdentity {
+            message_id: "missing".into(),
+            ..identity
+        };
+        relay_queue::enqueue_in_tx(
+            &tx,
+            relay_queue::RelayTarget::User(8),
+            &identity,
+            b"missing",
+            20,
+            42,
+            "1.0",
+        )?;
+        assert!(matches!(
+            client_relay_delivery::acknowledge_client_delivery_in_tx(&tx, 8, 42),
+            Err(StorageError::InvalidRelayTransition)
+        ));
+        assert_eq!(
+            tx.query_row(
+                "SELECT count(*) FROM pending_relays WHERE relay_message_id = ?1",
+                params!["missing"],
+                |row| row.get::<_, i64>(0)
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
     fn pool_creation_failure_is_returned() -> Result<(), StorageError> {
         let not_a_directory =
             std::env::temp_dir().join(format!("iota-storage-pool-test-{}", std::process::id()));
@@ -2163,7 +3163,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 49);
+        assert_eq!(version, 60);
         for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
             let mut statement =
                 conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -2182,7 +3182,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 49);
+        assert_eq!(version, 60);
         for table in [
             "sync_heads",
             "sync_events",
@@ -2271,7 +3271,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 49);
+        assert_eq!(version, 60);
         let credential: (i64, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64) = conn.query_row(
             "SELECT opaque_profile, opaque_record, encrypted_tu_credential, account_public_key_sha256, created_at, updated_at FROM user_password_credentials WHERE user_id = 7",
             [],
@@ -2307,7 +3307,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
         run_migrations_on_connection(&conn)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 49);
+        assert_eq!(version, 60);
         let credential: (i64, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64) = conn.query_row(
             "SELECT opaque_profile, opaque_record, encrypted_tu_credential, account_public_key_sha256, created_at, updated_at FROM user_password_credentials WHERE user_id = 7",
             [],
@@ -2353,7 +3353,7 @@ mod tests {
         run_migrations_on_connection(&conn)?;
 
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 49);
+        assert_eq!(version, 60);
         for column in [
             "id",
             "user_id",
@@ -2448,7 +3448,7 @@ mod tests {
         )?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         assert_eq!(preserved, "remote_committed");
-        assert_eq!(version, 49);
+        assert_eq!(version, 60);
         Ok(())
     }
 
@@ -2486,7 +3486,7 @@ mod tests {
         })?;
         assert_eq!(count, 0);
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 49);
+        assert_eq!(version, 60);
         Ok(())
     }
 

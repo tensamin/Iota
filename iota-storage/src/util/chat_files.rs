@@ -6,7 +6,7 @@ use rusqlite::{OptionalExtension, Transaction, params};
 
 pub const MAX_UNIQUE_REACTIONS_PER_MESSAGE: usize = 10;
 
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum MessageState {
     Read,
     Received,
@@ -107,6 +107,7 @@ pub struct NewMessage<'a> {
 pub struct StoredReaction {
     pub reaction: String,
     pub user_id: i64,
+    pub principal: Option<iota_identity::PrincipalHandle>,
 }
 
 /*
@@ -150,6 +151,28 @@ pub fn edit_message_for_principal(
     )
 }
 
+pub fn edit_message_for_principal_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    external_principal: iota_identity::PrincipalHandle,
+    message_time: i64,
+    editor_id: i64,
+    new_content: &str,
+) -> Result<(), StorageError> {
+    update_message_content_in_tx(
+        tx,
+        storage_owner,
+        external_user,
+        Some(external_principal),
+        message_time,
+        editor_id,
+        new_content,
+        true,
+        None,
+    )
+}
+
 /* Applies an edit received from the message sender to the recipient's copy. */
 pub fn apply_remote_edit(
     storage_owner: i64,
@@ -159,9 +182,7 @@ pub fn apply_remote_edit(
     new_content: &str,
 ) -> Result<(), StorageError> {
     if editor_id != external_user {
-        return Err(StorageError::Other(
-            "Remote editor does not match chat partner".into(),
-        ));
+        return Err(StorageError::MessageUnauthorized);
     }
 
     update_message_content(
@@ -175,6 +196,93 @@ pub fn apply_remote_edit(
     )
 }
 
+/// VersionNumber identifies the replacement ciphertext's key, as used by the
+/// client's encryptChatText/decryptChatText calls. It may be an older available
+/// epoch or a new epoch, independent of the original message's key version.
+/// The relay calls require_edit_key_in_tx with the authenticated chat first.
+/// See client/packages/chat/src/components/message.tsx and context.tsx in the
+/// sibling client repository for edit production and live decryption.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit edit identity, key version and caller transaction"
+)]
+pub fn edit_message_for_principal_versioned_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    external_principal: iota_identity::PrincipalHandle,
+    message_time: i64,
+    editor_id: i64,
+    new_content: &str,
+    key_version: i64,
+) -> Result<(), StorageError> {
+    update_message_content_in_tx(
+        tx,
+        storage_owner,
+        external_user,
+        Some(external_principal),
+        message_time,
+        editor_id,
+        new_content,
+        true,
+        Some(key_version),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit edit identity, key version and caller transaction"
+)]
+pub fn apply_remote_edit_for_principal_versioned_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    external_principal: iota_identity::PrincipalHandle,
+    message_time: i64,
+    editor_id: i64,
+    new_content: &str,
+    key_version: i64,
+) -> Result<(), StorageError> {
+    if editor_id != external_user {
+        return Err(StorageError::MessageUnauthorized);
+    }
+    update_message_content_in_tx(
+        tx,
+        storage_owner,
+        external_user,
+        Some(external_principal),
+        message_time,
+        editor_id,
+        new_content,
+        false,
+        Some(key_version),
+    )
+}
+
+/// Check the exact ciphertext epoch, rather than the latest chat secret. A
+/// missing epoch is recoverable when its secret arrives, including after restart.
+pub fn require_edit_key_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    chat_id: &str,
+    key_version: i64,
+) -> Result<(), StorageError> {
+    if key_version <= 0 {
+        return Err(StorageError::InvalidRelayPayload("edit key version"));
+    }
+    crate::util::e2ee_storage::get_chat_secret_on(
+        tx,
+        &crate::util::e2ee_storage::ChatSecretQuery {
+            user_id: storage_owner.to_string(),
+            chat_id: chat_id.to_owned(),
+            secret_id: Some(crate::util::e2ee_storage::principal_secret_id(chat_id)),
+            version: Some(key_version),
+        },
+    )?
+    .ok_or(StorageError::MissingRelayDependency)?;
+    Ok(())
+}
+
 pub fn apply_remote_edit_for_principal(
     storage_owner: i64,
     external_user: i64,
@@ -184,9 +292,7 @@ pub fn apply_remote_edit_for_principal(
     new_content: &str,
 ) -> Result<(), StorageError> {
     if editor_id != external_user {
-        return Err(StorageError::Other(
-            "Remote editor does not match chat partner".into(),
-        ));
+        return Err(StorageError::MessageUnauthorized);
     }
     update_message_content(
         storage_owner,
@@ -208,10 +314,68 @@ fn update_message_content(
     new_content: &str,
     require_sent_by_self: bool,
 ) -> Result<(), StorageError> {
-    db::with_db(|conn| {
-        let msg = conn.query_row(
+    db::with_immediate_transaction(|tx| {
+        update_message_content_in_tx(
+            tx,
+            storage_owner,
+            external_user,
+            external_principal,
+            message_time,
+            editor_id,
+            new_content,
+            require_sent_by_self,
+            None,
+        )
+    })
+}
+
+pub fn apply_remote_edit_for_principal_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    external_principal: iota_identity::PrincipalHandle,
+    message_time: i64,
+    editor_id: i64,
+    new_content: &str,
+) -> Result<(), StorageError> {
+    if editor_id != external_user {
+        return Err(StorageError::MessageUnauthorized);
+    }
+    update_message_content_in_tx(
+        tx,
+        storage_owner,
+        external_user,
+        Some(external_principal),
+        message_time,
+        editor_id,
+        new_content,
+        false,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit message identity and caller transaction"
+)]
+fn update_message_content_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    external_principal: Option<iota_identity::PrincipalHandle>,
+    message_time: i64,
+    editor_id: i64,
+    new_content: &str,
+    require_sent_by_self: bool,
+    key_version: Option<i64>,
+) -> Result<(), StorageError> {
+    if key_version.is_some_and(|version| version <= 0) {
+        return Err(StorageError::InvalidRelayPayload("edit key version"));
+    }
+    let msg = tx
+        .query_row(
             r#"
-            SELECT id, content, sent_by_self, history_deleted
+            SELECT id, content, sent_by_self, history_deleted, key_version
             FROM messages
             WHERE storage_owner = ?1
               AND message_time = ?3
@@ -233,58 +397,54 @@ fn update_message_content(
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             },
-        )?;
+        )
+        .optional()?
+        .ok_or(StorageError::MissingRelayDependency)?;
 
-        let (msg_id, old_content, sent_by_self, history_deleted) = msg;
-        if require_sent_by_self && sent_by_self != 1 {
-            return Err(StorageError::Other(
-                "Only the original sender can edit this message".into(),
-            ));
-        }
-        if !require_sent_by_self && sent_by_self != 0 {
-            return Err(StorageError::Other(
-                "Remote edits may only update received messages".into(),
-            ));
-        }
+    let (msg_id, old_content, sent_by_self, history_deleted, old_key_version) = msg;
+    if require_sent_by_self && sent_by_self != 1 {
+        return Err(StorageError::MessageUnauthorized);
+    }
+    if !require_sent_by_self && sent_by_self != 0 {
+        return Err(StorageError::MessageUnauthorized);
+    }
 
-        if history_deleted != 0 {
-            return Ok(());
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+    if history_deleted != 0 {
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
 
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
+    tx.execute(
             r#"
-            INSERT INTO message_edits (message_id, content_before, content_after, edited_at, edited_by)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO message_edits (message_id, content_before, content_after, edited_at, edited_by, content_before_key_version, content_after_key_version)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
-            params![msg_id, old_content, new_content, now, editor_id],
+            params![msg_id, old_content, new_content, now, editor_id, old_key_version, key_version.unwrap_or(old_key_version)],
         )?;
 
-        tx.execute(
-            r#"
+    tx.execute(
+        r#"
             UPDATE messages
-            SET content = ?1, edited_count = edited_count + 1
+            SET content = ?1, edited_count = edited_count + 1,
+                key_version = COALESCE(?3, key_version)
             WHERE id = ?2
             "#,
-            params![new_content, msg_id],
-        )?;
-        sync::record_event(
-            &tx,
-            storage_owner,
-            EntityType::Message,
-            msg_id,
-            Operation::Upsert,
-        )?;
-        tx.commit()?;
-
-        Ok(())
-    })
+        params![new_content, msg_id, key_version],
+    )?;
+    sync::record_event(
+        tx,
+        storage_owner,
+        EntityType::Message,
+        msg_id,
+        Operation::Upsert,
+    )?;
+    Ok(())
 }
 
 pub fn hard_delete_message(
@@ -301,10 +461,27 @@ fn hard_delete_message_with_principal(
     external_principal: Option<iota_identity::PrincipalHandle>,
     message_time: i64,
 ) -> Result<(), StorageError> {
-    db::with_db(|conn| {
-        let msg_id = conn
-            .query_row(
-                r#"
+    db::with_immediate_transaction(|tx| {
+        hard_delete_message_with_principal_in_tx(
+            tx,
+            storage_owner,
+            external_user,
+            external_principal,
+            message_time,
+        )
+    })
+}
+
+fn hard_delete_message_with_principal_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    external_principal: Option<iota_identity::PrincipalHandle>,
+    message_time: i64,
+) -> Result<(), StorageError> {
+    let msg_id = tx
+        .query_row(
+            r#"
             SELECT id, history_deleted FROM messages
             WHERE storage_owner = ?1
               AND message_time = ?3
@@ -314,24 +491,21 @@ fn hard_delete_message_with_principal(
               )
             ORDER BY id DESC LIMIT 1
             "#,
-                params![
-                    storage_owner,
-                    external_user,
-                    message_time,
-                    external_principal.map(|principal| principal.0)
-                ],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-        let Some(msg_id) = msg_id else {
-            return Ok(());
-        };
+            params![
+                storage_owner,
+                external_user,
+                message_time,
+                external_principal.map(|principal| principal.0)
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(msg_id) = msg_id else {
+        return Ok(());
+    };
 
-        let tx = conn.unchecked_transaction()?;
-        purge_message_in_tx(&tx, storage_owner, msg_id)?;
-        tx.commit()?;
-        Ok(())
-    })
+    purge_message_in_tx(tx, storage_owner, msg_id)?;
+    Ok(())
 }
 
 pub fn purge_message(storage_owner: i64, message_id: i64) -> Result<(), StorageError> {
@@ -486,20 +660,81 @@ fn delete_message_with_principal(
     message_time: i64,
     sent_by_self: bool,
 ) -> Result<(), StorageError> {
-    match ensure_message_direction(
+    db::with_immediate_transaction(|tx| {
+        delete_message_with_principal_in_tx(
+            tx,
+            storage_owner,
+            external_user,
+            external_principal,
+            message_time,
+            sent_by_self,
+        )
+    })
+}
+
+pub fn delete_message_for_principal_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    external_principal: iota_identity::PrincipalHandle,
+    message_time: i64,
+) -> Result<(), StorageError> {
+    delete_message_with_principal_in_tx(
+        tx,
+        storage_owner,
+        external_user,
+        Some(external_principal),
+        message_time,
+        true,
+    )
+}
+
+pub fn apply_remote_delete_for_principal_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    external_principal: iota_identity::PrincipalHandle,
+    message_time: i64,
+    sender_id: i64,
+) -> Result<(), StorageError> {
+    if sender_id != external_user {
+        return Err(StorageError::MessageUnauthorized);
+    }
+    delete_message_with_principal_in_tx(
+        tx,
+        storage_owner,
+        external_user,
+        Some(external_principal),
+        message_time,
+        false,
+    )
+}
+
+fn delete_message_with_principal_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    external_principal: Option<iota_identity::PrincipalHandle>,
+    message_time: i64,
+    sent_by_self: bool,
+) -> Result<(), StorageError> {
+    match ensure_message_direction_in_tx(
+        tx,
         storage_owner,
         external_user,
         external_principal,
         message_time,
         sent_by_self,
     ) {
-        Ok(()) if sent_by_self => hard_delete_message_with_principal(
+        Ok(()) if sent_by_self => hard_delete_message_with_principal_in_tx(
+            tx,
             storage_owner,
             external_user,
             external_principal,
             message_time,
         ),
-        Ok(()) => flag_deleted_by_external_with_principal(
+        Ok(()) => flag_deleted_by_external_with_principal_in_tx(
+            tx,
             storage_owner,
             external_user,
             external_principal,
@@ -518,9 +753,7 @@ pub fn apply_remote_delete(
     sender_id: i64,
 ) -> Result<(), StorageError> {
     if sender_id != external_user {
-        return Err(StorageError::Other(
-            "Remote sender does not match chat partner".into(),
-        ));
+        return Err(StorageError::MessageUnauthorized);
     }
     delete_message_with_principal(storage_owner, external_user, None, message_time, false)
 }
@@ -533,9 +766,7 @@ pub fn apply_remote_delete_for_principal(
     sender_id: i64,
 ) -> Result<(), StorageError> {
     if sender_id != external_user {
-        return Err(StorageError::Other(
-            "Remote sender does not match chat partner".into(),
-        ));
+        return Err(StorageError::MessageUnauthorized);
     }
     delete_message_with_principal(
         storage_owner,
@@ -546,16 +777,16 @@ pub fn apply_remote_delete_for_principal(
     )
 }
 
-fn ensure_message_direction(
+fn ensure_message_direction_in_tx(
+    tx: &Transaction<'_>,
     storage_owner: i64,
     external_user: i64,
     external_principal: Option<iota_identity::PrincipalHandle>,
     message_time: i64,
     expected_sent_by_self: bool,
 ) -> Result<(), StorageError> {
-    db::with_db(|conn| {
-        let sent_by_self: i64 = conn.query_row(
-            r#"
+    let sent_by_self: i64 = tx.query_row(
+        r#"
             SELECT sent_by_self FROM messages
             WHERE storage_owner = ?1
               AND message_time = ?3
@@ -565,21 +796,18 @@ fn ensure_message_direction(
               )
             ORDER BY id DESC LIMIT 1
             "#,
-            params![
-                storage_owner,
-                external_user,
-                message_time,
-                external_principal.map(|principal| principal.0)
-            ],
-            |row| row.get(0),
-        )?;
-        if (sent_by_self != 0) != expected_sent_by_self {
-            return Err(StorageError::Other(
-                "Message sender is not authorized".into(),
-            ));
-        }
-        Ok(())
-    })
+        params![
+            storage_owner,
+            external_user,
+            message_time,
+            external_principal.map(|principal| principal.0)
+        ],
+        |row| row.get(0),
+    )?;
+    if (sent_by_self != 0) != expected_sent_by_self {
+        return Err(StorageError::MessageUnauthorized);
+    }
+    Ok(())
 }
 
 /*
@@ -600,10 +828,26 @@ fn flag_deleted_by_external_with_principal(
     external_principal: Option<iota_identity::PrincipalHandle>,
     message_time: i64,
 ) -> Result<(), StorageError> {
-    db::with_db(|conn| {
-        let tx = conn.unchecked_transaction()?;
-        let affected = tx.execute(
-            r#"
+    db::with_immediate_transaction(|tx| {
+        flag_deleted_by_external_with_principal_in_tx(
+            tx,
+            storage_owner,
+            external_user,
+            external_principal,
+            message_time,
+        )
+    })
+}
+
+fn flag_deleted_by_external_with_principal_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    external_principal: Option<iota_identity::PrincipalHandle>,
+    message_time: i64,
+) -> Result<(), StorageError> {
+    let affected = tx.execute(
+        r#"
             UPDATE messages
             SET deleted_by_external = 1
             WHERE storage_owner = ?1
@@ -613,32 +857,30 @@ fn flag_deleted_by_external_with_principal(
                   OR external_principal = ?4
               )
             "#,
-            params![
-                storage_owner,
-                external_user,
-                message_time,
-                external_principal.map(|principal| principal.0)
-            ],
-        )?;
-        if affected == 0 {
-            return Err(StorageError::Other("Message not found".into()));
-        }
-        let msg_id: i64 = tx.query_row(
+        params![
+            storage_owner,
+            external_user,
+            message_time,
+            external_principal.map(|principal| principal.0)
+        ],
+    )?;
+    if affected == 0 {
+        return Err(StorageError::Other("Message not found".into()));
+    }
+    let msg_id: i64 = tx.query_row(
             "SELECT id FROM messages WHERE storage_owner = ?1 AND message_time = ?3 AND ((?4 IS NULL AND external_user = ?2) OR external_principal = ?4) ORDER BY id DESC LIMIT 1",
             params![storage_owner, external_user, message_time, external_principal.map(|principal| principal.0)],
             |r| r.get(0),
         )?;
-        sync::record_event(
-            &tx,
-            storage_owner,
-            EntityType::Message,
-            msg_id,
-            Operation::Delete,
-        )?;
-        update_contact_last_message_in_tx(&tx, storage_owner, external_user, external_principal)?;
-        tx.commit()?;
-        Ok(())
-    })
+    sync::record_event(
+        tx,
+        storage_owner,
+        EntityType::Message,
+        msg_id,
+        Operation::Delete,
+    )?;
+    update_contact_last_message_in_tx(tx, storage_owner, external_user, external_principal)?;
+    Ok(())
 }
 
 /*
@@ -651,35 +893,42 @@ pub fn delete_edit_history(
     external_user: i64,
     message_time: i64,
 ) -> Result<(), StorageError> {
-    db::with_db(|conn| {
-        let (msg_id, history_deleted): (i64, i64) = conn.query_row(
-            r#"
+    db::with_immediate_transaction(|tx| {
+        delete_edit_history_in_tx(tx, storage_owner, external_user, message_time)
+    })
+}
+
+pub fn delete_edit_history_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    message_time: i64,
+) -> Result<(), StorageError> {
+    let (msg_id, history_deleted): (i64, i64) = tx.query_row(
+        r#"
             SELECT id, history_deleted FROM messages
             WHERE storage_owner = ?1 AND external_user = ?2 AND message_time = ?3
             ORDER BY id DESC LIMIT 1
             "#,
-            params![storage_owner, external_user, message_time],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if history_deleted != 0 {
-            return Ok(());
-        }
+        params![storage_owner, external_user, message_time],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if history_deleted != 0 {
+        return Ok(());
+    }
 
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM message_edits WHERE message_id = ?1",
-            params![msg_id],
-        )?;
-        sync::record_event(
-            &tx,
-            storage_owner,
-            EntityType::Message,
-            msg_id,
-            Operation::Upsert,
-        )?;
-        tx.commit()?;
-        Ok(())
-    })
+    tx.execute(
+        "DELETE FROM message_edits WHERE message_id = ?1",
+        params![msg_id],
+    )?;
+    sync::record_event(
+        tx,
+        storage_owner,
+        EntityType::Message,
+        msg_id,
+        Operation::Upsert,
+    )?;
+    Ok(())
 }
 
 pub fn add_reaction(
@@ -730,7 +979,61 @@ fn add_reaction_with_principal(
     reaction: &str,
 ) -> Result<(), StorageError> {
     db::with_immediate_transaction(|tx| {
-        let (msg_id, history_deleted): (i64, i64) = tx.query_row(
+        add_reaction_with_principal_in_tx(
+            tx,
+            storage_owner,
+            external_user,
+            external_principal,
+            message_time,
+            user_id,
+            user_principal,
+            reaction,
+        )
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit reaction identity and caller transaction"
+)]
+pub fn add_reaction_for_principal_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    external_principal: iota_identity::PrincipalHandle,
+    message_time: i64,
+    user_id: i64,
+    user_principal: iota_identity::PrincipalHandle,
+    reaction: &str,
+) -> Result<(), StorageError> {
+    add_reaction_with_principal_in_tx(
+        tx,
+        storage_owner,
+        external_user,
+        Some(external_principal),
+        message_time,
+        user_id,
+        Some(user_principal),
+        reaction,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit reaction identity and caller transaction"
+)]
+fn add_reaction_with_principal_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    external_principal: Option<iota_identity::PrincipalHandle>,
+    message_time: i64,
+    user_id: i64,
+    user_principal: Option<iota_identity::PrincipalHandle>,
+    reaction: &str,
+) -> Result<(), StorageError> {
+    let (msg_id, history_deleted): (i64, i64) = tx
+        .query_row(
             r#"
             SELECT id, history_deleted FROM messages
             WHERE storage_owner = ?1
@@ -748,33 +1051,35 @@ fn add_reaction_with_principal(
                 external_principal.map(|principal| principal.0)
             ],
             |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if history_deleted != 0 {
-            return Ok(());
-        }
+        )
+        .optional()?
+        .ok_or(StorageError::MissingRelayDependency)?;
+    if history_deleted != 0 {
+        return Ok(());
+    }
 
-        let reaction_exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM reactions WHERE message_id = ?1 AND reaction = ?2)",
-            params![msg_id, reaction],
+    let reaction_exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM reactions WHERE message_id = ?1 AND reaction = ?2)",
+        params![msg_id, reaction],
+        |row| row.get(0),
+    )?;
+    if !reaction_exists {
+        let unique_reactions: i64 = tx.query_row(
+            "SELECT COUNT(DISTINCT reaction) FROM reactions WHERE message_id = ?1",
+            [msg_id],
             |row| row.get(0),
         )?;
-        if !reaction_exists {
-            let unique_reactions: i64 = tx.query_row(
-                "SELECT COUNT(DISTINCT reaction) FROM reactions WHERE message_id = ?1",
-                [msg_id],
-                |row| row.get(0),
-            )?;
-            if unique_reactions >= MAX_UNIQUE_REACTIONS_PER_MESSAGE as i64 {
-                return Err(StorageError::ReactionLimitReached);
-            }
+        if unique_reactions >= MAX_UNIQUE_REACTIONS_PER_MESSAGE as i64 {
+            return Err(StorageError::ReactionLimitReached);
         }
+    }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
 
-        let inserted = tx.execute(
+    let inserted = tx.execute(
             r#"
             INSERT OR IGNORE INTO reactions (message_id, user_id, user_principal, reaction, created_at)
             VALUES (?1, ?2, ?3, ?4, ?5)
@@ -787,19 +1092,18 @@ fn add_reaction_with_principal(
                 now
             ],
         )?;
-        if inserted > 0 {
-            sync::record_event(
-                tx,
-                storage_owner,
-                EntityType::Message,
-                msg_id,
-                Operation::Upsert,
-            )?;
-            Ok(())
-        } else {
-            Ok(())
-        }
-    })
+    if inserted > 0 {
+        sync::record_event(
+            tx,
+            storage_owner,
+            EntityType::Message,
+            msg_id,
+            Operation::Upsert,
+        )?;
+        Ok(())
+    } else {
+        Ok(())
+    }
 }
 
 pub fn remove_reaction(
@@ -849,8 +1153,62 @@ fn remove_reaction_with_principal(
     user_principal: Option<iota_identity::PrincipalHandle>,
     reaction: &str,
 ) -> Result<(), StorageError> {
-    db::with_db(|conn| {
-        let (msg_id, history_deleted): (i64, i64) = conn.query_row(
+    db::with_immediate_transaction(|tx| {
+        remove_reaction_with_principal_in_tx(
+            tx,
+            storage_owner,
+            external_user,
+            external_principal,
+            message_time,
+            user_id,
+            user_principal,
+            reaction,
+        )
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit reaction identity and caller transaction"
+)]
+pub fn remove_reaction_for_principal_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    external_principal: iota_identity::PrincipalHandle,
+    message_time: i64,
+    user_id: i64,
+    user_principal: iota_identity::PrincipalHandle,
+    reaction: &str,
+) -> Result<(), StorageError> {
+    remove_reaction_with_principal_in_tx(
+        tx,
+        storage_owner,
+        external_user,
+        Some(external_principal),
+        message_time,
+        user_id,
+        Some(user_principal),
+        reaction,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit reaction identity and caller transaction"
+)]
+fn remove_reaction_with_principal_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    external_user: i64,
+    external_principal: Option<iota_identity::PrincipalHandle>,
+    message_time: i64,
+    user_id: i64,
+    user_principal: Option<iota_identity::PrincipalHandle>,
+    reaction: &str,
+) -> Result<(), StorageError> {
+    let (msg_id, history_deleted): (i64, i64) = tx
+        .query_row(
             r#"
             SELECT id, history_deleted FROM messages
             WHERE storage_owner = ?1
@@ -868,13 +1226,14 @@ fn remove_reaction_with_principal(
                 external_principal.map(|principal| principal.0)
             ],
             |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if history_deleted != 0 {
-            return Ok(());
-        }
+        )
+        .optional()?
+        .ok_or(StorageError::MissingRelayDependency)?;
+    if history_deleted != 0 {
+        return Ok(());
+    }
 
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
+    tx.execute(
             "DELETE FROM reactions WHERE message_id = ?1 AND ((?3 IS NULL AND user_id = ?2) OR user_principal = ?3) AND reaction = ?4",
             params![
                 msg_id,
@@ -883,19 +1242,24 @@ fn remove_reaction_with_principal(
                 reaction
             ],
         )?;
-        sync::record_event(
-            &tx,
-            storage_owner,
-            EntityType::Message,
-            msg_id,
-            Operation::Upsert,
-        )?;
-        tx.commit()?;
-        Ok(())
-    })
+    sync::record_event(
+        tx,
+        storage_owner,
+        EntityType::Message,
+        msg_id,
+        Operation::Upsert,
+    )?;
+    Ok(())
 }
 
 pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
+    db::with_immediate_transaction(|tx| add_message_in_tx(tx, message))
+}
+
+pub fn add_message_in_tx(
+    tx: &Transaction<'_>,
+    message: NewMessage<'_>,
+) -> Result<i64, StorageError> {
     let NewMessage {
         relay_signer_id,
         relay_signer_principal,
@@ -915,7 +1279,7 @@ pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
         initial_state,
     } = message;
     let stored_at = sync::now_millis();
-    let policy = message_storage_policy::get(storage_owner)?;
+    let policy = message_storage_policy::get_in_tx(tx, storage_owner)?;
     let expires_at = match policy.retention {
         MessageRetention::Forever => None,
         MessageRetention::Duration { duration_ms } => Some(
@@ -924,9 +1288,7 @@ pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
                 .ok_or_else(|| StorageError::Other("message expiry overflow".into()))?,
         ),
     };
-    db::with_db(|conn| {
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
+    tx.execute(
             r#"
             INSERT INTO messages (
                 storage_owner, external_user, message_time, content, sent_by_self,
@@ -956,31 +1318,29 @@ pub fn add_message(message: NewMessage<'_>) -> Result<i64, StorageError> {
                 relay_signer_principal.0,
             ],
         )?;
-        let msg_id = tx.last_insert_rowid();
-        sync::record_event(
-            &tx,
-            storage_owner,
-            EntityType::Message,
-            msg_id,
-            Operation::Upsert,
-        )?;
-        let mut contact =
-            crate::users::contact::Contact::for_principal(external_user, external_principal);
-        contact.set_last_message_at(
-            destination_iota_received_at
-                .or(origin_iota_received_at)
-                .unwrap_or(authored_at),
-        );
-        crate::util::chats_util::upsert_contact(&tx, storage_owner, &contact)?;
-        if !sent_by_self {
-            tx.execute(
+    let msg_id = tx.last_insert_rowid();
+    sync::record_event(
+        tx,
+        storage_owner,
+        EntityType::Message,
+        msg_id,
+        Operation::Upsert,
+    )?;
+    let mut contact =
+        crate::users::contact::Contact::for_principal(external_user, external_principal);
+    contact.set_last_message_at(
+        destination_iota_received_at
+            .or(origin_iota_received_at)
+            .unwrap_or(authored_at),
+    );
+    crate::util::chats_util::upsert_contact(tx, storage_owner, &contact)?;
+    if !sent_by_self {
+        tx.execute(
                 "UPDATE contacts SET notifications = CASE WHEN notifications < 9223372036854775807 THEN notifications + 1 ELSE notifications END WHERE storage_owner = ?1 AND principal_handle = ?2",
                 params![storage_owner, external_principal.0],
             )?;
-        }
-        tx.commit()?;
-        Ok(msg_id)
-    })
+    }
+    Ok(msg_id)
 }
 
 pub fn change_message_state_by_relay_id(
@@ -990,9 +1350,25 @@ pub fn change_message_state_by_relay_id(
     relay_message_id: &str,
     new_state: MessageState,
 ) -> Result<Option<MessageStateUpdate>, StorageError> {
-    db::with_db(|conn| {
-        let tx = conn.unchecked_transaction()?;
-        let Some((msg_id, current, message_time)) = tx
+    db::with_immediate_transaction(|tx| {
+        change_message_state_by_relay_id_in_tx(
+            tx,
+            storage_owner,
+            relay_signer_principal,
+            relay_message_id,
+            new_state,
+        )
+    })
+}
+
+pub fn change_message_state_by_relay_id_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    relay_signer_principal: iota_identity::PrincipalHandle,
+    relay_message_id: &str,
+    new_state: MessageState,
+) -> Result<Option<MessageStateUpdate>, StorageError> {
+    let Some((msg_id, current, message_time)) = tx
             .query_row(
                 "SELECT id, message_state, message_time FROM messages WHERE storage_owner = ?1 AND relay_signer_principal = ?2 AND relay_message_id = ?3",
                 params![storage_owner, relay_signer_principal.0, relay_message_id],
@@ -1008,24 +1384,22 @@ pub fn change_message_state_by_relay_id(
         else {
             return Ok(None);
         };
-        let final_state = MessageState::from_str(&current).upgrade(new_state);
-        tx.execute(
-            "UPDATE messages SET message_state = ?1 WHERE id = ?2",
-            params![final_state.as_str(), msg_id],
-        )?;
-        sync::record_event(
-            &tx,
-            storage_owner,
-            EntityType::Message,
-            msg_id,
-            Operation::Upsert,
-        )?;
-        tx.commit()?;
-        Ok(Some(MessageStateUpdate {
-            send_time: message_time,
-            state: final_state,
-        }))
-    })
+    let final_state = MessageState::from_str(&current).upgrade(new_state);
+    tx.execute(
+        "UPDATE messages SET message_state = ?1 WHERE id = ?2",
+        params![final_state.as_str(), msg_id],
+    )?;
+    sync::record_event(
+        tx,
+        storage_owner,
+        EntityType::Message,
+        msg_id,
+        Operation::Upsert,
+    )?;
+    Ok(Some(MessageStateUpdate {
+        send_time: message_time,
+        state: final_state,
+    }))
 }
 
 #[expect(
@@ -1044,14 +1418,46 @@ pub fn record_message_receipt(
     event_at: i64,
     recorded_at: i64,
 ) -> Result<Option<MessageStateUpdate>, StorageError> {
+    db::with_immediate_transaction(|tx| {
+        record_message_receipt_in_tx(
+            tx,
+            storage_owner,
+            target_signer_id,
+            target_signer_principal,
+            target_message_id,
+            receipt_signer_id,
+            receipt_signer_principal,
+            receipt_message_id,
+            receipt_type,
+            event_at,
+            recorded_at,
+        )
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit persisted receipt fields and caller transaction"
+)]
+pub fn record_message_receipt_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    target_signer_id: i64,
+    target_signer_principal: iota_identity::PrincipalHandle,
+    target_message_id: &str,
+    receipt_signer_id: i64,
+    receipt_signer_principal: iota_identity::PrincipalHandle,
+    receipt_message_id: &str,
+    receipt_type: MessageState,
+    event_at: i64,
+    recorded_at: i64,
+) -> Result<Option<MessageStateUpdate>, StorageError> {
     let receipt_type = match receipt_type {
         MessageState::Received => "received",
         MessageState::Read => "read",
         _ => return Err(StorageError::Other("invalid message receipt state".into())),
     };
-    db::with_db(|conn| {
-        let tx = conn.unchecked_transaction()?;
-        let Some((message_id, message_time, external_principal, authored_at, history_deleted)) = tx
+    let Some((message_id, message_time, external_principal, authored_at, history_deleted)) = tx
             .query_row(
                 "SELECT id, message_time, external_principal, authored_at, history_deleted FROM messages WHERE storage_owner = ?1 AND relay_signer_principal = ?2 AND relay_message_id = ?3",
                 params![storage_owner, target_signer_principal.0, target_message_id],
@@ -1067,55 +1473,51 @@ pub fn record_message_receipt(
             )
             .optional()?
         else {
-            return Err(StorageError::Other("message receipt target was not found".into()));
+            return Err(StorageError::MissingRelayDependency);
         };
-        if external_principal != receipt_signer_principal.0 {
-            return Err(StorageError::Other(
-                "message receipt signer is not the chat partner".into(),
-            ));
-        }
-        if event_at > recorded_at.saturating_add(5 * 60 * 1000)
-            || authored_at.is_some_and(|authored_at| event_at < authored_at)
-        {
-            return Err(StorageError::Other(
-                "message receipt event time is outside the accepted clock range".into(),
-            ));
-        }
-        if history_deleted != 0 {
-            return Ok(None);
-        }
-        tx.execute(
+    if external_principal != receipt_signer_principal.0 {
+        return Err(StorageError::MessageUnauthorized);
+    }
+    if event_at > recorded_at.saturating_add(5 * 60 * 1000)
+        || authored_at.is_some_and(|authored_at| event_at < authored_at)
+    {
+        return Err(StorageError::InvalidRelayPayload(
+            "receipt event time outside accepted clock range",
+        ));
+    }
+    if history_deleted != 0 {
+        return Ok(None);
+    }
+    tx.execute(
             "INSERT OR IGNORE INTO message_receipts (storage_owner, target_signer_id, target_signer_principal, target_message_id, receipt_signer_id, receipt_signer_principal, receipt_message_id, receipt_type, event_at, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![storage_owner, target_signer_id, target_signer_principal.0, target_message_id, receipt_signer_id, receipt_signer_principal.0, receipt_message_id, receipt_type, event_at, recorded_at],
         )?;
-        let (state_column, recorded_column) = if receipt_type == "read" {
-            ("read_at", "read_recorded_at")
-        } else {
-            ("client_received_at", "client_received_recorded_at")
-        };
-        let final_state = MessageState::from_str(&tx.query_row(
-            "SELECT message_state FROM messages WHERE id = ?1",
-            [message_id],
-            |row| row.get::<_, String>(0),
-        )?)
-        .upgrade(MessageState::from_str(receipt_type));
-        tx.execute(
+    let (state_column, recorded_column) = if receipt_type == "read" {
+        ("read_at", "read_recorded_at")
+    } else {
+        ("client_received_at", "client_received_recorded_at")
+    };
+    let final_state = MessageState::from_str(&tx.query_row(
+        "SELECT message_state FROM messages WHERE id = ?1",
+        [message_id],
+        |row| row.get::<_, String>(0),
+    )?)
+    .upgrade(MessageState::from_str(receipt_type));
+    tx.execute(
             &format!("UPDATE messages SET {state_column} = COALESCE({state_column}, ?1), {recorded_column} = COALESCE({recorded_column}, ?2), message_state = ?3 WHERE id = ?4"),
             params![event_at, recorded_at, final_state.as_str(), message_id],
         )?;
-        sync::record_event(
-            &tx,
-            storage_owner,
-            EntityType::Message,
-            message_id,
-            Operation::Upsert,
-        )?;
-        tx.commit()?;
-        Ok(Some(MessageStateUpdate {
-            send_time: message_time,
-            state: final_state,
-        }))
-    })
+    sync::record_event(
+        tx,
+        storage_owner,
+        EntityType::Message,
+        message_id,
+        Operation::Upsert,
+    )?;
+    Ok(Some(MessageStateUpdate {
+        send_time: message_time,
+        state: final_state,
+    }))
 }
 
 pub fn record_destination_iota_received(
@@ -1124,9 +1526,25 @@ pub fn record_destination_iota_received(
     relay_message_id: &str,
     accepted_at: i64,
 ) -> Result<(), StorageError> {
-    db::with_db(|conn| {
-        let tx = conn.unchecked_transaction()?;
-        let Some(message_id) = tx
+    db::with_immediate_transaction(|tx| {
+        record_destination_iota_received_in_tx(
+            tx,
+            storage_owner,
+            relay_signer_principal,
+            relay_message_id,
+            accepted_at,
+        )
+    })
+}
+
+pub fn record_destination_iota_received_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    relay_signer_principal: iota_identity::PrincipalHandle,
+    relay_message_id: &str,
+    accepted_at: i64,
+) -> Result<(), StorageError> {
+    let Some(message_id) = tx
             .query_row(
                 "SELECT id FROM messages WHERE storage_owner = ?1 AND relay_signer_principal = ?2 AND relay_message_id = ?3",
                 params![storage_owner, relay_signer_principal.0, relay_message_id],
@@ -1136,20 +1554,18 @@ pub fn record_destination_iota_received(
         else {
             return Ok(());
         };
-        tx.execute(
+    tx.execute(
             "UPDATE messages SET destination_iota_received_at = COALESCE(destination_iota_received_at, ?1), delivery_failed_at = NULL, delivery_failure = NULL, message_state = CASE WHEN message_state = 'sending' THEN 'sent' ELSE message_state END WHERE id = ?2",
             params![accepted_at, message_id],
         )?;
-        sync::record_event(
-            &tx,
-            storage_owner,
-            EntityType::Message,
-            message_id,
-            Operation::Upsert,
-        )?;
-        tx.commit()?;
-        Ok(())
-    })
+    sync::record_event(
+        tx,
+        storage_owner,
+        EntityType::Message,
+        message_id,
+        Operation::Upsert,
+    )?;
+    Ok(())
 }
 
 pub fn record_delivery_failure(
@@ -1159,9 +1575,27 @@ pub fn record_delivery_failure(
     failure: &str,
     failed_at: i64,
 ) -> Result<(), StorageError> {
-    db::with_db(|conn| {
-        let tx = conn.unchecked_transaction()?;
-        let Some(message_id) = tx
+    db::with_immediate_transaction(|tx| {
+        record_delivery_failure_in_tx(
+            tx,
+            storage_owner,
+            relay_signer_principal,
+            relay_message_id,
+            failure,
+            failed_at,
+        )
+    })
+}
+
+pub fn record_delivery_failure_in_tx(
+    tx: &Transaction<'_>,
+    storage_owner: i64,
+    relay_signer_principal: iota_identity::PrincipalHandle,
+    relay_message_id: &str,
+    failure: &str,
+    failed_at: i64,
+) -> Result<(), StorageError> {
+    let Some(message_id) = tx
             .query_row(
                 "SELECT id FROM messages WHERE storage_owner = ?1 AND relay_signer_principal = ?2 AND relay_message_id = ?3",
                 params![storage_owner, relay_signer_principal.0, relay_message_id],
@@ -1171,20 +1605,18 @@ pub fn record_delivery_failure(
         else {
             return Ok(());
         };
-        tx.execute(
+    tx.execute(
             "UPDATE messages SET delivery_failed_at = ?1, delivery_failure = ?2 WHERE id = ?3 AND destination_iota_received_at IS NULL",
             params![failed_at, failure, message_id],
         )?;
-        sync::record_event(
-            &tx,
-            storage_owner,
-            EntityType::Message,
-            message_id,
-            Operation::Upsert,
-        )?;
-        tx.commit()?;
-        Ok(())
-    })
+    sync::record_event(
+        tx,
+        storage_owner,
+        EntityType::Message,
+        message_id,
+        Operation::Upsert,
+    )?;
+    Ok(())
 }
 
 pub fn change_message_state(
@@ -1257,7 +1689,7 @@ fn load_reactions(
         .map(|(i, _)| format!("?{}", i + 1))
         .collect();
     let query = format!(
-        "SELECT message_id, reaction, user_id FROM reactions WHERE message_id IN ({}) ORDER BY created_at ASC, id ASC",
+        "SELECT message_id, reaction, user_id, user_principal FROM reactions WHERE message_id IN ({}) ORDER BY created_at ASC, id ASC",
         placeholders.join(", ")
     );
 
@@ -1274,6 +1706,9 @@ fn load_reactions(
             StoredReaction {
                 reaction: row.get(1)?,
                 user_id: row.get(2)?,
+                principal: row
+                    .get::<_, Option<i64>>(3)?
+                    .map(iota_identity::PrincipalHandle),
             },
         ))
     })?;
@@ -1594,7 +2029,389 @@ pub fn get_all_messages(storage_owner: i64) -> Result<Vec<StoredMessage>, Storag
 
 #[cfg(test)]
 mod tests {
-    use super::MessageState;
+    use super::*;
+    use iota_identity::PrincipalHandle;
+    use rusqlite::Connection;
+
+    fn edit_fixture(conn: &Connection) -> Result<(), StorageError> {
+        conn.execute_batch(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, storage_owner INTEGER,
+                external_user INTEGER, external_principal INTEGER, message_time INTEGER,
+                content TEXT, sent_by_self INTEGER, history_deleted INTEGER DEFAULT 0,
+                edited_count INTEGER DEFAULT 0, key_version INTEGER);
+             CREATE TABLE message_edits (message_id INTEGER, content_before TEXT,
+                 content_after TEXT, edited_at INTEGER, edited_by INTEGER,
+                 content_before_key_version INTEGER, content_after_key_version INTEGER);
+             CREATE TABLE sync_heads (user_id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+             CREATE TABLE sync_events (user_id INTEGER, version INTEGER, entity_type TEXT,
+                entity_id INTEGER, operation TEXT, created_at INTEGER);
+             CREATE TABLE chat_secrets (user_id TEXT, chat_id TEXT, secret_id TEXT,
+                version INTEGER, encrypted_secret BLOB, kem_ciphertext BLOB,
+                wrapping_scheme TEXT, created_at INTEGER, updated_at INTEGER);
+             INSERT INTO messages (id, storage_owner, external_user, external_principal,
+                message_time, content, sent_by_self, key_version)
+             VALUES (1, 7, 8, 71, 10, 'original', 1, 2),
+                    (2, 8, 7, 70, 10, 'original', 0, 2);
+             INSERT INTO chat_secrets VALUES
+                ('7', 'principal:70:71', 'chat:principal:70:71:main', 1, X'01', X'02', 'test', 0, 0),
+                ('7', 'principal:70:71', 'chat:principal:70:71:main', 2, X'03', X'04', 'test', 0, 0);",
+        )?;
+        Ok(())
+    }
+
+    fn edit_state(conn: &Connection) -> Result<(String, i64, i64, i64, i64), StorageError> {
+        Ok(conn.query_row(
+            "SELECT content, key_version, edited_count,
+                (SELECT count(*) FROM message_edits), (SELECT count(*) FROM sync_events)
+             FROM messages WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?)
+    }
+
+    #[test]
+    fn edit_epochs_update_ciphertext_metadata_history_and_sync_together() -> Result<(), StorageError>
+    {
+        let mut conn = Connection::open_in_memory()?;
+        edit_fixture(&conn)?;
+        let tx = conn.transaction()?;
+        // An older epoch remains usable after rotation, even when it differs
+        // from the key of the original ciphertext.
+        require_edit_key_in_tx(&tx, 7, "principal:70:71", 1)?;
+        edit_message_for_principal_versioned_in_tx(
+            &tx,
+            7,
+            8,
+            PrincipalHandle(71),
+            10,
+            7,
+            "old-key edit",
+            1,
+        )?;
+        require_edit_key_in_tx(&tx, 7, "principal:70:71", 2)?;
+        edit_message_for_principal_versioned_in_tx(
+            &tx,
+            7,
+            8,
+            PrincipalHandle(71),
+            10,
+            7,
+            "new-key edit",
+            2,
+        )?;
+        apply_remote_edit_for_principal_versioned_in_tx(
+            &tx,
+            8,
+            7,
+            PrincipalHandle(70),
+            10,
+            7,
+            "old-key edit",
+            1,
+        )?;
+        // Legacy callers do not declare a new epoch and preserve the current one.
+        edit_message_for_principal_in_tx(&tx, 7, 8, PrincipalHandle(71), 10, 7, "compatible edit")?;
+        tx.commit()?;
+        assert_eq!(edit_state(&conn)?, ("compatible edit".into(), 2, 3, 4, 4));
+        assert_eq!(
+            conn.query_row(
+                "SELECT content, key_version, edited_count FROM messages WHERE id = 2",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?
+                )),
+            )?,
+            ("old-key edit".into(), 1, 1)
+        );
+        let history: Vec<(String, String, i64)> = conn.prepare(
+            "SELECT content_before, content_after, edited_by FROM message_edits WHERE message_id = 1 ORDER BY rowid",
+        )?.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            history,
+            vec![
+                ("original".into(), "old-key edit".into(), 7),
+                ("old-key edit".into(), "new-key edit".into(), 7),
+                ("new-key edit".into(), "compatible edit".into(), 7),
+            ]
+        );
+        let epochs: Vec<(i64, i64)> = conn.prepare("SELECT content_before_key_version, content_after_key_version FROM message_edits WHERE message_id = 1 ORDER BY rowid")?
+            .query_map([], |row| Ok((row.get(0)?,row.get(1)?)))?.collect::<Result<_,_>>()?;
+        assert_eq!(epochs, vec![(2, 1), (1, 2), (2, 2)]);
+        Ok(())
+    }
+
+    #[test]
+    fn edit_sync_failure_rolls_back_both_copies_and_can_retry() -> Result<(), StorageError> {
+        let mut conn = Connection::open_in_memory()?;
+        edit_fixture(&conn)?;
+        let before = edit_state(&conn)?;
+        conn.execute_batch(
+            "CREATE TRIGGER fail_recipient_sync BEFORE INSERT ON sync_events
+             WHEN NEW.user_id = 8
+             BEGIN SELECT RAISE(ABORT, 'injected sync failure'); END;",
+        )?;
+        let tx = conn.transaction()?;
+        edit_message_for_principal_versioned_in_tx(
+            &tx,
+            7,
+            8,
+            PrincipalHandle(71),
+            10,
+            7,
+            "edited",
+            1,
+        )?;
+        assert!(matches!(
+            apply_remote_edit_for_principal_versioned_in_tx(
+                &tx,
+                8,
+                7,
+                PrincipalHandle(70),
+                10,
+                7,
+                "edited",
+                1,
+            ),
+            Err(StorageError::Db(_))
+        ));
+        tx.rollback()?;
+        assert_eq!(edit_state(&conn)?, before);
+        assert_eq!(conn.query_row(
+            "SELECT count(*) FROM messages WHERE content = 'original' AND key_version = 2 AND edited_count = 0",
+            [], |row| row.get::<_, i64>(0),
+        )?, 2);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM sync_heads", [], |row| row
+                .get::<_, i64>(0))?,
+            0
+        );
+
+        conn.execute_batch("DROP TRIGGER fail_recipient_sync;")?;
+        let tx = conn.transaction()?;
+        edit_message_for_principal_versioned_in_tx(
+            &tx,
+            7,
+            8,
+            PrincipalHandle(71),
+            10,
+            7,
+            "edited",
+            1,
+        )?;
+        apply_remote_edit_for_principal_versioned_in_tx(
+            &tx,
+            8,
+            7,
+            PrincipalHandle(70),
+            10,
+            7,
+            "edited",
+            1,
+        )?;
+        tx.commit()?;
+        assert_eq!(edit_state(&conn)?, ("edited".into(), 1, 1, 2, 2));
+        assert_eq!(conn.query_row(
+            "SELECT count(*) FROM messages WHERE content = 'edited' AND key_version = 1 AND edited_count = 1",
+            [], |row| row.get::<_, i64>(0),
+        )?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_or_unauthorized_edits_do_not_change_history_or_sync() -> Result<(), StorageError> {
+        let mut conn = Connection::open_in_memory()?;
+        edit_fixture(&conn)?;
+        let before = edit_state(&conn)?;
+        let tx = conn.transaction()?;
+        for version in [0, -1] {
+            assert!(matches!(
+                require_edit_key_in_tx(&tx, 7, "principal:70:71", version),
+                Err(StorageError::InvalidRelayPayload(_))
+            ));
+            assert!(matches!(
+                edit_message_for_principal_versioned_in_tx(
+                    &tx,
+                    7,
+                    8,
+                    PrincipalHandle(71),
+                    10,
+                    7,
+                    "invalid",
+                    version,
+                ),
+                Err(StorageError::InvalidRelayPayload(_))
+            ));
+        }
+        assert!(matches!(
+            apply_remote_edit_for_principal_versioned_in_tx(
+                &tx,
+                8,
+                7,
+                PrincipalHandle(70),
+                10,
+                9,
+                "forged",
+                1,
+            ),
+            Err(StorageError::MessageUnauthorized)
+        ));
+        assert!(matches!(
+            apply_remote_edit_for_principal_versioned_in_tx(
+                &tx,
+                7,
+                8,
+                PrincipalHandle(71),
+                10,
+                8,
+                "wrong direction",
+                1,
+            ),
+            Err(StorageError::MessageUnauthorized)
+        ));
+        assert!(matches!(
+            edit_message_for_principal_versioned_in_tx(
+                &tx,
+                8,
+                7,
+                PrincipalHandle(70),
+                10,
+                8,
+                "wrong direction",
+                1,
+            ),
+            Err(StorageError::MessageUnauthorized)
+        ));
+        assert!(matches!(
+            edit_message_for_principal_versioned_in_tx(
+                &tx,
+                7,
+                8,
+                PrincipalHandle(999),
+                10,
+                7,
+                "wrong authority",
+                1,
+            ),
+            Err(StorageError::MissingRelayDependency)
+        ));
+        assert!(matches!(
+            edit_message_for_principal_versioned_in_tx(
+                &tx,
+                7,
+                8,
+                PrincipalHandle(71),
+                11,
+                7,
+                "missing target",
+                1,
+            ),
+            Err(StorageError::MissingRelayDependency)
+        ));
+        tx.commit()?;
+        assert_eq!(edit_state(&conn)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_edit_epoch_can_recover_after_reopen_without_partial_mutation()
+    -> Result<(), StorageError> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("edit.sqlite3");
+        {
+            let mut conn = Connection::open(&path)?;
+            edit_fixture(&conn)?;
+            let before = edit_state(&conn)?;
+            let tx = conn.transaction()?;
+            // The other owner's key and another authority's namespace do not satisfy this edit.
+            for (owner, chat, version) in [
+                (8, "principal:70:71", 1),
+                (7, "principal:70:99", 1),
+                (7, "principal:70:71", 3),
+            ] {
+                assert!(matches!(
+                    require_edit_key_in_tx(&tx, owner, chat, version),
+                    Err(StorageError::MissingRelayDependency)
+                ));
+            }
+            edit_message_for_principal_versioned_in_tx(
+                &tx,
+                7,
+                8,
+                PrincipalHandle(71),
+                10,
+                7,
+                "uncommitted",
+                1,
+            )?;
+            // A failed second local effect must roll back key metadata and history too.
+            assert!(matches!(
+                require_edit_key_in_tx(&tx, 8, "principal:70:71", 1),
+                Err(StorageError::MissingRelayDependency)
+            ));
+            tx.rollback()?;
+            assert_eq!(edit_state(&conn)?, before);
+        }
+        let mut conn = Connection::open(&path)?;
+        let tx = conn.transaction()?;
+        tx.execute("INSERT INTO chat_secrets SELECT user_id, chat_id, secret_id, 3, encrypted_secret, kem_ciphertext, wrapping_scheme, created_at, updated_at FROM chat_secrets WHERE version = 2", [])?;
+        require_edit_key_in_tx(&tx, 7, "principal:70:71", 3)?;
+        edit_message_for_principal_versioned_in_tx(
+            &tx,
+            7,
+            8,
+            PrincipalHandle(71),
+            10,
+            7,
+            "recovered",
+            3,
+        )?;
+        tx.commit()?;
+        assert_eq!(edit_state(&conn)?, ("recovered".into(), 3, 1, 1, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_edit_does_not_restore_removed_history() -> Result<(), StorageError> {
+        let mut conn = Connection::open_in_memory()?;
+        edit_fixture(&conn)?;
+        conn.execute("UPDATE messages SET content = '', history_deleted = 1", [])?;
+        let before = edit_state(&conn)?;
+        let tx = conn.transaction()?;
+        edit_message_for_principal_versioned_in_tx(
+            &tx,
+            7,
+            8,
+            PrincipalHandle(71),
+            10,
+            7,
+            "restore",
+            1,
+        )?;
+        apply_remote_edit_for_principal_versioned_in_tx(
+            &tx,
+            8,
+            7,
+            PrincipalHandle(70),
+            10,
+            7,
+            "restore",
+            1,
+        )?;
+        tx.commit()?;
+        assert_eq!(edit_state(&conn)?, before);
+        Ok(())
+    }
 
     #[test]
     fn upgrade_prefers_highest_state() {

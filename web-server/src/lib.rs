@@ -11,7 +11,7 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 #[async_trait::async_trait]
@@ -22,6 +22,24 @@ pub trait ClientPublicKeyResolver: Send + Sync {
 #[async_trait::async_trait]
 pub trait MtpConnectionHandler: Send + Sync {
     async fn accept(&self, connection: mtp::webserver::WebMTPConnection);
+
+    /// Interrupt the transport on shutdown, then await the handler's cleanup.
+    async fn accept_until_shutdown(
+        &self,
+        connection: mtp::webserver::WebMTPConnection,
+        shutdown: CancellationToken,
+    ) {
+        let sender = connection.sender.clone();
+        let handler = self.accept(connection);
+        tokio::pin!(handler);
+        tokio::select! {
+            _ = &mut handler => {},
+            _ = shutdown.cancelled() => {
+                sender.close();
+                handler.await;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +65,7 @@ pub struct WebConfig {
     pub required: bool,
     pub max_mtp_sessions: usize,
     pub max_mtp_sessions_per_user: usize,
+    pub shutdown_budget: std::time::Duration,
     pub authority_discovery: iota_identity::AuthorityDiscoveryDocument,
     pub local_users: Arc<dyn LocalUserStore>,
     pub descriptor_publisher: Arc<dyn LocalDescriptorPublisher>,
@@ -89,17 +108,32 @@ impl Drop for UserSessionGuard {
 
 pub struct WebServerHandle {
     cancellation: CancellationToken,
-    join: Mutex<Option<JoinHandle<()>>>,
+    join: Mutex<(Option<JoinHandle<ShutdownReport>>, Option<ShutdownReport>)>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownReport {
+    Complete,
+    Incomplete { remaining_handlers: usize },
+    SupervisorFailed,
+}
+
 impl WebServerHandle {
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> ShutdownReport {
         self.cancellation.cancel();
-        self.join().await;
+        self.join().await
     }
-    pub async fn join(&self) {
-        if let Some(join) = self.join.lock().await.take() {
-            let _ = join.await;
+    pub async fn join(&self) -> ShutdownReport {
+        // Keep ownership in the handle until completion. A cancelled waiter must
+        // not detach the supervisor or make another shutdown caller return early.
+        let mut join = self.join.lock().await;
+        if let Some(task) = join.0.as_mut() {
+            let result = task.await.unwrap_or(ShutdownReport::SupervisorFailed);
+            join.0.take();
+            join.1 = Some(result);
         }
+        join.1
+            .expect("supervisor result retained for every shutdown caller")
     }
 }
 
@@ -317,43 +351,84 @@ pub async fn start(
     let session_limit = Arc::new(tokio::sync::Semaphore::new(config.max_mtp_sessions));
     let user_sessions = Arc::new(StdMutex::new(HashMap::<u64, usize>::new()));
     let max_user_sessions = config.max_mtp_sessions_per_user;
+    let shutdown_budget = config.shutdown_budget;
     let join = tokio::spawn(async move {
+        let mut handlers = JoinSet::new();
+        let mut handler_failed = false;
         loop {
             tokio::select! {
+                biased;
+                _ = task_cancellation.cancelled() => break,
+                Some(result) = handlers.join_next(), if !handlers.is_empty() => {
+                    if let Err(error) = result { handler_failed = true; log!("MTP handler failed: {}", error); }
+                },
                 result = server.accept() => match result {
                     Ok(Some(connection)) => {
                         let Ok(permit) = session_limit.clone().try_acquire_owned() else {
                             log!("Rejected MTP connection: session limit reached");
+                            connection.sender.close();
                             continue;
                         };
                         let user_guard = if connection.client_id & (1_u64 << 63) == 0 {
                             let mut sessions = user_sessions.lock().unwrap();
-                            let count = sessions.entry(connection.client_id).or_default();
-                            if *count >= max_user_sessions {
+                            let count = sessions.get(&connection.client_id).copied().unwrap_or_default();
+                            if count >= max_user_sessions {
                                 log!("Rejected MTP connection: per-user session limit reached");
+                                connection.sender.close();
                                 continue;
                             }
-                            *count += 1;
+                            sessions.insert(connection.client_id, count + 1);
                             Some(UserSessionGuard { sessions: user_sessions.clone(), user_id: connection.client_id })
                         } else {
                             None
                         };
                         let handler = mtp_handler.clone();
-                        tokio::spawn(async move {
+                        let shutdown = task_cancellation.child_token();
+                        handlers.spawn(async move {
                             let _permit = permit;
                             let _user_guard = user_guard;
-                            handler.accept(connection).await;
+                            handler.accept_until_shutdown(connection, shutdown).await;
                         });
                     }
                     Ok(None) => break,
                     Err(error) => log!("MTP webserver connection failed: {}", error),
                 },
-                _ = task_cancellation.cancelled() => { server.shutdown().await; break; }
             }
+        }
+        task_cancellation.cancel();
+        let cleanup = async {
+            server.shutdown().await;
+            while let Some(result) = handlers.join_next().await {
+                if let Err(error) = result {
+                    handler_failed = true;
+                    log!("MTP handler failed during shutdown: {}", error);
+                }
+            }
+        };
+        if tokio::time::timeout(shutdown_budget, cleanup)
+            .await
+            .is_err()
+        {
+            let remaining_handlers = handlers.len();
+            log!(
+                "MTP shutdown incomplete: {} handlers exceeded {:?}; connection state may require recovery, durable relay retries remain queued",
+                remaining_handlers,
+                shutdown_budget
+            );
+            // Do not abort a mutation-bearing handler. Permits remain owned by
+            // detached tasks until termination. The daemon exits with failure;
+            // SQLite transaction rollback and durable retries govern recovery.
+            handlers.detach_all();
+            return ShutdownReport::Incomplete { remaining_handlers };
+        }
+        if handler_failed {
+            ShutdownReport::SupervisorFailed
+        } else {
+            ShutdownReport::Complete
         }
     });
     Ok(Some(Arc::new(WebServerHandle {
         cancellation,
-        join: Mutex::new(Some(join)),
+        join: Mutex::new((Some(join), None)),
     })))
 }

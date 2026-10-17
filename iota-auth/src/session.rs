@@ -15,6 +15,7 @@ pub enum SessionCapability {
     Communities,
     Community(CommunityId),
     RelayOrigination,
+    Federation,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -29,6 +30,7 @@ impl SessionCapabilities {
             SessionCapability::LocalStorage,
             SessionCapability::Communities,
             SessionCapability::RelayOrigination,
+            SessionCapability::Federation,
         ]))
     }
 
@@ -73,6 +75,7 @@ pub struct AuthenticatedSession {
     pub connection_id: Uuid,
     pub identity: SessionIdentity,
     pub capabilities: SessionCapabilities,
+    pub hosted_lease: Option<iota_identity::HostedAuthorizationLease>,
 }
 
 impl AuthenticatedSession {
@@ -101,10 +104,22 @@ impl SessionManager {
             .map(|session| session.clone())
     }
 
+    pub fn snapshot(&self) -> Vec<AuthenticatedSession> {
+        self.sessions
+            .iter()
+            .map(|session| session.value().clone())
+            .collect()
+    }
+
     pub fn remove(&self, connection_id: Uuid) -> Option<AuthenticatedSession> {
         self.sessions
             .remove(&connection_id)
             .map(|(_, session)| session)
+    }
+
+    pub fn remove_principal(&self, principal: PrincipalHandle) {
+        self.sessions
+            .retain(|_, session| session.principal() != principal);
     }
 
     pub fn grant_community(
@@ -157,6 +172,7 @@ mod tests {
                 principal: PrincipalHandle(12),
             },
             capabilities: SessionCapabilities::for_community(CommunityId("community-a".into())),
+            hosted_lease: None,
         });
 
         assert!(
@@ -183,6 +199,7 @@ mod tests {
                 principal: PrincipalHandle(9),
             },
             capabilities: SessionCapabilities::hosted(),
+            hosted_lease: None,
         };
         assert_eq!(session.principal(), PrincipalHandle(9));
     }

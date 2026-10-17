@@ -1,4 +1,3 @@
-use dashmap::DashMap;
 use iota_connection::message_common::*;
 use iota_connection::message_handlers;
 use iota_connection::relay::message_security_class;
@@ -12,15 +11,13 @@ use mtp::crypto::Keyring;
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 // ============================================================================
 // Waiting Task System
 // ============================================================================
-
-type WaitingTask = Box<dyn Fn(Arc<ClientConnection>, CommunicationValue) -> bool + Send + Sync>;
 
 #[allow(dead_code)]
 pub struct ClientConnection {
@@ -29,7 +26,7 @@ pub struct ClientConnection {
     connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub connection_id: Uuid,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
-    pub waiting_tasks: DashMap<u32, WaitingTask>,
+    pub waiting_tasks: tau::ResponseCorrelator,
     shutdown: Arc<RwLock<bool>>,
     keyring: Arc<RwLock<Option<Arc<Keyring>>>>,
 }
@@ -41,7 +38,7 @@ impl ClientConnection {
         connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
         connection_id: Uuid,
         shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
-        waiting_tasks: DashMap<u32, WaitingTask>,
+        waiting_tasks: tau::ResponseCorrelator,
         shutdown: Arc<RwLock<bool>>,
     ) -> Self {
         Self {
@@ -91,11 +88,13 @@ impl ClientConnection {
                     break;
                 }
             }
+            self_clone.waiting_tasks.close();
             // Handle Close
         });
     }
 
     pub async fn stop(&self) {
+        self.waiting_tasks.close();
         if let Some(tx) = self.shutdown_tx.lock().await.take() {
             let _ = tx.send(true);
         }
@@ -115,7 +114,18 @@ impl ClientConnection {
     // Message Handling
     // -------------------------------------------------------------------------
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
+        if cv.type_map().is_none() {
+            return;
+        }
         log_cv_in!(&cv);
+
+        if !cv.is_type(CommunicationType::Relay)
+            && cv
+                .id()
+                .is_some_and(|id| self.waiting_tasks.complete(id, cv.clone()))
+        {
+            return;
+        }
 
         if cv.is_type(CommunicationType::Relay) {
             log_t!(
@@ -131,6 +141,7 @@ impl ClientConnection {
         if matches!(
             message_security_class(&cv),
             iota_connection::relay::MessageSecurityClass::RelayOnly
+                | iota_connection::relay::MessageSecurityClass::Unsupported
         ) {
             let _ = self
                 .send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
@@ -155,7 +166,9 @@ impl ClientConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::AccountStateRequest) {
+        if cv.is_type(CommunicationType::AccountStateRequest)
+            || cv.is_type(CommunicationType::RelayReceiptPage)
+        {
             // Account initialization is routed through Omikron.
             self.send_message(
                 &CommunicationValue::new(CommunicationType::ErrorInvalidData).with_request_id(&cv),
@@ -419,37 +432,46 @@ impl ClientConnection {
         cv: &CommunicationValue,
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
-        let (tx, mut rx) = mpsc::channel(1);
-        let msg_id = cv
-            .require_id()
-            .map_err(|error| format!("cannot await response without a message id: {error}"))?;
-
-        let task_tx = tx.clone();
-        self.waiting_tasks.insert(
-            msg_id,
-            Box::new(move |_, response_cv| {
-                let inner_tx = task_tx.clone();
-                tokio::spawn(async move {
-                    let _ = inner_tx.send(response_cv).await;
-                });
-                true
-            }),
-        );
-
-        self.send_message(cv).await;
-
         let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
-
-        match tokio::time::timeout(timeout, rx.recv()).await {
-            Ok(Some(response_cv)) => Ok(response_cv),
-            Ok(_) => Err("Failed to receive response, channel was closed.".to_string()),
-            Err(_) => {
-                self.waiting_tasks.remove(&msg_id);
-                Err(format!(
-                    "Request timed out after {} seconds.",
-                    timeout.as_secs()
-                ))
-            }
-        }
+        let expected = cv.get_comm_type_enum();
+        self.waiting_tasks
+            .exchange(
+                cv,
+                timeout,
+                move |response| {
+                    let actual = response.get_comm_type_enum();
+                    actual.is_some() && actual == expected
+                        || actual.is_some_and(tau::is_protocol_error)
+                        || actual == Some(CommunicationType::Success)
+                            && matches!(
+                                expected,
+                                Some(
+                                    CommunicationType::ChallengeResponse
+                                        | CommunicationType::Relay
+                                        | CommunicationType::AccountStateApplied
+                                        | CommunicationType::MessageEdit
+                                        | CommunicationType::MessageReactionAdd
+                                        | CommunicationType::MessageReactionRemove
+                                        | CommunicationType::MessageDeleteLive
+                                )
+                            )
+                        || matches!(
+                            (expected, actual),
+                            (
+                                Some(CommunicationType::AccountStateRequest),
+                                Some(CommunicationType::AccountStateSnapshot)
+                            ) | (
+                                Some(CommunicationType::GetChatSecret),
+                                Some(CommunicationType::ChatSecretResponse)
+                            )
+                        )
+                },
+                |outbound| {
+                    let connection = &self;
+                    async move { connection.send_message_result(&outbound).await }
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())
     }
 }

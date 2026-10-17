@@ -1,3 +1,5 @@
+pub mod blocking;
+pub mod hosted_auth;
 pub mod identity;
 pub mod node_directory;
 pub mod storage_error;

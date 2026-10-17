@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::{LocalDeliverySink, route_outcome};
+use crate::LocalDeliverySink;
 
 const ROUTER_PROTOCOL: &str = "tensamin-relay-router:v1";
 static NEXT_ROUTER_FRAME_ID: AtomicU32 = AtomicU32::new(1);
@@ -310,6 +310,16 @@ impl PeerRouter for RelayRouterClient {
             .request(&request, None)
             .await
             .map_err(|error| RouteError::Delivery(error.to_string()))?;
+        if response.id() != request.id() {
+            return Err(RouteError::Delivery(
+                "unrelated relay-router response".into(),
+            ));
+        }
+        // The router envelope has its own correlation scope. Restore the inner request's ID.
+        let response = match frame.id() {
+            Some(id) => response.with_id(id),
+            None => response.without_id(),
+        };
         if response.is_type(CommunicationType::ErrorNoIota)
             || response.is_type(CommunicationType::ErrorInternal)
         {
@@ -321,7 +331,7 @@ impl PeerRouter for RelayRouterClient {
                     .to_owned(),
             });
         }
-        route_outcome(response)
+        RouteOutcome::from_relay_response(&frame, response)
     }
 }
 

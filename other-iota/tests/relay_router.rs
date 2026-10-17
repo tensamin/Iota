@@ -184,6 +184,11 @@ async fn authenticated_router_forwards_opaque_relay_v2() {
     let handle_b = SqlitePrincipalStore
         .upsert_remote_descriptor(&principal_b)
         .unwrap();
+    iota_storage::util::db::with_immediate_transaction(|tx| {
+        tx.execute("INSERT INTO users(user_id, username, public_key, created_at) VALUES(1, 'recipient', 'test', 1)", [])?;
+        tx.execute("INSERT INTO hosted_principals(local_user_id, principal_handle) VALUES(1, ?1)", [handle_b.0])?;
+        Ok(())
+    }).unwrap();
     let chat_id = e2ee_storage::principal_chat_id(handle_a, handle_b).unwrap();
     e2ee_storage::put_chat_secret(e2ee_storage::StoredChatSecret {
         user_id: "1".into(),
@@ -199,11 +204,10 @@ async fn authenticated_router_forwards_opaque_relay_v2() {
     .unwrap();
 
     let relay = Arc::new(
-        RelayService::new(Arc::new(HostedRecipient(handle_b)), Arc::new(NoRoute), None)
-            .with_federation(
-                Arc::new(StoreResolver),
-                Arc::new(TestNodeIdentity(iota_b.clone())),
-            ),
+        RelayService::new(Arc::new(HostedRecipient(handle_b)), Arc::new(NoRoute)).with_federation(
+            Arc::new(StoreResolver),
+            Arc::new(TestNodeIdentity(iota_b.clone())),
+        ),
     );
     let deliveries = Arc::new(Deliveries::default());
     let router = Arc::new(RelayRouterService::default());
@@ -281,12 +285,18 @@ async fn authenticated_router_forwards_opaque_relay_v2() {
         principal_b.descriptor().principal.clone(),
         iota_b.node_id().clone(),
         "through-router".into(),
-        10,
+        iota_storage::util::sync::now_millis() as u64,
         CommunicationValue::new(CommunicationType::MessageSend)
             .add_typed_default(DataType::Content, DataValue::Str("opaque".into()))
             .add_typed_default(DataType::SendTime, DataValue::SignedNumber(10))
             .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(1)),
         &user_a,
+        vec![
+            iota_a.public_keys(),
+            iota_b.public_keys(),
+            user_a.public_key_bundle(),
+            user_b.public_key_bundle(),
+        ],
     )
     .unwrap()
     .into_frame(7)

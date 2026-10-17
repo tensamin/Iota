@@ -49,8 +49,14 @@ impl OmikronConnection {
             }
         };
         let request_id = prepared.request_id;
+        let type_map = frame
+            .type_map()
+            .expect("handler request has a negotiated type map")
+            .clone();
         let connection = self.clone();
-        tokio::spawn(async move {
+        let pending = self.track_operation();
+        self.preparation_tasks.lock().await.spawn(async move {
+            let _pending = pending;
             match connection
                 .execute_password_provisioning_start(prepared)
                 .await
@@ -62,9 +68,11 @@ impl OmikronConnection {
                 }
                 Err(error) => {
                     iota_logger::log!("Password KE1 processing failed: {error}");
-                    let response =
-                        CommunicationValue::new(CommunicationType::ErrorNotAuthenticated)
-                            .with_id(request_id);
+                    let response = CommunicationValue::new_with_type_map(
+                        CommunicationType::ErrorNotAuthenticated,
+                        &type_map,
+                    )
+                    .with_id(request_id);
                     let _ = connection.send_message(&response).await;
                 }
             }
@@ -126,8 +134,15 @@ impl OmikronConnection {
             attempt,
             delay,
         } = prepared;
+        let cancellation = self.preparation_cancellation();
+        if cancellation.is_cancelled() {
+            return Err("connection closed".into());
+        }
         if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err("connection closed".into()),
+                _ = tokio::time::sleep(delay) => {},
+            }
         }
         let principal = self.password_principal(user_id).await?;
         let (response, pending) = self

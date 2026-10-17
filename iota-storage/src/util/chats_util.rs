@@ -84,6 +84,30 @@ pub fn mod_user(storage_owner: i64, contact: &Contact) -> Result<(), StorageErro
     db::with_immediate_transaction(|tx| upsert_contact(tx, storage_owner, contact))
 }
 
+pub fn add_conversation(
+    storage_owner: i64,
+    other_id: i64,
+    name: Option<&str>,
+) -> Result<(), StorageError> {
+    db::with_immediate_transaction(|tx| {
+        let mut contact = Contact::new(other_id);
+        contact.user_name = name.map(str::to_owned);
+        upsert_contact(tx, storage_owner, &contact)
+    })
+}
+
+pub fn add_conversation_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    storage_owner: i64,
+    other_id: i64,
+    other_principal: iota_identity::PrincipalHandle,
+    name: Option<&str>,
+) -> Result<(), StorageError> {
+    let mut contact = Contact::for_principal(other_id, other_principal);
+    contact.user_name = name.map(str::to_owned);
+    upsert_contact(tx, storage_owner, &contact)
+}
+
 pub fn get_users_by_principals(
     storage_owner: i64,
     principals: &[iota_identity::PrincipalHandle],

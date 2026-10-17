@@ -1,7 +1,6 @@
 use dashmap::DashMap;
 use iota_identity::{
-    IdentityError, IdentityResolver, IotaNodeId, LocalUserId, NodeIdentityResolver,
-    PrincipalHandle, PrincipalId,
+    IdentityError, IdentityResolver, IotaNodeId, NodeIdentityResolver, PrincipalHandle, PrincipalId,
 };
 use mtp::crypto::{PublicKeyBundle, SigAlgorithm, verify_ed25519, verify_ml_dsa};
 use rand_core::{OsRng, RngCore};
@@ -137,6 +136,7 @@ impl ForeignPrincipalAuthenticator {
                 principal: pending.principal,
             },
             capabilities: SessionCapabilities::foreign_authenticated(),
+            hosted_lease: None,
         };
         self.sessions.insert(session.clone());
         Ok(session)
@@ -155,16 +155,16 @@ impl HostedSessionRegistrar {
     pub fn authenticate(
         &self,
         connection_id: Uuid,
-        local_user: LocalUserId,
-        principal: PrincipalHandle,
+        lease: iota_identity::HostedAuthorizationLease,
     ) -> AuthenticatedSession {
         let session = AuthenticatedSession {
             connection_id,
             identity: SessionIdentity::Hosted {
-                local_user,
-                principal,
+                local_user: lease.identity.local_user,
+                principal: lease.identity.principal,
             },
             capabilities: SessionCapabilities::hosted(),
+            hosted_lease: Some(lease),
         };
         self.sessions.insert(session.clone());
         session

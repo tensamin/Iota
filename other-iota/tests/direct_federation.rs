@@ -336,6 +336,11 @@ async fn authenticated_peer_delivers_relay_v2_to_same_numeric_user_on_another_io
         .upsert_remote_descriptor(&principal_b)
         .unwrap();
     assert_ne!(handle_a, handle_b);
+    iota_storage::util::db::with_immediate_transaction(|tx| {
+        tx.execute("INSERT INTO users(user_id, username, public_key, created_at) VALUES(1, 'recipient', 'test', 1)", [])?;
+        tx.execute("INSERT INTO hosted_principals(local_user_id, principal_handle) VALUES(1, ?1)", [handle_b.0])?;
+        Ok(())
+    }).unwrap();
 
     let chat_id = e2ee_storage::principal_chat_id(handle_a, handle_b).unwrap();
     e2ee_storage::put_chat_secret(e2ee_storage::StoredChatSecret {
@@ -356,7 +361,7 @@ async fn authenticated_peer_delivers_relay_v2_to_same_numeric_user_on_another_io
         principal: handle_b,
     });
     let relay_b = Arc::new(
-        RelayService::new(local_users, Arc::new(NoRoute), None)
+        RelayService::new(local_users, Arc::new(NoRoute))
             .with_federation(resolver, Arc::new(TestNodeIdentity(iota_b.clone()))),
     );
     let deliveries = Arc::new(Deliveries::default());
@@ -440,9 +445,15 @@ async fn authenticated_peer_delivers_relay_v2_to_same_numeric_user_on_another_io
         principal_b.descriptor().principal.clone(),
         iota_b.node_id().clone(),
         "a-to-b".into(),
-        10,
+        iota_storage::util::sync::now_millis() as u64,
         content,
         &user_a,
+        vec![
+            iota_a.public_keys(),
+            iota_b.public_keys(),
+            user_a.public_key_bundle(),
+            user_b.public_key_bundle(),
+        ],
     )
     .unwrap()
     .into_frame(7)
@@ -469,7 +480,7 @@ async fn authenticated_peer_delivers_relay_v2_to_same_numeric_user_on_another_io
         let delivered = deliveries.0.lock().unwrap();
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].0, handle_b);
-        assert!(delivered[0].1.is_type(CommunicationType::MessageLive));
+        assert!(delivered[0].1.is_type(CommunicationType::Relay));
     }
 
     shutdown.send(()).unwrap();
@@ -488,7 +499,6 @@ async fn authenticated_peer_delivers_relay_v2_to_same_numeric_user_on_another_io
                 principal: handle_b,
             }),
             Arc::new(NoRoute),
-            None,
         )
         .with_federation(
             Arc::new(StoreResolver),
@@ -528,7 +538,6 @@ async fn authenticated_peer_delivers_relay_v2_to_same_numeric_user_on_another_io
                 principal: handle_a,
             }),
             Arc::new(NoRoute),
-            None,
         )
         .with_federation(
             Arc::new(StoreResolver),
@@ -549,12 +558,18 @@ async fn authenticated_peer_delivers_relay_v2_to_same_numeric_user_on_another_io
         principal_b.descriptor().principal.clone(),
         iota_b.node_id().clone(),
         "a-to-b-after-reconnect".into(),
-        11,
+        iota_storage::util::sync::now_millis() as u64,
         CommunicationValue::new(CommunicationType::MessageSend)
             .add_typed_default(DataType::Content, DataValue::Str("second".into()))
             .add_typed_default(DataType::SendTime, DataValue::SignedNumber(11))
             .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(1)),
         &user_a,
+        vec![
+            iota_a.public_keys(),
+            iota_b.public_keys(),
+            user_a.public_key_bundle(),
+            user_b.public_key_bundle(),
+        ],
     )
     .unwrap()
     .into_frame(8)

@@ -23,7 +23,7 @@ pub async fn start(port: u16, state: Arc<DaemonState>) -> bool {
     let bind_ip: std::net::IpAddr = bind_addr.parse().expect("Invalid BIND_ADDRESS");
 
     let server_state = state.clone();
-    let _ = tokio::spawn(async move {
+    drop(tokio::spawn(async move {
         let server = match load_tls_config() {
             Ok(Some(tls_config)) => {
                 log!("HTTPS (HTTP/2) Server running on {}:{}", bind_addr, port);
@@ -67,7 +67,7 @@ pub async fn start(port: u16, state: Arc<DaemonState>) -> bool {
         server.await.unwrap();
         server_state.active_tasks.remove("WebServer");
         log!("Web Server shutdown complete.");
-    });
+    }));
 
     if let Ok(server_handle) = rx.await {
         tokio::spawn(async move {
@@ -144,7 +144,7 @@ fn load_tls_config() -> Result<Option<Arc<ServerConfig>>, Box<dyn StdError>> {
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, key_ders.remove(0))
-        .map_err(|e| io::Error::new(ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     Ok(Some(Arc::new(config)))
 }

@@ -268,8 +268,8 @@ impl SqlitePrincipalStore {
             },
         )?;
         let handle = self.upsert_remote_descriptor(&descriptor)?;
-        db::with_db(|connection| {
-            connection.execute(
+        db::with_immediate_transaction(|transaction| {
+            transaction.execute(
                 "INSERT INTO hosted_principals (local_user_id, principal_handle) VALUES (?1, ?2) ON CONFLICT(local_user_id) DO UPDATE SET principal_handle = excluded.principal_handle",
                 params![user.id.0, handle.0],
             )?;
@@ -677,6 +677,19 @@ impl PrincipalStore for SqlitePrincipalStore {
                             "conflicting principal descriptor revision was rejected".into(),
                         ));
                     }
+                }
+                let mut previous_keys = transaction
+                    .prepare("SELECT public_key FROM principal_keys WHERE principal_pk = ?1 AND source_revision = ?2 ORDER BY public_key")?
+                    .query_map(params![handle, revision], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut next_keys = descriptor.public_keys.iter().map(public_key_bundle_to_base64).collect::<Vec<_>>();
+                previous_keys.sort();
+                next_keys.sort();
+                if previous_keys != next_keys {
+                    transaction.execute(
+                        "UPDATE hosted_auth_state SET generation = generation + 1 WHERE local_user_id IN (SELECT local_user_id FROM hosted_principals WHERE principal_handle = ?1)",
+                        [handle],
+                    )?;
                 }
             }
             transaction.execute(

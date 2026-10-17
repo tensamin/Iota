@@ -3,9 +3,7 @@ use iota_auth::{
     ForeignPrincipalAuthenticator, HostedSessionRegistrar, IotaPeerAuthenticator, SessionManager,
 };
 use iota_connection::connection_handler::{PeerRouter, RouteDestination, RouteError, RouteOutcome};
-use iota_connection::relay_service::{
-    LegacyRelayDecoder, LegacyRelayIdentity, RelayNodeIdentity, RelayService,
-};
+use iota_connection::relay_service::{RelayNodeIdentity, RelayService};
 use iota_identity::{
     AuthorityId, AuthorityKind, AuthorityLocator, CompositeIdentityResolver, IdentityError,
     IdentityResolver, IotaNodeId, LocalUserStore, NodeDirectory, NodeIdentityResolver,
@@ -112,7 +110,7 @@ impl DaemonServices {
         let relay_identity: Arc<dyn RelayNodeIdentity> =
             Arc::new(StandaloneRelayIdentity(identity.clone()));
         let relay = Arc::new(
-            RelayService::new(local_users.clone(), router.clone(), None)
+            RelayService::new(local_users.clone(), router.clone())
                 .with_federation(identities.clone(), relay_identity),
         );
         Ok(Self::compose(DaemonServiceComponents {
@@ -129,20 +127,23 @@ impl DaemonServices {
         }))
     }
 
-    pub fn new(omikron: Arc<OmikronConnection>) -> Result<Arc<Self>, IdentityError> {
+    pub fn new(
+        omikron: Arc<OmikronConnection>,
+        identity: iota_identity::LocalNodeIdentity,
+    ) -> Result<Arc<Self>, IdentityError> {
         let client: Arc<dyn OmikronClient> = omikron.clone();
         let authority =
             AuthorityId::omega_legacy(&omikron_connector::omega_discovery::omega_host())
                 .map_err(|error| IdentityError::InvalidIdentifier(error.to_string()))?;
         iota_storage::identity::SqlitePrincipalStore.migrate_legacy_omega_authority(&authority)?;
         let router: Arc<dyn PeerRouter> = Arc::new(
-            omikron_connector::router::OmikronPeerRouter::new(client.clone(), authority.clone()),
+            omikron_connector::router::OmikronPeerRouter::new(client.clone()),
         );
         let services = Self::centralized(
             client,
             Some(router),
             Some(omikron.session_manager()),
-            Some(omikron.clone()),
+            Some(Arc::new(StandaloneRelayIdentity(identity))),
         );
         let _ = omikron.install_relay_service(services.relay.clone());
         Ok(services)
@@ -157,7 +158,7 @@ impl DaemonServices {
         client: Arc<dyn OmikronClient>,
         router: Option<Arc<dyn PeerRouter>>,
         sessions: Option<Arc<SessionManager>>,
-        node_identity: Option<Arc<dyn LegacyRelayIdentity>>,
+        node_identity: Option<Arc<dyn RelayNodeIdentity>>,
     ) -> Arc<Self> {
         let principals: Arc<dyn PrincipalStore> =
             Arc::new(iota_storage::identity::SqlitePrincipalStore);
@@ -172,7 +173,11 @@ impl DaemonServices {
             Arc::new(iota_storage::identity::LocalIdentityResolver::new(
                 authority.clone(),
                 AuthorityKind::Omega,
-                PrincipalHome::Omega(locator.clone()),
+                node_identity
+                    .as_ref()
+                    .and_then(|identity| identity.node_id())
+                    .map(PrincipalHome::Iota)
+                    .unwrap_or_else(|| PrincipalHome::Omega(locator.clone())),
                 local_users.clone(),
                 Arc::new(iota_storage::identity::SqlitePrincipalStore),
             ));
@@ -190,21 +195,13 @@ impl DaemonServices {
         let router: Arc<dyn PeerRouter> = router.unwrap_or_else(|| {
             Arc::new(omikron_connector::router::OmikronPeerRouter::new(
                 client.clone(),
-                authority.clone(),
             ))
         });
-        let legacy_decoder = node_identity.map(|node_identity| {
-            Arc::new(LegacyRelayDecoder::new(
-                identities.clone(),
-                node_identity,
-                authority,
-            ))
-        });
-        let relay = Arc::new(RelayService::new(
-            local_users.clone(),
-            router.clone(),
-            legacy_decoder,
-        ));
+        let mut relay = RelayService::new(local_users.clone(), router.clone());
+        if let Some(node_identity) = node_identity {
+            relay = relay.with_federation(identities.clone(), node_identity);
+        }
+        let relay = Arc::new(relay);
         Self::compose_with_sessions(
             DaemonServiceComponents {
                 accounts: Arc::new(OmegaAccountAuthority::new(client.clone())),
@@ -277,7 +274,7 @@ impl DaemonServices {
             identities: identities.clone(),
             principals: inactive.clone(),
             local_users: inactive.clone(),
-            relay: Arc::new(RelayService::new(inactive.clone(), inactive.clone(), None)),
+            relay: Arc::new(RelayService::new(inactive.clone(), inactive.clone())),
             router: inactive,
             direct_router: None,
             relay_routers: None,
@@ -491,12 +488,6 @@ impl RelayNodeIdentity for InactiveServices {
     }
 }
 
-impl LegacyRelayIdentity for InactiveServices {
-    fn legacy_iota_id(&self) -> Option<u64> {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,7 +502,7 @@ mod tests {
             principals: adapters.clone(),
             local_users: adapters.clone(),
             node_identities: Arc::new(InactiveNodeIdentityResolver),
-            relay: Arc::new(RelayService::new(adapters.clone(), adapters.clone(), None)),
+            relay: Arc::new(RelayService::new(adapters.clone(), adapters.clone())),
             router: adapters,
             direct_router: None,
             relay_routers: None,

@@ -28,14 +28,16 @@ fn validate(user_id: i64) -> Result<(), StorageError> {
     }
 }
 pub fn get(user_id: i64) -> Result<ReceiptPolicy, StorageError> {
+    db::with_db(|conn| get_on(conn, user_id))
+}
+
+pub fn get_on(conn: &rusqlite::Connection, user_id: i64) -> Result<ReceiptPolicy, StorageError> {
     validate(user_id)?;
-    db::with_db(|conn| {
-        let found = conn.query_row("SELECT send_read_receipts, send_received_receipts, revision, updated_at FROM user_receipt_policy WHERE user_id = ?1", [user_id], |r| Ok(ReceiptPolicy { user_id, send_read_receipts: r.get(0)?, send_received_receipts: r.get(1)?, revision: r.get(2)?, updated_at: r.get(3)? })).optional()?;
-        Ok(found.unwrap_or(ReceiptPolicy {
-            user_id,
-            ..default_policy()
-        }))
-    })
+    let found = conn.query_row("SELECT send_read_receipts, send_received_receipts, revision, updated_at FROM user_receipt_policy WHERE user_id = ?1", [user_id], |r| Ok(ReceiptPolicy { user_id, send_read_receipts: r.get(0)?, send_received_receipts: r.get(1)?, revision: r.get(2)?, updated_at: r.get(3)? })).optional()?;
+    Ok(found.unwrap_or(ReceiptPolicy {
+        user_id,
+        ..default_policy()
+    }))
 }
 pub fn set(
     user_id: i64,

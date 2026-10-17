@@ -53,7 +53,7 @@ fn pending_iota_relay_uses_bounded_backoff_and_quarantine() {
     }
     assert!(relay_queue::list_active(1).unwrap().is_empty());
 
-    relay_queue::quarantine_for_frame(7, "wrong acknowledgement").unwrap();
+    relay_queue::quarantine(id, "wrong acknowledgement").unwrap();
     let relay = relay_queue::list(1).unwrap().remove(0);
     assert_eq!(relay.delivery_state, PendingRelayDeliveryState::Quarantined);
     assert_eq!(relay.last_error.as_deref(), Some("wrong acknowledgement"));

@@ -290,8 +290,7 @@ pub fn finalize_local_release(
             "user residency was not found".into(),
         ));
     };
-    db::with_db(|conn| {
-        let tx = conn.unchecked_transaction()?;
+    db::with_immediate_transaction(|tx| {
         tx.execute(
             "DELETE FROM tauth_codes WHERE local_user_id = ?1",
             params![user_id],
@@ -325,7 +324,6 @@ pub fn finalize_local_release(
                ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, lifecycle_state = 'released', updated_at = excluded.updated_at"#,
             params![user_id, username, now_millis()],
         )?;
-        tx.commit()?;
         Ok(())
     })?;
     remove_user_credential(user_id, Some(&username))
@@ -411,10 +409,35 @@ fn run_purge_stages(
 
 fn purge_database_rows(user_id: i64) -> Result<(), crate::storage_error::StorageError> {
     crate::util::user_assets::purge_user(user_id)?;
-    db::with_db(|conn| {
-        let tx = conn.unchecked_transaction()?;
+    db::with_immediate_transaction(|tx| {
+        // Erasure fences outstanding application, but must not remove another
+        // principal's work merely because its remote numeric ID is the same.
+        // Applied work stays applied, but cannot resume deferred recovery.
+        // Guard JSON traversal without changing corrupt diagnostic bytes.
+        tx.execute(
+            "UPDATE relay_inbox SET state = CASE WHEN state = 'applied' THEN state ELSE 'rejected' END,
+             rejected_at = CASE WHEN state = 'applied' THEN rejected_at ELSE COALESCE(rejected_at, ?2) END,
+             rejection_reason = CASE WHEN state = 'applied' THEN rejection_reason ELSE 'invalid_operation' END,
+             processing_owner = NULL, processing_deadline = NULL,
+             recovery_status = 'blocked', recovery_error_code = 'recipient_erased'
+             WHERE state IN ('received', 'processing', 'applied') AND prepared_operation IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM json_each('[\"$.effects\",\"$.operation.effects\"]') path,
+                   json_each(CASE WHEN json_valid(CAST(relay_inbox.prepared_operation AS TEXT))
+                       THEN CAST(relay_inbox.prepared_operation AS TEXT) ELSE '{}' END, path.value) effect
+                   WHERE CASE WHEN effect.type = 'object' THEN json_extract(effect.value, '$.owner') END = ?1)",
+            params![user_id, now_millis()],
+        )?;
         tx.execute(
             "DELETE FROM message_receipts WHERE storage_owner = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM relay_acceptance_receipts WHERE storage_owner = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM relay_receipt_backfill_blocks WHERE storage_owner = ?1 AND storage_owner <> 0",
             params![user_id],
         )?;
         tx.execute("DELETE FROM message_edits WHERE message_id IN (SELECT id FROM messages WHERE storage_owner = ?1)", params![user_id])?;
@@ -473,18 +496,19 @@ fn purge_database_rows(user_id: i64) -> Result<(), crate::storage_error::Storage
             params![user_id],
         )?;
         tx.execute(
-            "DELETE FROM pending_relays WHERE relay_signer_id = ?1 OR relay_destination_user_id = ?1 OR signer_principal = (SELECT principal_handle FROM hosted_principals WHERE local_user_id = ?1) OR destination_principal = (SELECT principal_handle FROM hosted_principals WHERE local_user_id = ?1)",
+            "UPDATE pending_relays SET delivery_state = 'quarantined', last_error = 'recipient_erased'
+             WHERE target_kind = 0 AND destination_id = ?1
+               AND destination_principal = (SELECT principal_handle FROM hosted_principals WHERE local_user_id = ?1)",
             params![user_id],
         )?;
+        // Destination acceptance can still finish an accepted delivery, but its
+        // deferred origin copy is cancelled permanently by authoritative erasure.
         tx.execute(
-            "DELETE FROM relay_replay WHERE EXISTS (SELECT 1 FROM relay_inbox WHERE relay_inbox.signer_principal = relay_replay.signer_principal AND relay_inbox.message_id = relay_replay.message_id AND (relay_inbox.signer_principal = (SELECT principal_handle FROM hosted_principals WHERE local_user_id = ?1) OR relay_inbox.destination_id = ?1))",
-            params![user_id],
+            "UPDATE relay_deferred_secrets SET completed_at = COALESCE(completed_at, ?2),
+             encrypted_secret = x'', kem_ciphertext = x'', wrapping_scheme = 'erased'
+             WHERE storage_owner = ?1",
+            params![user_id, now_millis()],
         )?;
-        tx.execute(
-            "DELETE FROM relay_inbox WHERE signer_principal = (SELECT principal_handle FROM hosted_principals WHERE local_user_id = ?1) OR destination_id = ?1",
-            params![user_id],
-        )?;
-        tx.commit()?;
         Ok(())
     })
 }
@@ -574,6 +598,16 @@ pub fn erase_user_locally(user_id: i64) -> Result<(), crate::storage_error::Stor
             .find(|entry| entry.user_id == user_id)
             .map(|entry| entry.username),
     };
+    // Fence authorization before filesystem or other nontransactional cleanup.
+    match crate::hosted_auth::current(iota_identity::LocalUserId(user_id)) {
+        Ok(state) if state.enabled => {
+            crate::hosted_auth::revoke(iota_identity::LocalUserId(user_id))?;
+        }
+        Ok(_) => {}
+        Err(crate::storage_error::StorageError::HostedAuthorizationDenied)
+            if username.is_none() => {}
+        Err(error) => return Err(error),
+    }
     purge_user_data(user_id)?;
     db::with_db(|conn| {
         conn.execute(

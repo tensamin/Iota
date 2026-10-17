@@ -179,34 +179,6 @@ impl fmt::Display for LocalNodeIdentityError {
 
 impl std::error::Error for LocalNodeIdentityError {}
 
-#[cfg(unix)]
-fn verify_private_keyring(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if !metadata.file_type().is_file()
-        || metadata.mode() & 0o077 != 0
-        || metadata.uid() != unsafe { libc::geteuid() }
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "keyring must be a regular owner-only file owned by the service user",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn verify_private_keyring(_: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "keyring permissions cannot be verified on this platform",
-    ))
-}
-
 #[derive(Clone)]
 pub struct LocalNodeIdentity {
     keyring: Arc<mtp::crypto::Keyring>,
@@ -238,17 +210,22 @@ impl LocalNodeIdentity {
                 source,
             })?;
         }
-        verify_private_keyring(path).map_err(|error| LocalNodeIdentityError::Storage {
-            path: path.display().to_string(),
-            source: error.to_string(),
-        })?;
-        let keyring = match mtp::files::load_keyring_raw(path) {
-            Ok(keyring) => keyring,
-            Err(mtp::files::FileError::Io(error))
-                if error.kind() == std::io::ErrorKind::NotFound =>
-            {
+        let keyring = match tau::load_private_keyring(path) {
+            Ok(Some(keyring)) => keyring,
+            Ok(None) => {
                 let keyring = legacy.unwrap_or_else(mtp::crypto::Keyring::generate);
-                Self::save_keyring_verified(&keyring, path)?;
+                match tau::create_private_keyring(&keyring, path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Self::load_or_create(path, None);
+                    }
+                    Err(error) => {
+                        return Err(LocalNodeIdentityError::Storage {
+                            path: path.display().to_string(),
+                            source: error.to_string(),
+                        });
+                    }
+                }
                 keyring
             }
             Err(error) => {
@@ -276,22 +253,20 @@ impl LocalNodeIdentity {
         keyring: &mtp::crypto::Keyring,
         path: &Path,
     ) -> Result<(), LocalNodeIdentityError> {
-        mtp::files::save_keyring_raw(keyring, path).map_err(|error| {
+        tau::replace_private_keyring(keyring, path).map_err(|error| {
             LocalNodeIdentityError::Storage {
                 path: path.display().to_string(),
                 source: error.to_string(),
             }
         })?;
-        verify_private_keyring(path).map_err(|error| LocalNodeIdentityError::Storage {
-            path: path.display().to_string(),
-            source: error.to_string(),
-        })?;
-        let persisted = mtp::files::load_keyring_raw(path).map_err(|error| {
-            LocalNodeIdentityError::Storage {
+        let persisted = tau::load_private_keyring(path)
+            .map_err(|error| LocalNodeIdentityError::Storage {
                 path: path.display().to_string(),
                 source: error.to_string(),
-            }
-        })?;
+            })?
+            .ok_or_else(|| {
+                LocalNodeIdentityError::Verification("persisted keyring disappeared".into())
+            })?;
         let expected = keyring
             .try_to_bytes()
             .map_err(|error| LocalNodeIdentityError::Verification(error.to_string()))?;
@@ -1015,6 +990,21 @@ pub struct LocalUserDescriptor {
     pub username: String,
     pub display_name: Option<String>,
     pub public_key: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatedHostedIdentity {
+    pub local_user: LocalUserId,
+    pub principal: PrincipalHandle,
+    pub auth_generation: i64,
+}
+
+/// Application-issued lease, never a credential supplied by a client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostedAuthorizationLease {
+    pub connection_id: String,
+    pub server_instance: String,
+    pub identity: ValidatedHostedIdentity,
 }
 
 pub trait LocalUserStore: Send + Sync {

@@ -243,6 +243,8 @@ fn ipc_error_response(code: IpcErrorCode) -> HttpResponse {
     HttpResponse::build(status).json(json!({ "status": code.to_string() }))
 }
 
+// Return the handler's response directly without changing its error API.
+#[allow(clippy::result_large_err)]
 fn user_id(payload: &Value) -> Result<i64, HttpResponse> {
     payload
         .get("uuid")

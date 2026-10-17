@@ -10,11 +10,10 @@ use iota_identity::{
     PrincipalStore, PublicKeyBundle, ResolutionContext, ResolvedPrincipal, UserAddress,
     UserSelector,
 };
-use iota_util::mtp_compat::OptionalDataValueExt;
 use mtp::codec::CommunicationValue;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 pub mod relay_router;
@@ -216,7 +215,16 @@ pub struct RemoteIotaResolver {
     client: Arc<dyn FederationIdentityClient>,
     principals: Arc<dyn PrincipalStore>,
     nodes: Arc<dyn NodeDirectory>,
-    authorities: RwLock<HashMap<AuthorityLocator, DiscoveredAuthority>>,
+    authorities: RwLock<HashMap<AuthorityLocator, CachedIotaAuthority>>,
+    discovery_freshness: std::time::Duration,
+}
+
+#[derive(Clone)]
+struct CachedIotaAuthority {
+    authority: DiscoveredAuthority,
+    node: IotaNodeId,
+    verified_at: i64,
+    descriptor_revision: i64,
 }
 
 impl RemoteIotaResolver {
@@ -230,7 +238,13 @@ impl RemoteIotaResolver {
             principals,
             nodes,
             authorities: RwLock::new(HashMap::new()),
+            discovery_freshness: std::time::Duration::from_secs(60),
         }
+    }
+
+    pub fn with_discovery_freshness(mut self, freshness: std::time::Duration) -> Self {
+        self.discovery_freshness = freshness;
+        self
     }
 
     pub fn pin_node(
@@ -256,13 +270,25 @@ impl RemoteIotaResolver {
         locator: &AuthorityLocator,
         allow_network: bool,
     ) -> Result<DiscoveredAuthority, IdentityError> {
-        if let Some(authority) = self
+        let cached = self
             .authorities
             .read()
             .ok()
-            .and_then(|authorities| authorities.get(locator).cloned())
-        {
-            return Ok(authority);
+            .and_then(|authorities| authorities.get(locator).cloned());
+        if let Some(cached) = &cached {
+            if self.nodes.pinned_node(locator)?.as_ref() != Some(&cached.node) {
+                return Err(IdentityError::KeyPinMismatch);
+            }
+            if let Ok(node) = self.nodes.resolve_node(&cached.node).await
+                && node.descriptor_revision == cached.descriptor_revision
+                && node.resolved_at == cached.verified_at
+                && now_millis().saturating_sub(cached.verified_at)
+                    < i64::try_from(self.discovery_freshness.as_millis()).unwrap_or(i64::MAX)
+            {
+                return Ok(cached.authority.clone());
+            }
+            // Keep the expected identity even if refresh fails. This entry is
+            // unusable until its verified descriptor generation matches again.
         }
         if !allow_network {
             let node = self.nodes.pinned_node(locator)?.ok_or_else(|| {
@@ -287,8 +313,24 @@ impl RemoteIotaResolver {
         if authority.service != AuthorityKind::Iota {
             return Err(IdentityError::NotFound);
         }
-        if let Ok(mut authorities) = self.authorities.write() {
-            authorities.insert(locator.clone(), authority.clone());
+        let node = authority.node_id.as_ref().ok_or_else(|| {
+            IdentityError::InvalidDescriptor("Iota discovery contains no node ID".into())
+        })?;
+        if authority.authority_id != AuthorityId::for_iota(node)
+            || IotaNodeId::from_public_keys(&authority.public_keys)? != *node
+        {
+            return Err(IdentityError::InvalidDescriptor(
+                "discovery authority, node identity and public key disagree".into(),
+            ));
+        }
+        let expected = self
+            .nodes
+            .pinned_node(locator)?
+            .or_else(|| cached.map(|entry| entry.node));
+        if expected.is_some() && authority.node_id != expected {
+            return Err(IdentityError::InvalidDescriptor(
+                "authority locator node identity changed from its pin".into(),
+            ));
         }
         Ok(authority)
     }
@@ -369,6 +411,18 @@ impl RemoteIotaResolver {
             .pin_endpoint(locator, expected_node, now_millis())?;
         if let Some(certificate) = raw_ip_certificate {
             self.nodes.pin_endpoint_certificate(locator, certificate)?;
+        }
+        let node = self.nodes.resolve_node(expected_node).await?;
+        if let Ok(mut authorities) = self.authorities.write() {
+            authorities.insert(
+                locator.clone(),
+                CachedIotaAuthority {
+                    authority: authority.clone(),
+                    node: expected_node.clone(),
+                    verified_at: node.resolved_at,
+                    descriptor_revision: node.descriptor_revision,
+                },
+            );
         }
 
         let signed = self
@@ -494,12 +548,13 @@ impl IdentityResolver for RemoteIotaResolver {
         let locator = self.authorities.read().ok().and_then(|authorities| {
             authorities
                 .iter()
-                .find(|(_, authority)| authority.authority_id == principal.authority)
-                .map(|(locator, authority)| (locator.clone(), authority.clone()))
+                .find(|(_, entry)| entry.authority.authority_id == principal.authority)
+                .map(|(locator, _)| locator.clone())
         });
         if context.allow_network
-            && let Some((locator, authority)) = locator
+            && let Some(locator) = locator
         {
+            let authority = self.authority(&locator, true).await?;
             return self
                 .refresh(
                     &locator,
@@ -796,9 +851,13 @@ fn now_millis() -> i64 {
 #[async_trait]
 pub trait DirectPeerConnection: Send + Sync {
     async fn send_relay(&self, frame: CommunicationValue) -> Result<RouteOutcome, RouteError>;
+    fn authenticated_key(&self) -> Option<PublicKeyBundle> {
+        None
+    }
+    fn close(&self) {}
 }
 
-type RegisteredDirectPeer = (u64, Arc<dyn DirectPeerConnection>);
+type RegisteredDirectPeer = (u64, Arc<dyn DirectPeerConnection>, bool);
 
 #[derive(Default)]
 pub struct DirectPeerRouter {
@@ -808,12 +867,40 @@ pub struct DirectPeerRouter {
 }
 
 impl DirectPeerRouter {
-    pub fn register(&self, node: IotaNodeId, connection: Arc<dyn DirectPeerConnection>) -> u64 {
-        let registration = self.next_registration.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Ok(mut peers) = self.peers.write() {
-            peers.insert(node, (registration, connection));
+    pub fn register(
+        &self,
+        node: IotaNodeId,
+        connection: Arc<dyn DirectPeerConnection>,
+    ) -> Result<u64, RouteError> {
+        Ok(self
+            .register_selected(node, connection, true)?
+            .expect("preferred route is published"))
+    }
+
+    fn register_selected(
+        &self,
+        node: IotaNodeId,
+        connection: Arc<dyn DirectPeerConnection>,
+        preferred: bool,
+    ) -> Result<Option<u64>, RouteError> {
+        let mut peers = self
+            .peers
+            .write()
+            .map_err(|_| RouteError::Delivery("peer route registry lock poisoned".into()))?;
+        if !preferred && peers.get(&node).is_some_and(|current| current.2) {
+            return Ok(None);
         }
-        registration
+        let registration = self.next_registration.fetch_add(1, Ordering::Relaxed) + 1;
+        let replaced = peers
+            .insert(node.clone(), (registration, connection, preferred))
+            .is_some();
+        iota_logger::log!(
+            "Peer route publication: node={} generation={} replaced={}",
+            node.as_str(),
+            registration,
+            replaced
+        );
+        Ok(Some(registration))
     }
 
     pub fn unregister(&self, node: &IotaNodeId, registration: u64) {
@@ -823,6 +910,11 @@ impl DirectPeerRouter {
                 .is_some_and(|current| current.0 == registration)
         {
             peers.remove(node);
+            iota_logger::log!(
+                "Peer route removal: node={} generation={}",
+                node.as_str(),
+                registration
+            );
         }
     }
 
@@ -851,27 +943,44 @@ impl PeerRouter for DirectPeerRouter {
                 reason: "direct Iota router cannot route a legacy Omega destination".into(),
             });
         };
+        let manager = self
+            .manager
+            .read()
+            .ok()
+            .and_then(|manager| manager.as_ref().and_then(Weak::upgrade));
         let mut connection = self
             .peers
             .read()
             .ok()
-            .and_then(|peers| peers.get(node).map(|peer| peer.1.clone()));
-        if connection.is_none() {
-            let manager = self
-                .manager
+            .and_then(|peers| peers.get(node).map(|peer| (peer.0, peer.1.clone())));
+        if connection.is_none()
+            && let Some(manager) = manager.as_ref()
+        {
+            manager.connect_best(node).await?;
+            connection = self
+                .peers
                 .read()
                 .ok()
-                .and_then(|manager| manager.as_ref().and_then(Weak::upgrade));
-            if let Some(manager) = manager {
-                manager.connect_best(node).await?;
-                connection = self
-                    .peers
-                    .read()
-                    .ok()
-                    .and_then(|peers| peers.get(node).map(|peer| peer.1.clone()));
+                .and_then(|peers| peers.get(node).map(|peer| (peer.0, peer.1.clone())));
+        }
+        let (generation, connection) =
+            connection.ok_or_else(|| RouteError::NoRoute(node.clone()))?;
+        if let Some(manager) = manager {
+            if manager.shutdown.is_cancelled() {
+                return Err(RouteError::Delivery("peer manager is shutting down".into()));
+            }
+            let key = connection.authenticated_key().ok_or_else(|| {
+                RouteError::Delivery("peer route has no authenticated key".into())
+            })?;
+            if let Err(error) = manager.validate_peer(node, &key).await {
+                self.unregister(node, generation);
+                connection.close();
+                return Err(RouteError::Delivery(error.to_string()));
+            }
+            if manager.shutdown.is_cancelled() {
+                return Err(RouteError::Delivery("peer manager is shutting down".into()));
             }
         }
-        let connection = connection.ok_or_else(|| RouteError::NoRoute(node.clone()))?;
         connection.send_relay(frame).await
     }
 }
@@ -887,6 +996,32 @@ pub struct PeerManager {
     router: Arc<DirectPeerRouter>,
     relay: Arc<RelayService>,
     deliveries: Arc<dyn LocalDeliverySink>,
+    shutdown: tokio_util::sync::CancellationToken,
+    outgoing: std::sync::Mutex<Option<tokio::task::JoinSet<()>>>,
+    outgoing_failed: AtomicBool,
+    shutdown_join: tokio::sync::Mutex<(Option<tokio::task::JoinHandle<bool>>, Option<bool>)>,
+}
+
+/// Produced only by PeerManager's trusted node-directory validation.
+pub struct ValidatedPeer {
+    node: IotaNodeId,
+    public_key: Vec<u8>,
+}
+
+struct OutgoingRegistration {
+    router: Arc<DirectPeerRouter>,
+    node: IotaNodeId,
+    generation: Option<u64>,
+    connection: Arc<mtp::client::MTPConnection>,
+}
+
+impl Drop for OutgoingRegistration {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation {
+            self.router.unregister(&self.node, generation);
+        }
+        self.connection.sender.close_immediate();
+    }
 }
 
 impl PeerManager {
@@ -903,6 +1038,10 @@ impl PeerManager {
             router,
             relay,
             deliveries,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            outgoing: std::sync::Mutex::new(Some(tokio::task::JoinSet::new())),
+            outgoing_failed: AtomicBool::new(false),
+            shutdown_join: tokio::sync::Mutex::new((None, None)),
         }
     }
 
@@ -912,45 +1051,149 @@ impl PeerManager {
         endpoint: &AuthorityLocator,
         pinned_certificate: Option<Vec<u8>>,
     ) -> Result<(), RouteError> {
-        let resolved = self
-            .nodes
-            .resolve_node(&node)
-            .await
-            .map_err(|error| RouteError::Delivery(error.to_string()))?;
+        if self.shutdown.is_cancelled() {
+            return Err(RouteError::Delivery("peer manager is shutting down".into()));
+        }
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.nodes.resolve_node(&node),
+        )
+        .await
+        .map_err(|_| RouteError::Delivery("peer directory lookup timed out".into()))?
+        .map_err(|error| RouteError::Delivery(error.to_string()))?;
         let host_key = resolved
             .public_keys
             .first()
-            .ok_or_else(|| RouteError::Delivery("remote node has no trusted key".into()))?;
+            .ok_or_else(|| RouteError::Delivery("remote node has no trusted key".into()))?
+            .clone();
         let mut config = mtp::client::ClientConfig::new(format!("https://{}/", endpoint.as_str()))
             .with_client_id(self.identity.node_id().mtp_authentication_hint())
             .with_description(format!("iota-peer:{}", self.identity.node_id().as_str()));
         if let Some(certificate) = pinned_certificate {
             config = config.with_pinned_pem(certificate);
         }
-        let connection =
-            mtp::client::MTPClient::auth_connect(config, &self.identity.keyring(), host_key)
-                .await
-                .map_err(|error| RouteError::Delivery(error.to_string()))?;
+        let keyring = self.identity.keyring();
+        let connection = tokio::select! {
+            _ = self.shutdown.cancelled() => return Err(RouteError::Delivery("peer manager is shutting down".into())),
+            connection = tokio::time::timeout(std::time::Duration::from_secs(15), mtp::client::MTPClient::auth_connect(config, &keyring, &host_key)) =>
+                connection.map_err(|_| RouteError::Delivery("peer handshake timed out".into()))?
+                    .map_err(|error| RouteError::Delivery(error.to_string()))?,
+        };
         if connection.auth_state != mtp::client::AuthState::Authenticated {
+            connection.sender.close_immediate();
             return Err(RouteError::Delivery(
                 "remote peer did not complete node authentication".into(),
             ));
         }
+        let connection = Arc::new(connection);
+        let mut registration = OutgoingRegistration {
+            router: self.router.clone(),
+            node: node.clone(),
+            generation: None,
+            connection: connection.clone(),
+        };
+        if let Err(error) = self.validate_peer(&node, &host_key).await {
+            connection.sender.close_immediate();
+            return Err(RouteError::Delivery(error.to_string()));
+        }
         self.nodes
             .pin_endpoint(endpoint, &node, now_millis())
             .map_err(|error| RouteError::Delivery(error.to_string()))?;
-        let connection = Arc::new(connection);
-        let registration = Some(
-            self.router
-                .register(node.clone(), Arc::new(OutgoingPeer(connection.clone()))),
-        );
+        let mut outgoing = self.outgoing.lock().expect("peer supervisor lock poisoned");
+        let Some(tasks) = outgoing.as_mut().filter(|_| !self.shutdown.is_cancelled()) else {
+            connection.sender.close_immediate();
+            return Err(RouteError::Delivery("peer manager is shutting down".into()));
+        };
+        registration.generation = self.router.register_selected(
+            node.clone(),
+            Arc::new(OutgoingPeer(connection.clone(), host_key.clone())),
+            !self.prefers_inbound(&node),
+        )?;
         let manager = self.clone();
-        tokio::spawn(async move {
-            manager
-                .outgoing_read_loop(node, connection, registration)
-                .await;
+        while let Some(result) = tasks.try_join_next() {
+            if let Err(error) = result {
+                self.outgoing_failed.store(true, Ordering::Release);
+                iota_logger::log!("Outbound peer task failed: {}", error);
+            }
+        }
+        tasks.spawn(async move {
+            manager.outgoing_read_loop(host_key, registration).await;
         });
         Ok(())
+    }
+
+    /// Stop dials and signal both inbound and outbound peer handlers.
+    pub fn stop(&self) {
+        self.shutdown.cancel();
+    }
+
+    /// Called after authoritative directory revocation. Remove the selected
+    /// route and close its transport without affecting another node.
+    pub fn revoke_peer(&self, node: &IotaNodeId) -> Result<(), RouteError> {
+        let removed = self
+            .router
+            .peers
+            .write()
+            .map_err(|_| RouteError::Delivery("peer route registry lock poisoned".into()))?
+            .remove(node);
+        if let Some((generation, connection, _)) = removed {
+            connection.close();
+            iota_logger::log!(
+                "Peer revoked: node={} generation={}",
+                node.as_str(),
+                generation
+            );
+        }
+        Ok(())
+    }
+
+    /// Retain the drain task across concurrent callers and cancelled waiters.
+    /// Incomplete shutdown never treats an aborted mutation as successful cleanup.
+    pub async fn shutdown(&self, budget: std::time::Duration) -> bool {
+        self.stop();
+        let mut join = self.shutdown_join.lock().await;
+        if join.0.is_none() && join.1.is_none() {
+            let tasks = self
+                .outgoing
+                .lock()
+                .expect("peer supervisor lock poisoned")
+                .take();
+            let mut clean = !self.outgoing_failed.load(Ordering::Acquire);
+            join.0 = Some(tokio::spawn(async move {
+                let Some(mut tasks) = tasks else {
+                    return clean;
+                };
+                if tokio::time::timeout(budget, async {
+                    while let Some(result) = tasks.join_next().await {
+                        if let Err(error) = result {
+                            clean = false;
+                            iota_logger::log!(
+                                "Outbound peer task failed during shutdown: {}",
+                                error
+                            );
+                        }
+                    }
+                })
+                .await
+                .is_err()
+                {
+                    iota_logger::log!(
+                        "Outbound peer shutdown incomplete: remaining={} budget={:?}",
+                        tasks.len(),
+                        budget
+                    );
+                    tasks.detach_all();
+                    return false;
+                }
+                clean
+            }));
+        }
+        if let Some(task) = join.0.as_mut() {
+            let result = task.await.unwrap_or(false);
+            join.0.take();
+            join.1 = Some(result);
+        }
+        join.1.expect("peer shutdown result retained")
     }
 
     pub async fn connect_best(self: &Arc<Self>, node: &IotaNodeId) -> Result<(), RouteError> {
@@ -987,12 +1230,30 @@ impl PeerManager {
 
     async fn outgoing_read_loop(
         self: Arc<Self>,
-        node: IotaNodeId,
-        connection: Arc<mtp::client::MTPConnection>,
-        registration: Option<u64>,
+        key: PublicKeyBundle,
+        registration: OutgoingRegistration,
     ) {
-        while let Ok(frame) = connection.receive().await {
-            self.process_incoming(&node, frame, |response| {
+        let node = &registration.node;
+        let connection = &registration.connection;
+        let mut trust_check = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            let frame = tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => break,
+                _ = trust_check.tick() => {
+                    let trusted = tokio::select! {
+                        _ = self.shutdown.cancelled() => break,
+                        peer = self.validate_peer(node, &key) => peer,
+                    };
+                    if let Err(error) = trusted {
+                        iota_logger::log!("Peer trust invalidated: node={} reason={}", node.as_str(), error);
+                        break;
+                    }
+                    continue;
+                },
+                frame = connection.receive() => match frame { Ok(frame) => frame, Err(_) => break },
+            };
+            let operation = self.process_incoming(node, &key, &self.shutdown, frame, |response| {
                 let sender = connection.sender.clone();
                 async move {
                     sender
@@ -1000,184 +1261,412 @@ impl PeerManager {
                         .await
                         .map_err(|error| error.to_string())
                 }
-            })
-            .await;
-        }
-        if let Some(registration) = registration {
-            self.router.unregister(&node, registration);
+            });
+            tokio::pin!(operation);
+            tokio::select! {
+                _ = &mut operation => {},
+                _ = self.shutdown.cancelled() => {
+                    connection.sender.close_immediate();
+                    operation.await;
+                },
+            }
         }
     }
 
-    async fn process_incoming<F, Fut>(&self, node: &IotaNodeId, frame: CommunicationValue, send: F)
-    where
+    async fn process_incoming<F, Fut>(
+        &self,
+        node: &IotaNodeId,
+        key: &PublicKeyBundle,
+        shutdown: &tokio_util::sync::CancellationToken,
+        frame: CommunicationValue,
+        send: F,
+    ) where
         F: FnOnce(CommunicationValue) -> Fut,
         Fut: Future<Output = Result<(), String>>,
     {
-        let outcome = self
-            .relay
-            .accept_relay(
-                IngressSource::DirectPeer {
-                    node_id: node.clone(),
-                },
-                frame,
-            )
-            .await;
-        let Ok(outcome) = outcome else {
+        if !frame.is_type(mtp::codec::CommunicationType::Relay)
+            || iota_connection::relay::message_security_class(&frame)
+                != iota_connection::relay::MessageSecurityClass::AuthenticatedPeerControl
+        {
             return;
+        }
+        let source = IngressSource::DirectPeer {
+            node_id: node.clone(),
+        };
+        let request = frame.clone();
+        let prepared = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            _ = self.shutdown.cancelled() => return,
+            verified = self.relay.prepare_relay(&source, frame) => verified,
+        };
+        let verified = match prepared {
+            Ok(verified) => verified,
+            Err(error) => {
+                let response =
+                    iota_connection::relay_service::relay_error_response(&request, &error);
+                tokio::select! {
+                    _ = shutdown.cancelled() => {},
+                    _ = tokio::time::timeout(std::time::Duration::from_secs(5), send(response)) => {},
+                }
+                return;
+            }
+        };
+        let trusted = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            _ = self.shutdown.cancelled() => return,
+            peer = self.validate_peer(node, key) => peer,
+        };
+        if trusted.is_err() {
+            return;
+        }
+        let outcome = self.relay.accept_verified_relay(source, verified).await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let response =
+                    iota_connection::relay_service::relay_error_response(&request, &error);
+                tokio::select! {
+                    _ = shutdown.cancelled() => {},
+                    _ = tokio::time::timeout(std::time::Duration::from_secs(5), send(response)) => {},
+                }
+                return;
+            }
         };
         let (response, deliveries) = outcome.into_parts();
         for delivery in deliveries {
-            self.deliveries
-                .deliver(delivery.recipient, delivery.frame)
-                .await;
+            tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.deliveries.deliver(delivery.recipient, delivery.frame),
+            ) => {},
+            }
         }
         if let Some(response) = response {
-            let _ = send(response).await;
+            tokio::select! {
+                _ = shutdown.cancelled() => {},
+                _ = tokio::time::timeout(std::time::Duration::from_secs(5), send(response)) => {},
+            }
         }
     }
 }
 
 fn prefers_inbound(local: &IotaNodeId, remote: &IotaNodeId) -> bool {
+    // The smaller node selects outbound; the larger selects inbound. Both ends
+    // select the same transport when they dial simultaneously.
     local.as_str() > remote.as_str()
 }
 
-struct OutgoingPeer(Arc<mtp::client::MTPConnection>);
+struct OutgoingPeer(Arc<mtp::client::MTPConnection>, PublicKeyBundle);
 
 #[async_trait]
 impl DirectPeerConnection for OutgoingPeer {
+    fn authenticated_key(&self) -> Option<PublicKeyBundle> {
+        Some(self.1.clone())
+    }
+    fn close(&self) {
+        self.0.sender.close_immediate();
+    }
     async fn send_relay(&self, frame: CommunicationValue) -> Result<RouteOutcome, RouteError> {
-        let response = self
-            .0
-            .request(&frame, None)
-            .await
-            .map_err(|error| RouteError::Delivery(error.to_string()))?;
-        route_outcome(response)
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.0.request(&frame, None),
+        )
+        .await
+        .map_err(|_| RouteError::Delivery("peer relay request timed out".into()))?
+        .map_err(|error| RouteError::Delivery(error.to_string()))?;
+        RouteOutcome::from_relay_response(&frame, response)
     }
 }
 
-fn route_outcome(response: CommunicationValue) -> Result<RouteOutcome, RouteError> {
-    if response.is_type(mtp::codec::CommunicationType::Success) {
-        let relay_message_id = response
-            .get_data(mtp::codec::DataType::RelayMessageId)
-            .as_str()
-            .ok_or_else(|| {
-                RouteError::Delivery("peer acknowledgement has no RelayMessageId".into())
-            })?
-            .to_owned();
-        let destination_accepted_at = response
-            .get_data(mtp::codec::DataType::RelayAcceptedAt)
-            .as_number()
-            .and_then(|value| i64::try_from(value).ok())
-            .ok_or_else(|| {
-                RouteError::Delivery("peer acknowledgement has no RelayAcceptedAt".into())
-            })?;
-        Ok(RouteOutcome::Accepted {
-            relay_message_id,
-            destination_accepted_at,
+impl PeerManager {
+    pub async fn validate_peer(
+        &self,
+        node: &IotaNodeId,
+        public_key: &PublicKeyBundle,
+    ) -> Result<ValidatedPeer, IdentityError> {
+        if &IotaNodeId::from_public_keys(public_key)? != node {
+            return Err(IdentityError::KeyPinMismatch);
+        }
+        let expected = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.nodes.resolve_node(node),
+        )
+        .await
+        .map_err(|_| IdentityError::Unavailable("peer directory lookup timed out".into()))??;
+        if &expected.node != node {
+            return Err(IdentityError::KeyPinMismatch);
+        }
+        let actual = public_key
+            .try_as_bytes()
+            .map_err(|error| IdentityError::InvalidIdentifier(error.to_string()))?;
+        if !expected.public_keys.iter().any(|key| {
+            key.try_as_bytes()
+                .map(|trusted| trusted == actual)
+                .unwrap_or(false)
+        }) {
+            return Err(IdentityError::KeyPinMismatch);
+        }
+        if expected
+            .valid_until
+            .is_some_and(|until| until <= now_millis())
+        {
+            return Err(IdentityError::Unavailable(
+                "trusted peer descriptor expired".into(),
+            ));
+        }
+        Ok(ValidatedPeer {
+            node: node.clone(),
+            public_key: actual,
         })
-    } else if response.is_type(mtp::codec::CommunicationType::ErrorInternal) {
-        Ok(RouteOutcome::Retryable {
-            reason: "remote Iota returned an internal error".into(),
-        })
-    } else {
-        Ok(RouteOutcome::Rejected {
-            response_type: response
-                .get_comm_type_enum()
-                .unwrap_or(mtp::codec::CommunicationType::ErrorInvalidData),
-        })
+    }
+
+    pub async fn accept_validated(
+        &self,
+        connection: mtp::webserver::WebMTPConnection,
+        peer: ValidatedPeer,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<(), IdentityError> {
+        let node = peer.node;
+        if shutdown.is_cancelled() || self.shutdown.is_cancelled() {
+            return Ok(());
+        }
+        // The handoff cannot be reused with a transport authenticated by another key.
+        if connection.auth_state != mtp::host::AuthState::Authenticated
+            || connection.client_id != node.mtp_authentication_hint()
+            || connection
+                .description
+                .as_deref()
+                .and_then(|description| description.strip_prefix("iota-peer:"))
+                .and_then(|description| IotaNodeId::new(description).ok())
+                .as_ref()
+                != Some(&node)
+            || connection
+                .client_public_key
+                .as_ref()
+                .and_then(|key| key.try_as_bytes().ok())
+                .as_ref()
+                != Some(&peer.public_key)
+        {
+            return Err(IdentityError::KeyPinMismatch);
+        }
+        let connection = Arc::new(connection);
+        let key = connection
+            .client_public_key
+            .as_ref()
+            .expect("validated transport has a key")
+            .clone();
+        let pending: PendingPeerResponses = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registration = self
+            .router
+            .register_selected(
+                node.clone(),
+                Arc::new(IncomingPeer {
+                    connection: connection.clone(),
+                    pending: pending.clone(),
+                }),
+                self.prefers_inbound(&node),
+            )
+            .map_err(|error| IdentityError::Unavailable(error.to_string()))?;
+        struct IncomingRegistration<'a> {
+            router: &'a DirectPeerRouter,
+            node: &'a IotaNodeId,
+            registration: Option<u64>,
+            pending: PendingPeerResponses,
+            sender: mtp::webserver::WebMtpSender,
+        }
+
+        impl Drop for IncomingRegistration<'_> {
+            fn drop(&mut self) {
+                if let Some(registration) = self.registration {
+                    self.router.unregister(self.node, registration);
+                }
+                self.pending
+                    .lock()
+                    .expect("peer response lock poisoned")
+                    .clear();
+                self.sender.close();
+            }
+        }
+
+        let _registration = IncomingRegistration {
+            router: &self.router,
+            node: &node,
+            registration,
+            pending: pending.clone(),
+            sender: connection.sender.clone(),
+        };
+        let mut trust_check = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            let frame = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                _ = self.shutdown.cancelled() => break,
+                _ = trust_check.tick() => {
+                    let trusted = tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = self.shutdown.cancelled() => break,
+                        peer = self.validate_peer(&node, &key) => peer,
+                    };
+                    if let Err(error) = trusted {
+                        iota_logger::log!("Peer trust invalidated: node={} reason={}", node.as_str(), error);
+                        break;
+                    }
+                    continue;
+                },
+                frame = connection.receive() => match frame { Ok(frame) => frame, Err(_) => break },
+            };
+            if let Some(frame_id) = frame.id()
+                && let Some((_, response)) = pending
+                    .lock()
+                    .expect("peer response lock poisoned")
+                    .remove(&frame_id)
+            {
+                let _ = response.send(frame);
+                continue;
+            }
+            let operation = self.process_incoming(&node, &key, &shutdown, frame, |response| {
+                let sender = connection.sender.clone();
+                async move {
+                    sender
+                        .send(&response)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            });
+            tokio::pin!(operation);
+            tokio::select! {
+                _ = &mut operation => {},
+                _ = shutdown.cancelled() => {
+                    pending.lock().expect("peer response lock poisoned").clear();
+                    connection.sender.close(); operation.await;
+                },
+                _ = self.shutdown.cancelled() => {
+                    pending.lock().expect("peer response lock poisoned").clear();
+                    connection.sender.close(); operation.await;
+                },
+            }
+        }
+        Ok(())
     }
 }
 
 #[async_trait]
 impl web_server::MtpConnectionHandler for PeerManager {
     async fn accept(&self, connection: mtp::webserver::WebMTPConnection) {
-        if connection.auth_state != mtp::host::AuthState::Authenticated {
-            return;
-        }
-        let Some(public_key) = connection.client_public_key.clone() else {
-            return;
-        };
-        let Ok(node) = IotaNodeId::from_public_keys(&public_key) else {
-            return;
-        };
-        let Ok(expected) = self.nodes.resolve_node(&node).await else {
-            return;
-        };
-        let Ok(actual) = public_key.try_as_bytes() else {
-            return;
-        };
-        if !expected.public_keys.iter().any(|key| {
-            key.try_as_bytes()
-                .map(|trusted| trusted == actual)
-                .unwrap_or(false)
-        }) {
-            return;
-        }
-        let connection = Arc::new(connection);
-        let pending: Arc<
-            tokio::sync::Mutex<HashMap<u32, tokio::sync::oneshot::Sender<CommunicationValue>>>,
-        > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let registration = self.prefers_inbound(&node).then(|| {
-            self.router.register(
-                node.clone(),
-                Arc::new(IncomingPeer {
-                    connection: connection.clone(),
-                    pending: pending.clone(),
-                }),
-            )
-        });
-        while let Ok(frame) = connection.receive().await {
-            if let Some(frame_id) = frame.id()
-                && let Some(response) = pending.lock().await.remove(&frame_id)
-            {
-                let _ = response.send(frame);
-                continue;
-            }
-            self.process_incoming(&node, frame, |response| {
-                let sender = connection.sender.clone();
-                async move {
-                    sender
-                        .send(&response)
-                        .await
-                        .map_err(|error| error.to_string())
-                }
-            })
+        self.accept_until_shutdown(connection, tokio_util::sync::CancellationToken::new())
             .await;
+    }
+
+    async fn accept_until_shutdown(
+        &self,
+        connection: mtp::webserver::WebMTPConnection,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
+        let sender = connection.sender.clone();
+        let result = async {
+            if connection.auth_state != mtp::host::AuthState::Authenticated {
+                return Err(IdentityError::KeyPinMismatch);
+            }
+            let key = connection
+                .client_public_key
+                .as_ref()
+                .ok_or(IdentityError::KeyPinMismatch)?;
+            let node = IotaNodeId::from_public_keys(key)?;
+            let validated = tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                peer = self.validate_peer(&node, key) => peer?,
+            };
+            self.accept_validated(connection, validated, shutdown).await
         }
-        if let Some(registration) = registration {
-            self.router.unregister(&node, registration);
+        .await;
+        if let Err(error) = result {
+            iota_logger::log!("Peer compatibility handler rejected connection: {}", error);
         }
+        sender.close();
     }
 }
 
 struct IncomingPeer {
     connection: Arc<mtp::webserver::WebMTPConnection>,
-    pending:
-        Arc<tokio::sync::Mutex<HashMap<u32, tokio::sync::oneshot::Sender<CommunicationValue>>>>,
+    pending: PendingPeerResponses,
+}
+
+type PendingPeerResponses = Arc<
+    std::sync::Mutex<HashMap<u32, (Arc<()>, tokio::sync::oneshot::Sender<CommunicationValue>)>>,
+>;
+
+struct PendingPeerRequest {
+    pending: PendingPeerResponses,
+    frame_id: u32,
+    instance: Arc<()>,
+}
+
+impl Drop for PendingPeerRequest {
+    fn drop(&mut self) {
+        let mut pending = self.pending.lock().expect("peer response lock poisoned");
+        if pending
+            .get(&self.frame_id)
+            .is_some_and(|(instance, _)| Arc::ptr_eq(instance, &self.instance))
+        {
+            pending.remove(&self.frame_id);
+        }
+    }
 }
 
 #[async_trait]
 impl DirectPeerConnection for IncomingPeer {
+    fn authenticated_key(&self) -> Option<PublicKeyBundle> {
+        self.connection.client_public_key.clone()
+    }
+    fn close(&self) {
+        self.pending
+            .lock()
+            .expect("peer response lock poisoned")
+            .clear();
+        self.connection.sender.close();
+    }
     async fn send_relay(&self, frame: CommunicationValue) -> Result<RouteOutcome, RouteError> {
         let frame_id = frame
             .id()
             .filter(|frame_id| *frame_id != 0)
             .ok_or_else(|| RouteError::Delivery("relay request has no frame ID".into()))?;
         let (send, receive) = tokio::sync::oneshot::channel();
-        if self.pending.lock().await.insert(frame_id, send).is_some() {
-            return Err(RouteError::Delivery(
-                "relay request ID is already pending".into(),
-            ));
+        let instance = Arc::new(());
+        {
+            let mut pending = self.pending.lock().expect("peer response lock poisoned");
+            match pending.entry(frame_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((instance.clone(), send));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    return Err(RouteError::Delivery(
+                        "relay request ID is already pending".into(),
+                    ));
+                }
+            }
         }
-        if let Err(error) = self.connection.sender.send(&frame).await {
-            self.pending.lock().await.remove(&frame_id);
+        let _request = PendingPeerRequest {
+            pending: self.pending.clone(),
+            frame_id,
+            instance,
+        };
+        let sent = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.connection.sender.send(&frame),
+        )
+        .await
+        .map_err(|_| RouteError::Delivery("peer relay send timed out".into()))?;
+        if let Err(error) = sent {
             return Err(RouteError::Delivery(error.to_string()));
         }
         let response = tokio::time::timeout(std::time::Duration::from_secs(30), receive)
             .await
             .map_err(|_| RouteError::Delivery("peer relay request timed out".into()))?
             .map_err(|_| RouteError::Delivery("peer relay connection closed".into()))?;
-        route_outcome(response)
+        RouteOutcome::from_relay_response(&frame, response)
     }
 }
 
@@ -1225,6 +1714,42 @@ mod tests {
     }
 
     #[test]
+    fn route_publication_fails_when_the_registry_is_poisoned() {
+        let router = Arc::new(DirectPeerRouter::default());
+        let poisoning = router.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoning.peers.write().unwrap();
+            panic!("poison route registry");
+        })
+        .join();
+        assert!(router.register(node(), Arc::new(AcceptingPeer)).is_err());
+    }
+
+    #[test]
+    fn nonpreferred_and_stale_connections_cannot_remove_the_selected_route() {
+        let router = DirectPeerRouter::default();
+        let node = node();
+        let old = router
+            .register_selected(node.clone(), Arc::new(AcceptingPeer), false)
+            .unwrap()
+            .unwrap();
+        let selected = router
+            .register_selected(node.clone(), Arc::new(AcceptingPeer), true)
+            .unwrap()
+            .unwrap();
+        assert!(
+            router
+                .register_selected(node.clone(), Arc::new(AcceptingPeer), false)
+                .unwrap()
+                .is_none()
+        );
+        router.unregister(&node, old);
+        assert!(router.has_connection(&node));
+        router.unregister(&node, selected);
+        assert!(!router.has_connection(&node));
+    }
+
+    #[test]
     fn captured_der_certificate_is_stored_as_valid_pem() {
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let certificate = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
@@ -1251,7 +1776,9 @@ mod tests {
     async fn direct_router_uses_the_connection_registered_for_the_node() {
         let router = DirectPeerRouter::default();
         let node = node();
-        router.register(node.clone(), Arc::new(AcceptingPeer));
+        router
+            .register(node.clone(), Arc::new(AcceptingPeer))
+            .unwrap();
 
         let outcome = router
             .route(
@@ -1637,6 +2164,97 @@ mod tests {
             principal_id,
             user.public_key_bundle(),
         )
+    }
+
+    #[tokio::test]
+    async fn discovery_cache_tracks_verified_generation_and_deadline() {
+        let (resolver, client, _, nodes, locator, _, _) = remote_fixture(1);
+        let authority = resolver.authority(&locator, true).await.unwrap();
+        // Discovery alone never creates a verified cache entry.
+        assert!(resolver.authorities.read().unwrap().is_empty());
+        resolver
+            .refresh(&locator, &authority, &UserSelector::UserId(7))
+            .await
+            .unwrap();
+        client.authority.lock().unwrap().protocols = vec!["changed".into()];
+        assert_eq!(
+            resolver.authority(&locator, true).await.unwrap().protocols,
+            authority.protocols
+        );
+        let fresh =
+            RemoteIotaResolver::new(client.clone(), resolver.principals.clone(), nodes.clone())
+                .with_discovery_freshness(std::time::Duration::ZERO);
+        fresh
+            .refresh(&locator, &authority, &UserSelector::UserId(7))
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.authority(&locator, true).await.unwrap().protocols,
+            vec!["changed"]
+        );
+        let node = authority.node_id.as_ref().unwrap();
+        nodes
+            .values
+            .lock()
+            .unwrap()
+            .get_mut(node)
+            .unwrap()
+            .descriptor_revision += 1;
+        assert_eq!(
+            resolver.authority(&locator, true).await.unwrap().protocols,
+            vec!["changed"]
+        );
+        assert_ne!(
+            resolver
+                .authorities
+                .read()
+                .unwrap()
+                .get(&locator)
+                .unwrap()
+                .descriptor_revision,
+            nodes
+                .values
+                .lock()
+                .unwrap()
+                .get(node)
+                .unwrap()
+                .descriptor_revision
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_refresh_rejects_identity_change_and_removed_trust() {
+        let (resolver, client, _, nodes, locator, _, _) = remote_fixture(1);
+        let authority = resolver.authority(&locator, true).await.unwrap();
+        resolver
+            .refresh(&locator, &authority, &UserSelector::UserId(7))
+            .await
+            .unwrap();
+        nodes.pins.lock().unwrap().remove(&locator);
+        assert_eq!(
+            resolver.authority(&locator, true).await.unwrap_err(),
+            IdentityError::KeyPinMismatch
+        );
+        nodes
+            .pins
+            .lock()
+            .unwrap()
+            .insert(locator.clone(), authority.node_id.clone().unwrap());
+        resolver
+            .authorities
+            .write()
+            .unwrap()
+            .get_mut(&locator)
+            .unwrap()
+            .verified_at = 0;
+        client.authority.lock().unwrap().node_id = Some(
+            IotaNodeId::from_public_keys(&mtp::crypto::Keyring::generate().public_key_bundle())
+                .unwrap(),
+        );
+        assert!(matches!(
+            resolver.authority(&locator, true).await.unwrap_err(),
+            IdentityError::InvalidDescriptor(_)
+        ));
     }
 
     #[tokio::test]

@@ -21,27 +21,19 @@ impl SqliteNodeDirectory {
         hint: u64,
     ) -> Result<Option<PublicKeyBundle>, IdentityError> {
         db::with_db(|connection| {
-            let mut statement = connection.prepare("SELECT node_id FROM node_directory")?;
-            let nodes = statement
-                .query_map([], |row| row.get::<_, String>(0))?
+            let now = now_millis();
+            let mut statement = connection.prepare(
+                "SELECT n.node_id, k.public_key FROM node_directory n JOIN node_keys k ON k.node_id = n.node_id AND k.source_revision = n.descriptor_revision WHERE n.authentication_hint = ?1 AND (n.descriptor_valid_until IS NULL OR n.descriptor_valid_until > ?2) AND k.valid_from <= ?2 AND (k.valid_until IS NULL OR k.valid_until > ?2)",
+            )?;
+            let matches = statement
+                .query_map(params![hint as i64, now], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
-            for node in nodes {
-                let node = IotaNodeId::new(node).map_err(|error| {
-                    crate::storage_error::StorageError::Other(error.to_string())
-                })?;
-                if node.mtp_authentication_hint() != hint {
-                    continue;
-                }
-                let key = connection
-                    .query_row(
-                        "SELECT public_key FROM node_keys WHERE node_id = ?1 AND (valid_until IS NULL OR valid_until > ?2) ORDER BY source_revision DESC LIMIT 1",
-                        params![node.as_str(), now_millis()],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?;
-                return Ok(key);
+            if matches.len() > 1 {
+                let nodes = matches.iter().map(|(node, _)| node.as_str()).collect::<Vec<_>>();
+                iota_logger::log!("Ambiguous peer authentication hint {}: {:?}", hint, nodes);
+                return Err(crate::storage_error::StorageError::Other("ambiguous peer authentication hint".into()));
             }
-            Ok(None)
+            Ok(matches.into_iter().next().map(|(_, key)| key))
         })
         .map_err(storage_error)?
         .map(|key| {
@@ -137,14 +129,15 @@ impl SqliteNodeDirectory {
             transaction.execute(
                 r#"INSERT INTO node_directory (
                        node_id, descriptor_revision, descriptor_valid_until,
-                       direct_endpoints, relay_hints, last_resolved_at
-                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                       direct_endpoints, relay_hints, last_resolved_at, authentication_hint
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                    ON CONFLICT(node_id) DO UPDATE SET
                        descriptor_revision = excluded.descriptor_revision,
                        descriptor_valid_until = excluded.descriptor_valid_until,
                        direct_endpoints = excluded.direct_endpoints,
                        relay_hints = excluded.relay_hints,
-                       last_resolved_at = excluded.last_resolved_at"#,
+                       last_resolved_at = excluded.last_resolved_at,
+                       authentication_hint = excluded.authentication_hint"#,
                 params![
                     descriptor.node.as_str(),
                     descriptor.revision,
@@ -152,6 +145,7 @@ impl SqliteNodeDirectory {
                     direct_endpoints,
                     relay_hints,
                     verified.resolved_at(),
+                    descriptor.node.mtp_authentication_hint() as i64,
                 ],
             )?;
             transaction.execute(
@@ -341,7 +335,10 @@ impl SqliteNodeDirectory {
 #[async_trait]
 impl NodeIdentityResolver for SqliteNodeDirectory {
     async fn resolve_node(&self, node: &IotaNodeId) -> Result<ResolvedNodeIdentity, IdentityError> {
-        let resolved = self.load(node)?.ok_or(IdentityError::NotFound)?;
+        let node = node.clone();
+        let resolved = crate::blocking::identity_lookup(move || SqliteNodeDirectory.load(&node))
+            .await?
+            .ok_or(IdentityError::NotFound)?;
         if resolved
             .valid_until
             .is_some_and(|valid_until| valid_until <= now_millis())

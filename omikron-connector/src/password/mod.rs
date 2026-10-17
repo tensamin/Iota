@@ -62,15 +62,17 @@ impl OmikronConnection {
                 "{}/.well-known/tensamin",
                 crate::omega_discovery::api_base()
             );
-            let response =
-                tokio::time::timeout(Duration::from_secs(10), self.http_client.get(url).send())
-                    .await
-                    .map_err(|_| "Omega identity lookup timed out")?
-                    .map_err(|error| error.to_string())?
-                    .error_for_status()
-                    .map_err(|error| error.to_string())?;
-            let discovery: serde_json::Value =
-                response.json().await.map_err(|error| error.to_string())?;
+            let cancellation = self.preparation_cancellation();
+            let discovery: serde_json::Value = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err("connection closed".into()),
+                result = tokio::time::timeout(Duration::from_secs(10), async {
+                    self.http_client.get(url).send().await
+                        .map_err(|error| error.to_string())?
+                        .error_for_status().map_err(|error| error.to_string())?
+                        .json().await.map_err(|error| error.to_string())
+                }) => result.map_err(|_| "Omega identity lookup timed out")??,
+            };
             let key = discovery
                 .get("public_key")
                 .and_then(serde_json::Value::as_str)
