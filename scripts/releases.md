@@ -13,12 +13,12 @@ iota update check
 iota update apply
 ```
 
-`iota update channel` shows the selected channel. Selection atomically persists
-`/etc/iota/update.env` without fetching or applying a release. The standalone
-`iota-updater` supports the same commands. Check and apply read this file directly,
+`iota update channel` shows the installed channel. Selecting the same channel is
+idempotent; switching an existing installation to another channel is rejected.
+Install the bundle for the intended channel instead. The standalone `iota-updater`
+supports the same commands. Check and apply read `/etc/iota/update.env` directly,
 including the pinned public key and key ID. Process environment cannot replace
-the trust configuration. Channel selection preserves both trust values and all
-per-channel anti-replay state.
+the trust configuration or per-channel anti-replay state.
 
 The manifest URL is
 `https://github.com/TensaminDev/Production-Pins/releases/download/CHANNEL/iota-update-linux-ARCH.json`.
@@ -28,9 +28,12 @@ active release belongs to the other channel. It still rejects older sequences,
 sequence/version reuse and failed activation sequences. Same-channel explicit
 rollback remains respected.
 
-The initial ZIP installer remains supported. It preserves existing update.env
-and removes a previously provisioned unattended update timer. The update service
-is an explicit oneshot apply operation with no timer.
+The ZIP installer installs the bundle's channel and public key in `update.env`
+and enables `iota-update.timer`. It checks hourly with up to 15 minutes of jitter,
+starting five minutes after boot. `iota update apply` also works manually.
+Production-Pins signs metadata valid for 90 days. Immutable release binaries are
+referenced by the moving channel manifests; expired or invalid signatures are
+rejected before activation.
 
 ## Release script contracts
 
