@@ -344,7 +344,7 @@ impl ConsentState {
 
         if let Some(eula) = &self.eula {
             file_out.push_str(&format!("\
-            \n\"EULA=true\" indicates that you read, understood and accepted Tensamin's End User Licence agreement. You can find our EULA at https://legal.methanium.net/tensamin/eula\
+            \n\"EULA=true\" indicates that you read, understood and accepted Tensamin's End User Licence agreement. You can find our EULA at https://legal.nonanium.net/tensamin/eula\
             \nEULA={}\
             \nEULA-VERSION={}\
             \nEULA-HASH={}\
@@ -354,7 +354,7 @@ impl ConsentState {
                 && let Some(tos) = &self.tos
             {
                 file_out.push_str(&format!("\
-                \n\"Terms-of-Service=true\" indicates that you read, understood and accepted Tensamin's Terms of Service. You can find our Terms of Serivce at https://legal.methanium.net/tensamin/terms-of-service\
+                \n\"Terms-of-Service=true\" indicates that you read, understood and accepted Tensamin's Terms of Service. You can find our Terms of Serivce at https://legal.nonanium.net/tensamin/terms-of-service\
                 \nTerms-of-Service={}\
                 \nTerms-of-Service-VERSION={}\
                 \nTerms-of-Service-HASH={}\
@@ -364,7 +364,7 @@ impl ConsentState {
                 && let Some(pp) = &self.privacy
             {
                 file_out.push_str(&format!("\
-                \n\"Privacy-Policy=true\" indicates that you read, understood and accepted Tensamin's Privacy Policy. You can find our Privacy Policy at https://legal.methanium.net/tensamin/privacy-policy\
+                \n\"Privacy-Policy=true\" indicates that you read, understood and accepted Tensamin's Privacy Policy. You can find our Privacy Policy at https://legal.nonanium.net/tensamin/privacy-policy\
                 \nPrivacy-Policy={}\
                 \nPrivacy-Policy-VERSION={}\
                 \nPrivacy-Policy-HASH={}\
@@ -372,7 +372,7 @@ impl ConsentState {
             }
         } else {
             file_out.push_str("\
-                \n\"EULA=true\" indicates that you read, understood and accepted Tensamin's End User Licence Agreement. You can find Tensamin's EULA at https://legal.methanium.net/tensamin/eula\
+                \n\"EULA=true\" indicates that you read, understood and accepted Tensamin's End User Licence Agreement. You can find Tensamin's EULA at https://legal.nonanium.net/tensamin/eula\
                 \nEULA=false\
                 ");
         }

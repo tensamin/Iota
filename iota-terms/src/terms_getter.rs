@@ -30,7 +30,7 @@ impl std::fmt::Display for Type {
 
 pub fn get_link(terms_type: Type) -> String {
     format!(
-        "https://legal.methanium.net/tensamin/{}",
+        "https://legal.nonanium.net/tensamin/{}",
         terms_type.to_str()
     )
 }
@@ -70,7 +70,7 @@ pub async fn get_newest_docs() -> Option<(Doc, Doc, Doc)> {
 
 pub async fn get_terms(terms_type: Type) -> Option<String> {
     reqwest::get(format!(
-        "https://legal.methanium.net/tensamin/{}/raw",
+        "https://legal.nonanium.net/tensamin/{}/raw",
         terms_type.to_str()
     ))
     .await
@@ -95,7 +95,7 @@ mod tests {
     fn links_to_the_tensamin_document_page() {
         assert_eq!(
             get_link(Type::TOS),
-            "https://legal.methanium.net/tensamin/terms-of-service"
+            "https://legal.nonanium.net/tensamin/terms-of-service"
         );
     }
 }

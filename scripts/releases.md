@@ -21,7 +21,7 @@ the trust configuration. Channel selection preserves both trust values and all
 per-channel anti-replay state.
 
 The manifest URL is
-`https://git.methanium.net/tensamin/prod-pins/releases/download/CHANNEL/iota-update-linux-ARCH.json`.
+`https://github.com/TensaminDev/Production-Pins/releases/download/CHANNEL/iota-update-linux-ARCH.json`.
 The signature URL appends `.sig`. CHANNEL is `stable` or `canary`, ARCH is
 `x86_64` or `aarch64`. Apply can select a previously accepted target when the
 active release belongs to the other channel. It still rejects older sequences,
@@ -77,8 +77,8 @@ The prod-pins workflow needs:
 - Expected pinned public key, supplied as the bundle PUBLIC_KEY argument.
 - Base product version, channel, positive release sequence, RFC 3339 publication
   and expiry timestamps, architecture and immutable artifact BASE_URL.
-- A Forgejo API token with release upload access to `tensamin/prod-pins`.
+- A GitHub token with release upload access to `TensaminDev/Production-Pins`.
 
 Build the Rust release binaries plus `iota-release` and `iota-bundle`. Shell
 scripts require bash, git, coreutils, jq and zip. No Iota publishing workflow
-remains; verification runs in `.forgejo/workflows/validate.yml`.
+remains; verification is provided by the repository's Nix flake checks.

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::{collections::BTreeMap, fs};
 
 const CONFIG: &str = "/etc/iota/update.env";
-const RELEASES: &str = "https://git.methanium.net/tensamin/prod-pins/releases/download";
+const RELEASES: &str = "https://github.com/TensaminDev/Production-Pins/releases/download";
 
 pub fn manifest_url(channel: &str, architecture: &str) -> Result<String> {
     if !matches!(channel, "stable" | "canary") {

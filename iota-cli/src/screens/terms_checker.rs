@@ -87,19 +87,19 @@ impl IotaScreen for TermsCheckerScreen {
                 height: content_height,
             });
         let eula_text = if size.width < 70 {
-            "EULA ¹ (https://legal.methanium.net/tensamin/eula)"
+            "EULA ¹ (https://legal.nonanium.net/tensamin/eula)"
         } else {
-            "End User Licence Agreement ¹ (https://legal.methanium.net/tensamin/eula)"
+            "End User Licence Agreement ¹ (https://legal.nonanium.net/tensamin/eula)"
         };
         let tos_text = if size.width < 72 {
-            "ToS ² (https://legal.methanium.net/tensamin/terms-of-service)"
+            "ToS ² (https://legal.nonanium.net/tensamin/terms-of-service)"
         } else {
-            "Terms of Service ² (https://legal.methanium.net/tensamin/terms-of-service)"
+            "Terms of Service ² (https://legal.nonanium.net/tensamin/terms-of-service)"
         };
         let pp_text = if size.width < 68 {
-            "PP ² (https://legal.methanium.net/tensamin/privacy-policy)"
+            "PP ² (https://legal.nonanium.net/tensamin/privacy-policy)"
         } else {
-            "Privacy Policy ² (https://legal.methanium.net/tensamin/privacy-policy)"
+            "Privacy Policy ² (https://legal.nonanium.net/tensamin/privacy-policy)"
         };
 
         let (mut optional_lines, agree_lines): (Vec<i16>, Vec<&str>) = if size.width > 143 {
