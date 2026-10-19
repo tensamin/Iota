@@ -31,14 +31,6 @@ pub fn install_linux_bundle_with_operator(bundle: &Path, operator: Option<&str>)
     let product_version = product_version(staging.path())?;
     validate_update_environment(staging.path())?;
 
-    for directory in ["/usr/local/lib/systemd/system", "/etc/systemd/system"] {
-        let timer = Path::new(directory).join("iota-update.timer");
-        if timer.exists() {
-            run("systemctl", &["disable", "--now", "iota-update.timer"])?;
-            fs::remove_file(timer).context("remove legacy unattended update timer")?;
-        }
-    }
-
     render_daemon_service(&staging.path().join("systemd/iota-daemon.service"))?;
 
     let version_dir = format!(

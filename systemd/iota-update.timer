@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for signed Tensamin Iota updates hourly
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+RandomizedDelaySec=15min
+Unit=iota-update.service
+
+[Install]
+WantedBy=timers.target

@@ -13,24 +13,27 @@ iota update check
 iota update apply
 ```
 
-`iota update channel` shows the selected channel. Selection atomically persists
-`/etc/iota/update.env` without fetching or applying a release. The standalone
-`iota-updater` supports the same commands. Check and apply read this file directly,
+`iota update channel` shows the installed channel. Selecting the same channel is
+idempotent; switching an existing installation to another channel is rejected.
+Install the bundle for the intended channel instead. The standalone `iota-updater`
+supports the same commands. Check and apply read `/etc/iota/update.env` directly,
 including the pinned public key and key ID. Process environment cannot replace
-the trust configuration. Channel selection preserves both trust values and all
-per-channel anti-replay state.
+the trust configuration or per-channel anti-replay state.
 
 The manifest URL is
-`https://git.methanium.net/tensamin/prod-pins/releases/download/CHANNEL/iota-update-linux-ARCH.json`.
+`https://github.com/TensaminDev/Production-Pins/releases/download/CHANNEL/iota-update-linux-ARCH.json`.
 The signature URL appends `.sig`. CHANNEL is `stable` or `canary`, ARCH is
 `x86_64` or `aarch64`. Apply can select a previously accepted target when the
 active release belongs to the other channel. It still rejects older sequences,
 sequence/version reuse and failed activation sequences. Same-channel explicit
 rollback remains respected.
 
-The initial ZIP installer remains supported. It preserves existing update.env
-and removes a previously provisioned unattended update timer. The update service
-is an explicit oneshot apply operation with no timer.
+The ZIP installer installs the bundle's channel and public key in `update.env`
+and enables `iota-update.timer`. It checks hourly with up to 15 minutes of jitter,
+starting five minutes after boot. `iota update apply` also works manually.
+Production-Pins signs metadata valid for 90 days. Immutable release binaries are
+referenced by the moving channel manifests; expired or invalid signatures are
+rejected before activation.
 
 ## Release script contracts
 
@@ -77,8 +80,8 @@ The prod-pins workflow needs:
 - Expected pinned public key, supplied as the bundle PUBLIC_KEY argument.
 - Base product version, channel, positive release sequence, RFC 3339 publication
   and expiry timestamps, architecture and immutable artifact BASE_URL.
-- A Forgejo API token with release upload access to `tensamin/prod-pins`.
+- A GitHub token with release upload access to `TensaminDev/Production-Pins`.
 
 Build the Rust release binaries plus `iota-release` and `iota-bundle`. Shell
 scripts require bash, git, coreutils, jq and zip. No Iota publishing workflow
-remains; verification runs in `.forgejo/workflows/validate.yml`.
+remains; verification is provided by the repository's Nix flake checks.

@@ -193,7 +193,7 @@ impl IotaScreen for TermsUpdaterScreen {
             if self.eula_future {
                 if size.width < 80 {
                     text_lines.push(checkbox(
-                        "EULA ¹³ (https://legal.methanium.net/tensamin/eula)",
+                        "EULA ¹³ (https://legal.nonanium.net/tensamin/eula)",
                         self.eula,
                         self.focus == Focus::Eula,
                         true,
@@ -206,7 +206,7 @@ impl IotaScreen for TermsUpdaterScreen {
                     text_lines.push(Line::from(format!("    Goes into effect on {}", date)));
                 } else {
                     text_lines.push(checkbox(
-                        "End User Licence Agreement ¹³ (https://legal.methanium.net/tensamin/eula)",
+                        "End User Licence Agreement ¹³ (https://legal.nonanium.net/tensamin/eula)",
                         self.eula,
                         self.focus == Focus::Eula,
                         true,
@@ -221,14 +221,14 @@ impl IotaScreen for TermsUpdaterScreen {
             } else {
                 if size.width < 80 {
                     text_lines.push(checkbox(
-                        "EULA ¹ (https://legal.methanium.net/tensamin/eula)",
+                        "EULA ¹ (https://legal.nonanium.net/tensamin/eula)",
                         self.eula,
                         self.focus == Focus::Eula,
                         true,
                     ));
                 } else {
                     text_lines.push(checkbox(
-                        "End User Licence Agreement ¹ (https://legal.methanium.net/tensamin/eula)",
+                        "End User Licence Agreement ¹ (https://legal.nonanium.net/tensamin/eula)",
                         self.eula,
                         self.focus == Focus::Eula,
                         true,
@@ -242,7 +242,7 @@ impl IotaScreen for TermsUpdaterScreen {
             if self.tos_future {
                 if size.width < 80 {
                     text_lines.push(checkbox(
-                        "ToS ²³ (https://legal.methanium.net/tensamin/terms-of-service)",
+                        "ToS ²³ (https://legal.nonanium.net/tensamin/terms-of-service)",
                         self.tos,
                         self.focus == Focus::Tos,
                         self.eula,
@@ -255,7 +255,7 @@ impl IotaScreen for TermsUpdaterScreen {
                     text_lines.push(Line::from(format!("    Goes into effect on {}", date)));
                 } else {
                     text_lines.push(checkbox(
-                        "Terms of Service ²³ (https://legal.methanium.net/tensamin/terms-of-service)",
+                        "Terms of Service ²³ (https://legal.nonanium.net/tensamin/terms-of-service)",
                         self.tos,
                         self.focus == Focus::Tos,
                         self.eula,
@@ -270,14 +270,14 @@ impl IotaScreen for TermsUpdaterScreen {
             } else {
                 if size.width < 80 {
                     text_lines.push(checkbox(
-                        "ToS ² (https://legal.methanium.net/tensamin/terms-of-service)",
+                        "ToS ² (https://legal.nonanium.net/tensamin/terms-of-service)",
                         self.tos,
                         self.focus == Focus::Tos,
                         self.eula,
                     ));
                 } else {
                     text_lines.push(checkbox(
-                        "Terms of Service ² (https://legal.methanium.net/tensamin/terms-of-service)",
+                        "Terms of Service ² (https://legal.nonanium.net/tensamin/terms-of-service)",
                         self.tos,
                         self.focus == Focus::Tos,
                         self.eula,
@@ -291,7 +291,7 @@ impl IotaScreen for TermsUpdaterScreen {
             if self.pp_future {
                 if size.width < 80 {
                     text_lines.push(checkbox(
-                        "PP ²³ (https://legal.methanium.net/tensamin/privacy-policy)",
+                        "PP ²³ (https://legal.nonanium.net/tensamin/privacy-policy)",
                         self.pp,
                         self.focus == Focus::Pp,
                         self.eula,
@@ -304,7 +304,7 @@ impl IotaScreen for TermsUpdaterScreen {
                     text_lines.push(Line::from(format!("    Goes into effect on {}", date)));
                 } else {
                     text_lines.push(checkbox(
-                        "Privacy Policy ²³ (https://legal.methanium.net/tensamin/privacy-policy)",
+                        "Privacy Policy ²³ (https://legal.nonanium.net/tensamin/privacy-policy)",
                         self.pp,
                         self.focus == Focus::Pp,
                         self.eula,
@@ -319,14 +319,14 @@ impl IotaScreen for TermsUpdaterScreen {
             } else {
                 if size.width < 80 {
                     text_lines.push(checkbox(
-                        "PP ² (https://legal.methanium.net/tensamin/privacy-policy)",
+                        "PP ² (https://legal.nonanium.net/tensamin/privacy-policy)",
                         self.pp,
                         self.focus == Focus::Pp,
                         self.eula,
                     ));
                 } else {
                     text_lines.push(checkbox(
-                        "Privacy Policy ² (https://legal.methanium.net/tensamin/privacy-policy)",
+                        "Privacy Policy ² (https://legal.nonanium.net/tensamin/privacy-policy)",
                         self.pp,
                         self.focus == Focus::Pp,
                         self.eula,
