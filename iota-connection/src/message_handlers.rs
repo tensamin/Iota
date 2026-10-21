@@ -522,10 +522,6 @@ pub fn apply_verified_relay_content(
                 .with_payload(content.content.clone());
             let recipients = chat_secret_recipients(&frame)
                 .ok_or_else(|| "Relay SetChatSecret has no recipients".to_string())?;
-            let recipient = recipients
-                .iter()
-                .find(|value| value.user_id == storage_owner.to_string())
-                .ok_or_else(|| "Relay SetChatSecret recipient mismatch".to_string())?;
             let chat_id = data_string(&frame, DataType::ChatId)
                 .ok_or_else(|| "Relay SetChatSecret is missing ChatId".to_string())?;
             let secret_id = data_string(&frame, DataType::SecretId)
@@ -556,15 +552,30 @@ pub fn apply_verified_relay_content(
             if !participants.contains(&context.final_recipient_id) {
                 return Err("Relay SetChatSecret recipient is not in ChatId".into());
             }
+            if storage_owner != sender_id && storage_owner != recipient_id {
+                return Err("Relay SetChatSecret storage owner is not a participant".into());
+            }
             if secret_id != format!("chat:{chat_id}:main") {
                 return Err("Relay SetChatSecret has an invalid secret namespace".into());
             }
-            if context.signer_id != participants[0] {
+            let principals = iota_storage::identity::SqlitePrincipalStore;
+            let shared_iota = principals
+                .principal_for_local_user(iota_identity::LocalUserId(sender_id))
+                .map_err(|error| error.to_string())?
+                == Some(signer_principal)
+                && principals
+                    .principal_for_local_user(iota_identity::LocalUserId(recipient_id))
+                    .map_err(|error| error.to_string())?
+                    == Some(recipient_principal);
+            // A shared Iota can choose both version-one envelopes in one
+            // transaction. Cross-Iota publication and later rotations retain
+            // their single authoritative writer.
+            if context.signer_id != participants[0] && !(shared_iota && version == 1) {
                 return Err(
                     "Relay SetChatSecret was signed by a non-authoritative participant".into(),
                 );
             }
-            if context.final_recipient_id != participants[1] {
+            if context.final_recipient_id == context.signer_id {
                 return Err("Relay SetChatSecret recipient is not the peer participant".into());
             }
             if recipients.len() != 2 {
@@ -585,26 +596,39 @@ pub fn apply_verified_relay_content(
                     || "Relay SetChatSecret has an invalid principal pair".to_string(),
                 )?;
             let principal_secret_id = e2ee_storage::principal_secret_id(&principal_chat_id);
-            e2ee_storage::migrate_chat_secret_namespace(
-                &storage_owner.to_string(),
-                &chat_id,
-                &secret_id,
-                &principal_chat_id,
-                &principal_secret_id,
-            )
-            .map_err(|error| error.to_string())?;
-            e2ee_storage::put_chat_secret(e2ee_storage::StoredChatSecret {
-                user_id: storage_owner.to_string(),
-                chat_id: principal_chat_id,
-                secret_id: principal_secret_id,
-                version,
-                encrypted_secret: recipient.encrypted_secret.clone(),
-                kem_ciphertext: recipient.kem_ciphertext.clone(),
-                wrapping_scheme,
-                created_at,
-                updated_at: now_millis_i64(),
-            })
-            .map_err(|error| error.to_string())?;
+            let owners = if shared_iota {
+                vec![sender_id, recipient_id]
+            } else {
+                vec![storage_owner]
+            };
+            let records = owners
+                .iter()
+                .map(|owner| {
+                    let recipient = recipients
+                        .iter()
+                        .find(|value| value.user_id == owner.to_string())
+                        .ok_or_else(|| "Relay SetChatSecret recipient mismatch".to_string())?;
+                    e2ee_storage::migrate_chat_secret_namespace(
+                        &owner.to_string(),
+                        &chat_id,
+                        &secret_id,
+                        &principal_chat_id,
+                        &principal_secret_id,
+                    )?;
+                    Ok(e2ee_storage::StoredChatSecret {
+                        user_id: owner.to_string(),
+                        chat_id: principal_chat_id.clone(),
+                        secret_id: principal_secret_id.clone(),
+                        version,
+                        encrypted_secret: recipient.encrypted_secret.clone(),
+                        kem_ciphertext: recipient.kem_ciphertext.clone(),
+                        wrapping_scheme: wrapping_scheme.clone(),
+                        created_at,
+                        updated_at: now_millis_i64(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            e2ee_storage::put_chat_secrets(&records).map_err(|error| error.to_string())?;
             Ok(RelayApplicationResult::default())
         }
         CommunicationType::AddConversation => {
