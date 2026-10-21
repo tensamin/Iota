@@ -75,6 +75,8 @@ pub async fn get_terms(terms_type: Type) -> Option<String> {
     ))
     .await
     .ok()?
+    .error_for_status()
+    .ok()?
     .text()
     .await
     .ok()
