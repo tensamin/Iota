@@ -48,6 +48,8 @@ pub enum ConfigError {
     InvalidStorageLimit(&'static str),
     #[error("invalid max_relay_future_skew_millis")]
     InvalidRelayFutureSkew,
+    #[error("invalid federation configuration: {0}")]
+    InvalidFederation(&'static str),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +141,24 @@ pub enum WebMode {
 #[serde(deny_unknown_fields)]
 pub struct WebSettings {
     #[serde(default)]
+    pub federation_mode: FederationMode,
+    #[serde(default)]
+    pub serve_relay_router: bool,
+    #[serde(default)]
+    pub relay_router_public: bool,
+    #[serde(default)]
+    pub relay_router_allowed_nodes: Vec<String>,
+    #[serde(default)]
+    pub relay_mailbox: Option<crate::relay_mailbox::MailboxLimits>,
+    #[serde(default)]
+    pub authority_locator: Option<String>,
+    #[serde(default)]
+    pub allow_lan_federation: bool,
+    #[serde(default)]
+    pub allow_raw_ip_federation: bool,
+    #[serde(default)]
+    pub peer_introduction: iota_identity::peer_introduction::PeerIntroductionLimits,
+    #[serde(default)]
     pub mode: WebMode,
     #[serde(default = "default_web_bind")]
     pub bind: String,
@@ -161,6 +181,15 @@ pub struct WebSettings {
     #[serde(default)]
     pub relay_hints: Vec<String>,
 }
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FederationMode {
+    #[default]
+    Private,
+    FederatedDirect,
+    FederatedRelay,
+}
 const fn default_max_mtp_sessions() -> usize {
     256
 }
@@ -180,6 +209,15 @@ impl Default for WebSettings {
     fn default() -> Self {
         Self {
             mode: WebMode::default(),
+            federation_mode: FederationMode::Private,
+            serve_relay_router: false,
+            relay_router_public: false,
+            relay_router_allowed_nodes: Vec::new(),
+            relay_mailbox: None,
+            authority_locator: None,
+            allow_lan_federation: false,
+            allow_raw_ip_federation: false,
+            peer_introduction: Default::default(),
             bind: default_web_bind(),
             port: default_port(),
             asset_dir: default_web_asset_dir(),
@@ -268,6 +306,80 @@ fn parse_config(path: &Path, yaml: &str) -> Result<IotaConfig, ConfigError> {
 }
 
 pub fn validate_config(config: &IotaConfig) -> Result<(), ConfigError> {
+    let web = &config.web;
+    let introduction = &web.peer_introduction;
+    if web.serve_relay_router && matches!(web.federation_mode, FederationMode::Private) {
+        return Err(ConfigError::InvalidFederation(
+            "router operation requires federation mode",
+        ));
+    }
+    for node in &web.relay_router_allowed_nodes {
+        iota_identity::IotaNodeId::new(node).map_err(|source| {
+            ConfigError::InvalidFederationEndpoint {
+                endpoint: node.clone(),
+                source,
+            }
+        })?;
+    }
+    if !(1024..=256 * 1024).contains(&introduction.max_request_bytes)
+        || !(1..=64).contains(&introduction.max_concurrent_requests)
+        || !(1000..=60_000).contains(&introduction.request_timeout_ms)
+        || !(1000..=120_000).contains(&introduction.challenge_lifetime_ms)
+        || !(1000..=900_000).contains(&introduction.admission_lifetime_ms)
+        || introduction.max_pending_challenges == 0
+        || introduction.max_pending_challenges > 100_000
+        || introduction.max_challenges_per_origin == 0
+        || introduction.max_admissions == 0
+    {
+        return Err(ConfigError::InvalidFederation("peer introduction limits"));
+    }
+    if let Some(locator) = &web.authority_locator {
+        iota_identity::AuthorityLocator::new(locator).map_err(|source| {
+            ConfigError::InvalidFederationEndpoint {
+                endpoint: locator.clone(),
+                source,
+            }
+        })?;
+    }
+    if !matches!(web.federation_mode, FederationMode::Private) {
+        if !matches!(web.mode, WebMode::Network)
+            || web.certificate.is_none()
+            || web.key.is_none()
+            || web.authority_locator.is_none()
+        {
+            return Err(ConfigError::InvalidFederation(
+                "public federation requires network HTTPS and an authority locator",
+            ));
+        }
+        if matches!(web.federation_mode, FederationMode::FederatedDirect)
+            && web.direct_endpoints.is_empty()
+        {
+            return Err(ConfigError::InvalidFederation(
+                "direct federation requires an advertised MTP endpoint",
+            ));
+        }
+        if matches!(web.federation_mode, FederationMode::FederatedRelay)
+            && (config.relay_routers.is_empty() || !web.direct_endpoints.is_empty())
+        {
+            return Err(ConfigError::InvalidFederation(
+                "relay federation requires configured routers and no public direct endpoint",
+            ));
+        }
+    }
+    if let Some(limits) = &web.relay_mailbox
+        && (!web.serve_relay_router
+            || limits.max_frame_bytes == 0
+            || limits.max_frame_bytes > 4 * 1024 * 1024
+            || limits.max_entries == 0
+            || limits.max_entries_per_sender == 0
+            || limits.max_entries_per_destination == 0
+            || limits.max_total_bytes < limits.max_frame_bytes
+            || !(1000..=7 * 24 * 60 * 60 * 1000).contains(&limits.ttl_ms))
+    {
+        return Err(ConfigError::InvalidFederation(
+            "relay mailbox limits or router role",
+        ));
+    }
     config
         .web
         .bind

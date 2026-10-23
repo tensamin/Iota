@@ -81,13 +81,22 @@ impl DaemonServices {
             ));
         let nodes = Arc::new(iota_storage::node_directory::SqliteNodeDirectory);
         let node_directory: Arc<dyn NodeDirectory> = nodes.clone();
+        let web = &iota_storage::util::config_util::CONFIG.load().web;
         let federation_client: Arc<dyn other_iota::FederationIdentityClient> =
-            Arc::new(other_iota::HttpFederationIdentityClient::default());
-        let remote_iota: Arc<dyn IdentityResolver> = Arc::new(other_iota::RemoteIotaResolver::new(
-            federation_client.clone(),
-            principals.clone(),
-            node_directory.clone(),
-        ));
+            Arc::new(other_iota::HttpFederationIdentityClient::new(
+                web.allow_lan_federation,
+                web.allow_raw_ip_federation,
+            ));
+        let remote_iota: Arc<dyn IdentityResolver> = Arc::new(
+            other_iota::RemoteIotaResolver::new(
+                federation_client.clone(),
+                principals.clone(),
+                node_directory.clone(),
+            )
+            .with_authority_directory(Arc::new(
+                iota_storage::authority_directory::SqliteAuthorityDirectory,
+            )),
+        );
         let remote_omega: Arc<dyn IdentityResolver> =
             Arc::new(other_iota::RemoteOmegaResolver::new(
                 federation_client,

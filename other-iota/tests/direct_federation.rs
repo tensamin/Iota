@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use iota_connection::connection_handler::{PeerRouter, RouteDestination, RouteError, RouteOutcome};
-use iota_connection::federated_relay::FederatedRelayV2;
+use iota_connection::federated_relay::FederatedRelay;
 use iota_connection::relay_service::{RelayNodeIdentity, RelayService};
 use iota_identity::{
     AuthorityLocator, IdentityError, IdentityResolver, IotaNodeId, LocalNodeIdentity,
@@ -120,6 +120,7 @@ impl PeerRouter for NoRoute {
 struct MemoryNodes {
     nodes: RwLock<HashMap<IotaNodeId, ResolvedNodeIdentity>>,
     certificates: RwLock<HashMap<AuthorityLocator, Vec<u8>>>,
+    successful_dials: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait]
@@ -184,6 +185,8 @@ impl NodeDirectory for MemoryNodes {
         _: &IotaNodeId,
         _: &AuthorityLocator,
     ) -> Result<(), IdentityError> {
+        self.successful_dials
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }
@@ -318,7 +321,7 @@ async fn start_peer_server(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn authenticated_peer_delivers_relay_v2_to_same_numeric_user_on_another_iota() {
+async fn authenticated_peer_delivers_relay_to_same_numeric_user_on_another_iota() {
     let storage = tempfile::tempdir().unwrap();
     iota_util::file_util::configure_storage_directory(storage.path().to_owned());
     iota_storage::util::db::initialize_database().unwrap();
@@ -434,13 +437,26 @@ async fn authenticated_peer_delivers_relay_v2_to_same_numeric_user_on_another_io
         Arc::new(Deliveries::default()),
     ));
     router_a.attach_manager(&manager_a);
-    manager_a.connect_best(iota_b.node_id()).await.unwrap();
+    let (first, second, third) = tokio::join!(
+        manager_a.connect_best(iota_b.node_id()),
+        manager_a.connect_best(iota_b.node_id()),
+        manager_a.connect_best(iota_b.node_id()),
+    );
+    first.unwrap();
+    second.unwrap();
+    third.unwrap();
+    assert_eq!(
+        nodes_a
+            .successful_dials
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
 
     let content = CommunicationValue::new(CommunicationType::MessageSend)
         .add_typed_default(DataType::Content, DataValue::Str("ciphertext".into()))
         .add_typed_default(DataType::SendTime, DataValue::SignedNumber(10))
         .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(1));
-    let frame = FederatedRelayV2::sign(
+    let frame = FederatedRelay::sign(
         principal_a.descriptor().principal.clone(),
         principal_b.descriptor().principal.clone(),
         iota_b.node_id().clone(),
@@ -553,7 +569,7 @@ async fn authenticated_peer_delivers_relay_v2_to_same_numeric_user_on_another_io
     ));
     router_a.attach_manager(&manager_a);
 
-    let second = FederatedRelayV2::sign(
+    let second = FederatedRelay::sign(
         principal_a.descriptor().principal.clone(),
         principal_b.descriptor().principal.clone(),
         iota_b.node_id().clone(),

@@ -53,6 +53,19 @@ impl IdentityResolver for FixtureResolver {
 async fn verify_fixture(json: &[u8], expected_producer: &str) {
     let f: ClientFixture = serde_json::from_slice(json).unwrap();
     assert_eq!(f.producer, expected_producer);
+    let raw: serde_json::Value = serde_json::from_str(&f.wire).unwrap();
+    if raw.get("version").is_some() {
+        // Production clients are outside this migration. Their frozen signed fixtures
+        // prove that the old format is rejected, rather than being rewritten in place.
+        assert_eq!(raw["version"], 2);
+        assert!(protocol::RelayWire::from_json(f.wire.as_bytes()).is_err());
+        let map = TypeMap::new(
+            mtp::type_map::Version::parse(raw["type_map_version"].as_str().unwrap()).unwrap(),
+        );
+        let frame = CommunicationValue::try_from_bytes_with(&f.frame, &map).unwrap();
+        assert!(iota_connection::federated_relay::parse_wire(&frame).is_err());
+        return;
+    }
     let wire = protocol::RelayWire::from_json(f.wire.as_bytes()).unwrap();
     let signer_keys = f
         .signer_keys
@@ -143,7 +156,7 @@ async fn verify_fixture(json: &[u8], expected_producer: &str) {
 }
 
 #[tokio::test]
-async fn actual_chromium_wrapper_opens_at_iota_ingress() {
+async fn chromium_fixture_obeys_selected_federation_format() {
     let fixture = std::env::var("RELAY_BROWSER_INTEROP_FIXTURE")
         .ok()
         .map(std::fs::read)
@@ -154,7 +167,7 @@ async fn actual_chromium_wrapper_opens_at_iota_ingress() {
 }
 
 #[tokio::test]
-async fn actual_desktop_producer_opens_at_iota_ingress() {
+async fn desktop_fixture_obeys_selected_federation_format() {
     let path = std::env::var("RELAY_DESKTOP_INTEROP_FIXTURE").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/relay_desktop_v2.json",

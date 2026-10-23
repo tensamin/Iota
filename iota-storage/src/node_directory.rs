@@ -100,34 +100,61 @@ impl SqliteNodeDirectory {
             ));
         }
         db::with_immediate_transaction(|transaction| {
-            let current = transaction
+            Self::upsert_in_tx(
+                transaction,
+                verified,
+                &direct_endpoints,
+                &relay_hints,
+                &public_key,
+            )
+        })
+        .map_err(storage_error)
+    }
+
+    pub(crate) fn upsert_in_tx(
+        transaction: &rusqlite::Transaction<'_>,
+        verified: &VerifiedNodeDescriptor,
+        direct_endpoints: &str,
+        relay_hints: &str,
+        public_key: &str,
+    ) -> Result<(), crate::storage_error::StorageError> {
+        let descriptor = verified.descriptor();
+        let current = transaction
                 .query_row(
                     "SELECT n.descriptor_revision, n.last_resolved_at, n.descriptor_valid_until, n.direct_endpoints, n.relay_hints, (SELECT public_key FROM node_keys WHERE node_id = n.node_id AND source_revision = n.descriptor_revision LIMIT 1) FROM node_directory n WHERE n.node_id = ?1",
                     [descriptor.node.as_str()],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?)),
                 )
                 .optional()?;
-            if let Some((revision, resolved_at, valid_until, current_endpoints, current_relays, current_key)) = current {
-                if revision > descriptor.revision
-                    || (revision == descriptor.revision && resolved_at > verified.resolved_at())
-                {
-                    return Err(crate::storage_error::StorageError::Other(
-                        "stale node descriptor update was rejected".into(),
-                    ));
-                }
-                if revision == descriptor.revision
-                    && (valid_until != descriptor.valid_until
-                        || current_endpoints != direct_endpoints
-                        || current_relays != relay_hints
-                        || current_key.as_deref() != Some(public_key.as_str()))
-                {
-                    return Err(crate::storage_error::StorageError::Other(
-                        "conflicting node descriptor revision was rejected".into(),
-                    ));
-                }
+        if let Some((
+            revision,
+            resolved_at,
+            valid_until,
+            current_endpoints,
+            current_relays,
+            current_key,
+        )) = current
+        {
+            if revision > descriptor.revision
+                || (revision == descriptor.revision && resolved_at > verified.resolved_at())
+            {
+                return Err(crate::storage_error::StorageError::Other(
+                    "stale node descriptor update was rejected".into(),
+                ));
             }
-            transaction.execute(
-                r#"INSERT INTO node_directory (
+            if revision == descriptor.revision
+                && (valid_until != descriptor.valid_until
+                    || current_endpoints != direct_endpoints
+                    || current_relays != relay_hints
+                    || current_key.as_deref() != Some(public_key))
+            {
+                return Err(crate::storage_error::StorageError::Other(
+                    "conflicting node descriptor revision was rejected".into(),
+                ));
+            }
+        }
+        transaction.execute(
+            r#"INSERT INTO node_directory (
                        node_id, descriptor_revision, descriptor_valid_until,
                        direct_endpoints, relay_hints, last_resolved_at, authentication_hint
                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -138,38 +165,36 @@ impl SqliteNodeDirectory {
                        relay_hints = excluded.relay_hints,
                        last_resolved_at = excluded.last_resolved_at,
                        authentication_hint = excluded.authentication_hint"#,
-                params![
-                    descriptor.node.as_str(),
-                    descriptor.revision,
-                    descriptor.valid_until,
-                    direct_endpoints,
-                    relay_hints,
-                    verified.resolved_at(),
-                    descriptor.node.mtp_authentication_hint() as i64,
-                ],
-            )?;
-            transaction.execute(
+            params![
+                descriptor.node.as_str(),
+                descriptor.revision,
+                descriptor.valid_until,
+                direct_endpoints,
+                relay_hints,
+                verified.resolved_at(),
+                descriptor.node.mtp_authentication_hint() as i64,
+            ],
+        )?;
+        transaction.execute(
                 "UPDATE node_keys SET valid_until = MIN(COALESCE(valid_until, ?2), ?2) WHERE node_id = ?1",
                 params![descriptor.node.as_str(), verified.resolved_at()],
             )?;
-            transaction.execute(
-                r#"INSERT INTO node_keys (
+        transaction.execute(
+            r#"INSERT INTO node_keys (
                        node_id, public_key, valid_from, valid_until, source_revision
                    ) VALUES (?1, ?2, ?3, ?4, ?5)
                    ON CONFLICT(node_id, public_key) DO UPDATE SET
                        valid_until = excluded.valid_until,
                        source_revision = excluded.source_revision"#,
-                params![
-                    descriptor.node.as_str(),
-                    public_key,
-                    verified.resolved_at(),
-                    descriptor.valid_until,
-                    descriptor.revision,
-                ],
-            )?;
-            Ok(())
-        })
-        .map_err(storage_error)
+            params![
+                descriptor.node.as_str(),
+                public_key,
+                verified.resolved_at(),
+                descriptor.valid_until,
+                descriptor.revision,
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn pin_endpoint_record(
@@ -178,7 +203,7 @@ impl SqliteNodeDirectory {
         node: &IotaNodeId,
         now: i64,
     ) -> Result<(), IdentityError> {
-        db::with_db(|connection| {
+        db::with_immediate_transaction(|connection| {
             let current = connection
                 .query_row(
                     "SELECT node_id FROM node_endpoint_pins WHERE endpoint = ?1",
@@ -352,6 +377,28 @@ impl NodeIdentityResolver for SqliteNodeDirectory {
 }
 
 impl iota_identity::NodeDirectory for SqliteNodeDirectory {
+    fn peer_admission(
+        &self,
+        node: &IotaNodeId,
+        key: &PublicKeyBundle,
+        now: i64,
+    ) -> Result<Option<iota_identity::peer_introduction::PeerTrust>, IdentityError> {
+        crate::peer_admission::trust_for_peer(node, key, now).map(Some)
+    }
+
+    fn promote_peer(
+        &self,
+        trust: &iota_identity::peer_introduction::PeerTrust,
+        key: &PublicKeyBundle,
+        now: i64,
+    ) -> Result<Option<iota_identity::peer_introduction::PeerTrust>, IdentityError> {
+        crate::peer_admission::promote(trust, key, now).map(Some)
+    }
+
+    fn revoke_peer_admission(&self, node: &IotaNodeId) -> Result<(), IdentityError> {
+        crate::peer_admission::revoke(node)
+    }
+
     fn upsert_node_descriptor(
         &self,
         descriptor: &VerifiedNodeDescriptor,

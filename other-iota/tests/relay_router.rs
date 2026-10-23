@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use iota_connection::connection_handler::{PeerRouter, RouteDestination, RouteError, RouteOutcome};
-use iota_connection::federated_relay::FederatedRelayV2;
+use iota_connection::federated_relay::FederatedRelay;
 use iota_connection::relay_service::{RelayNodeIdentity, RelayService};
 use iota_identity::{
     AuthorityLocator, IdentityError, IdentityResolver, IotaNodeId, LocalNodeIdentity,
@@ -167,7 +167,20 @@ fn certificate() -> (Vec<u8>, Vec<u8>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn authenticated_router_forwards_opaque_relay_v2() {
+async fn authenticated_router_forwards_and_mailboxes_opaque_relays() {
+    if std::env::var("TENSAMIN_ROUTER_TEST_MODE").is_err() {
+        for mode in ["online", "mailbox"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("authenticated_router_forwards_and_mailboxes_opaque_relays")
+                .env("TENSAMIN_ROUTER_TEST_MODE", mode)
+                .status()
+                .unwrap();
+            assert!(status.success(), "router mode {mode}");
+        }
+        return;
+    }
+    let mailbox = std::env::var("TENSAMIN_ROUTER_TEST_MODE").unwrap() == "mailbox";
     let storage = tempfile::tempdir().unwrap();
     iota_util::file_util::configure_storage_directory(storage.path().to_owned());
     iota_storage::util::db::initialize_database().unwrap();
@@ -210,7 +223,11 @@ async fn authenticated_router_forwards_opaque_relay_v2() {
         ),
     );
     let deliveries = Arc::new(Deliveries::default());
-    let router = Arc::new(RelayRouterService::default());
+    let router = Arc::new(if mailbox {
+        RelayRouterService::with_mailbox(Default::default())
+    } else {
+        RelayRouterService::default()
+    });
     let router_keyring = Keyring::generate();
     let router_public_key = router_keyring.public_key_bundle();
     let key_a = iota_a.public_keys();
@@ -280,7 +297,7 @@ async fn authenticated_router_forwards_opaque_relay_v2() {
     .await
     .unwrap();
 
-    let frame = FederatedRelayV2::sign(
+    let frame = FederatedRelay::sign(
         principal_a.descriptor().principal.clone(),
         principal_b.descriptor().principal.clone(),
         iota_b.node_id().clone(),
@@ -311,6 +328,9 @@ async fn authenticated_router_forwards_opaque_relay_v2() {
             .unwrap(),
         RouteOutcome::Retryable { .. }
     ));
+    if mailbox {
+        assert_eq!(iota_storage::util::db::with_db(|db| Ok(db.query_row("SELECT COUNT(*) FROM relay_mailbox WHERE encrypted_frame IS NOT NULL AND acceptance IS NULL",[],|r|r.get::<_,i64>(0))?)).unwrap(),1);
+    }
 
     let _iota_b_router = RelayRouterClient::connect(
         iota_b.clone(),
@@ -329,6 +349,15 @@ async fn authenticated_router_forwards_opaque_relay_v2() {
     })
     .await
     .unwrap();
+    if mailbox {
+        tokio::time::timeout(std::time::Duration::from_secs(10),async {
+            loop {
+                let count=iota_storage::util::db::with_db(|db| Ok(db.query_row("SELECT COUNT(*) FROM relay_mailbox WHERE acceptance IS NOT NULL AND encrypted_frame IS NULL",[],|r|r.get::<_,i64>(0))?)).unwrap();
+                if count==1 { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }).await.unwrap();
+    }
     let outcome = iota_a_router
         .route(&RouteDestination::Iota(iota_b.node_id().clone()), frame)
         .await

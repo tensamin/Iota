@@ -1,0 +1,1111 @@
+use super::*;
+
+impl CommandRouter {
+    pub(super) async fn execute(&self, request_id: u64, request: LocalRequest) -> ResponseResult {
+        if !self.services.active
+            && !matches!(
+                request,
+                LocalRequest::GetStatus | LocalRequest::GetDaemonStatus
+            )
+        {
+            return ResponseResult::Error(IpcErrorCode::Unauthorized);
+        }
+        let needs_account_authority = matches!(
+            request,
+            LocalRequest::CreateUser { .. }
+                | LocalRequest::InspectTuCredential { .. }
+                | LocalRequest::AttachUserFromTu { .. }
+                | LocalRequest::ReconcileUser { .. }
+                | LocalRequest::ReleaseUser { .. }
+                | LocalRequest::CompleteDeleteUser { .. }
+        );
+        let needs_centralized_provider = matches!(
+            request,
+            LocalRequest::CreateInvitation {
+                authority: InvitationAuthority::Omega,
+                ..
+            }
+        );
+        if (needs_account_authority && !self.services.accounts.is_available().await)
+            || (needs_centralized_provider && self.services.centralized.is_none())
+        {
+            return ResponseResult::Error(
+                if self.runtime.current_startup_phase() != StartupPhase::Ready {
+                    IpcErrorCode::NotReady
+                } else {
+                    IpcErrorCode::OmikronUnavailable
+                },
+            );
+        }
+        match request {
+            LocalRequest::GetStatus => {
+                let phase = self.runtime.current_startup_phase();
+                let degraded = self.runtime.degraded_reason.borrow().clone();
+                let tasks: Vec<String> = self
+                    .runtime
+                    .state
+                    .active_tasks
+                    .iter()
+                    .map(|task| task.to_string())
+                    .collect();
+                ResponseResult::Ok(ResponsePayload::Status(StatusResponse {
+                    phase: format!("{:?}", phase),
+                    tasks: tasks.clone(),
+                    degraded_reason: degraded,
+                }))
+            }
+            LocalRequest::ListTasks => {
+                let tasks: Vec<TaskSummary> = self
+                    .runtime
+                    .state
+                    .active_tasks
+                    .iter()
+                    .map(|task| TaskSummary {
+                        name: task.to_string(),
+                    })
+                    .collect();
+                ResponseResult::Ok(ResponsePayload::Tasks(tasks))
+            }
+            LocalRequest::ListUsers => {
+                let pending = match pending_operations::get_all() {
+                    Ok(operations) => operations
+                        .into_iter()
+                        .map(|operation| {
+                            let kind = match operation.operation {
+                                PendingUserOperationKind::Create => UserOperationKind::Create,
+                                PendingUserOperationKind::Attach => UserOperationKind::Attach,
+                                PendingUserOperationKind::Release => UserOperationKind::Release,
+                                PendingUserOperationKind::Purge => UserOperationKind::Purge,
+                            };
+                            (
+                                operation.user_id,
+                                UserOperationSummary {
+                                    operation: kind,
+                                    phase: operation.phase.as_str().into(),
+                                },
+                            )
+                        })
+                        .collect::<std::collections::HashMap<_, _>>(),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.pending_operations_load_failed",
+                            "request_id={} error={}",
+                            request_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                    }
+                };
+                let users = match user_manager::get_residency() {
+                    Ok(users) => users,
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.residency_load_failed",
+                            "request_id={} error={}",
+                            request_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                    }
+                }
+                .into_iter()
+                .map(|user| {
+                    let user_id = user.user_id;
+                    let profile = user_manager::get_user(user.user_id)?;
+                    Ok(UserSummary {
+                        credential_status: credential_status(&user, profile.as_ref()),
+                        user_id,
+                        username: user.username,
+                        state: match user.state {
+                            user_manager::LocalUserState::Managed => {
+                                iota_ipc::LocalUserState::Managed
+                            }
+                            user_manager::LocalUserState::Released => {
+                                iota_ipc::LocalUserState::Released
+                            }
+                        },
+                        data_present: user.data_present,
+                        pending_operation: pending.get(&user_id).cloned(),
+                    })
+                })
+                .collect::<Result<Vec<_>, iota_storage::storage_error::StorageError>>();
+                let users = match users {
+                    Ok(users) => users,
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.profile_load_failed",
+                            "request_id={} error={}",
+                            request_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                    }
+                };
+                ResponseResult::Ok(ResponsePayload::Users(users))
+            }
+            LocalRequest::ListTAuthApps => match crate::tauth_apps::list() {
+                Ok(apps) => ResponseResult::Ok(ResponsePayload::TAuthApps(apps)),
+                Err(error) => {
+                    log!("TAuth app listing failed: {error}");
+                    ResponseResult::Error(IpcErrorCode::StorageFailure)
+                }
+            },
+            LocalRequest::GetTAuthApp { app_id } => match crate::tauth_apps::get(&app_id) {
+                Ok(Some(app)) => ResponseResult::Ok(ResponsePayload::TAuthApp(app)),
+                Ok(None) => ResponseResult::Error(IpcErrorCode::NotFound),
+                Err(error) => {
+                    log!("TAuth app lookup failed: {error}");
+                    ResponseResult::Error(IpcErrorCode::StorageFailure)
+                }
+            },
+            LocalRequest::CreateTAuthApp {
+                owner_user_id,
+                domain,
+                name,
+                redirects,
+                connection,
+            } => {
+                match crate::tauth_apps::create(owner_user_id, domain, name, redirects, connection)
+                {
+                    Ok(created) => ResponseResult::Ok(ResponsePayload::TAuthAppCreated {
+                        app: created.app,
+                        credential: created.credential,
+                        txt_record: created.txt_record,
+                        manifest_template: created.manifest_template,
+                    }),
+                    Err(error) => {
+                        log!("TAuth app creation failed: {error}");
+                        ResponseResult::Error(IpcErrorCode::InvalidRequest)
+                    }
+                }
+            }
+            LocalRequest::ExportTAuthApp { app_id } => match crate::tauth_apps::export(&app_id) {
+                Ok(Some(credential)) => {
+                    ResponseResult::Ok(ResponsePayload::TAuthAppCredentialExport {
+                        app_id,
+                        credential,
+                    })
+                }
+                Ok(None) => ResponseResult::Error(IpcErrorCode::NotFound),
+                Err(error) => {
+                    log!("TAuth app export failed: {error}");
+                    ResponseResult::Error(IpcErrorCode::StorageFailure)
+                }
+            },
+            LocalRequest::DeleteTAuthApp { app_id } => match crate::tauth_apps::delete(&app_id) {
+                Ok(true) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                    message: format!(
+                        "Deleted TAuth app {app_id}. Remove its DNS TXT record and HTTPS manifest."
+                    ),
+                }),
+                Ok(false) => ResponseResult::Error(IpcErrorCode::NotFound),
+                Err(error) => {
+                    log!("TAuth app deletion failed: {error}");
+                    ResponseResult::Error(IpcErrorCode::StorageFailure)
+                }
+            },
+            LocalRequest::CreateInvitation {
+                authority,
+                lifetime_seconds,
+                password,
+                label,
+            } => {
+                if authority == InvitationAuthority::Iota {
+                    return ResponseResult::Error(IpcErrorCode::Unsupported);
+                }
+                if lifetime_seconds == 0 || lifetime_seconds > 7 * 24 * 60 * 60 {
+                    return ResponseResult::Error(IpcErrorCode::InvalidRequest);
+                }
+                let Some(omikron) = self.services.omikron() else {
+                    return ResponseResult::Error(IpcErrorCode::OmikronUnavailable);
+                };
+                let password_protected = password.is_some();
+                let mut request = CommunicationValue::new(CommunicationType::CreateUserInvitation)
+                    .add_typed_default(
+                        DataType::InvitationAuthority,
+                        DataValue::Str("omega".into()),
+                    )
+                    .add_typed_default(
+                        DataType::InvitationLifetimeSeconds,
+                        DataValue::SignedNumber(lifetime_seconds.into()),
+                    );
+                if let Some(password) = password {
+                    request = request.add_typed_default(
+                        DataType::InvitationPassword,
+                        DataValue::Str(password.0),
+                    );
+                }
+                if let Some(label) = label.as_ref() {
+                    request = request.add_typed_default(
+                        DataType::InvitationLabel,
+                        DataValue::Str(label.clone()),
+                    );
+                }
+                let response = match omikron
+                    .await_response(&request, Duration::from_secs(20))
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(omikron_connector::OmikronError::Timeout(_)) => {
+                        return ResponseResult::Error(IpcErrorCode::Timeout);
+                    }
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Warn,
+                            "invitation.create_failed",
+                            "request_id={} error={}",
+                            request_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::OmikronUnavailable);
+                    }
+                };
+                let invitation_id = response
+                    .get_data(DataType::InvitationId)
+                    .as_signed_number()
+                    .and_then(|value| i64::try_from(value).ok());
+                let raw_token = response
+                    .get_data(DataType::InvitationToken)
+                    .as_str()
+                    .map(str::to_owned);
+                let expires_at = response
+                    .get_data(DataType::InvitationExpiresAt)
+                    .as_signed_number()
+                    .and_then(|value| i64::try_from(value).ok());
+                let created_at = response
+                    .get_data(DataType::InvitationCreatedAt)
+                    .as_signed_number()
+                    .and_then(|value| i64::try_from(value).ok());
+                let remote_revision = response
+                    .get_data(DataType::InvitationRevision)
+                    .as_signed_number()
+                    .and_then(|value| i64::try_from(value).ok())
+                    .unwrap_or(1);
+                let short_url = response
+                    .get_data(DataType::Link)
+                    .as_str()
+                    .map(str::to_owned);
+                let Some((invitation_id, raw_token, created_at, expires_at)) = invitation_id
+                    .zip(raw_token)
+                    .zip(created_at)
+                    .zip(expires_at)
+                    .map(|(((id, token), created), expires)| (id, token, created, expires))
+                else {
+                    log_event!(
+                        PrintType::Command,
+                        LogLevel::Error,
+                        "invitation.invalid_response",
+                        "request_id={} reason=missing_required_fields",
+                        request_id
+                    );
+                    return ResponseResult::Error(IpcErrorCode::InternalFailure);
+                };
+                let summary = iota_storage::users::invitations::InvitationSummary {
+                    invitation_id,
+                    authority: iota_storage::users::invitations::InvitationAuthority::Omega,
+                    label,
+                    password_protected,
+                    created_at,
+                    expires_at: Some(expires_at),
+                    state: iota_storage::users::invitations::InvitationState::Pending,
+                    remote_revision,
+                    redeemed_user_id: None,
+                    redeemed_at: None,
+                    revoked_at: None,
+                    pending_action: None,
+                    pending_action_at: None,
+                    last_synced_at: Some(now_millis()),
+                    local_provisioned_user_id: None,
+                    local_provisioned_at: None,
+                };
+                let mirror_result =
+                    iota_storage::users::invitations::insert(&summary, None, now_millis());
+                ResponseResult::Ok(ResponsePayload::InvitationCreated(
+                    invitation_created_after_mirror(
+                        request_id,
+                        authority,
+                        invitation_id,
+                        raw_token,
+                        expires_at,
+                        short_url,
+                        mirror_result,
+                    ),
+                ))
+            }
+            LocalRequest::ListInvitations { authority } => {
+                if authority != Some(InvitationAuthority::Iota)
+                    && let Some(omikron) = self.services.omikron()
+                    && omikron.is_connected().await
+                {
+                    match omikron.sync_omega_invitations().await {
+                        Ok(()) => {}
+                        Err(omikron_connector::OmikronError::Storage(_)) => {
+                            return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                        }
+                        Err(omikron_connector::OmikronError::Timeout(_)) => {
+                            return ResponseResult::Error(IpcErrorCode::Timeout);
+                        }
+                        Err(omikron_connector::OmikronError::Disconnected(_)) => {
+                            return ResponseResult::Error(IpcErrorCode::OmikronUnavailable);
+                        }
+                        Err(_) => return ResponseResult::Error(IpcErrorCode::InternalFailure),
+                    }
+                }
+                if let Err(error) = iota_storage::users::invitations::expire_pending(now_millis()) {
+                    log_event!(
+                        PrintType::Command,
+                        LogLevel::Error,
+                        "invitation.expire_failed",
+                        "request_id={} error={}",
+                        request_id,
+                        error
+                    );
+                    return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                }
+                let invitations = match iota_storage::users::invitations::list() {
+                    Ok(invitations) => invitations,
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "invitation.list_failed",
+                            "request_id={} error={}",
+                            request_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                    }
+                };
+                let mut summaries = Vec::new();
+                for invitation in invitations {
+                    let invitation_authority = match invitation.authority {
+                        iota_storage::users::invitations::InvitationAuthority::Omega => {
+                            InvitationAuthority::Omega
+                        }
+                        iota_storage::users::invitations::InvitationAuthority::Iota => {
+                            InvitationAuthority::Iota
+                        }
+                    };
+                    if authority.is_some_and(|filter| filter != invitation_authority) {
+                        continue;
+                    }
+                    let display_state = if invitation.pending_action
+                        == Some(iota_storage::users::invitations::PendingAction::Revoke)
+                    {
+                        InvitationState::RevocationPending
+                    } else if invitation.authority
+                        == iota_storage::users::invitations::InvitationAuthority::Omega
+                        && invitation.state
+                            == iota_storage::users::invitations::InvitationState::Pending
+                        && invitation
+                            .expires_at
+                            .is_some_and(|expires_at| expires_at <= now_millis())
+                    {
+                        InvitationState::Expired
+                    } else {
+                        match invitation.state {
+                            iota_storage::users::invitations::InvitationState::Pending => {
+                                InvitationState::Pending
+                            }
+                            iota_storage::users::invitations::InvitationState::Provisioning => {
+                                InvitationState::Provisioning
+                            }
+                            iota_storage::users::invitations::InvitationState::Redeemed => {
+                                InvitationState::Redeemed
+                            }
+                            iota_storage::users::invitations::InvitationState::Revoked => {
+                                InvitationState::Revoked
+                            }
+                            iota_storage::users::invitations::InvitationState::Expired => {
+                                InvitationState::Expired
+                            }
+                        }
+                    };
+                    summaries.push(InvitationSummary {
+                        authority: invitation_authority,
+                        invitation_id: invitation.invitation_id,
+                        label: invitation.label,
+                        password_protected: invitation.password_protected,
+                        created_at: invitation.created_at,
+                        expires_at: invitation.expires_at,
+                        state: display_state,
+                        redeemed_user_id: invitation.redeemed_user_id,
+                        local_provisioned_user_id: invitation.local_provisioned_user_id,
+                        local_provisioned_at: invitation.local_provisioned_at,
+                    });
+                }
+                ResponseResult::Ok(ResponsePayload::Invitations(summaries))
+            }
+            LocalRequest::RevokeInvitation {
+                authority,
+                invitation_id,
+            } => {
+                if authority == InvitationAuthority::Iota {
+                    return ResponseResult::Error(IpcErrorCode::Unsupported);
+                }
+                let changed = match iota_storage::users::invitations::mark_revoke_pending(
+                    invitation_id,
+                    now_millis(),
+                ) {
+                    Ok(changed) => changed,
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                if !changed {
+                    return ResponseResult::Error(IpcErrorCode::Conflict);
+                }
+                if let Some(omikron) = self.services.omikron()
+                    && omikron.is_connected().await
+                {
+                    omikron.flush_pending_invitation_actions().await;
+                }
+                let invitation =
+                    match iota_storage::users::invitations::list()
+                        .ok()
+                        .and_then(|items| {
+                            items
+                                .into_iter()
+                                .find(|item| item.invitation_id == invitation_id)
+                        }) {
+                        Some(invitation) => invitation,
+                        None => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                    };
+                let state = if invitation.pending_action
+                    == Some(iota_storage::users::invitations::PendingAction::Revoke)
+                {
+                    InvitationState::RevocationPending
+                } else {
+                    match invitation.state {
+                        iota_storage::users::invitations::InvitationState::Pending => {
+                            InvitationState::Pending
+                        }
+                        iota_storage::users::invitations::InvitationState::Provisioning => {
+                            InvitationState::Provisioning
+                        }
+                        iota_storage::users::invitations::InvitationState::Redeemed => {
+                            InvitationState::Redeemed
+                        }
+                        iota_storage::users::invitations::InvitationState::Revoked => {
+                            InvitationState::Revoked
+                        }
+                        iota_storage::users::invitations::InvitationState::Expired => {
+                            InvitationState::Expired
+                        }
+                    }
+                };
+                ResponseResult::Ok(ResponsePayload::InvitationUpdated(InvitationSummary {
+                    authority: InvitationAuthority::Omega,
+                    invitation_id,
+                    label: invitation.label,
+                    password_protected: invitation.password_protected,
+                    created_at: invitation.created_at,
+                    expires_at: invitation.expires_at,
+                    state,
+                    redeemed_user_id: invitation.redeemed_user_id,
+                    local_provisioned_user_id: invitation.local_provisioned_user_id,
+                    local_provisioned_at: invitation.local_provisioned_at,
+                }))
+            }
+            LocalRequest::CreateUser { username } => {
+                match self
+                    .services
+                    .accounts
+                    .create_user(CreateUserRequest { username })
+                    .await
+                {
+                    Ok(user) => ResponseResult::Ok(ResponsePayload::UserCreated {
+                        user_id: user.user.0,
+                        username: user.username,
+                    }),
+                    Err(error) => {
+                        log!("User creation failed: {error:?}");
+                        match error {
+                            AccountError::InvalidRequest(_) => {
+                                ResponseResult::Error(IpcErrorCode::InvalidRequest)
+                            }
+                            AccountError::Timeout(_) => {
+                                ResponseResult::Error(IpcErrorCode::Timeout)
+                            }
+                            AccountError::Unavailable(_) => {
+                                ResponseResult::Error(IpcErrorCode::OmikronUnavailable)
+                            }
+                            AccountError::Conflict(_) => {
+                                ResponseResult::Error(IpcErrorCode::Conflict)
+                            }
+                            AccountError::Storage(_) => {
+                                ResponseResult::Error(IpcErrorCode::StorageFailure)
+                            }
+                            AccountError::Internal(_) => {
+                                ResponseResult::Error(IpcErrorCode::InternalFailure)
+                            }
+                            AccountError::Unauthorized(_) => {
+                                ResponseResult::Error(IpcErrorCode::Unauthorized)
+                            }
+                            AccountError::NotFound => ResponseResult::Error(IpcErrorCode::NotFound),
+                        }
+                    }
+                }
+            }
+            LocalRequest::PurgeUserData { user_id } => match user_manager::purge_user_data(user_id)
+            {
+                Ok(()) => ResponseResult::Ok(ResponsePayload::UserDataPurged { user_id }),
+                Err(iota_storage::storage_error::StorageError::PendingRelayOwnershipUnknown) => {
+                    log!(
+                        "User data purge is waiting for pending relay ownership classification for {user_id}"
+                    );
+                    ResponseResult::Error(IpcErrorCode::StorageFailure)
+                }
+                Err(error) => {
+                    log!("User data purge failed for {user_id}: {error}");
+                    ResponseResult::Error(IpcErrorCode::StorageFailure)
+                }
+            },
+            LocalRequest::AttachUserFromTu { credential } => {
+                match self
+                    .services
+                    .accounts
+                    .attach_user(credential.0.as_bytes())
+                    .await
+                {
+                    Ok(user) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: format!("Added {} ({}) to this Iota", user.username, user.user.0),
+                    }),
+                    Err(error) => {
+                        log!("Credential attach failed: {error:?}");
+                        ResponseResult::Error(IpcErrorCode::Unauthorized)
+                    }
+                }
+            }
+            LocalRequest::InspectTuCredential { credential } => {
+                match self
+                    .services
+                    .accounts
+                    .inspect_credential(credential.0.as_bytes())
+                    .await
+                {
+                    Ok(preview) => ResponseResult::Ok(ResponsePayload::TuCredentialPreview(
+                        iota_ipc::TuCredentialPreview {
+                            user_id: preview.user.0,
+                            username: preview.username,
+                            assigned_iota_id: preview.assigned_iota_id,
+                        },
+                    )),
+                    Err(error) => {
+                        log!("Credential inspection failed: {error:?}");
+                        ResponseResult::Error(IpcErrorCode::Unauthorized)
+                    }
+                }
+            }
+            LocalRequest::ReconcileUser { user_id } => {
+                let residency = match user_manager::get_residency_by_id(user_id) {
+                    Ok(Some(residency)) => residency,
+                    Ok(None) => return ResponseResult::Error(IpcErrorCode::NotFound),
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                let reconciliation = match self
+                    .services
+                    .accounts
+                    .reconcile_user(LocalUserId(user_id))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        log!("User reconciliation failed for {user_id}: {error:?}");
+                        return ResponseResult::Error(IpcErrorCode::OmikronUnavailable);
+                    }
+                };
+                let action = if reconciliation.released_locally {
+                    ReconcileAction::ReleasedLocally
+                } else {
+                    ReconcileAction::None
+                };
+                ResponseResult::Ok(ResponsePayload::UserReconciled(UserReconcileResult {
+                    user_id,
+                    local_state: match residency.state {
+                        user_manager::LocalUserState::Managed => iota_ipc::LocalUserState::Managed,
+                        user_manager::LocalUserState::Released => {
+                            iota_ipc::LocalUserState::Released
+                        }
+                    },
+                    omega_iota_id: reconciliation.remote_iota_id,
+                    action,
+                }))
+            }
+            LocalRequest::ForceDetachUser { user_id } => {
+                match user_manager::force_local_detach(user_id) {
+                    Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: format!(
+                            "Force-detached user {user_id} locally; Omega was not changed"
+                        ),
+                    }),
+                    Err(error) => {
+                        log!("Force local detach failed for {user_id}: {error}");
+                        ResponseResult::Error(IpcErrorCode::StorageFailure)
+                    }
+                }
+            }
+            LocalRequest::ForgetReleasedUser { user_id } => {
+                match user_manager::forget_released_user(user_id) {
+                    Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: format!("Forgot released user residency {user_id}"),
+                    }),
+                    Err(error) => {
+                        log!("Forget residency failed for {user_id}: {error}");
+                        ResponseResult::Error(IpcErrorCode::Conflict)
+                    }
+                }
+            }
+            LocalRequest::GetUserDiagnostics { user_id } => {
+                let residency = match user_manager::get_residency_by_id(user_id) {
+                    Ok(Some(residency)) => residency,
+                    Ok(None) => return ResponseResult::Error(IpcErrorCode::NotFound),
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                let profile = match user_manager::get_user(user_id) {
+                    Ok(profile) => profile,
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                let pending_operation = match pending_operations::get_all() {
+                    Ok(operations) => operations
+                        .into_iter()
+                        .find(|operation| operation.user_id == user_id)
+                        .map(|operation| {
+                            format!(
+                                "{}/{}",
+                                operation.operation.as_str(),
+                                operation.phase.as_str()
+                            )
+                        }),
+                    Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                let credential_status = credential_status(&residency, profile.as_ref());
+                ResponseResult::Ok(ResponsePayload::UserDiagnostics(UserDiagnostics {
+                    user_id,
+                    username: residency.username,
+                    local_state: match residency.state {
+                        user_manager::LocalUserState::Managed => iota_ipc::LocalUserState::Managed,
+                        user_manager::LocalUserState::Released => {
+                            iota_ipc::LocalUserState::Released
+                        }
+                    },
+                    data_present: residency.data_present,
+                    credential_status,
+                    tauth_grant_count: iota_storage::tauth::list_grants(user_id)
+                        .map_or(0, |grants| grants.len()),
+                    pending_operation,
+                }))
+            }
+            LocalRequest::RevokeTAuthGrant { user_id, app_id } => {
+                match user_manager::revoke_tauth_grant(user_id, &app_id) {
+                    Ok(true) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: format!("Revoked TAuth grant {app_id} for user {user_id}"),
+                    }),
+                    Ok(false) => ResponseResult::Error(IpcErrorCode::NotFound),
+                    Err(error) => {
+                        log!("TAuth grant revocation failed for {user_id}: {error}");
+                        ResponseResult::Error(IpcErrorCode::StorageFailure)
+                    }
+                }
+            }
+            LocalRequest::RevokeAllTAuthGrants { user_id } => {
+                match user_manager::revoke_all_tauth_grants(user_id) {
+                    Ok(removed) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: format!("Revoked {removed} TAuth grants for user {user_id}"),
+                    }),
+                    Err(error) => {
+                        log!("TAuth grant revocation failed for {user_id}: {error}");
+                        ResponseResult::Error(IpcErrorCode::StorageFailure)
+                    }
+                }
+            }
+            LocalRequest::CompleteDeleteUser {
+                user_id,
+                credential,
+            } => {
+                let contents = match credential {
+                    Some(value) => Ok(value.0),
+                    None => user_manager::get_user(user_id)
+                        .map_err(|_| ())
+                        .and_then(|user| user.ok_or(()))
+                        .and_then(|user| {
+                            iota_util::file_util::read_user_credential_with_legacy(
+                                user_id,
+                                &user.username,
+                            )
+                            .map_err(|_| ())
+                        })
+                        .and_then(|value| value.ok_or(())),
+                };
+                let Ok(contents) = contents else {
+                    return ResponseResult::Error(IpcErrorCode::Unauthorized);
+                };
+                match self
+                    .services
+                    .accounts
+                    .delete_user(LocalUserId(user_id), contents.as_bytes())
+                    .await
+                {
+                    Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: format!("Deleted Tensamin account {user_id}"),
+                    }),
+                    Err(error) => {
+                        log!("Credential deletion failed for {user_id}: {error:?}");
+                        ResponseResult::Error(IpcErrorCode::Unauthorized)
+                    }
+                }
+            }
+            LocalRequest::RemoveUser { .. } => ResponseResult::Error(IpcErrorCode::InvalidRequest),
+            LocalRequest::ReleaseUser { user_id } => {
+                match self
+                    .services
+                    .accounts
+                    .release_user(LocalUserId(user_id))
+                    .await
+                {
+                    Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: format!("Released user {user_id}; hosted data was retained"),
+                    }),
+                    Err(AccountError::NotFound) => ResponseResult::Error(IpcErrorCode::NotFound),
+                    Err(AccountError::Unauthorized(_)) => {
+                        ResponseResult::Error(IpcErrorCode::Unauthorized)
+                    }
+                    Err(AccountError::Conflict(_)) => ResponseResult::Error(IpcErrorCode::Conflict),
+                    Err(AccountError::Timeout(_)) => ResponseResult::Error(IpcErrorCode::Timeout),
+                    Err(AccountError::Unavailable(_)) => {
+                        ResponseResult::Error(IpcErrorCode::OmikronUnavailable)
+                    }
+                    Err(AccountError::Storage(error)) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.release_storage_failed",
+                            "request_id={} user_id={} error={:?}",
+                            request_id,
+                            user_id,
+                            error
+                        );
+                        ResponseResult::Error(IpcErrorCode::StorageFailure)
+                    }
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.release_failed",
+                            "request_id={} user_id={} error={:?}",
+                            request_id,
+                            user_id,
+                            error
+                        );
+                        ResponseResult::Error(IpcErrorCode::InternalFailure)
+                    }
+                }
+            }
+            LocalRequest::ReconnectOmikron => match self.services.omikron() {
+                Some(omikron) => match omikron.reconnect().await {
+                    Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: "Reconnected to Omikron server".into(),
+                    }),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Warn,
+                            "ipc.omikron_reconnect_failed",
+                            "request_id={} error={}",
+                            request_id,
+                            error
+                        );
+                        ResponseResult::Error(IpcErrorCode::OmikronUnavailable)
+                    }
+                },
+                None => ResponseResult::Error(IpcErrorCode::OmikronUnavailable),
+            },
+            LocalRequest::RotateIotaIdentity => match self.services.omikron() {
+                Some(omikron) => match omikron.rotate_identity().await {
+                    Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                        message: "New identity registered with Omikron".into(),
+                    }),
+                    Err(error) => {
+                        log!("Iota identity rotation failed: {}", error);
+                        ResponseResult::Error(IpcErrorCode::OmikronUnavailable)
+                    }
+                },
+                None => ResponseResult::Error(IpcErrorCode::OmikronUnavailable),
+            },
+            LocalRequest::RequestProcessExit { intent } => {
+                if matches!(intent, ExitIntent::Restart)
+                    && !matches!(
+                        crate::deployment::from_environment().supervisor,
+                        iota_ipc::SupervisorKind::Systemd | iota_ipc::SupervisorKind::IotaUi
+                    )
+                {
+                    return ResponseResult::Error(IpcErrorCode::Conflict);
+                }
+                self.runtime.request_shutdown(match intent {
+                    ExitIntent::Stop => ShutdownReason::Stop,
+                    ExitIntent::Restart => ShutdownReason::Restart,
+                });
+                ResponseResult::Ok(ResponsePayload::Acknowledged {
+                    message: "process exit accepted".into(),
+                })
+            }
+            LocalRequest::GetDaemonStatus => ResponseResult::Ok(ResponsePayload::DaemonStatus(
+                iota_ipc::DaemonStatusResponse {
+                    formatted: format!("{:?}", self.runtime.snapshot()),
+                },
+            )),
+            LocalRequest::RestartDaemon => {
+                self.runtime.request_shutdown(ShutdownReason::Restart);
+                ResponseResult::Ok(ResponsePayload::Acknowledged {
+                    message: "Daemon restart requested".into(),
+                })
+            }
+            LocalRequest::StopDaemon => {
+                self.runtime.request_shutdown(ShutdownReason::Stop);
+                ResponseResult::Ok(ResponsePayload::Acknowledged {
+                    message: "Daemon shutdown requested".into(),
+                })
+            }
+            LocalRequest::GetConfig => {
+                let cfg = config_util::CONFIG.load();
+                let yaml = serde_yaml::to_string(&**cfg).unwrap_or_default();
+                ResponseResult::Ok(ResponsePayload::Config(ConfigResponse { yaml }))
+            }
+            LocalRequest::SetConfig { key, value } => {
+                match config_util::modify_config_value(&key, &value) {
+                    Ok(()) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Info,
+                            "config.changed",
+                            "request_id={} key={:?}",
+                            request_id,
+                            key
+                        );
+                        ResponseResult::Ok(ResponsePayload::Acknowledged {
+                            message: format!("Set {key}"),
+                        })
+                    }
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Warn,
+                            "config.change_failed",
+                            "request_id={} key={:?} error={}",
+                            request_id,
+                            key,
+                            error
+                        );
+                        ResponseResult::Error(IpcErrorCode::InvalidRequest)
+                    }
+                }
+            }
+            LocalRequest::ReloadConfig => match config_util::load_config() {
+                Ok(()) => ResponseResult::Ok(ResponsePayload::Acknowledged {
+                    message: "Configuration reloaded".into(),
+                }),
+                Err(error) => {
+                    log_event!(
+                        PrintType::Command,
+                        LogLevel::Warn,
+                        "config.reload_failed",
+                        "request_id={} error={}",
+                        request_id,
+                        error
+                    );
+                    ResponseResult::Error(IpcErrorCode::InvalidRequest)
+                }
+            },
+            LocalRequest::GetOmikronStatus => {
+                let connected = match self.services.omikron() {
+                    Some(omikron) => omikron.is_connected().await,
+                    None => false,
+                };
+                let iota_id = config_util::CONFIG.load().iota_id;
+                ResponseResult::Ok(ResponsePayload::OmikronStatus(OmikronStatusResponse {
+                    connected,
+                    iota_id,
+                }))
+            }
+            LocalRequest::ListComponents => {
+                let snapshot = self.runtime.snapshot();
+                let components: Vec<ComponentStatusResponse> = snapshot
+                    .components
+                    .into_iter()
+                    .map(|(id, health)| ComponentStatusResponse {
+                        id,
+                        status: health.status,
+                        message: health.message,
+                    })
+                    .collect();
+                ResponseResult::Ok(ResponsePayload::Components(components))
+            }
+            LocalRequest::GetUser { user_id } => {
+                let residency = match user_manager::get_residency_by_id(user_id) {
+                    Ok(Some(residency)) => residency,
+                    Ok(None) => return ResponseResult::Error(IpcErrorCode::NotFound),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.residency_load_failed",
+                            "request_id={} user_id={} error={}",
+                            request_id,
+                            user_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                    }
+                };
+                match user_manager::get_user(user_id) {
+                    Ok(Some(user)) => {
+                        let credential_status = credential_status(&residency, Some(&user));
+                        ResponseResult::Ok(ResponsePayload::UserDetail(UserDetailResponse {
+                            user_id: user.user_id,
+                            username: user.username,
+                            display_name: user.display_name,
+                            created_at: user.created_at,
+                            tauth_grants: iota_storage::tauth::list_grants(user_id)
+                                .map(|grants| {
+                                    grants.into_iter().map(|grant| grant.app_id).collect()
+                                })
+                                .unwrap_or_default(),
+                            state: iota_ipc::LocalUserState::Managed,
+                            data_present: residency.data_present,
+                            credential_status,
+                        }))
+                    }
+                    Ok(None) if residency.state == user_manager::LocalUserState::Released => {
+                        ResponseResult::Ok(ResponsePayload::UserDetail(UserDetailResponse {
+                            user_id: residency.user_id,
+                            username: residency.username,
+                            display_name: None,
+                            created_at: 0,
+                            tauth_grants: Vec::new(),
+                            state: iota_ipc::LocalUserState::Released,
+                            data_present: residency.data_present,
+                            credential_status: iota_ipc::CredentialStatus::None,
+                        }))
+                    }
+                    Ok(None) => ResponseResult::Error(IpcErrorCode::StorageFailure),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.profile_load_failed",
+                            "request_id={} user_id={} error={}",
+                            request_id,
+                            user_id,
+                            error
+                        );
+                        ResponseResult::Error(IpcErrorCode::StorageFailure)
+                    }
+                }
+            }
+            LocalRequest::ExportUserCredential { user_id } => {
+                let residency = match user_manager::get_residency_by_id(user_id) {
+                    Ok(Some(residency)) => residency,
+                    Ok(None) => return ResponseResult::Error(IpcErrorCode::NotFound),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.residency_load_failed",
+                            "request_id={} user_id={} error={}",
+                            request_id,
+                            user_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                    }
+                };
+                if residency.state != user_manager::LocalUserState::Managed
+                    || residency.credential_origin != user_manager::CredentialOrigin::Local
+                {
+                    return ResponseResult::Error(IpcErrorCode::Conflict);
+                }
+                let credential = match iota_util::file_util::read_user_credential_with_legacy(
+                    user_id,
+                    &residency.username,
+                ) {
+                    Ok(Some(credential)) => credential,
+                    Ok(None) => return ResponseResult::Error(IpcErrorCode::NotFound),
+                    Err(error) => {
+                        log_event!(
+                            PrintType::Command,
+                            LogLevel::Error,
+                            "user.credential_read_failed",
+                            "request_id={} user_id={} error={}",
+                            request_id,
+                            user_id,
+                            error
+                        );
+                        return ResponseResult::Error(IpcErrorCode::StorageFailure);
+                    }
+                };
+                let parsed = match iota_util::tu::TuCredential::parse(&credential) {
+                    Ok(parsed) if parsed.user_id == user_id => parsed,
+                    Ok(_) | Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                };
+                ResponseResult::Ok(ResponsePayload::UserCredentialExport {
+                    user_id,
+                    username: residency.username,
+                    credential: iota_ipc::SecretString(parsed.to_canonical_string()),
+                })
+            }
+            LocalRequest::ImportUser { .. } => ResponseResult::Error(IpcErrorCode::InvalidRequest),
+            LocalRequest::GetLogs { limit } => {
+                let entries = if let Ok(buf) = self.log_buffer.lock() {
+                    bounded_log_entries(buf.recent(limit.min(MAX_LOG_ENTRIES_PER_RESPONSE)))
+                } else {
+                    Vec::new()
+                };
+                ResponseResult::Ok(ResponsePayload::LogEntries(LogEntriesResponse { entries }))
+            }
+            LocalRequest::CheckUpdate => match iota_updater::check_update().await {
+                Ok(available) => {
+                    ResponseResult::Ok(ResponsePayload::UpdateStatus(UpdateStatusResponse {
+                        available,
+                    }))
+                }
+                Err(error) => {
+                    log_event!(
+                        PrintType::Command,
+                        LogLevel::Error,
+                        "update.check_failed",
+                        "request_id={} error={}",
+                        request_id,
+                        error
+                    );
+                    ResponseResult::Error(IpcErrorCode::InternalFailure)
+                }
+            },
+            LocalRequest::ListCommunities => {
+                let iota_id = config_util::CONFIG.load().iota_id;
+                let Ok(iota_id) = iota_id.map(i64::try_from).unwrap_or(Ok(0)) else {
+                    return ResponseResult::Ok(ResponsePayload::Communities(Vec::new()));
+                };
+                let stored =
+                    match iota_storage::util::communities_util::CommunitiesUtil::get_communities(
+                        iota_id,
+                    ) {
+                        Ok(stored) => stored,
+                        Err(_) => return ResponseResult::Error(IpcErrorCode::StorageFailure),
+                    };
+                let summaries: Vec<CommunitySummary> = stored
+                    .into_iter()
+                    .map(|c| CommunitySummary {
+                        name: c.address,
+                        title: c.title,
+                    })
+                    .collect();
+                ResponseResult::Ok(ResponsePayload::Communities(summaries))
+            }
+        }
+    }
+}

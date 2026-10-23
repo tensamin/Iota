@@ -2,19 +2,18 @@ use iota_identity::{
     AuthorityId, IdentityError, IdentityResolver, IotaNodeId, PrincipalId, ResolutionContext,
     ResolvedPrincipal,
 };
-use iota_util::mtp_compat::OptionalDataValueExt;
-use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+use mtp::codec::{CommunicationValue, DataType, DataValue};
 use mtp::crypto::{Keyring, PublicKeyBundle};
 pub use tau_relay_protocol as protocol;
 
 /// Application identity resolution stays in Iota. The shared protocol owns the wire and crypto.
 #[derive(Clone, Debug)]
-pub struct FederatedRelayV2 {
+pub struct FederatedRelay {
     wire: tau_relay_protocol::RelayWire,
 }
 
 #[derive(Clone, Debug)]
-pub struct VerifiedFederatedRelayV2 {
+pub struct VerifiedFederatedRelay {
     pub signer: ResolvedPrincipal,
     pub recipient: ResolvedPrincipal,
     pub destination: IotaNodeId,
@@ -50,7 +49,7 @@ fn protocol_error(error: tau_relay_protocol::Error) -> IdentityError {
     IdentityError::InvalidDescriptor(error.to_string())
 }
 
-impl FederatedRelayV2 {
+impl FederatedRelay {
     #[expect(
         clippy::too_many_arguments,
         reason = "explicit immutable signed relay and encryption recipients"
@@ -90,7 +89,7 @@ pub async fn decode_and_verify_for_ingress(
     identities: &dyn IdentityResolver,
     expected_destination: Option<&IotaNodeId>,
     keyring: &Keyring,
-) -> Result<VerifiedFederatedRelayV2, IdentityError> {
+) -> Result<VerifiedFederatedRelay, IdentityError> {
     let wire = parse_wire(&frame)?;
     let payload = match frame.get_data(DataType::SecurePayload) {
         Some(DataValue::Bytes(bytes)) => bytes,
@@ -131,7 +130,7 @@ pub async fn decode_and_verify_for_ingress(
         expected_destination.map(IotaNodeId::as_str),
     )
     .map_err(protocol_error)?;
-    Ok(VerifiedFederatedRelayV2 {
+    Ok(VerifiedFederatedRelay {
         signer,
         recipient,
         destination,
@@ -143,22 +142,9 @@ pub async fn decode_and_verify_for_ingress(
     })
 }
 
-pub(crate) fn parse_wire(
+pub fn parse_wire(
     frame: &CommunicationValue,
 ) -> Result<tau_relay_protocol::RelayWire, IdentityError> {
-    if !frame.is_type(CommunicationType::Relay)
-        || frame.get_data(DataType::VersionNumber).as_number() != Some(2)
-    {
-        return Err(IdentityError::InvalidDescriptor("expected Relay V2".into()));
-    }
-    let payload = match frame.get_data(DataType::SecurePayload) {
-        Some(DataValue::Bytes(bytes)) => bytes,
-        _ => {
-            return Err(IdentityError::InvalidDescriptor(
-                "missing relay payload".into(),
-            ));
-        }
-    };
-    tau_relay_protocol::RelayWire::from_json(payload)
+    tau_relay_protocol::RelayWire::from_frame(frame)
         .map_err(|error| IdentityError::InvalidDescriptor(error.to_string()))
 }

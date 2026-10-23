@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::LocalDeliverySink;
 
-const ROUTER_PROTOCOL: &str = "tensamin-relay-router:v1";
+const ROUTER_PROTOCOL: &str = "tensamin-relay-router";
 static NEXT_ROUTER_FRAME_ID: AtomicU32 = AtomicU32::new(1);
 
 #[async_trait]
@@ -22,13 +22,93 @@ trait RouterPeerConnection: Send + Sync {
 
 type RegisteredRouterPeer = (u64, Arc<dyn RouterPeerConnection>);
 
-#[derive(Default)]
+struct RouterRegistration {
+    router: RelayRouterService,
+    node: IotaNodeId,
+    generation: u64,
+}
+
+impl Drop for RouterRegistration {
+    fn drop(&mut self) {
+        self.router.unregister(&self.node, self.generation);
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct RelayRouterService {
-    peers: RwLock<HashMap<IotaNodeId, RegisteredRouterPeer>>,
-    next_registration: AtomicU64,
+    peers: Arc<RwLock<HashMap<IotaNodeId, RegisteredRouterPeer>>>,
+    next_registration: Arc<AtomicU64>,
+    mailbox: Option<iota_storage::relay_mailbox::MailboxLimits>,
+}
+
+/// Share one TLS endpoint while retaining distinct peer and router role authorization.
+pub struct RelayRouterGateway {
+    pub inner: Arc<dyn web_server::MtpConnectionHandler>,
+    pub peers: Arc<crate::PeerManager>,
+    pub router: Arc<RelayRouterService>,
+    pub public: bool,
+    pub allowed_nodes: Vec<String>,
+}
+
+#[async_trait]
+impl web_server::MtpConnectionHandler for RelayRouterGateway {
+    async fn accept(&self, connection: mtp::webserver::WebMTPConnection) {
+        if connection
+            .description
+            .as_deref()
+            .is_some_and(|d| d.starts_with("iota-router: "))
+        {
+            if connection.auth_state != mtp::host::AuthState::Authenticated {
+                return;
+            }
+            let Some(key) = connection.client_public_key.clone() else {
+                return;
+            };
+            let Ok(node) = IotaNodeId::from_public_keys(&key) else {
+                return;
+            };
+            if !self.public
+                && !self
+                    .allowed_nodes
+                    .iter()
+                    .any(|allowed| allowed == node.as_str())
+            {
+                return;
+            }
+            if connection.client_id != node.mtp_authentication_hint()
+                || connection.description.as_deref()
+                    != Some(&format!("iota-router: {}", node.as_str()))
+            {
+                return;
+            }
+            let Ok(candidate) = self.peers.validate_peer(&node, &key).await else {
+                return;
+            };
+            if self.peers.establish_peer(candidate, &key).await.is_err() {
+                return;
+            }
+            let sender = connection.sender.clone();
+            let handler = self.router.accept(connection);
+            tokio::pin!(handler);
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            tokio::select! {
+                _ = &mut handler => {},
+                _ = self.peers.monitor_peer(&node,&key,&shutdown) => { sender.close(); },
+            }
+        } else {
+            self.inner.accept(connection).await;
+        }
+    }
 }
 
 impl RelayRouterService {
+    pub fn with_mailbox(limits: iota_storage::relay_mailbox::MailboxLimits) -> Self {
+        Self {
+            mailbox: Some(limits),
+            ..Self::default()
+        }
+    }
+
     pub fn has_connection(&self, node: &IotaNodeId) -> bool {
         self.peers
             .read()
@@ -64,6 +144,55 @@ impl RelayRouterService {
                 "relay router source and destination are identical".into(),
             ));
         }
+        let wire = iota_connection::federated_relay::parse_wire(&frame)
+            .map_err(|e| RouteError::Delivery(e.to_string()))?;
+        if wire.destination != destination.as_str()
+            || wire.signer.authority != iota_identity::AuthorityId::for_iota(source).as_str()
+        {
+            return Err(RouteError::Delivery(
+                "router source or destination binding mismatch".into(),
+            ));
+        }
+        if let Some(limits) = &self.mailbox {
+            let identity = serde_json::to_vec(&(
+                &wire.signer,
+                &wire.recipient,
+                &wire.destination,
+                &wire.message_id,
+            ))
+            .map_err(|e| RouteError::Delivery(e.to_string()))?;
+            let envelope = iota_storage::relay_mailbox::MailboxEnvelope {
+                destination: destination.as_str().into(),
+                sender: source.as_str().into(),
+                id: mtp::crypto::sha256(&identity).to_vec(),
+                frame: frame
+                    .clone()
+                    .without_id()
+                    .to_bytes()
+                    .map_err(|e| RouteError::Delivery(e.to_string()))?,
+                type_map_version: wire.type_map_version.clone(),
+            };
+            let limits = limits.clone();
+            let acceptance = iota_storage::blocking::identity_lookup(move || {
+                iota_storage::relay_mailbox::store(&envelope, &limits, crate::now_millis())
+                    .map_err(|e| iota_identity::IdentityError::Storage(e.to_string()))
+            })
+            .await
+            .map_err(|e| RouteError::Delivery(e.to_string()))?;
+            if let Some(acceptance) = acceptance {
+                let map = frame.type_map().expect("validated relay type map");
+                return CommunicationValue::from_bytes_with(&acceptance, map)
+                    .map(|v| v.with_id(frame.id().unwrap_or_default()))
+                    .map_err(|e| RouteError::Delivery(e.to_string()));
+            }
+            // Keep the origin's durable queue pending until a real destination acceptance is retained.
+            return Ok(CommunicationValue::new(CommunicationType::ErrorNoIota)
+                .with_id(frame.id().unwrap_or_default())
+                .add_typed_default(
+                    DataType::ErrorMessage,
+                    DataValue::Str("stored for forwarding; destination acceptance pending".into()),
+                ));
+        }
         let peer = self
             .peers
             .read()
@@ -86,8 +215,13 @@ impl web_server::MtpConnectionHandler for RelayRouterService {
         let Ok(node) = IotaNodeId::from_public_keys(&public_key) else {
             return;
         };
+        if connection.client_id != node.mtp_authentication_hint()
+            || connection.description.as_deref() != Some(&format!("iota-router: {}", node.as_str()))
+        {
+            return;
+        }
         let connection = Arc::new(connection);
-        let pending = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let registration = self.register(
             node.clone(),
             Arc::new(IncomingRouterPeer {
@@ -95,9 +229,25 @@ impl web_server::MtpConnectionHandler for RelayRouterService {
                 pending: pending.clone(),
             }),
         );
-        while let Ok(frame) = connection.receive().await {
+        let _registration = RouterRegistration {
+            router: self.clone(),
+            node: node.clone(),
+            generation: registration,
+        };
+        let mailbox = self.deliver_mailbox(&node, connection.clone(), pending.clone());
+        tokio::pin!(mailbox);
+        let mut requests = tokio::task::JoinSet::new();
+        loop {
+            let frame = tokio::select! {
+                result = connection.receive() => match result { Ok(frame) => frame, Err(_) => break },
+                _ = &mut mailbox => break,
+                Some(_) = requests.join_next(), if !requests.is_empty() => continue,
+            };
             if let Some(frame_id) = frame.id()
-                && let Some(response) = pending.lock().await.remove(&frame_id)
+                && let Some(response) = pending
+                    .lock()
+                    .expect("router pending lock poisoned")
+                    .remove(&frame_id)
             {
                 let _ = response.send(frame);
                 continue;
@@ -105,32 +255,122 @@ impl web_server::MtpConnectionHandler for RelayRouterService {
             let Some(frame_id) = frame.id() else {
                 continue;
             };
-            let response = match decode_router_request(&frame) {
-                Ok((destination, relay)) => match self.forward(&node, &destination, relay).await {
-                    Ok(response) => response.with_id(frame_id),
-                    Err(RouteError::NoRoute(_)) => {
-                        CommunicationValue::new(CommunicationType::ErrorNoIota).with_id(frame_id)
-                    }
-                    Err(RouteError::Delivery(message)) => {
-                        CommunicationValue::new(CommunicationType::ErrorInternal)
-                            .with_id(frame_id)
-                            .add_typed_default(DataType::ErrorMessage, DataValue::Str(message))
-                    }
-                },
-                Err(message) => CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                    .with_id(frame_id)
-                    .add_typed_default(DataType::ErrorMessage, DataValue::Str(message)),
-            };
-            let _ = connection.sender.send(&response).await;
+            if requests.len() >= 32 {
+                continue;
+            }
+            let router = self.clone();
+            let node = node.clone();
+            let connection = connection.clone();
+            requests.spawn(async move {
+                let response = match decode_router_request(&frame) {
+                    Ok((destination, relay)) => match router
+                        .forward(&node, &destination, relay)
+                        .await
+                    {
+                        Ok(response) => response.with_id(frame_id),
+                        Err(RouteError::NoRoute(_)) => {
+                            CommunicationValue::new(CommunicationType::ErrorNoIota)
+                                .with_id(frame_id)
+                        }
+                        Err(RouteError::Delivery(message)) => {
+                            CommunicationValue::new(CommunicationType::ErrorInternal)
+                                .with_id(frame_id)
+                                .add_typed_default(DataType::ErrorMessage, DataValue::Str(message))
+                        }
+                    },
+                    Err(message) => CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                        .with_id(frame_id)
+                        .add_typed_default(DataType::ErrorMessage, DataValue::Str(message)),
+                };
+                let _ = connection.sender.send(&response).await;
+            });
         }
-        self.unregister(&node, registration);
+    }
+}
+
+impl RelayRouterService {
+    async fn deliver_mailbox(
+        &self,
+        node: &IotaNodeId,
+        connection: Arc<mtp::webserver::WebMTPConnection>,
+        pending: Arc<
+            std::sync::Mutex<HashMap<u32, tokio::sync::oneshot::Sender<CommunicationValue>>>,
+        >,
+    ) {
+        let peer = IncomingRouterPeer {
+            connection,
+            pending,
+        };
+        loop {
+            let Some(limits) = self.mailbox.clone() else {
+                return std::future::pending::<()>().await;
+            };
+            let destination = node.as_str().to_owned();
+            let claim = iota_storage::blocking::identity_lookup(move || {
+                iota_storage::relay_mailbox::claim(&destination, crate::now_millis())
+                    .map_err(|e| iota_identity::IdentityError::Storage(e.to_string()))
+            })
+            .await;
+            let Ok(Some(claim)) = claim else {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            };
+            let frame =
+                mtp::type_map::Version::parse(&claim.envelope.type_map_version).and_then(|v| {
+                    CommunicationValue::from_bytes_with(&claim.envelope.frame, &TypeMap::new(v))
+                        .ok()
+                });
+            let accepted = if let Some(frame) = frame {
+                let request = frame.with_id(next_frame_id());
+                match peer.request(request.clone()).await {
+                    Ok(response)
+                        if matches!(
+                            RouteOutcome::from_relay_response(&request, response.clone()),
+                            Ok(RouteOutcome::Accepted { .. })
+                        ) =>
+                    {
+                        response.without_id().to_bytes().ok()
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let _ = iota_storage::blocking::identity_lookup(move || {
+                if let Some(acceptance) = accepted {
+                    iota_storage::relay_mailbox::acknowledge(
+                        &claim,
+                        &acceptance,
+                        &limits,
+                        crate::now_millis(),
+                    )
+                    .map(|_| ())
+                } else {
+                    iota_storage::relay_mailbox::retry(&claim, crate::now_millis())
+                }
+                .map_err(|e| iota_identity::IdentityError::Storage(e.to_string()))
+            })
+            .await;
+        }
     }
 }
 
 struct IncomingRouterPeer {
     connection: Arc<mtp::webserver::WebMTPConnection>,
-    pending:
-        Arc<tokio::sync::Mutex<HashMap<u32, tokio::sync::oneshot::Sender<CommunicationValue>>>>,
+    pending: Arc<std::sync::Mutex<HashMap<u32, tokio::sync::oneshot::Sender<CommunicationValue>>>>,
+}
+
+struct PendingResponse {
+    peer: Arc<std::sync::Mutex<HashMap<u32, tokio::sync::oneshot::Sender<CommunicationValue>>>>,
+    id: u32,
+}
+impl Drop for PendingResponse {
+    fn drop(&mut self) {
+        self.peer
+            .lock()
+            .expect("router pending lock poisoned")
+            .remove(&self.id);
+    }
 }
 
 #[async_trait]
@@ -140,21 +380,33 @@ impl RouterPeerConnection for IncomingRouterPeer {
         mut frame: CommunicationValue,
     ) -> Result<CommunicationValue, RouteError> {
         let frame_id = next_frame_id();
+        let original_id = frame.id();
         frame = frame.with_id(frame_id);
         let (send, receive) = tokio::sync::oneshot::channel();
-        if self.pending.lock().await.insert(frame_id, send).is_some() {
-            return Err(RouteError::Delivery(
-                "relay router request ID is already pending".into(),
-            ));
+        {
+            let mut pending = self.pending.lock().expect("router pending lock poisoned");
+            if pending.len() >= 32 || pending.contains_key(&frame_id) {
+                return Err(RouteError::Delivery(
+                    "relay router request ID is already pending".into(),
+                ));
+            }
+            pending.insert(frame_id, send);
         }
+        let _pending = PendingResponse {
+            peer: self.pending.clone(),
+            id: frame_id,
+        };
         if let Err(error) = self.connection.sender.send(&frame).await {
-            self.pending.lock().await.remove(&frame_id);
             return Err(RouteError::Delivery(error.to_string()));
         }
-        tokio::time::timeout(std::time::Duration::from_secs(30), receive)
-            .await
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), receive).await;
+        result
             .map_err(|_| RouteError::Delivery("relay router request timed out".into()))?
             .map_err(|_| RouteError::Delivery("relay router connection closed".into()))
+            .map(|response| match original_id {
+                Some(id) => response.with_id(id),
+                None => response.without_id(),
+            })
     }
 }
 
@@ -163,6 +415,7 @@ pub struct RelayRouterClient {
     connection: Arc<mtp::client::MTPConnection>,
     connected: AtomicBool,
     disconnected: tokio::sync::Notify,
+    reader: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Default)]
@@ -171,6 +424,11 @@ pub struct RelayRouterSet {
 }
 
 impl RelayRouterSet {
+    pub fn is_connected(&self) -> bool {
+        self.routers
+            .read()
+            .is_ok_and(|routers| routers.iter().any(|router| router.is_connected()))
+    }
     pub fn add(&self, router: Arc<RelayRouterClient>) {
         if let Ok(mut routers) = self.routers.write() {
             routers.retain(|current| current.router_id() != router.router_id());
@@ -244,9 +502,10 @@ impl RelayRouterClient {
             connection: Arc::new(connection),
             connected: AtomicBool::new(true),
             disconnected: tokio::sync::Notify::new(),
+            reader: tokio::sync::Mutex::new(None),
         });
         let reader = client.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             while let Ok(frame) = reader.connection.receive().await {
                 let outcome = relay
                     .accept_relay(
@@ -270,11 +529,28 @@ impl RelayRouterClient {
             reader.connected.store(false, Ordering::Release);
             reader.disconnected.notify_waiters();
         });
+        *client.reader.lock().await = Some(task);
         Ok(client)
     }
 
     pub fn router_id(&self) -> &RelayRouterId {
         &self.router_id
+    }
+
+    pub async fn shutdown(&self) {
+        self.connection.sender.close_immediate();
+        self.connected.store(false, Ordering::Release);
+        self.disconnected.notify_waiters();
+        let mut reader = self.reader.lock().await;
+        if let Some(task) = reader.as_mut()
+            && tokio::time::timeout(std::time::Duration::from_secs(5), &mut *task)
+                .await
+                .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        reader.take();
     }
 
     pub fn is_connected(&self) -> bool {
@@ -410,6 +686,10 @@ fn decode_router_request(
     };
     let relay = CommunicationValue::from_bytes_with(payload, &TypeMap::new(version))
         .map_err(|error| error.to_string())?;
+    let wire = iota_connection::federated_relay::parse_wire(&relay).map_err(|e| e.to_string())?;
+    if wire.destination != destination.as_str() {
+        return Err("router destination differs from signed destination".into());
+    }
     Ok((destination, relay))
 }
 

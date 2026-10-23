@@ -1,4 +1,5 @@
 use super::*;
+use iota_identity::PrincipalStore as _;
 
 // Maintenance may drop the entire flush on attempt cancellation. Retain the
 // exact claim until the callback finishes, and release only that generation.
@@ -172,9 +173,15 @@ impl OmikronConnection {
                 let _ = relay_queue::quarantine_claimed(&dispatch.0, "invalid_frame");
                 continue;
             };
-            if !frame.is_type(CommunicationType::Relay)
-                || frame.get_data(DataType::VersionNumber).as_number() != Some(2)
-            {
+            let identity_matches=(|| {
+                let wire=iota_connection::federated_relay::parse_wire(&frame).ok()?;
+                let signer=iota_storage::identity::SqlitePrincipalStore.get_principal(record.signer_principal?).ok()??;
+                let recipient=iota_storage::identity::SqlitePrincipalStore.get_principal(record.destination_principal?).ok()??;
+                Some(wire.message_id==*record.relay_message_id.as_ref()?
+                    && wire.signer==iota_connection::federated_relay::protocol_principal(&signer.principal)
+                    && wire.recipient==iota_connection::federated_relay::protocol_principal(&recipient.principal))
+            })().unwrap_or(false);
+            if !identity_matches {
                 log!(
                     "Retaining pending Relay {} with a noncanonical frame",
                     record.id

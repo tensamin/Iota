@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tau = { git = "https://github.com/TensaminDev/Tau.git", rev = "6465cd77f61e0df3316f331b6a49885864a81033" }
+tau = { git = "https://github.com/TensaminDev/Tau.git", rev = "1c9df9f237e72d17752090a1bdffb7340627deae" }
 async-trait = "0.1.89"
 base64 = "0.22.1"
 mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "9f7f94e4cbd227610784ae47a1e7a1acf66f8584", features = ["crypto", "files", "raw"] }

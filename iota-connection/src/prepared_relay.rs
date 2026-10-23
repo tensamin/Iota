@@ -158,7 +158,7 @@ fn text(frame: &CommunicationValue, field: DataType) -> Result<String, StorageEr
 }
 
 pub(crate) fn prepare_application(
-    verified: &crate::federated_relay::VerifiedFederatedRelayV2,
+    verified: &crate::federated_relay::VerifiedFederatedRelay,
     sender: Option<LocalUserId>,
     recipient: Option<LocalUserId>,
 ) -> Result<PreparedRelayOperation, StorageError> {
@@ -306,7 +306,12 @@ pub(crate) fn prepare_application(
             }
         }
         CommunicationType::SetChatSecret => {
-            if signer_identity >= recipient_identity {
+            let version = positive_version()?;
+            // A shared Iota commits both initial envelopes in the same transaction.
+            let shared_initializer = sender.is_some() && recipient.is_some() && version == 1;
+            if signer_identity == recipient_identity
+                || (signer_identity > recipient_identity && !shared_initializer)
+            {
                 return Err(StorageError::MessageUnauthorized);
             }
             let chat_id = text(frame, DataType::ChatId)?;
@@ -347,18 +352,30 @@ pub(crate) fn prepare_application(
                 };
                 copies.push((id, copy));
             }
-            copies.sort_by(|(first, _), (second, _)| first.cmp(second));
-            if copies[0].0 != signer_identity || copies[1].0 != recipient_identity {
+            let sender_index = copies
+                .iter()
+                .position(|(identity, _)| *identity == signer_identity)
+                .ok_or(StorageError::MessageUnauthorized)?;
+            let sender_copy = copies.remove(sender_index).1;
+            let (identity, recipient_copy) = copies.remove(0);
+            if identity != recipient_identity {
                 return Err(StorageError::MessageUnauthorized);
             }
             ApplicationOperation::SetChatSecret {
                 chat_id,
-                legacy_chat_id: (signer_identity.authority == recipient_identity.authority)
-                    .then(|| format!("{signer_id}:{recipient_id}")),
-                version: positive_version()?,
+                legacy_chat_id: (signer_identity.authority == recipient_identity.authority).then(
+                    || {
+                        format!(
+                            "{}:{}",
+                            signer_id.min(recipient_id),
+                            signer_id.max(recipient_id)
+                        )
+                    },
+                ),
+                version,
                 wrapping_scheme: text(frame, DataType::WrappingScheme)?,
-                sender: copies.remove(0).1,
-                recipient: copies.remove(0).1,
+                sender: sender_copy,
+                recipient: recipient_copy,
             }
         }
         _ => return Err(StorageError::UnsupportedRelayOperation),

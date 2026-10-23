@@ -1,3 +1,4 @@
+pub use iota_identity::peer_introduction::PeerTrust;
 use iota_identity::{IotaNodeId, LocalUserId, PrincipalHandle};
 use tau::{AdmissionEngine, AuthenticationRequirement, RoleRule, RoleRules};
 
@@ -14,7 +15,7 @@ pub enum IotaConnectionIdentity {
         principal: PrincipalHandle,
         auth_generation: i64,
     },
-    DirectPeer(IotaNodeId),
+    DirectPeer(PeerTrust),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +40,8 @@ pub enum GatewayError {
     UntrustedPeerKey,
     #[error("peer directory lookup failed or trusted descriptor unavailable")]
     PeerDirectoryLookup,
+    #[error("peer admission is provisional, expired or no longer bound to this transport")]
+    PeerNotEstablished,
     #[error("application session creation failed: {0}")]
     SessionCreation(#[source] tau::AdmissionError),
     #[error("application session activation failed: {0}")]
@@ -92,16 +95,29 @@ pub(crate) fn parse_description(
     }
 }
 
-pub(crate) fn peer_identity(
+pub(crate) fn peer_node(
     id: u64,
     key: &mtp::crypto::PublicKeyBundle,
     declared: Option<&IotaNodeId>,
-) -> Result<IotaConnectionIdentity, GatewayError> {
+) -> Result<IotaNodeId, GatewayError> {
     let node = IotaNodeId::from_public_keys(key).map_err(|_| GatewayError::InvalidPeerBinding)?;
     if declared != Some(&node) || id != node.mtp_authentication_hint() {
         return Err(GatewayError::InvalidPeerBinding);
     }
-    Ok(IotaConnectionIdentity::DirectPeer(node))
+    Ok(node)
+}
+
+pub(crate) fn peer_identity(
+    id: u64,
+    key: &mtp::crypto::PublicKeyBundle,
+    declared: Option<&IotaNodeId>,
+    trust: PeerTrust,
+) -> Result<IotaConnectionIdentity, GatewayError> {
+    let node = peer_node(id, key, declared)?;
+    if trust.node() != &node || !trust.is_established_at(iota_storage::util::sync::now_millis()) {
+        return Err(GatewayError::PeerNotEstablished);
+    }
+    Ok(IotaConnectionIdentity::DirectPeer(trust))
 }
 
 #[cfg(test)]
@@ -128,13 +144,42 @@ mod tests {
         ] {
             assert!(parse_description(raw).is_err());
         }
-        assert!(peer_identity(node.mtp_authentication_hint(), &key, Some(&node)).is_ok());
-        assert!(peer_identity(node.mtp_authentication_hint() ^ 1, &key, Some(&node)).is_err());
-        assert!(peer_identity(node.mtp_authentication_hint(), &key, None).is_err());
+        assert!(peer_node(node.mtp_authentication_hint(), &key, Some(&node)).is_ok());
+        assert!(peer_node(node.mtp_authentication_hint() ^ 1, &key, Some(&node)).is_err());
+        assert!(peer_node(node.mtp_authentication_hint(), &key, None).is_err());
         let other =
             IotaNodeId::from_public_keys(&mtp::crypto::Keyring::generate().public_key_bundle())
                 .unwrap();
-        assert!(peer_identity(node.mtp_authentication_hint(), &key, Some(&other)).is_err());
+        assert!(peer_node(node.mtp_authentication_hint(), &key, Some(&other)).is_err());
+        let now = iota_storage::util::sync::now_millis();
+        for trust in [
+            PeerTrust::Provisional {
+                node: node.clone(),
+                revision: 1,
+                admitted_at: now,
+                expires_at: now + 60_000,
+            },
+            PeerTrust::Established {
+                node: node.clone(),
+                revision: 1,
+                valid_until: Some(now),
+            },
+            PeerTrust::Established {
+                node: other,
+                revision: 1,
+                valid_until: None,
+            },
+        ] {
+            assert!(
+                peer_identity(node.mtp_authentication_hint(), &key, Some(&node), trust).is_err()
+            );
+        }
+        let trust = PeerTrust::Established {
+            node: node.clone(),
+            revision: 1,
+            valid_until: Some(now + 60_000),
+        };
+        assert!(peer_identity(node.mtp_authentication_hint(), &key, Some(&node), trust).is_ok());
         let facts = tau::ConnectionFacts {
             mtp_client_id: 1,
             description: Some("client"),

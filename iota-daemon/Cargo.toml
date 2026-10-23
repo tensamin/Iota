@@ -18,3 +18,12 @@ omikron-connector = { path = "../omikron-connector" }
 other-iota = { path = "../other-iota" }
 web-server = { path = "../web-server" }
 tokio = { version = "1.50.0", features = ["full"] }
+serde_json = "1"
+
+[dev-dependencies]
+mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "9f7f94e4cbd227610784ae47a1e7a1acf66f8584", features = ["client", "crypto"] }
+rcgen = "0.14"
+reqwest = { version = "0.13", features = ["json"] }
+rusqlite = "0.40"
+serde_yaml = "0.9"
+tempfile = "3"

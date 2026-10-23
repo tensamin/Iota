@@ -1,8 +1,6 @@
 use async_trait::async_trait;
 use iota_connection::connection_handler::{PeerRouter, RouteDestination, RouteError, RouteOutcome};
-use iota_identity::IotaNodeId;
-use iota_util::mtp_compat::OptionalDataValueExt;
-use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+use mtp::codec::{CommunicationType, CommunicationValue};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,25 +28,9 @@ impl PeerRouter for OmikronPeerRouter {
                 "legacy numeric relay routing is unsupported".into(),
             ));
         };
-        if frame.type_map().is_none()
-            || !frame.is_type(CommunicationType::Relay)
-            || frame.get_data(DataType::VersionNumber).as_number() != Some(2)
-        {
-            return Err(RouteError::Delivery(
-                "expected a negotiated V2 relay frame".into(),
-            ));
-        }
-        #[derive(serde::Deserialize)]
-        struct DeclaredRoute {
-            version: u32,
-            destination: IotaNodeId,
-        }
-        let Some(DataValue::Bytes(payload)) = frame.get_data(DataType::SecurePayload) else {
-            return Err(RouteError::Delivery("relay envelope is missing".into()));
-        };
-        let declared: DeclaredRoute = serde_json::from_slice(payload)
+        let declared = iota_connection::federated_relay::parse_wire(&frame)
             .map_err(|error| RouteError::Delivery(format!("invalid relay envelope: {error}")))?;
-        if declared.version != 2 || &declared.destination != node {
+        if declared.destination != node.as_str() {
             return Err(RouteError::Delivery(
                 "signed relay destination does not match its route target".into(),
             ));
@@ -80,9 +62,11 @@ mod tests {
     use super::*;
     use crate::OmikronError;
     use iota_connection::{
-        connection_handler::bind_relay_response_identity, federated_relay::FederatedRelayV2,
+        connection_handler::bind_relay_response_identity, federated_relay::FederatedRelay,
     };
+    use iota_identity::IotaNodeId;
     use iota_identity::{AuthorityId, PrincipalId};
+    use mtp::codec::{DataType, DataValue};
     use mtp::crypto::Keyring;
     use std::sync::{Mutex, OnceLock};
 
@@ -144,7 +128,7 @@ mod tests {
     fn relay_frame(destination: &IotaNodeId) -> CommunicationValue {
         static KEYS: OnceLock<[Keyring; 2]> = OnceLock::new();
         let keys = KEYS.get_or_init(|| [Keyring::generate(), Keyring::generate()]);
-        let frame = FederatedRelayV2::sign(
+        let frame = FederatedRelay::sign(
             PrincipalId {
                 authority: AuthorityId::new("authority:origin").unwrap(),
                 user_id: 1,

@@ -1,7 +1,11 @@
+pub mod authority_directory;
 pub mod blocking;
 pub mod hosted_auth;
 pub mod identity;
 pub mod node_directory;
+pub mod node_transition;
+pub mod peer_admission;
+pub mod relay_mailbox;
 pub mod storage_error;
 pub mod tauth;
 pub mod users;

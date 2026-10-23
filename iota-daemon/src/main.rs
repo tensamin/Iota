@@ -550,7 +550,12 @@ async fn run() -> ExitCode {
             Ok(())
         })
         .await;
-    if let Some(relay_routers) = &services.relay_routers {
+    if let Some(relay_routers) = services.relay_routers.as_ref().filter(|_| {
+        !matches!(
+            web.federation_mode,
+            iota_storage::util::config_util::FederationMode::Private
+        )
+    }) {
         for router in &relay_router_settings {
             let endpoint = match iota_identity::AuthorityLocator::new(router.endpoint.clone()) {
                 Ok(endpoint) => endpoint,
@@ -590,10 +595,47 @@ async fn run() -> ExitCode {
             let relay = services.relay.clone();
             let identity = node_identity.clone();
             let deliveries: Arc<dyn other_iota::LocalDeliverySink> = client_connections.clone();
+            let introducer = match web
+                .authority_locator
+                .as_ref()
+                .map(iota_identity::AuthorityLocator::new)
+                .transpose()
+                .and_then(|locator| {
+                    other_iota::introduction::HttpPeerIntroducer::new(
+                        node_descriptor.clone(),
+                        locator,
+                        web.allow_lan_federation,
+                    )
+                })
+                .and_then(|client| client.with_pinned_certificate(&certificate))
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    eprintln!("Cannot configure relay introduction: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let target = match iota_identity::IotaNodeId::from_public_keys(&public_key) {
+                Ok(node) => node,
+                Err(error) => {
+                    eprintln!("Invalid router identity: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
             runtime
                 .tasks
                 .spawn_tracked("relay-router", async move {
                     loop {
+                        use other_iota::introduction::PeerIntroducer;
+                        let introduced=tokio::select! {
+                            _=router_runtime.cancellation.cancelled()=>break,
+                            result=introducer.introduce(&identity,&target,&endpoint)=>result,
+                        };
+                        if let Err(error)=introduced {
+                            log!("Relay router introduction failed: {error}");
+                            tokio::select! { _=router_runtime.cancellation.cancelled()=>break, _=tokio::time::sleep(Duration::from_secs(30))=>{} }
+                            continue;
+                        }
                         match other_iota::relay_router::RelayRouterClient::connect(
                             identity.clone(),
                             &endpoint,
@@ -608,7 +650,7 @@ async fn run() -> ExitCode {
                                 relay_routers.add(connected.clone());
                                 tokio::select! {
                                     _ = connected.wait_disconnected() => {},
-                                    _ = router_runtime.cancellation.cancelled() => break,
+                                    _ = router_runtime.cancellation.cancelled() => { connected.shutdown().await; break; },
                                 }
                             }
                             Err(error) => {
@@ -629,28 +671,97 @@ async fn run() -> ExitCode {
         }
     }
     let mut peer_manager = None;
-    let mtp_handler: Arc<dyn web_server::MtpConnectionHandler> =
-        if let Some(router) = services.direct_router.clone() {
-            let nodes: Arc<dyn iota_identity::NodeDirectory> =
-                Arc::new(iota_storage::node_directory::SqliteNodeDirectory);
-            let deliveries: Arc<dyn other_iota::LocalDeliverySink> = client_connections.clone();
-            let peers = Arc::new(other_iota::PeerManager::new(
+    let mut peer_introduction: Option<
+        Arc<dyn iota_identity::peer_introduction::PeerIntroductionService>,
+    > = None;
+    let mtp_handler: Arc<dyn web_server::MtpConnectionHandler> = if let Some(router) =
+        services.direct_router.clone().filter(|_| {
+            !matches!(
+                web.federation_mode,
+                iota_storage::util::config_util::FederationMode::Private
+            )
+        }) {
+        let nodes: Arc<dyn iota_identity::NodeDirectory> =
+            Arc::new(iota_storage::node_directory::SqliteNodeDirectory);
+        let deliveries: Arc<dyn other_iota::LocalDeliverySink> = client_connections.clone();
+        let resolver = Arc::new(
+            other_iota::RemoteIotaResolver::new(
+                Arc::new(other_iota::HttpFederationIdentityClient::new(
+                    web.allow_lan_federation,
+                    web.allow_raw_ip_federation,
+                )),
+                services.principals.clone(),
+                nodes.clone(),
+            )
+            .with_authority_directory(Arc::new(
+                iota_storage::authority_directory::SqliteAuthorityDirectory,
+            )),
+        );
+        peer_introduction = Some(Arc::new(
+            other_iota::introduction::IntroductionService::new(
+                node_identity.node_id().clone(),
+                resolver.clone(),
+                web.peer_introduction.clone(),
+            ),
+        ));
+        let authority_locator = web
+            .authority_locator
+            .as_ref()
+            .map(iota_identity::AuthorityLocator::new)
+            .transpose();
+        let introducer = match authority_locator.and_then(|locator| {
+            other_iota::introduction::HttpPeerIntroducer::new(
+                node_descriptor.clone(),
+                locator,
+                web.allow_lan_federation,
+            )
+        }) {
+            Ok(introducer) => Arc::new(introducer),
+            Err(error) => {
+                eprintln!("Cannot configure peer introduction: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let peers = Arc::new(
+            other_iota::PeerManager::new(
                 node_identity.clone(),
                 nodes,
                 router.clone(),
                 services.relay.clone(),
                 deliveries,
-            ));
-            router.attach_manager(&peers);
-            peer_manager = Some(peers.clone());
+            )
+            .with_introducer(introducer)
+            .with_authority_resolver(resolver),
+        );
+        router.attach_manager(&peers);
+        peer_manager = Some(peers.clone());
+        let gateway: Arc<dyn web_server::MtpConnectionHandler> =
             Arc::new(client::ConnectionGateway::new(
                 client::tau_gateway::admission_engine(),
                 client_connections.clone(),
+                peers.clone(),
+            ));
+        if web.serve_relay_router {
+            let router = match &web.relay_mailbox {
+                Some(limits) => {
+                    other_iota::relay_router::RelayRouterService::with_mailbox(limits.clone())
+                }
+                None => other_iota::relay_router::RelayRouterService::default(),
+            };
+            Arc::new(other_iota::relay_router::RelayRouterGateway {
+                inner: gateway,
                 peers,
-            ))
+                router: Arc::new(router),
+                public: web.relay_router_public,
+                allowed_nodes: web.relay_router_allowed_nodes.clone(),
+            })
         } else {
-            client_connections.clone()
-        };
+            gateway
+        }
+    } else {
+        client_connections.clone()
+    };
+    let diagnostic_descriptor = node_descriptor.clone();
     let web_config = web_server::WebConfig {
         mode: match web.mode {
             iota_storage::util::config_util::WebMode::Disabled => web_server::WebMode::Disabled,
@@ -687,11 +798,18 @@ async fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
-            protocols: vec!["identity-http-v1".into(), "mtp-relay-v2".into()],
+            protocols: iota_identity::FEDERATION_PROTOCOLS
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             node_descriptor: Some("/federation/v1/node".into()),
-            direct_endpoints: Vec::new(),
-            relay_hints: Vec::new(),
+            direct_endpoints: node_descriptor.descriptor.direct_endpoints.clone(),
+            relay_hints: node_descriptor.descriptor.relay_hints.clone(),
         },
+        publish_discovery: !matches!(
+            web.federation_mode,
+            iota_storage::util::config_util::FederationMode::Private
+        ),
         local_users: services.local_users.clone(),
         descriptor_publisher: Arc::new(
             iota_storage::identity::SqliteLocalDescriptorPublisher::new(node_identity.clone()),
@@ -702,6 +820,8 @@ async fn run() -> ExitCode {
             services.local_users.clone(),
         )),
         mtp_handler,
+        peer_introduction,
+        introduction_limits: web.peer_introduction.clone(),
     };
     let mut web_handle = None;
     match web_server::start(web_config, runtime.cancellation.clone()).await {
@@ -727,6 +847,43 @@ async fn run() -> ExitCode {
         }
     }
 
+    if web_handle.is_some() {
+        let diagnostics_runtime = runtime.clone();
+        let routers = services.relay_routers.clone();
+        let peers = peer_manager.clone();
+        let authority = web.authority_locator.clone();
+        let allow_lan = web.allow_lan_federation;
+        runtime.tasks.spawn_tracked("federation-health",async move {
+            let client=iota_util::federation_http::client_builder(allow_lan).build().map_err(|e|e.to_string())?;
+            let mut interval=tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tokio::select! { _=diagnostics_runtime.cancellation.cancelled()=>break, _=interval.tick()=>{} }
+                let tls=if let Some(authority)=&authority {
+                    let result=async {
+                        let locator=iota_identity::AuthorityLocator::new(authority)?;
+                        iota_util::federation_http::url(&locator,"/.well-known/tensamin",allow_lan)?;
+                        let discovered=iota_util::authority_discovery::discover_authority(&client,&locator).await?;
+                        Ok::<_,iota_identity::IdentityError>(discovered.node_id.as_ref()==Some(&diagnostic_descriptor.descriptor.node))
+                    };
+                    Some(tokio::select! { _=diagnostics_runtime.cancellation.cancelled()=>break, result=result=>result.unwrap_or(false) })
+                } else { None };
+                let valid=diagnostic_descriptor.clone().verify(None,iota_storage::util::sync::now_millis()).is_ok();
+                let backlog=iota_storage::util::db::with_db(|db| Ok(db.query_row("SELECT COUNT(*),MIN(CASE WHEN attempt_count>0 THEN next_attempt_at END) FROM pending_relays WHERE target_kind=2 AND delivery_state!='quarantined'",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<i64>>(1)?)))?));
+                let (pending,oldest)=backlog.map_err(|e|e.to_string())?;
+                let message=serde_json::json!({
+                    "discovery_reachable":null,"advertised_mtp_reachable":null,
+                    "external_probe_status":"not_configured","local_discovery_probe":tls,
+                    "tls_identity_valid":tls,"node_descriptor_valid":valid,
+                    "relay_router_connected":routers.as_ref().is_some_and(|r|r.is_connected()),
+                    "last_peer_authentication_error":peers.as_ref().and_then(|p|p.last_authentication_error()),
+                    "pending_relay_count":pending,"oldest_retry":oldest,
+                }).to_string();
+                if valid && tls!=Some(false) { diagnostics_runtime.set_component_healthy(iota_ipc::ComponentId::Web,Some(message)); }
+                else { diagnostics_runtime.set_component_degraded(iota_ipc::ComponentId::Web,message); }
+            }
+            Ok(())
+        }).await;
+    }
     runtime.set_startup_phase(StartupPhase::Ready);
     log!("iota-daemon started (phase: Ready)");
 

@@ -229,8 +229,25 @@ pub fn migrate_chat_secret_namespace_in_tx(
 }
 
 pub fn put_chat_secret(record: StoredChatSecret) -> Result<(), StorageError> {
-    db::with_immediate_transaction(|tx| put_chat_secret_in_tx(tx, &record))
+    put_chat_secrets(&[record])
+}
+
+/// Commit every local recipient envelope together, including during initialization.
+pub fn put_chat_secrets(records: &[StoredChatSecret]) -> Result<(), StorageError> {
+    db::with_db(|connection| put_chat_secrets_in_connection(connection, records))
         .map_err(|error| error.to_string())
+}
+
+fn put_chat_secrets_in_connection(
+    connection: &Connection,
+    records: &[StoredChatSecret],
+) -> Result<(), TransactionError> {
+    let tx = Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
+    for record in records {
+        put_chat_secret_in_tx(&tx, record)?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 pub fn put_chat_secret_in_tx(
@@ -347,8 +364,150 @@ fn chat_secret_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChatS
 
 #[cfg(test)]
 mod tests {
-    use super::{principal_chat_id, principal_secret_id};
+    use super::{
+        StoredChatSecret, principal_chat_id, principal_secret_id, put_chat_secrets_in_connection,
+    };
     use iota_identity::PrincipalHandle;
+
+    fn initialize(connection: &rusqlite::Connection) {
+        connection
+            .execute_batch(
+                "CREATE TABLE chat_secrets (
+                user_id TEXT NOT NULL, chat_id TEXT NOT NULL, secret_id TEXT NOT NULL,
+                version INTEGER NOT NULL, encrypted_secret BLOB NOT NULL,
+                kem_ciphertext BLOB NOT NULL, wrapping_scheme TEXT NOT NULL,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, chat_id, secret_id, version)
+            );",
+            )
+            .unwrap();
+    }
+
+    fn envelopes(proposal: u8) -> [StoredChatSecret; 2] {
+        [1, 2].map(|owner| StoredChatSecret {
+            user_id: owner.to_string(),
+            chat_id: "principal:1:2".into(),
+            secret_id: "chat:principal:1:2:main".into(),
+            version: 1,
+            encrypted_secret: vec![proposal, owner],
+            kem_ciphertext: vec![proposal, owner, 3],
+            wrapping_scheme: "test-envelope".into(),
+            created_at: 1,
+            updated_at: 1,
+        })
+    }
+
+    #[test]
+    fn shared_envelopes_commit_together_and_identical_replays_are_idempotent() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        initialize(&connection);
+        let records = envelopes(7);
+        put_chat_secrets_in_connection(&connection, &records).unwrap();
+        put_chat_secrets_in_connection(&connection, &records).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM chat_secrets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        for record in records {
+            let stored = connection.query_row(
+                "SELECT user_id, chat_id, secret_id, version, encrypted_secret, kem_ciphertext, wrapping_scheme, created_at, updated_at FROM chat_secrets WHERE user_id = ?1",
+                [&record.user_id], super::chat_secret_from_row,
+            ).unwrap();
+            assert_eq!(stored, record);
+        }
+    }
+
+    #[test]
+    fn conflict_in_second_envelope_rolls_back_the_first() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        initialize(&connection);
+        let existing = envelopes(4);
+        put_chat_secrets_in_connection(&connection, &existing[1..]).unwrap();
+        assert!(put_chat_secrets_in_connection(&connection, &envelopes(9)).is_err());
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM chat_secrets WHERE user_id = '1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let stored: Vec<u8> = connection
+            .query_row(
+                "SELECT encrypted_secret FROM chat_secrets WHERE user_id = '2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, existing[1].encrypted_secret);
+    }
+
+    #[test]
+    fn rotation_requires_consecutive_versions_for_every_recipient() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        initialize(&connection);
+        let initial = envelopes(1);
+        put_chat_secrets_in_connection(&connection, &initial[..1]).unwrap();
+        let mut rotation = envelopes(2);
+        for record in &mut rotation {
+            record.version = 2;
+        }
+        assert!(put_chat_secrets_in_connection(&connection, &rotation).is_err());
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM chat_secrets WHERE version = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        put_chat_secrets_in_connection(&connection, &initial[1..]).unwrap();
+        put_chat_secrets_in_connection(&connection, &rotation).unwrap();
+        assert!(put_chat_secrets_in_connection(&connection, &envelopes(3)).is_err());
+    }
+
+    #[test]
+    fn concurrent_initializers_choose_one_pair_that_survives_reopening() {
+        let storage = tempfile::tempdir().unwrap();
+        let path = storage.path().join("e2ee.sqlite3");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        initialize(&connection);
+        drop(connection);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers = [6, 8].map(|proposal| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let connection = rusqlite::Connection::open(path).unwrap();
+                connection
+                    .busy_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                let mut records = envelopes(proposal);
+                if proposal == 8 {
+                    records.reverse();
+                }
+                barrier.wait();
+                put_chat_secrets_in_connection(&connection, &records).is_ok()
+            })
+        });
+        let winners = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().unwrap().then_some(()))
+            .count();
+        assert_eq!(winners, 1);
+        let connection = rusqlite::Connection::open(path).unwrap();
+        let mut statement = connection
+            .prepare("SELECT encrypted_secret FROM chat_secrets ORDER BY user_id")
+            .unwrap();
+        let stored = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0][0], stored[1][0]);
+        assert_ne!(stored[0], stored[1]);
+    }
 
     #[test]
     fn chat_secret_namespace_uses_principals() {

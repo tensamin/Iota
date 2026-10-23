@@ -18,13 +18,7 @@ pub async fn discover_authority(
         .map_err(|error| {
             IdentityError::Unavailable(format!("authority discovery rejected {url}: {error}"))
         })?;
-    let document = response
-        .json::<AuthorityDiscoveryDocument>()
-        .await
-        .map_err(|error| {
-            IdentityError::InvalidDescriptor(format!(
-                "invalid authority discovery document from {url}: {error}"
-            ))
-        })?;
+    let document: AuthorityDiscoveryDocument =
+        crate::federation_http::bounded_json(response).await?;
     document.verify()
 }

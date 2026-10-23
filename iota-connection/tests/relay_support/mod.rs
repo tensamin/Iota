@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use iota_auth::{AuthenticatedSession, SessionCapabilities, SessionIdentity};
 use iota_connection::{
     connection_handler::{PeerRouter, RouteDestination, RouteError, RouteOutcome},
-    federated_relay::FederatedRelayV2,
+    federated_relay::FederatedRelay,
     relay_service::{IngressSource, RelayNodeIdentity, RelayOutcome, RelayService},
 };
 use iota_identity::*;
@@ -235,7 +235,7 @@ impl Fixture {
         id: &str,
         content: CommunicationValue,
     ) -> CommunicationValue {
-        FederatedRelayV2::sign(
+        FederatedRelay::sign(
             self.ids[signer].clone(),
             self.ids[1 - signer].clone(),
             if signer == 0 {

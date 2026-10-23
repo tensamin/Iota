@@ -107,7 +107,7 @@ fn recovery_delay_ms(attempts: i64) -> i64 {
     min.saturating_mul(1_u64 << attempts.clamp(0, 20)).min(max) as i64
 }
 
-pub type VerifiedRelayEnvelope = crate::federated_relay::VerifiedFederatedRelayV2;
+pub type VerifiedRelayEnvelope = crate::federated_relay::VerifiedFederatedRelay;
 
 /// Only an exact durable wire match can create this proof. It grants no new claim.
 #[derive(Clone, Debug)]

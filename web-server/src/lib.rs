@@ -67,12 +67,16 @@ pub struct WebConfig {
     pub max_mtp_sessions_per_user: usize,
     pub shutdown_budget: std::time::Duration,
     pub authority_discovery: iota_identity::AuthorityDiscoveryDocument,
+    pub publish_discovery: bool,
     pub local_users: Arc<dyn LocalUserStore>,
     pub descriptor_publisher: Arc<dyn LocalDescriptorPublisher>,
     pub node_descriptor: SignedNodeDescriptor,
     pub node_identity: iota_identity::LocalNodeIdentity,
     pub client_keys: Arc<dyn ClientPublicKeyResolver>,
     pub mtp_handler: Arc<dyn MtpConnectionHandler>,
+    pub peer_introduction:
+        Option<Arc<dyn iota_identity::peer_introduction::PeerIntroductionService>>,
+    pub introduction_limits: iota_identity::peer_introduction::PeerIntroductionLimits,
 }
 
 #[derive(Debug)]
@@ -257,16 +261,32 @@ pub async fn start(
     let local_users = config.local_users.clone();
     let descriptor_publisher = config.descriptor_publisher.clone();
     let mtp_handler = config.mtp_handler.clone();
+    let introduction = config.peer_introduction.clone();
+    let publish_discovery = config.publish_discovery;
+    let introduction_limits = config.introduction_limits.clone();
+    let introduction_slots = Arc::new(tokio::sync::Semaphore::new(
+        introduction_limits.max_concurrent_requests,
+    ));
+    let introduction_rates = Arc::new(StdMutex::new(
+        HashMap::<IpAddr, (std::time::Instant, usize)>::new(),
+    ));
     let web_config = WebServerConfig::new()
+        .max_request_body(introduction_limits.max_request_bytes)
         .route("/", move |request, response| {
             root(assets.clone(), request, response)
         })
         .and_then(|web_config| {
+            if !publish_discovery {
+                return Ok(web_config);
+            }
             web_config.route("/.well-known/tensamin", move |request, response| {
                 authority_discovery(discovery.clone(), request, response)
             })
         })
         .and_then(|web_config| {
+            if !publish_discovery {
+                return Ok(web_config);
+            }
             let descriptor = node_descriptor.clone();
             web_config.route_method(Method::GET, "/federation/v1/node", move |_, response| {
                 let descriptor = descriptor.clone();
@@ -274,6 +294,9 @@ pub async fn start(
             })
         })
         .and_then(|web_config| {
+            if !publish_discovery {
+                return Ok(web_config);
+            }
             let publisher = descriptor_publisher.clone();
             web_config.route_pattern_method(
                 Method::GET,
@@ -307,6 +330,9 @@ pub async fn start(
             )
         })
         .and_then(|web_config| {
+            if !publish_discovery {
+                return Ok(web_config);
+            }
             let local_users = local_users.clone();
             let publisher = descriptor_publisher.clone();
             web_config.route_pattern_method(
@@ -334,6 +360,112 @@ pub async fn start(
                     }
                 },
             )
+        })
+        .and_then(|mut web_config| {
+            for (path, challenge) in [
+                ("/federation/peer/challenge", true),
+                ("/federation/peer/introduce", false),
+            ] {
+                let service = introduction.clone();
+                let slots = introduction_slots.clone();
+                let limits = introduction_limits.clone();
+                let rates = introduction_rates.clone();
+                web_config =
+                    web_config.route_method(Method::POST, path, move |request, response| {
+                        let service = service.clone();
+                        let slots = slots.clone();
+                        let limits = limits.clone();
+                        let rates = rates.clone();
+                        async move {
+                            let Some(service) = service else {
+                                return response
+                                    .status(http::StatusCode::NOT_FOUND)
+                                    .body("peer introduction disabled");
+                            };
+                            {
+                                let mut rates =
+                                    rates.lock().expect("introduction rate lock poisoned");
+                                rates.retain(|_, (at, _)| {
+                                    at.elapsed() < std::time::Duration::from_secs(60)
+                                });
+                                let origin = request.remote_addr.ip();
+                                if !rates.contains_key(&origin)
+                                    && rates.len() >= limits.max_pending_challenges
+                                {
+                                    return response
+                                        .status(http::StatusCode::TOO_MANY_REQUESTS)
+                                        .body("introduction rate limit");
+                                }
+                                let (_, count) = rates
+                                    .entry(origin)
+                                    .or_insert((std::time::Instant::now(), 0));
+                                if *count >= limits.max_challenges_per_origin.saturating_mul(2) {
+                                    return response
+                                        .status(http::StatusCode::TOO_MANY_REQUESTS)
+                                        .body("introduction rate limit");
+                                }
+                                *count += 1;
+                            }
+                            let Ok(_permit) = slots.try_acquire() else {
+                                return response
+                                    .status(http::StatusCode::TOO_MANY_REQUESTS)
+                                    .body("introduction busy");
+                            };
+                            let Some(body) = request.body else {
+                                return response
+                                    .status(http::StatusCode::BAD_REQUEST)
+                                    .body("missing introduction body");
+                            };
+                            if body.len() > limits.max_request_bytes {
+                                return response
+                                    .status(http::StatusCode::PAYLOAD_TOO_LARGE)
+                                    .body("introduction body too large");
+                            }
+                            let work = async {
+                                if challenge {
+                                    service
+                                        .challenge(body.to_vec(), request.remote_addr.ip())
+                                        .await
+                                        .and_then(|v| {
+                                            serde_json::to_vec(&v).map_err(|e| {
+                                                iota_identity::IdentityError::InvalidDescriptor(
+                                                    e.to_string(),
+                                                )
+                                            })
+                                        })
+                                } else {
+                                    service.introduce(body.to_vec()).await.and_then(|v| {
+                                        serde_json::to_vec(&v).map_err(|e| {
+                                            iota_identity::IdentityError::InvalidDescriptor(
+                                                e.to_string(),
+                                            )
+                                        })
+                                    })
+                                }
+                            };
+                            match tokio::time::timeout(
+                                std::time::Duration::from_millis(limits.request_timeout_ms),
+                                work,
+                            )
+                            .await
+                            {
+                                Ok(Ok(body)) => response
+                                    .header("content-type", "application/json")
+                                    .body(body),
+                                Ok(Err(error)) => {
+                                    log!("Peer introduction rejected: {}", error);
+                                    response
+                                        .status(http::StatusCode::FORBIDDEN)
+                                        .body("peer introduction rejected")
+                                }
+                                Err(_) => response
+                                    .status(http::StatusCode::GATEWAY_TIMEOUT)
+                                    .body("peer introduction timed out"),
+                            }
+                        }
+                    })?;
+            }
+            Ok(web_config)
         })
         .and_then(|web_config| {
             let assets = config.asset_dir.clone();

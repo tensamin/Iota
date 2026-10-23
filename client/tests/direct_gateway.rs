@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use client::{ClientConnectionManager, ConnectionGateway};
 use iota_auth::{HostedSessionRegistrar, SessionManager};
 use iota_connection::connection_handler::{PeerRouter, RouteDestination, RouteError, RouteOutcome};
-use iota_connection::federated_relay::FederatedRelayV2;
+use iota_connection::federated_relay::FederatedRelay;
 use iota_connection::relay_service::{RelayNodeIdentity, RelayService};
 use iota_identity::{
     AuthorityKind, IdentityError, IdentityResolver, IotaNodeId, LocalNodeIdentity,
@@ -340,7 +340,7 @@ async fn hosted_client_loads_state_originates_relay_and_receives_delivery() {
         Ok(())
     })
     .unwrap();
-    let offline = FederatedRelayV2::sign(
+    let offline = FederatedRelay::sign(
         remote_descriptor.descriptor().principal.clone(),
         PrincipalId {
             authority: local_node.authority_id().clone(),
@@ -479,7 +479,7 @@ async fn hosted_client_loads_state_originates_relay_and_receives_delivery() {
         .add_typed_default(DataType::Content, DataValue::Str("ciphertext".into()))
         .add_typed_default(DataType::SendTime, DataValue::SignedNumber(10))
         .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(1));
-    let outgoing = FederatedRelayV2::sign(
+    let outgoing = FederatedRelay::sign(
         PrincipalId {
             authority: local_node.authority_id().clone(),
             user_id: 1,
@@ -698,7 +698,7 @@ async fn hosted_client_loads_state_originates_relay_and_receives_delivery() {
         admissions.recv().await.unwrap().send(()).unwrap();
         // A relay response proves that initialization and trusted registration
         // finished for this particular connection, even when a route already exists.
-        let frame = FederatedRelayV2::sign(
+        let frame = FederatedRelay::sign(
             remote_descriptor.descriptor().principal.clone(),
             PrincipalId {
                 authority: local_node.authority_id().clone(),
@@ -802,6 +802,7 @@ async fn hosted_client_loads_state_originates_relay_and_receives_delivery() {
                     direct_endpoints: Vec::new(),
                     relay_hints: Vec::new(),
                 },
+                publish_discovery: true,
                 local_users: Arc::new(SqliteLocalUserStore),
                 descriptor_publisher: Arc::new(
                     iota_storage::identity::SqliteLocalDescriptorPublisher::new(local_node.clone()),
@@ -812,6 +813,8 @@ async fn hosted_client_loads_state_originates_relay_and_receives_delivery() {
                     SqliteLocalUserStore,
                 ))),
                 mtp_handler: gateway.clone(),
+                peer_introduction: None,
+                introduction_limits: Default::default(),
             },
             tokio_util::sync::CancellationToken::new(),
         )
@@ -918,7 +921,7 @@ async fn hosted_client_loads_state_originates_relay_and_receives_delivery() {
             let (reached, wait) = tokio::sync::oneshot::channel();
             let (resume, continued) = tokio::sync::oneshot::channel();
             *router.pause.lock().unwrap() = Some((reached, continued));
-            let frame = FederatedRelayV2::sign(
+            let frame = FederatedRelay::sign(
                 PrincipalId {
                     authority: local_node.authority_id().clone(),
                     user_id: 1,

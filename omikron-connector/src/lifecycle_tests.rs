@@ -198,7 +198,7 @@ async fn reader_stop_cancels_inflight_relay_identity_preparation() {
     );
     assert!(connector.install_relay_service(Arc::new(relay)).is_ok());
     transport.start_reader(&connector).await;
-    let frame = iota_connection::federated_relay::FederatedRelayV2::sign(
+    let frame = iota_connection::federated_relay::FederatedRelay::sign(
         PrincipalId {
             authority: node.authority_id().clone(),
             user_id: 1,
@@ -769,7 +769,7 @@ async fn real_relay_handler_panic_is_observed_and_shutdown_failure_stays_sticky(
         owner.clone().run_attempt(client, attempt).await.unwrap();
         owner.join_draining_attempts().await;
     }));
-    let frame = iota_connection::federated_relay::FederatedRelayV2::sign(
+    let frame = iota_connection::federated_relay::FederatedRelay::sign(
         PrincipalId {
             authority: node.authority_id().clone(),
             user_id: 1,
