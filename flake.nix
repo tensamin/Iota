@@ -7,7 +7,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     type-maps = {
-      url = "git+https://github.com/TensaminDev/MTP-Type-Maps.git?ref=main&rev=76793898fac4b242918e2f26dc67312cb459d88b";
+      url = "git+https://github.com/TensaminDev/MTP-Type-Maps.git?ref=main&rev=f0f856ca1d5fc3ca2b05a71f287c226ea58a6c60";
       flake = false;
     };
   };
