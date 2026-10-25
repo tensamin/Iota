@@ -313,6 +313,10 @@ async fn run() -> ExitCode {
                             } else {
                                 "connected (waiting for RTT sample)".into()
                             };
+                            let message = format!(
+                                "{message}; password authentication: {:?}",
+                                omikron_health.password_readiness()
+                            );
                             health_runtime.set_component_healthy(
                                 iota_ipc::ComponentId::Omikron,
                                 Some(message),

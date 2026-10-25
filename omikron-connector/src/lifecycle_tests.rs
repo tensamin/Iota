@@ -70,6 +70,8 @@ impl Loopback {
         );
         let attempt = Arc::new(ConnectionAttempt {
             generation: 1,
+            owner_omikron_id: Some(1),
+            owner_authority: Some(format!("omikron-key:{}", "a".repeat(64))),
             sender: Arc::new(self.client.sender.clone()),
             responses: tau::ResponseCorrelator::new(),
             cancellation: connector.cancellation.child_token(),
@@ -95,6 +97,28 @@ impl Loopback {
             .shutdown(tokio::time::Instant::now() + EXIT_BUDGET)
             .await;
     }
+}
+
+#[tokio::test]
+async fn envelope_authority_is_bound_to_the_current_identified_attempt() {
+    let network = Loopback::new().await;
+    let connector = network.connector().await;
+    assert_eq!(connector.call_envelope_owner().await, Some(1));
+    connector
+        .set_state(ConnectionState::Connected { identified: false })
+        .await;
+    assert_eq!(connector.call_envelope_owner().await, None);
+    connector
+        .set_state(ConnectionState::Connected { identified: true })
+        .await;
+    let bound = connector.bound_attempt.as_ref().unwrap().clone();
+    *connector.active_attempt.write().await = None;
+    assert_eq!(connector.call_envelope_owner().await, None);
+    *connector.active_attempt.write().await = Some(bound.clone());
+    assert_eq!(connector.call_envelope_owner().await, Some(1));
+    bound.close();
+    assert_eq!(connector.call_envelope_owner().await, None);
+    network.close().await;
 }
 
 // A dropped pending future proves cancellation reached the blocked operation,
@@ -638,6 +662,8 @@ async fn reconnect_replaces_real_attempt_workers_and_stop_joins_both_generations
     timeout(EXIT_BUDGET, in_transaction).await.unwrap().unwrap();
     let replacement = Arc::new(ConnectionAttempt {
         generation: 2,
+        owner_omikron_id: Some(1),
+        owner_authority: Some(format!("omikron-key:{}", "a".repeat(64))),
         sender: Arc::new(second.client.sender.clone()),
         responses: tau::ResponseCorrelator::new(),
         cancellation: root.cancellation.child_token(),

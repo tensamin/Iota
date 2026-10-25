@@ -639,17 +639,29 @@ impl OmikronConnection {
     }
 
     pub(super) async fn handle_call_envelope_store(self: Arc<Self>, cv: &CommunicationValue) {
-        let response = match CONFIG.load().omikron_id {
-            Some(owner) => message_handlers::handle_call_envelope_store(cv, owner),
-            None => error_response(cv, CommunicationType::ErrorInternal),
+        let recipient = cv
+            .get_data(DataType::ReceiverId)
+            .as_signed_number()
+            .and_then(|id| i64::try_from(id).ok());
+        let response = match self.call_envelope_owner().await {
+            Some(owner) if recipient.is_some_and(Self::call_recipient_is_hosted) => {
+                message_handlers::handle_call_envelope_store(cv, owner)
+            }
+            _ => error_response(cv, CommunicationType::ErrorInvalidData),
         };
         let _ = self.send_message(&response).await;
     }
 
     pub(super) async fn handle_call_envelope_get(self: Arc<Self>, cv: &CommunicationValue) {
-        let response = match CONFIG.load().omikron_id {
-            Some(owner) => message_handlers::handle_call_envelope_get(cv, owner),
-            None => error_response(cv, CommunicationType::ErrorInternal),
+        let recipient = cv
+            .get_data(DataType::ReceiverId)
+            .as_signed_number()
+            .and_then(|id| i64::try_from(id).ok());
+        let response = match self.call_envelope_owner().await {
+            Some(owner) if recipient.is_some_and(Self::call_recipient_is_hosted) => {
+                message_handlers::handle_call_envelope_get(cv, owner)
+            }
+            _ => error_response(cv, CommunicationType::ErrorInvalidData),
         };
         let _ = self.send_message(&response).await;
     }

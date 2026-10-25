@@ -2,9 +2,26 @@ use mtp::codec::{CommunicationType, CommunicationValue};
 
 pub use tau::MessageSecurityClass;
 
+/// Resolve through the negotiated dictionary. Older dictionaries cannot opt in
+/// merely by sending the numeric IDs used by the epoch protocol.
+pub fn is_call_key_envelope_request(frame: &CommunicationValue) -> bool {
+    matches!(
+        frame.get_type_name(),
+        Some(
+            "CallKeyEnvelopeStage"
+                | "CallKeyEnvelopeGet"
+                | "CallKeyEnvelopeRevoke"
+                | "CallKeyEnvelopeActivate"
+        )
+    )
+}
+
 /// Classification does not authorize a sender. Handlers still enforce their
 /// principal-specific application and Omikron control permissions.
 pub fn message_security_class(frame: &CommunicationValue) -> MessageSecurityClass {
+    if is_call_key_envelope_request(frame) {
+        return MessageSecurityClass::AuthenticatedPeerControl;
+    }
     const PEER_CONTROL_TYPES: &[CommunicationType] = &[
         CommunicationType::Relay,
         CommunicationType::GetChatSecret,
@@ -21,6 +38,7 @@ pub fn message_security_class(frame: &CommunicationValue) -> MessageSecurityClas
         CommunicationType::PasswordEnrollmentDisable,
         CommunicationType::PasswordProvisioningStart,
         CommunicationType::PasswordProvisioningFinish,
+        CommunicationType::ProvisioningCancel,
         CommunicationType::TAuthExchangeCode,
         CommunicationType::TAuthUser,
         CommunicationType::TAuthContacts,
@@ -79,6 +97,25 @@ pub fn message_security_class(frame: &CommunicationValue) -> MessageSecurityClas
 mod security_tests {
     use super::{MessageSecurityClass, message_security_class};
     use mtp::codec::{CommunicationType, CommunicationValue};
+
+    #[test]
+    fn epoch_envelopes_require_peer_control_when_negotiated() {
+        let tm = mtp::codec::TypeMap::latest();
+        for id in 233..=236 {
+            // Compiles against legacy dictionaries too. In that case the new
+            // operation cannot be decoded and must not acquire an allowlist slot.
+            let Some(kind) = tm.comm_enum_id(id) else {
+                continue;
+            };
+            let frame = CommunicationValue::new_with_type_map(kind, &tm);
+            if super::is_call_key_envelope_request(&frame) {
+                assert_eq!(
+                    message_security_class(&frame),
+                    MessageSecurityClass::AuthenticatedPeerControl
+                );
+            }
+        }
+    }
 
     #[test]
     fn relay_envelopes_require_authenticated_peer_control() {

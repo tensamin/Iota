@@ -142,6 +142,70 @@ pub async fn decode_and_verify_for_ingress(
     })
 }
 
+/// Open the native sealed format without translating its signature into Tau JSON.
+/// The caller must select both principals from authenticated, unambiguous identity
+/// resolution and bind the signer to the ingress session or authenticated peer.
+/// Durable replay must use the returned message ID and original frame together.
+pub fn decode_and_verify_native_for_ingress(
+    frame: CommunicationValue,
+    signer: ResolvedPrincipal,
+    recipient: ResolvedPrincipal,
+    expected_destination: &IotaNodeId,
+    keyring: &Keyring,
+    options: mtp::codec::relay::RelayOpenOptions,
+) -> Result<VerifiedFederatedRelay, IdentityError> {
+    use mtp::codec::relay::{
+        open_relay_content_with_limits_without_replay,
+        open_relay_metadata_with_limits_without_replay,
+    };
+
+    if signer.principal == recipient.principal
+        || signer.handle == recipient.handle
+        || signer.principal.user_id == 0
+        || recipient.principal.user_id == 0
+        || signer.principal.user_id == recipient.principal.user_id
+        || !matches!(&recipient.home, iota_identity::PrincipalHome::Iota(home) if home == expected_destination)
+    {
+        return Err(IdentityError::InvalidDescriptor(
+            "native relay principals or destination are ambiguous".into(),
+        ));
+    }
+    let relay_error =
+        |error: mtp::codec::relay::RelayError| IdentityError::InvalidDescriptor(error.to_string());
+    let metadata = open_relay_metadata_with_limits_without_replay(
+        &frame,
+        &[keyring],
+        Some(signer.principal.user_id),
+        |id| (id == signer.principal.user_id).then(|| signer.public_keys.clone()),
+        options,
+    )
+    .map_err(relay_error)?;
+    let content = open_relay_content_with_limits_without_replay(
+        &metadata,
+        &[keyring],
+        &signer.public_keys,
+        Some(recipient.principal.user_id),
+        options,
+    )
+    .map_err(relay_error)?;
+    let map = frame.type_map().ok_or_else(|| {
+        IdentityError::InvalidDescriptor("native relay type map is missing".into())
+    })?;
+    let application = CommunicationValue::new_with_type_map(content.message_type, map)
+        .with_payload(content.content);
+    Ok(VerifiedFederatedRelay {
+        signer,
+        recipient,
+        destination: expected_destination.clone(),
+        // Native MTP uses a u128 ID, unlike Tau's string namespace.
+        message_id: format!("mtp-sealed-v1:{}", metadata.message_id().get()),
+        created_at: metadata.created_at(),
+        content: Some(application),
+        frame,
+        durable_outcome: None,
+    })
+}
+
 pub fn parse_wire(
     frame: &CommunicationValue,
 ) -> Result<tau_relay_protocol::RelayWire, IdentityError> {

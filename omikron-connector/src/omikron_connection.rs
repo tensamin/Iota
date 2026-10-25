@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod account;
+mod call_envelopes;
 mod diagnostics;
 mod discovery;
 mod dispatch;
@@ -421,6 +422,8 @@ fn load_or_migrate_keyring_at(
 
 struct ConnectionAttempt {
     generation: u64,
+    owner_omikron_id: Option<i64>,
+    owner_authority: Option<String>,
     sender: Arc<Sender>,
     responses: tau::ResponseCorrelator,
     cancellation: CancellationToken,
@@ -545,6 +548,11 @@ pub struct OmikronConnection {
 }
 
 impl OmikronConnection {
+    pub(super) fn password_connection_generation(&self) -> u64 {
+        self.bound_attempt
+            .as_ref()
+            .map_or(0, |attempt| attempt.generation)
+    }
     pub fn new(active_tasks: Arc<DashSet<String>>, app: Arc<std::sync::Mutex<AppState>>) -> Self {
         Self::with_cancellation(CancellationToken::new(), active_tasks, app)
     }
@@ -659,10 +667,25 @@ impl OmikronConnection {
         self.state_watch_tx.subscribe()
     }
 
-    fn initialize_password_auth(&self, identity: &Path) {
+    pub fn password_readiness(&self) -> crate::PasswordReadiness {
+        *self.password_auth.readiness.read().unwrap()
+    }
+
+    /// Accepted, rejected, expired and cancelled exchanges, in that order.
+    pub fn password_exchange_counts(&self) -> [u64; 4] {
+        self.password_auth.metrics.snapshot()
+    }
+
+    fn initialize_password_auth(&self, identity: &Path) -> Result<(), String> {
         if let Err(error) = self.password_auth.initialize(identity) {
             log!("Password authentication unavailable: {}", error);
+            if std::env::var("PASSWORD_AUTH_REQUIRED").as_deref() == Ok("true") {
+                return Err(format!(
+                    "required password authentication unavailable: {error}"
+                ));
+            }
         }
+        Ok(())
     }
 
     // -------------------------------------------------------------------------

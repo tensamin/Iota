@@ -47,5 +47,13 @@ pub(super) fn run_migrations_on_connection(conn: &Connection) -> Result<(), Stor
     v21_to_v30::migrate(conn, current_version)?;
     v31_to_v40::migrate(conn, current_version)?;
     v41_to_v64::migrate(conn, current_version)?;
+    crate::util::call_envelopes::epochs::migrate(conn)?;
+    for (column, definition) in [
+        ("setup_sha256", "setup_sha256 BLOB"),
+        ("password_principal", "password_principal TEXT"),
+        ("password_iota_id", "password_iota_id INTEGER"),
+    ] {
+        add_table_column_if_missing(conn, "user_password_credentials", column, definition)?;
+    }
     Ok(())
 }

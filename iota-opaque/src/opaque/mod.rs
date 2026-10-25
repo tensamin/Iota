@@ -18,7 +18,7 @@ pub use server::{
     login_finish as server_login_finish, login_start as server_login_start,
     registration_finish as server_registration_finish,
     registration_start as server_registration_start, serialize_server_setup,
-    validate_login_request,
+    validate_login_finalization, validate_login_request, validate_registration_record,
 };
 
 #[cfg(test)]

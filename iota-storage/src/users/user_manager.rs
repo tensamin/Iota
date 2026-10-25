@@ -414,6 +414,11 @@ fn purge_database_rows(user_id: i64) -> Result<(), crate::storage_error::Storage
         // principal's work merely because its remote numeric ID is the same.
         // Applied work stays applied, but cannot resume deferred recovery.
         // Guard JSON traversal without changing corrupt diagnostic bytes.
+        tx.execute("UPDATE call_epoch_envelopes SET state = 'revoked', payload = NULL WHERE local_user_id = ?1", [user_id])?;
+        tx.execute(
+            "DELETE FROM call_envelopes WHERE recipient_id = ?1",
+            [user_id],
+        )?;
         tx.execute(
             "UPDATE relay_inbox SET state = CASE WHEN state = 'applied' THEN state ELSE 'rejected' END,
              rejected_at = CASE WHEN state = 'applied' THEN rejected_at ELSE COALESCE(rejected_at, ?2) END,

@@ -44,7 +44,7 @@ impl OmikronConnection {
         &self,
         frame: &CommunicationValue,
         kind: CommunicationType,
-    ) -> Result<VerifiedProtectedMessage, String> {
+    ) -> Result<(VerifiedProtectedMessage, String, i64), String> {
         let iota_id = iota_storage::util::config_util::CONFIG
             .load()
             .iota_id
@@ -56,16 +56,17 @@ impl OmikronConnection {
             .clone()
             .ok_or("Iota has no keyring")?;
         let mut replay = CommandReplayGuard;
+        let authenticated_key = std::cell::RefCell::new(None);
         let opened = open_protected_with_checked(
             frame,
             &[keyring.as_ref()],
             None,
             |signer_id| {
                 let id = i64::try_from(signer_id).ok()?;
-                let profile = user_manager::get_user(id).ok()??;
-                Some(vec![
-                    PublicKeyBundle::from_base64(&profile.public_key).ok()?,
-                ])
+                let (key, generation) =
+                    iota_storage::users::password_credentials::authorization(id).ok()?;
+                *authenticated_key.borrow_mut() = Some((key.clone(), generation));
+                Some(vec![PublicKeyBundle::from_base64(&key).ok()?])
             },
             ProtectedOpenOptions::new(
                 Some(iota_id),
@@ -79,7 +80,10 @@ impl OmikronConnection {
         if opened.message_type() != kind {
             return Err("wrong protected command type".into());
         }
-        Ok(opened)
+        let (key, generation) = authenticated_key
+            .into_inner()
+            .ok_or("missing account key")?;
+        Ok((opened, key, generation))
     }
 
     pub(super) async fn protected_response(

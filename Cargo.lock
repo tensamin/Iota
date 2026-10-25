@@ -2459,6 +2459,7 @@ dependencies = [
  "fs2",
  "iota-identity",
  "iota-logger",
+ "iota-opaque",
  "iota-paths",
  "iota-util",
  "json",
@@ -2474,6 +2475,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -5433,6 +5436,7 @@ dependencies = [
  "atomic",
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

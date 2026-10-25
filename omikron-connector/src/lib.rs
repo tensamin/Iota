@@ -9,3 +9,4 @@ pub mod user_ops;
 
 pub use client::{OmikronClient, OmikronError, OmikronStartupError};
 pub use omikron_connection::{OmikronConnection, ShutdownOutcome};
+pub use password::PasswordReadiness;

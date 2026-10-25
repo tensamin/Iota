@@ -73,9 +73,15 @@ impl OmikronConnection {
             };
         }
 
+        if iota_connection::relay::is_call_key_envelope_request(&cv) {
+            self.handle_call_key_envelope(&cv).await;
+            return;
+        }
+
         dispatch!(GetChatSecret, handle_get_chat_secret);
         dispatch!(TAuthAuthorize, handle_tauth_authorize);
         dispatch!(PasswordEnrollmentStart, handle_password_enrollment_start);
+        dispatch!(ProvisioningCancel, handle_password_provisioning_abort);
         dispatch!(PasswordEnrollmentFinish, handle_password_enrollment_finish);
         dispatch!(PasswordEnrollmentStatus, handle_password_enrollment_status);
         dispatch!(

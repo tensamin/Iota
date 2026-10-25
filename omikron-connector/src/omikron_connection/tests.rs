@@ -17,7 +17,7 @@ async fn damaged_password_setup_does_not_invalidate_iota_identity() {
         Arc::new(std::sync::Mutex::new(AppState::new())),
     );
     *connection.keyring.write().await = Some(identity.keyring());
-    connection.initialize_password_auth(&identity_path);
+    connection.initialize_password_auth(&identity_path).unwrap();
     assert!(connection.keyring.read().await.is_some());
     assert!(connection.password_auth.setup().is_err());
     assert_eq!(
@@ -498,6 +498,8 @@ async fn reconnect_isolates_waiters_and_old_handler_sends() {
     let attempt = |generation, sender: Sender| {
         Arc::new(ConnectionAttempt {
             generation,
+            owner_omikron_id: Some(1),
+            owner_authority: Some(format!("omikron-key:{}", "a".repeat(64))),
             sender: Arc::new(sender),
             responses: tau::ResponseCorrelator::new(),
             cancellation: CancellationToken::new(),

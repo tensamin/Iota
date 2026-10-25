@@ -178,3 +178,224 @@ async fn desktop_fixture_obeys_selected_federation_format() {
         std::fs::read(path).expect("generate the actual desktop fixture with relay_interop first");
     verify_fixture(&fixture, "desktop-federated_relay-sign").await;
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeClientFixture {
+    producer: String,
+    sdk: String,
+    frame: String,
+    signer_public_key: String,
+    node_keys: [String; 2],
+    chat_id: String,
+    secret_id: String,
+    encrypted_secrets: [String; 2],
+    kem_ciphertexts: [String; 2],
+}
+
+#[test]
+fn pinned_native_client_metadata_and_content_open_at_both_iotas() {
+    use iota_connection::federated_relay::decode_and_verify_native_for_ingress;
+    use mtp::codec::{CommunicationType, ProtectionPolicy, relay::RelayOpenOptions};
+
+    let fixture: NativeClientFixture =
+        serde_json::from_slice(include_bytes!("fixtures/relay_native_client.json")).unwrap();
+    assert_eq!(fixture.producer, "pinned-MTPClient.sendSealedRelay");
+    assert_eq!(
+        fixture.sdk,
+        "https://github.com/nonanium/MTP/releases/download/0.4.0-dev-b678361/mtp-0.4.0.tgz"
+    );
+    let nodes = fixture.node_keys.map(|key| {
+        LocalNodeIdentity::from_keyring(
+            Keyring::from_bytes(&STANDARD.decode(key).unwrap()).unwrap(),
+        )
+        .unwrap()
+    });
+    let signer_key = PublicKeyBundle::from_base64(&fixture.signer_public_key).unwrap();
+    let principal = |user_id, handle, home, keys| ResolvedPrincipal {
+        principal: PrincipalId {
+            authority: AuthorityId::new("omega:central").unwrap(),
+            user_id,
+        },
+        handle: PrincipalHandle(handle),
+        username: None,
+        public_keys: keys,
+        home: PrincipalHome::Iota(home),
+        descriptor_revision: 1,
+        valid_until: None,
+        resolved_at: 0,
+    };
+    let signer = principal(11, 91, nodes[0].node_id().clone(), vec![signer_key]);
+    let recipient = principal(22, 92, nodes[1].node_id().clone(), Vec::new());
+    let map = TypeMap::new(mtp::type_map::Version::parse("1.0").unwrap());
+    let bytes = STANDARD.decode(&fixture.frame).unwrap();
+    let frame = CommunicationValue::try_from_bytes_with(&bytes, &map).unwrap();
+    assert!(frame.payload().as_encrypted().is_some());
+    // Native sealed relays are not the frozen JSON Relay V2 format.
+    assert!(iota_connection::federated_relay::parse_wire(&frame).is_err());
+    let options = RelayOpenOptions::new(ProtectionPolicy::ed25519());
+    let mut message_id = None;
+    for node in &nodes {
+        let opened = decode_and_verify_native_for_ingress(
+            frame.clone(),
+            signer.clone(),
+            recipient.clone(),
+            nodes[1].node_id(),
+            &node.keyring(),
+            options,
+        )
+        .unwrap();
+        assert_eq!(opened.frame.to_bytes().unwrap(), bytes);
+        assert!(opened.message_id.starts_with("mtp-sealed-v1:"));
+        if let Some(expected) = &message_id {
+            assert_eq!(&opened.message_id, expected);
+        } else {
+            message_id = Some(opened.message_id.clone());
+        }
+        let application = opened.content.unwrap();
+        assert!(application.is_type(CommunicationType::SetChatSecret));
+        assert_eq!(
+            application
+                .get_data(DataType::ChatId)
+                .and_then(DataValue::as_str),
+            Some(fixture.chat_id.as_str())
+        );
+        assert_eq!(
+            application
+                .get_data(DataType::SecretId)
+                .and_then(DataValue::as_str),
+            Some(fixture.secret_id.as_str())
+        );
+        let copies = application
+            .get_data(DataType::Recipients)
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(copies.len(), 2);
+        for (index, copy) in copies.iter().enumerate() {
+            let field = |kind: DataType| copy.get_field(kind.try_to_id(&map).unwrap());
+            assert_eq!(
+                field(DataType::EncryptedSecret)
+                    .unwrap()
+                    .as_bytes()
+                    .unwrap(),
+                STANDARD.decode(&fixture.encrypted_secrets[index]).unwrap()
+            );
+            assert_eq!(
+                field(DataType::KemCiphertext).unwrap().as_bytes().unwrap(),
+                STANDARD.decode(&fixture.kem_ciphertexts[index]).unwrap()
+            );
+        }
+    }
+    assert!(
+        decode_and_verify_native_for_ingress(
+            frame.clone(),
+            signer.clone(),
+            recipient.clone(),
+            nodes[1].node_id(),
+            &Keyring::generate(),
+            options,
+        )
+        .is_err()
+    );
+    assert!(
+        decode_and_verify_native_for_ingress(
+            frame.clone(),
+            signer.clone(),
+            recipient.clone(),
+            nodes[0].node_id(),
+            &nodes[0].keyring(),
+            options,
+        )
+        .is_err()
+    );
+    assert!(
+        decode_and_verify_native_for_ingress(
+            frame.clone(),
+            recipient.clone(),
+            signer.clone(),
+            nodes[0].node_id(),
+            &nodes[0].keyring(),
+            options,
+        )
+        .is_err()
+    );
+    let mut forged_signer = signer.clone();
+    forged_signer.principal.user_id = 33;
+    assert!(
+        decode_and_verify_native_for_ingress(
+            frame.clone(),
+            forged_signer,
+            recipient.clone(),
+            nodes[1].node_id(),
+            &nodes[0].keyring(),
+            options,
+        )
+        .is_err()
+    );
+    let mut forged_recipient = recipient.clone();
+    forged_recipient.principal.user_id = 33;
+    assert!(
+        decode_and_verify_native_for_ingress(
+            frame.clone(),
+            signer.clone(),
+            forged_recipient,
+            nodes[1].node_id(),
+            &nodes[0].keyring(),
+            options,
+        )
+        .is_err()
+    );
+    let mut bounded = options;
+    bounded.decode_limits.max_blob_size = 1;
+    assert!(
+        decode_and_verify_native_for_ingress(
+            frame.clone(),
+            signer.clone(),
+            recipient.clone(),
+            nodes[1].node_id(),
+            &nodes[0].keyring(),
+            bounded,
+        )
+        .is_err()
+    );
+    // A stricter configured policy must not inherit the SDK's Ed25519 default.
+    assert!(
+        decode_and_verify_native_for_ingress(
+            frame.clone(),
+            signer.clone(),
+            recipient.clone(),
+            nodes[1].node_id(),
+            &nodes[0].keyring(),
+            RelayOpenOptions::new(ProtectionPolicy::dual()),
+        )
+        .is_err()
+    );
+    let mut wrong_keys = signer.clone();
+    wrong_keys.public_keys = vec![Keyring::generate().public_key_bundle()];
+    assert!(
+        decode_and_verify_native_for_ingress(
+            frame,
+            wrong_keys,
+            recipient.clone(),
+            nodes[1].node_id(),
+            &nodes[0].keyring(),
+            options,
+        )
+        .is_err()
+    );
+    let mut tampered = bytes;
+    *tampered.last_mut().unwrap() ^= 1;
+    let tampered = CommunicationValue::try_from_bytes_with(&tampered, &map).unwrap();
+    assert!(
+        decode_and_verify_native_for_ingress(
+            tampered,
+            signer,
+            recipient,
+            nodes[1].node_id(),
+            &nodes[0].keyring(),
+            options,
+        )
+        .is_err()
+    );
+}

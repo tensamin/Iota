@@ -8,13 +8,45 @@ use dashmap::DashMap;
 use iota_opaque::opaque::{self, PasswordServerSetup, ServerLoginState};
 use iota_storage::users::password_credentials;
 use mtp::crypto::PublicKeyBundle;
+use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordReadiness {
+    SetupUnavailable,
+    Initialized,
+    LegacyUnverified,
+    StorageValidationFailure,
+    ReenrollmentRequired,
+}
+
+#[derive(Default)]
+pub(crate) struct PasswordMetrics {
+    pub(super) accepted: std::sync::atomic::AtomicU64,
+    pub(super) rejected: std::sync::atomic::AtomicU64,
+    pub(super) expired: std::sync::atomic::AtomicU64,
+    pub(super) cancelled: std::sync::atomic::AtomicU64,
+}
+
+impl PasswordMetrics {
+    pub(crate) fn snapshot(&self) -> [u64; 4] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            self.accepted.load(Relaxed),
+            self.rejected.load(Relaxed),
+            self.expired.load(Relaxed),
+            self.cancelled.load(Relaxed),
+        ]
+    }
+}
+
 pub(super) struct PendingLogin {
+    pub(super) connection_generation: u64,
     pub(super) user_id: i64,
     pub(super) participant_id: u64,
     pub(super) contact_key: PublicKeyBundle,
+    pub(super) advertised_account_key: Option<Vec<u8>>,
     pub(super) state: Option<ServerLoginState>,
     pub(super) real_record: bool,
     pub(super) record_hash: Option<Vec<u8>>,
@@ -23,6 +55,8 @@ pub(super) struct PendingLogin {
 }
 
 pub(super) struct PendingEnrollment {
+    pub(super) public_key: String,
+    pub(super) authorization_generation: i64,
     pub(super) user_id: i64,
     pub(super) created: Instant,
     pub(super) _permit: OwnedSemaphorePermit,
@@ -88,6 +122,8 @@ impl Drop for AttemptLease {
 }
 
 pub(crate) struct PasswordAuthRuntime {
+    pub(crate) metrics: PasswordMetrics,
+    pub(crate) readiness: std::sync::RwLock<PasswordReadiness>,
     pub(super) setup: OnceLock<Arc<PasswordServerSetup>>,
     pub(super) omega_authority: OnceLock<String>,
     pub(super) logins: DashMap<Uuid, PendingLogin>,
@@ -98,27 +134,39 @@ pub(crate) struct PasswordAuthRuntime {
     exchange_slots: Arc<Semaphore>,
     enrollment_slots: Arc<Semaphore>,
     blocking_slots: Arc<Semaphore>,
+    per_account_limit: u32,
+    malformed_requests: std::sync::Mutex<(Instant, u32)>,
     pub(super) pending_ttl: Duration,
     pub(super) throttle: PasswordThrottleConfig,
 }
 
-fn configured_positive<T: std::str::FromStr + PartialOrd + Default>(name: &str, default: T) -> T {
+fn configured_positive<T: std::str::FromStr + PartialOrd + Default + Copy>(
+    name: &str,
+    default: T,
+    maximum: T,
+) -> T {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<T>().ok())
-        .filter(|value| *value > T::default())
+        .filter(|value| *value > T::default() && *value <= maximum)
         .unwrap_or(default)
 }
 
 impl Default for PasswordAuthRuntime {
     fn default() -> Self {
-        let max_pending = configured_positive("PASSWORD_MAX_PENDING_EXCHANGES", 1024);
+        let max_pending = configured_positive("PASSWORD_MAX_PENDING_EXCHANGES", 1024, 16384);
         let blocking_workers = configured_positive(
             "PASSWORD_MAX_BLOCKING_WORKERS",
-            std::thread::available_parallelism().map_or(1, usize::from),
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(256),
+            256,
         )
         .min(max_pending);
         Self {
+            metrics: PasswordMetrics::default(),
+            malformed_requests: std::sync::Mutex::new((Instant::now(), 0)),
+            readiness: std::sync::RwLock::new(PasswordReadiness::SetupUnavailable),
             setup: OnceLock::new(),
             omega_authority: OnceLock::new(),
             logins: DashMap::new(),
@@ -129,22 +177,26 @@ impl Default for PasswordAuthRuntime {
             exchange_slots: Arc::new(Semaphore::new(max_pending)),
             enrollment_slots: Arc::new(Semaphore::new(max_pending)),
             blocking_slots: Arc::new(Semaphore::new(blocking_workers)),
-            pending_ttl: Duration::from_secs(configured_positive(
-                "PASSWORD_PENDING_TTL_SECONDS",
-                180,
-            )),
+            per_account_limit: configured_positive("PASSWORD_MAX_ACCOUNT_EXCHANGES", 4, 64)
+                .min((max_pending / 4).max(1) as u32),
+            pending_ttl: Duration::from_secs(
+                configured_positive("PASSWORD_PENDING_TTL_SECONDS", 180, 600).max(60),
+            ),
             throttle: PasswordThrottleConfig {
                 failure_window: Duration::from_secs(configured_positive(
                     "PASSWORD_ATTEMPT_WINDOW_SECONDS",
                     300,
+                    3600,
                 )),
                 soft_delay_step: Duration::from_millis(configured_positive(
                     "PASSWORD_SOFT_DELAY_STEP_MS",
                     250,
+                    1000,
                 )),
                 soft_delay_cap: Duration::from_millis(configured_positive(
                     "PASSWORD_SOFT_DELAY_CAP_MS",
                     3000,
+                    5000,
                 )),
             },
         }
@@ -152,6 +204,38 @@ impl Default for PasswordAuthRuntime {
 }
 
 impl PasswordAuthRuntime {
+    pub(super) fn malformed_budget_available(&self) -> bool {
+        let mut state = self.malformed_requests.lock().unwrap();
+        if state.0.elapsed() >= Duration::from_secs(60) {
+            *state = (Instant::now(), 0);
+        }
+        state.1 < 128
+    }
+
+    pub(super) fn malformed_request(&self) {
+        self.malformed_requests.lock().unwrap().1 += 1;
+        self.metrics
+            .rejected
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(super) fn abort_login(&self, id: Uuid, user_id: i64, participant_id: u64, generation: u64) {
+        if let Some((_, mut pending)) = self.logins.remove_if(&id, |_, pending| {
+            pending.user_id == user_id
+                && pending.participant_id == participant_id
+                && pending.connection_generation == generation
+        }) {
+            self.metrics
+                .cancelled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(attempt) = pending.attempt.take() {
+                if pending.state.is_some() {
+                    attempt.failure();
+                } else {
+                    attempt.cancel();
+                }
+            }
+        }
+    }
     pub(super) fn begin_enrollment(&self) -> Result<OwnedSemaphorePermit, String> {
         self.enrollment_slots
             .clone()
@@ -163,12 +247,13 @@ impl PasswordAuthRuntime {
         &self,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, String> {
-        let permit = self
-            .blocking_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|error| error.to_string())?;
+        let permit = tokio::time::timeout(
+            Duration::from_secs(2),
+            self.blocking_slots.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| "password worker queue timed out".to_owned())?
+        .map_err(|error| error.to_string())?;
         tokio::task::spawn_blocking(move || {
             // Keep capacity reserved even if the awaiting task is cancelled.
             let _permit = permit;
@@ -179,6 +264,9 @@ impl PasswordAuthRuntime {
     }
 
     pub(crate) fn setup(&self) -> Result<Arc<PasswordServerSetup>, PasswordRuntimeError> {
+        if *self.readiness.read().unwrap() == PasswordReadiness::StorageValidationFailure {
+            return Err(PasswordRuntimeError::SetupUnavailable);
+        }
         self.setup
             .get()
             .cloned()
@@ -187,7 +275,7 @@ impl PasswordAuthRuntime {
 
     pub(crate) fn initialize(&self, identity: &Path) -> Result<(), String> {
         if self.setup.get().is_some() {
-            return Ok(());
+            return self.validate_storage();
         }
         let path = identity.with_file_name("password-auth.setup");
         let setup = match std::fs::read(&path) {
@@ -195,7 +283,10 @@ impl PasswordAuthRuntime {
                 opaque::deserialize_server_setup_owned(bytes).map_err(|error| error.to_string())?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if password_credentials::any().map_err(|error| error.to_string())? {
+                if password_credentials::any().map_err(|error| {
+                    *self.readiness.write().unwrap() = PasswordReadiness::StorageValidationFailure;
+                    error.to_string()
+                })? {
                     return Err("OPAQUE setup is missing while password credentials exist".into());
                 }
                 let setup = opaque::generate_server_setup();
@@ -206,8 +297,41 @@ impl PasswordAuthRuntime {
             }
             Err(error) => return Err(error.to_string()),
         };
+        let fingerprint = Sha256::digest(opaque::serialize_server_setup(&setup).as_slice());
+        let verified =
+            password_credentials::validate_setup_binding(&fingerprint).map_err(|error| {
+                *self.readiness.write().unwrap() = PasswordReadiness::StorageValidationFailure;
+                error.to_string()
+            })?;
+        *self.readiness.write().unwrap() = if verified {
+            PasswordReadiness::Initialized
+        } else {
+            PasswordReadiness::LegacyUnverified
+        };
         let _ = self.setup.set(Arc::new(setup));
         Ok(())
+    }
+
+    pub(super) fn validate_storage(&self) -> Result<(), String> {
+        let setup = self.setup.get().ok_or("OPAQUE setup unavailable")?;
+        let fingerprint = Sha256::digest(opaque::serialize_server_setup(setup).as_slice());
+        match password_credentials::validate_setup_binding(&fingerprint) {
+            Ok(verified) => {
+                let mut readiness = self.readiness.write().unwrap();
+                if *readiness != PasswordReadiness::ReenrollmentRequired {
+                    *readiness = if verified {
+                        PasswordReadiness::Initialized
+                    } else {
+                        PasswordReadiness::LegacyUnverified
+                    };
+                }
+                Ok(())
+            }
+            Err(error) => {
+                *self.readiness.write().unwrap() = PasswordReadiness::StorageValidationFailure;
+                Err(error.to_string())
+            }
+        }
     }
 
     pub(crate) fn prune(&self) {
@@ -222,6 +346,9 @@ impl PasswordAuthRuntime {
             if let Some((_, pending)) = self.logins.remove(&id)
                 && let Some(attempt) = pending.attempt
             {
+                self.metrics
+                    .expired
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 attempt.failure();
             }
         }
@@ -240,7 +367,12 @@ impl PasswordAuthRuntime {
             .exchange_slots
             .clone()
             .try_acquire_owned()
-            .map_err(|_| AttemptAdmissionError::ServerBusy)?;
+            .map_err(|_| {
+                self.metrics
+                    .rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                AttemptAdmissionError::ServerBusy
+            })?;
         let mut state = self
             .attempts
             .entry(user_id)
@@ -253,6 +385,15 @@ impl PasswordAuthRuntime {
             state.window_started = Instant::now();
             state.failures = 0;
         }
+        if state.in_flight >= self.per_account_limit {
+            self.metrics
+                .rejected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(AttemptAdmissionError::ServerBusy);
+        }
+        self.metrics
+            .accepted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         state.in_flight = state.in_flight.saturating_add(1);
         let pressure = state
             .failures

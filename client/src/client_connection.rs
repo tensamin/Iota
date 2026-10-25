@@ -119,6 +119,16 @@ impl ClientConnection {
         }
         log_cv_in!(&cv);
 
+        if iota_connection::relay::is_call_key_envelope_request(&cv)
+            || cv.is_type(CommunicationType::CallEnvelopeStore)
+            || cv.is_type(CommunicationType::CallEnvelopeGet)
+        {
+            let _ = self
+                .send_message(&error_response(&cv, CommunicationType::ErrorInvalidData))
+                .await;
+            return;
+        }
+
         if !cv.is_type(CommunicationType::Relay)
             && cv
                 .id()

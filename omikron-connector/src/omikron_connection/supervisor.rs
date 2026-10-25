@@ -246,7 +246,7 @@ impl OmikronConnection {
                 .map_err(|error| format!("Iota identity initialization failed: {error}"))?;
             let keyring = identity.keyring();
             *self.keyring.write().await = Some(keyring.clone());
-            self.initialize_password_auth(identity_path());
+            self.initialize_password_auth(identity_path())?;
 
             let existing_iota_id = CONFIG.load().iota_id;
 
@@ -324,6 +324,8 @@ impl OmikronConnection {
             };
         let attempt = Arc::new(ConnectionAttempt {
             generation,
+            owner_omikron_id: endpoint.id,
+            owner_authority: call_envelopes::owner_authority(&endpoint.public_key),
             sender: Arc::new(connection.sender.clone()),
             responses: tau::ResponseCorrelator::new(),
             cancellation: self.cancellation.child_token(),

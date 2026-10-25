@@ -12,6 +12,7 @@ iota-identity = { path = "../iota-identity" }
 iota-logger = { path = "../iota-logger" }
 iota-util = { path = "../iota-util" }
 iota-paths = { path = "../iota-paths" }
+iota-opaque = { path = "../iota-opaque" }
 base64 = "0.22.1"
 json = "*"
 arc-swap = "1"
@@ -19,11 +20,13 @@ once_cell = "1.21.3"
 r2d2 = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+uuid = { version = "1", features = ["serde", "v4"] }
 serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "2"
+zeroize = "1"
 rand = "0.8"
-rusqlite = "0.40.0"
+rusqlite = { version = "0.40.0", features = ["backup"] }
 fs2 = "0.4.3"
 tokio = { version = "1.50.0", features = ["full"] }
 

@@ -60,6 +60,18 @@ pub fn validate_login_request(request: &[u8]) -> Result<(), OpaqueIntegrationErr
         .map_err(|error| OpaqueIntegrationError::Opaque(error.to_string()))
 }
 
+pub fn validate_registration_record(record: &[u8]) -> Result<(), OpaqueIntegrationError> {
+    ServerRegistration::<OpaqueProfileV1>::deserialize(record)
+        .map(|_| ())
+        .map_err(|error| OpaqueIntegrationError::Opaque(error.to_string()))
+}
+
+pub fn validate_login_finalization(message: &[u8]) -> Result<(), OpaqueIntegrationError> {
+    CredentialFinalization::<OpaqueProfileV1>::deserialize(message)
+        .map(|_| ())
+        .map_err(|error| OpaqueIntegrationError::Opaque(error.to_string()))
+}
+
 /// Secret pending exchange state. Consumed by server_login_finish.
 pub struct ServerLoginState {
     // opaque-ke's ServerLogin zeroizes its secret state on drop.

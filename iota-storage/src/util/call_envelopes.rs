@@ -1,7 +1,10 @@
 use crate::{storage_error::StorageError, util::db};
 use rusqlite::{OptionalExtension, params};
 
+pub mod epochs;
+
 pub fn remove_expired(now: i64) -> Result<usize, StorageError> {
+    epochs::expire(now)?;
     db::with_db(
         |conn| Ok(conn.execute("DELETE FROM call_envelopes WHERE expires_at <= ?1", [now])?),
     )
@@ -39,6 +42,14 @@ pub struct CallEnvelope {
 
 pub fn store(envelope: &CallEnvelope, now: i64) -> Result<bool, StorageError> {
     db::with_immediate_transaction(|tx| {
+        if legacy_revoked(
+            tx,
+            envelope.recipient_id,
+            &envelope.call_id,
+            envelope.owner_omikron_id,
+        )? {
+            return Ok(false);
+        }
         tx.execute("DELETE FROM call_envelopes WHERE expires_at <= ?1", [now])?;
         #[expect(clippy::type_complexity, reason = "tuple matches the selected database columns")]
         let existing: Option<(i64, i64, i64, String, i64, Vec<u8>, Vec<u8>, String)> = tx.query_row(
@@ -71,6 +82,9 @@ pub fn get(
     now: i64,
 ) -> Result<Option<CallEnvelope>, StorageError> {
     db::with_db(|conn| {
+        if legacy_revoked(conn, recipient_id, call_id, owner)? {
+            return Ok(None);
+        }
         conn.query_row(
             "SELECT recipient_id, call_id, owner_omikron_id, inviter_id, created_at, expires_at, secret_id, version_number, encrypted_secret, kem_ciphertext, wrapping_scheme FROM call_envelopes WHERE recipient_id = ?1 AND call_id = ?2 AND owner_omikron_id = ?3 AND expires_at > ?4",
             params![recipient_id, call_id, owner, now],
@@ -79,4 +93,21 @@ pub fn get(
             }),
         ).optional().map_err(Into::into)
     })
+}
+
+fn legacy_revoked(
+    conn: &rusqlite::Connection,
+    recipient: i64,
+    call_id: &str,
+    owner: i64,
+) -> Result<bool, StorageError> {
+    let Ok(id) = uuid::Uuid::parse_str(call_id) else {
+        return Ok(false);
+    };
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM call_epoch_envelopes WHERE call_id = ?1
+        AND local_user_id = ?2 AND owner_omikron_id = ?3 AND epoch = 0 AND state = 'revoked')",
+        params![id.to_string(), recipient, owner],
+        |row| row.get(0),
+    )?)
 }
