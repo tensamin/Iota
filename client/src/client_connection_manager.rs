@@ -1,3 +1,4 @@
+mod chat_secret_notifications;
 mod delivery;
 mod identity;
 use delivery::authorized_hosted_frame;
@@ -48,6 +49,7 @@ struct HostedConnection {
     sender: mtp::webserver::WebMtpSender,
     responses: tau::ResponseCorrelator,
     delivery_ready: tokio::sync::Notify,
+    secret_ready: tokio::sync::Notify,
     state_applied: std::sync::atomic::AtomicBool,
 }
 
@@ -300,6 +302,7 @@ impl ClientConnectionManager {
                 sender: connection.sender.clone(),
                 responses: tau::ResponseCorrelator::new(),
                 delivery_ready: tokio::sync::Notify::new(),
+                secret_ready: tokio::sync::Notify::new(),
                 state_applied: std::sync::atomic::AtomicBool::new(false),
             });
             self.active
@@ -311,6 +314,8 @@ impl ClientConnectionManager {
         let (session, active) = session;
         let pending_delivery = self.deliver_pending(&session, &active, &shutdown);
         tokio::pin!(pending_delivery);
+        let secret_delivery = self.deliver_chat_secret_notifications(&session, &active, &shutdown);
+        tokio::pin!(secret_delivery);
         // Removing connection-local state on cancellation does not roll back
         // application operations that already committed.
         'receive: loop {
@@ -318,6 +323,7 @@ impl ClientConnectionManager {
                 biased;
                 _ = shutdown.cancelled() => break,
                 _ = &mut pending_delivery => break,
+                _ = &mut secret_delivery => break,
                 frame = connection.receive() => match frame { Ok(frame) => frame, Err(_) => break },
             };
             let valid = tokio::select! {
@@ -345,10 +351,20 @@ impl ClientConnectionManager {
                 || frame.is_type(CommunicationType::GetChatSecret)
                 || frame.is_type(CommunicationType::GetChats);
             let account_applied = frame.is_type(CommunicationType::AccountStateApplied);
-            for response in self
-                .handle(&current_session, &verified_key, &shutdown, frame)
-                .await
-            {
+            let handling = self.handle(&current_session, &verified_key, &shutdown, frame);
+            tokio::pin!(handling);
+            let responses = tokio::select! {
+                responses = &mut handling => responses,
+                _ = &mut secret_delivery => {
+                    handling.await;
+                    break 'receive;
+                },
+                _ = &mut pending_delivery => {
+                    handling.await;
+                    break 'receive;
+                },
+            };
+            for response in responses {
                 if private_read
                     && !response
                         .get_comm_type_enum()
@@ -374,6 +390,7 @@ impl ClientConnectionManager {
                         .state_applied
                         .store(true, std::sync::atomic::Ordering::Release);
                     active.delivery_ready.notify_one();
+                    active.secret_ready.notify_one();
                 }
             }
         }
@@ -494,7 +511,9 @@ impl ClientConnectionManager {
             return vec![message_handlers::handle_message_get(&frame)];
         }
         if frame.is_type(CommunicationType::GetChatSecret) {
-            return vec![message_handlers::handle_get_chat_secret(&frame)];
+            return vec![
+                iota_connection::chat_secret_recovery::handle_get_chat_secret(&frame).await,
+            ];
         }
         if frame.is_type(CommunicationType::GetChats) {
             return vec![message_handlers::handle_get_chats(&frame)];
@@ -526,6 +545,7 @@ impl other_iota::LocalDeliverySink for ClientConnectionManager {
                 continue;
             }
             connection.delivery_ready.notify_one();
+            connection.secret_ready.notify_one();
         }
     }
 }

@@ -124,6 +124,9 @@ fn now_millis() -> i64 {
 #[async_trait]
 pub trait DirectPeerConnection: Send + Sync {
     async fn send_relay(&self, frame: CommunicationValue) -> Result<RouteOutcome, RouteError>;
+    async fn send_peer_control(&self, _frame: CommunicationValue) -> Result<CommunicationValue, RouteError> {
+        Err(RouteError::Delivery("direct peer control is unsupported".into()))
+    }
     fn authenticated_key(&self) -> Option<PublicKeyBundle> {
         None
     }
@@ -137,6 +140,7 @@ pub struct DirectPeerRouter {
     peers: RwLock<HashMap<IotaNodeId, RegisteredDirectPeer>>,
     next_registration: AtomicU64,
     manager: RwLock<Option<Weak<PeerManager>>>,
+    recovery: RwLock<Option<Weak<dyn iota_connection::chat_secret_recovery::PeerRecoveryHandler>>>,
 }
 
 #[async_trait]
@@ -164,6 +168,7 @@ pub struct PeerManager {
     authority_resolver: Option<Arc<RemoteIotaResolver>>,
     last_authentication_error: std::sync::Mutex<Option<String>>,
     dials: std::sync::Mutex<HashMap<IotaNodeId, tokio::sync::watch::Receiver<DialState>>>,
+    recovery: RwLock<Option<Arc<dyn iota_connection::chat_secret_recovery::PeerRecoveryHandler>>>,
 }
 
 /// A checked directory/admission snapshot. Provisional trust is not permission

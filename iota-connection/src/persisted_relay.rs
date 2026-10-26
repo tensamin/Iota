@@ -17,6 +17,10 @@ enum StoredPreparedRelay {
 
 #[derive(Serialize, Deserialize)]
 struct PreparedRelayV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin_lease: Option<crate::prepared_relay::OriginLease>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret_escrow: Option<iota_storage::util::chat_secret_recovery::Escrow>,
     signer: i64,
     recipient: i64,
     message_id: String,
@@ -199,6 +203,8 @@ macro_rules! convert_operation {
 impl From<PreparedRelayOperation> for PreparedRelayV1 {
     fn from(value: PreparedRelayOperation) -> Self {
         Self {
+            origin_lease: value.origin_lease,
+            secret_escrow: value.secret_escrow,
             signer: value.signer.0,
             recipient: value.recipient.0,
             message_id: value.message_id,
@@ -253,6 +259,8 @@ impl TryFrom<PreparedRelayV1> for PreparedRelayOperation {
     type Error = StorageError;
     fn try_from(value: PreparedRelayV1) -> Result<Self, Self::Error> {
         let operation = Self {
+            origin_lease: value.origin_lease,
+            secret_escrow: value.secret_escrow,
             signer: PrincipalHandle(value.signer),
             recipient: PrincipalHandle(value.recipient),
             message_id: value.message_id,
@@ -346,6 +354,79 @@ pub(crate) fn validate_persisted_operation_identity(
     operation: &PreparedRelayOperation,
 ) -> Result<(), StorageError> {
     let p = operation;
+    p.validate_origin_lease()?;
+    if let Some(escrow) = &p.secret_escrow {
+        escrow.validate()?;
+        let ApplicationOperation::SetChatSecret {
+            chat_id,
+            version,
+            wrapping_scheme,
+            sender,
+            recipient,
+            ..
+        } = &p.operation
+        else {
+            return Err(invalid("unexpected persisted escrow"));
+        };
+        let signer = crate::federated_relay::canonical_principal(&p.signer_identity)
+            .map_err(|_| invalid("persisted escrow signer"))?;
+        let destination = crate::federated_relay::canonical_principal(&p.recipient_identity)
+            .map_err(|_| invalid("persisted escrow recipient"))?;
+        let signed = escrow
+            .envelopes
+            .iter()
+            .find(|copy| copy.owner == signer)
+            .ok_or_else(|| invalid("persisted escrow signer"))?;
+        let received = escrow
+            .envelopes
+            .iter()
+            .find(|copy| copy.owner == destination)
+            .ok_or_else(|| invalid("persisted escrow recipient"))?;
+        if escrow.signer != signer
+            || escrow.original_type_map_version != p.type_map_version
+            || escrow.message_id != p.message_id
+            || escrow.version != *version
+            || escrow.created_at != p.created_at as i64
+            || escrow.namespace.chat_id != *chat_id
+            || escrow.namespace.secret_id != tau_relay_protocol::chat_secret_id(chat_id)
+            || escrow.wrapping_scheme != *wrapping_scheme
+            || signed.encrypted_secret != sender.encrypted_secret
+            || signed.kem_ciphertext != sender.kem_ciphertext
+            || received.encrypted_secret != recipient.encrypted_secret
+            || received.kem_ciphertext != recipient.kem_ciphertext
+        {
+            return Err(invalid("persisted escrow operation mismatch"));
+        }
+        let map = mtp::codec::TypeMap::new(
+            mtp::type_map::Version::parse(&p.type_map_version)
+                .ok_or_else(|| invalid("persisted escrow type map"))?,
+        );
+        if mtp::codec::CommunicationType::SetChatSecret
+            .try_to_id(&map)
+            .is_none()
+        {
+            return Err(invalid("unsupported persisted original type map"));
+        }
+        let frame = mtp::codec::CommunicationValue::from_bytes_with(&escrow.original_frame, &map)
+            .map_err(|_| invalid("persisted original frame"))?;
+        if frame
+            .clone()
+            .without_id()
+            .to_bytes()
+            .map_err(|_| invalid("persisted original frame"))?
+            != p.frame
+        {
+            return Err(invalid("persisted escrow frame mismatch"));
+        }
+        let format = if crate::federated_relay::parse_wire(&frame).is_ok() {
+            iota_storage::util::chat_secret_recovery::RelayFormat::TauSignedRelayV1
+        } else {
+            iota_storage::util::chat_secret_recovery::RelayFormat::NativeMtpSealedV1
+        };
+        if escrow.format != format {
+            return Err(invalid("persisted escrow format mismatch"));
+        }
+    }
     if p.signer.0 <= 0
         || p.recipient.0 <= 0
         || p.signer == p.recipient
@@ -460,6 +541,7 @@ pub(crate) fn migrate_on(connection: &Connection) -> Result<(), StorageError> {
                     let matches: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM principals WHERE principal_pk = ?1 AND authority_id = ?2 AND remote_user_id = ?3)", params![handle.0, identity.authority, identity.user_id as i64], |r| r.get(0))?;
                     if !matches { return Err(invalid("persisted relay principal mapping")); }
                 }
+                backfill_escrow_on(connection,&p,&bytes,generation,&state)?;
                 encode_prepared_operation(&p)
             });
             match converted {
@@ -490,10 +572,251 @@ pub(crate) fn migrate_on(connection: &Connection) -> Result<(), StorageError> {
     }
 }
 
+/// Only retained verified operations carrying both originals and their exact
+/// original signed frame are eligible. Legacy DTOs without that proof stay
+/// unavailable. Never derive the other recipient copy from chat_secrets.
+fn backfill_escrow_on(
+    connection: &Connection,
+    operation: &PreparedRelayOperation,
+    observed: &[u8],
+    generation: i64,
+    state: &str,
+) -> Result<(), StorageError> {
+    use iota_storage::util::{chat_secret_recovery as recovery, relay_work};
+    let Some(escrow) = &operation.secret_escrow else {
+        return Ok(());
+    };
+    if !matches!(state, "applied" | "queued" | "delivered") {
+        return Ok(());
+    }
+    let tx = connection.unchecked_transaction()?;
+    let matches:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM relay_inbox WHERE signer_principal=?1 AND message_id=?2 AND prepared_operation=?3 AND processing_generation=?4 AND state=?5 AND recovery_status!='blocked')",params![operation.signer.0,operation.message_id,observed,generation,state],|row| row.get(0))?;
+    if !matches {
+        return Ok(());
+    }
+    for effect in &operation.effects {
+        if let Err(error) = relay_work::verify_owner_in_tx(&tx, effect.owner.0, effect.principal) {
+            if matches!(error, StorageError::RelayOwnerUnavailable) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        if effect.sent_by_self
+            && matches!(operation.delivery, DeliveryTarget::Remote(_))
+            && state != "delivered"
+        {
+            let finalized:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM relay_deferred_secrets WHERE signer_principal=?1 AND message_id=?2 AND storage_owner=?3 AND owner_principal=?4 AND completed_at IS NOT NULL)",params![operation.signer.0,operation.message_id,effect.owner.0,effect.principal.0],|row| row.get(0))?;
+            if !finalized {
+                return Ok(());
+            }
+        }
+    }
+    match recovery::commit_escrow_in_tx(&tx, escrow) {
+        Err(StorageError::RelayOwnerUnavailable) => return Ok(()),
+        result => result?,
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Legacy prepared DTOs retain the signed Tau frame, dictionary and both
+/// original copies. These candidates are NOT recovery authority yet. The
+/// coordinator must reverify the original frame with verify_recovery_escrow
+/// before importing them through commit_escrow_in_tx. Unfinalized remote-origin
+/// proposals are excluded even if their inbox state is queued.
+/// Requery in the import transaction after asynchronous proof verification.
+pub(crate) fn accepted_escrow_candidates_on(
+    connection: &Connection,
+    first: &iota_identity::PrincipalId,
+    second: &iota_identity::PrincipalId,
+    version: Option<i64>,
+    limit: usize,
+) -> Result<Vec<iota_storage::util::chat_secret_recovery::Escrow>, StorageError> {
+    use iota_storage::util::chat_secret_recovery as recovery;
+    // This also checks durable global erasure/reassignment fences.
+    recovery::pair_acceptance_on(connection, first, second)?;
+    let pair = recovery::sorted_pair(first, second)?;
+    let chat_id = recovery::canonical_chat_id(first, second)?;
+    let numeric = format!(
+        "{}:{}",
+        first.user_id.min(second.user_id),
+        first.user_id.max(second.user_id)
+    );
+    let document = "CASE WHEN json_valid(CAST(prepared_operation AS TEXT)) THEN CAST(prepared_operation AS TEXT) ELSE '{}' END";
+    let mut statement=connection.prepare(&format!("SELECT prepared_operation,state FROM relay_inbox WHERE state IN ('applied','queued','delivered') AND recovery_status!='blocked' AND
+        (json_extract({document},'$.operation.operation.SetChatSecret.chat_id') IN (?1,?2) OR json_extract({document},'$.operation.SetChatSecret.chat_id') IN (?1,?2))
+        AND (?4 IS NULL OR json_extract({document},'$.operation.operation.SetChatSecret.version')=?4 OR json_extract({document},'$.operation.SetChatSecret.version')=?4)
+        ORDER BY accepted_at DESC LIMIT ?3"))?;
+    let limit = limit.clamp(1, 500);
+    let rows = statement
+        .query_map(params![chat_id, numeric, limit as i64 + 1, version], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.len() > limit {
+        return Err(StorageError::Other(
+            "accepted chat secret evidence scan exceeds bound".into(),
+        ));
+    }
+    let mut result = Vec::new();
+    for (bytes, state) in rows {
+        let operation = match decode_prepared_operation(&bytes) {
+            Ok(operation) => operation,
+            Err(_) => continue,
+        };
+        let mut available = true;
+        for effect in &operation.effects {
+            match iota_storage::util::relay_work::verify_owner_on(
+                connection,
+                effect.owner.0,
+                effect.principal,
+            ) {
+                Ok(()) => (),
+                Err(StorageError::RelayOwnerUnavailable) => {
+                    available = false;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !available {
+            continue;
+        }
+        let signer = crate::federated_relay::canonical_principal(&operation.signer_identity)
+            .map_err(|_| invalid("legacy escrow signer"))?;
+        let recipient = crate::federated_relay::canonical_principal(&operation.recipient_identity)
+            .map_err(|_| invalid("legacy escrow recipient"))?;
+        if recovery::sorted_pair(&signer, &recipient)? != pair {
+            continue;
+        }
+        if matches!(operation.delivery, DeliveryTarget::Remote(_)) && state != "delivered" {
+            let finalized:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM relay_deferred_secrets WHERE signer_principal=?1 AND message_id=?2 AND completed_at IS NOT NULL)",params![operation.signer.0,operation.message_id],|row| row.get(0))?;
+            if !finalized {
+                continue;
+            }
+        }
+        let ApplicationOperation::SetChatSecret {
+            chat_id,
+            version: epoch,
+            wrapping_scheme,
+            sender,
+            recipient: recipient_copy,
+            ..
+        } = &operation.operation
+        else {
+            continue;
+        };
+        if version.is_some_and(|version| version != *epoch) {
+            continue;
+        }
+        let escrow = if let Some(escrow) = operation.secret_escrow {
+            escrow
+        } else {
+            // Native sealed ingress did not exist before escrow DTOs. Never
+            // reinterpret an unauthenticated reconstructed application as proof.
+            let Some(map_version) = mtp::type_map::Version::parse(&operation.type_map_version)
+            else {
+                continue;
+            };
+            let map = mtp::codec::TypeMap::new(map_version);
+            let Ok(frame) = mtp::codec::CommunicationValue::from_bytes_with(&operation.frame, &map)
+            else {
+                continue;
+            };
+            let Ok(wire) = crate::federated_relay::parse_wire(&frame) else {
+                continue;
+            };
+            if wire.signer != operation.signer_identity
+                || wire.recipient != operation.recipient_identity
+                || wire.message_id != operation.message_id
+                || wire.created_at != operation.created_at
+            {
+                continue;
+            }
+            let copy = |owner: &iota_identity::PrincipalId,
+                        secret: &SecretCopy|
+             -> Result<_, StorageError> {
+                Ok(recovery::RecipientEnvelope {
+                    owner: owner.clone(),
+                    recipient_id: recovery::OriginalRecipientId::Principal(
+                        recovery::principal_key(owner)?,
+                    ),
+                    encrypted_secret: secret.encrypted_secret.clone(),
+                    kem_ciphertext: secret.kem_ciphertext.clone(),
+                })
+            };
+            let sender_copy = copy(&signer, sender)?;
+            let receiver_copy = copy(&recipient, recipient_copy)?;
+            let envelopes = if pair[0] == signer {
+                [sender_copy, receiver_copy]
+            } else {
+                [receiver_copy, sender_copy]
+            };
+            let format = recovery::RelayFormat::TauSignedRelayV1;
+            recovery::Escrow {
+                first: pair[0].clone(),
+                second: pair[1].clone(),
+                version: *epoch,
+                namespace: recovery::WrappingNamespace {
+                    chat_id: chat_id.clone(),
+                    secret_id: tau_relay_protocol::chat_secret_id(chat_id),
+                },
+                wrapping_scheme: wrapping_scheme.clone(),
+                signer,
+                message_id: operation.message_id,
+                operation_digest: recovery::operation_digest(format, &operation.frame),
+                original_frame: operation.frame,
+                original_type_map_version: operation.type_map_version,
+                format,
+                envelopes,
+                created_at: i64::try_from(operation.created_at)
+                    .map_err(|_| invalid("legacy escrow creation time"))?,
+            }
+        };
+        if escrow.validate().is_ok() {
+            result.push(escrow);
+        }
+    }
+    result.sort_by_key(|escrow| std::cmp::Reverse(escrow.version));
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn accepted_evidence_scan_never_treats_a_truncated_result_as_complete() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(iota_storage::util::chat_secret_recovery::SCHEMA)
+            .unwrap();
+        connection.execute_batch("CREATE TABLE relay_inbox(prepared_operation BLOB,state TEXT,recovery_status TEXT,accepted_at INTEGER)").unwrap();
+        let first = iota_identity::PrincipalId {
+            authority: iota_identity::AuthorityId::new("authority-a").unwrap(),
+            user_id: 11,
+        };
+        let second = iota_identity::PrincipalId {
+            authority: iota_identity::AuthorityId::new("authority-b").unwrap(),
+            user_id: 22,
+        };
+        let chat =
+            iota_storage::util::chat_secret_recovery::canonical_chat_id(&first, &second).unwrap();
+        let document =
+            serde_json::to_vec(&json!({"operation":{"SetChatSecret":{"chat_id":chat,"version":1}}})).unwrap();
+        for accepted_at in [1, 2] {
+            connection
+                .execute(
+                    "INSERT INTO relay_inbox VALUES(?1,'applied','ready',?2)",
+                    params![document, accepted_at],
+                )
+                .unwrap();
+        }
+        assert!(
+            matches!(accepted_escrow_candidates_on(&connection,&first,&second,Some(1),1),Err(StorageError::Other(message)) if message.contains("exceeds bound"))
+        );
+    }
 
     // A fixed historical JSON shape, deliberately independent of runtime serde.
     fn legacy(message_id: &str) -> Vec<u8> {
@@ -568,6 +891,42 @@ mod tests {
         let mut runtime = decode_prepared_operation(&legacy("message")).unwrap();
         runtime.signer_id = 0;
         assert!(encode_prepared_operation(&runtime).is_err());
+    }
+
+    #[test]
+    fn bound_origin_lease_survives_persistence_and_cannot_be_reassigned() {
+        let mut operation = decode_prepared_operation(&legacy("lease-bound")).unwrap();
+        operation.effects.push(LocalEffect {
+            owner: LocalUserId(6),
+            principal: PrincipalHandle(1),
+            sent_by_self: true,
+        });
+        let lease = iota_identity::HostedAuthorizationLease {
+            connection_id: "forwarded-lease".into(),
+            server_instance: "server".into(),
+            identity: iota_identity::ValidatedHostedIdentity {
+                local_user: LocalUserId(6),
+                principal: PrincipalHandle(1),
+                auth_generation: 2,
+            },
+        };
+        operation.bind_origin_lease(&lease).unwrap();
+        let original = operation.origin_lease.clone();
+        let bytes = encode_prepared_operation(&operation).unwrap();
+        let restored = decode_prepared_operation(&bytes).unwrap();
+        assert_eq!(restored.origin_lease, original);
+        let mut another = lease.clone();
+        another.connection_id = "another-connection".into();
+        assert!(matches!(
+            operation.bind_origin_lease(&another),
+            Err(StorageError::HostedAuthorizationDenied)
+        ));
+        assert_eq!(operation.origin_lease, original);
+        operation.effects.retain(|effect| !effect.sent_by_self);
+        assert!(matches!(
+            encode_prepared_operation(&operation),
+            Err(StorageError::HostedAuthorizationDenied)
+        ));
     }
 
     #[test]

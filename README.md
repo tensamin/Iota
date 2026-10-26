@@ -5,6 +5,28 @@ Iota manages users and stores their messages and communities. It can be run in a
 
 The Iota is a work in progress.
 
+## Building the workspace sources
+
+Keep the `iota`, `tau`, and `mtp` checkouts alongside each other. Iota's root
+Cargo patches apply to transitive dependencies as well as its direct imports.
+The Nix flake locks the sibling Git sources and `iota/mtp-type-maps` by content,
+then rewrites the Cargo patch paths to those Nix store inputs for sandboxed
+builds. It does not compile edited Tau code against the old remote MTP pin.
+
+Run these commands from the `iota` checkout, not its parent directory:
+
+```sh
+nix flake update tau-src mtp-src type-maps
+nix develop --command cargo test --locked -p iota-connection
+nix build --no-link .#default
+```
+
+Nix's Git source filter excludes untracked files. Add new source files to Git
+before refreshing the inputs. Commit the sibling sources and refresh
+`flake.lock` before publishing a release. Cargo's local configuration forces
+`MTP_TYPE_MAPS=mtp-type-maps/type-maps.yaml`, so a devshell cannot silently
+substitute a different map. The Nix package uses its locked version of that map.
+
 ## Terminal themes
 
 The TUI defaults to the ANSI theme. Select a theme for one invocation with `--theme`:

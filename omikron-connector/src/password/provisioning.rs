@@ -407,8 +407,9 @@ impl OmikronConnection {
             .map_err(|_| PasswordFinishError::CredentialUnavailable)?;
         let discovered_fingerprint = super::wire::key_fingerprint(&discovered_key)
             .map_err(|_| PasswordFinishError::CredentialUnavailable)?;
-        let (_, authorization_generation) = password_credentials::authorization(pending.user_id)
-            .map_err(|_| PasswordFinishError::CredentialUnavailable)?;
+        let (release_key, authorization_generation) =
+            password_credentials::authorization(pending.user_id)
+                .map_err(|_| PasswordFinishError::CredentialUnavailable)?;
         if pending
             .advertised_account_key
             .as_ref()
@@ -487,7 +488,6 @@ impl OmikronConnection {
             .map_err(|_| PasswordFinishError::Storage)??;
         let wire =
             |kind, value| typed(kind, value).map_err(|_| PasswordFinishError::InvalidClientMessage);
-        let backup_hash = Sha256::digest(&credential.encrypted_tu_credential);
         let content = DataValue::Container(vec![
             wire(DataType::Uuid, DataValue::Str(id.to_string()))?,
             wire(
@@ -501,11 +501,11 @@ impl OmikronConnection {
             wire(DataType::IotaId, DataValue::SignedNumber(iota_id.into()))?,
             wire(
                 DataType::EncryptedCredential,
-                DataValue::Bytes(credential.encrypted_tu_credential),
+                DataValue::Bytes(credential.encrypted_tu_credential.clone()),
             )?,
             wire(
                 DataType::Sha256,
-                DataValue::Bytes(credential.account_public_key_sha256),
+                DataValue::Bytes(credential.account_public_key_sha256.clone()),
             )?,
         ]);
         let keyring = self
@@ -530,22 +530,24 @@ impl OmikronConnection {
                 &keyring,
             )
             .map_err(|_| PasswordFinishError::NodeUnavailable)?;
-        let (current_key, current_generation) =
-            password_credentials::authorization(pending.user_id)
-                .map_err(|_| PasswordFinishError::CredentialChanged)?;
-        let current = password_credentials::get(pending.user_id)
-            .map_err(|_| PasswordFinishError::Storage)?
-            .ok_or(PasswordFinishError::CredentialChanged)?;
-        if current_generation != authorization_generation
-            || super::wire::key_fingerprint(&current_key)
-                .map_err(|_| PasswordFinishError::CredentialChanged)?
-                != discovered_fingerprint
-            || pending.record_hash.as_deref()
-                != Some(Sha256::digest(&current.opaque_record).as_slice())
-            || Sha256::digest(&current.encrypted_tu_credential) != backup_hash
-        {
-            return Err(PasswordFinishError::CredentialChanged);
+        #[cfg(test)]
+        let gate = { self.password_auth.release_gate.lock().unwrap().take() };
+        #[cfg(test)]
+        if let Some((prepared, release)) = gate {
+            prepared.notify_one();
+            release.notified().await;
         }
+        if operation_started.elapsed() >= PASSWORD_OPERATION_TIMEOUT {
+            return Err(PasswordFinishError::BindingMismatch);
+        }
+        // This atomic snapshot grants release. Disablement or rotation that
+        // wins first rejects it. A later commit cannot retract ciphertext in flight.
+        password_credentials::authorize_release(
+            &credential,
+            &release_key,
+            authorization_generation,
+        )
+        .map_err(|_| PasswordFinishError::CredentialChanged)?;
         if operation_started.elapsed() >= PASSWORD_OPERATION_TIMEOUT {
             return Err(PasswordFinishError::BindingMismatch);
         }

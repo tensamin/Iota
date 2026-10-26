@@ -171,8 +171,10 @@ impl ClientConnection {
         }
 
         if cv.is_type(CommunicationType::GetChatSecret) {
-            self.send_message(&message_handlers::handle_get_chat_secret(&cv))
-                .await;
+            self.send_message(
+                &iota_connection::chat_secret_recovery::handle_get_chat_secret(&cv).await,
+            )
+            .await;
             return;
         }
 

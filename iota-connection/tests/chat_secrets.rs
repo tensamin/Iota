@@ -86,7 +86,7 @@ async fn offline_shared_iota_initialization_preserves_identity_versions_and_exis
         .accept(1, "non-authoritative-rotation", proposal(&fixture, 2, 8))
         .await;
     assert!(matches!(rotation, RelayOutcome::Rejected { .. }));
-    assert!(read(1, 2).is_type(CommunicationType::ErrorNotSet));
+    assert!(read(1, 2).is_type(CommunicationType::ErrorInternal));
 
     // Reconnect the authoritative participant for subsequent rotations.
     session.connection_id = uuid::Uuid::new_v4();

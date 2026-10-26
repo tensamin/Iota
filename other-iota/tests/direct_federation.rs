@@ -22,6 +22,172 @@ use std::sync::{Arc, Mutex, RwLock};
 
 struct StoreResolver;
 
+struct RecoveryProbe {
+    expected_node: IotaNodeId,
+    expected_key: PublicKeyBundle,
+    requests: std::sync::atomic::AtomicUsize,
+    nested: Option<Arc<DirectPeerRouter>>,
+}
+
+#[async_trait]
+impl iota_connection::chat_secret_recovery::PeerRecoveryHandler for RecoveryProbe {
+    async fn handle_peer_request(
+        &self,
+        node: &IotaNodeId,
+        key: &PublicKeyBundle,
+        request: &iota_connection::chat_secret_recovery::RecoveryRequest,
+    ) -> Result<
+        iota_connection::chat_secret_recovery::RecoveredEnvelope,
+        iota_connection::chat_secret_recovery::RecoveryError,
+    > {
+        assert_eq!(node, &self.expected_node);
+        assert_eq!(
+            key.try_as_bytes().unwrap(),
+            self.expected_key.try_as_bytes().unwrap()
+        );
+        request.validate().unwrap();
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(router) = &self.nested {
+            use iota_connection::chat_secret_recovery::*;
+            let mut nested = request.clone();
+            nested.owner = request.pair.partner(&request.owner).unwrap().clone();
+            nested.nonce[0] ^= 0xff;
+            let reply = RecoveryTransport::request(router.as_ref(), node, &nested)
+                .await
+                .unwrap();
+            assert_eq!(reply.reply.request, nested);
+            assert_eq!(
+                reply.reply.result,
+                Err(RecoveryError::AcceptedButEnvelopeUnavailable)
+            );
+        }
+        Err(iota_connection::chat_secret_recovery::RecoveryError::AcceptedButEnvelopeUnavailable)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_peer_control_correlates_nested_requests_on_the_same_authenticated_connection() {
+    use iota_connection::chat_secret_recovery::*;
+    let a = LocalNodeIdentity::from_keyring(Keyring::generate()).unwrap();
+    let b = LocalNodeIdentity::from_keyring(Keyring::generate()).unwrap();
+    let router_a = Arc::new(DirectPeerRouter::default());
+    let router_b = Arc::new(DirectPeerRouter::default());
+    let nodes_a = Arc::new(MemoryNodes::default());
+    let nodes_b = Arc::new(MemoryNodes::default());
+    nodes_a
+        .nodes
+        .write()
+        .unwrap()
+        .insert(b.node_id().clone(), resolved_node(&b, vec![]));
+    nodes_b
+        .nodes
+        .write()
+        .unwrap()
+        .insert(a.node_id().clone(), resolved_node(&a, vec![]));
+    let relay = || {
+        Arc::new(RelayService::new(
+            Arc::new(HostedRecipient {
+                principal: PrincipalHandle(1),
+            }),
+            Arc::new(NoRoute),
+        ))
+    };
+    let manager_a = Arc::new(PeerManager::new(
+        a.clone(),
+        nodes_a,
+        router_a.clone(),
+        relay(),
+        Arc::new(Deliveries::default()),
+    ));
+    let manager_b = Arc::new(PeerManager::new(
+        b.clone(),
+        nodes_b,
+        router_b.clone(),
+        relay(),
+        Arc::new(Deliveries::default()),
+    ));
+    router_a.attach_manager(&manager_a);
+    router_b.attach_manager(&manager_b);
+    let probe_a = Arc::new(RecoveryProbe {
+        expected_node: b.node_id().clone(),
+        expected_key: b.public_keys(),
+        requests: Default::default(),
+        nested: None,
+    });
+    let probe_b = Arc::new(RecoveryProbe {
+        expected_node: a.node_id().clone(),
+        expected_key: a.public_keys(),
+        requests: Default::default(),
+        nested: Some(router_b.clone()),
+    });
+    router_a.install_recovery(probe_a.clone());
+    router_b.install_recovery(probe_b.clone());
+    let (certificate, private_key) = certificate();
+    let (endpoint, shutdown, task) = start_peer_server(
+        0,
+        certificate.clone(),
+        private_key,
+        &a,
+        &b,
+        manager_b.clone(),
+    )
+    .await;
+    manager_a
+        .connect(b.node_id().clone(), &endpoint, Some(certificate))
+        .await
+        .unwrap();
+    let first = Principal {
+        authority: a.authority_id().as_str().to_owned(),
+        user_id: 1,
+    };
+    let second = Principal {
+        authority: b.authority_id().as_str().to_owned(),
+        user_id: 1,
+    };
+    let request = RecoveryRequest {
+        version: RECOVERY_VERSION,
+        pair: ConversationPair::new(first.clone(), second).unwrap(),
+        owner: first,
+        epoch: Some(1),
+        nonce: [7; 32],
+        proposal_digest: None,
+    };
+    let reply = RecoveryTransport::request(router_a.as_ref(), b.node_id(), &request)
+        .await
+        .unwrap();
+    assert_eq!(reply.reply.request, request);
+    assert_eq!(
+        reply.reply.result,
+        Err(RecoveryError::AcceptedButEnvelopeUnavailable)
+    );
+    let mut reversed = request.clone();
+    reversed.owner = request.pair.partner(&request.owner).unwrap().clone();
+    reversed.nonce = [8; 32];
+    let reply = RecoveryTransport::request(router_b.as_ref(), a.node_id(), &reversed)
+        .await
+        .unwrap();
+    assert_eq!(reply.reply.request, reversed);
+    assert_eq!(
+        reply.reply.result,
+        Err(RecoveryError::AcceptedButEnvelopeUnavailable)
+    );
+    assert_eq!(
+        probe_a.requests.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        probe_b.requests.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    manager_a.stop();
+    manager_b.stop();
+    let _ = shutdown.send(());
+    task.await.unwrap();
+    assert!(manager_a.shutdown(std::time::Duration::from_secs(3)).await);
+    assert!(manager_b.shutdown(std::time::Duration::from_secs(3)).await);
+}
+
 #[async_trait]
 impl IdentityResolver for StoreResolver {
     async fn resolve_address(

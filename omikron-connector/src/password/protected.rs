@@ -3,7 +3,7 @@ use mtp::{
     codec::{
         CommunicationType, CommunicationValue, DataValue, ProtectedMessageBuilder,
         ProtectedOpenOptions, ProtectionPolicy, ReplayError, ReplayGuard, VerifiedProtectedMessage,
-        open_protected_with_checked,
+        open_protected_with_checked, open_protected_with_without_replay,
     },
     crypto::{DualSigner, PublicKeyBundle},
 };
@@ -44,6 +44,7 @@ impl OmikronConnection {
         &self,
         frame: &CommunicationValue,
         kind: CommunicationType,
+        consume_replay: bool,
     ) -> Result<(VerifiedProtectedMessage, String, i64), String> {
         let iota_id = iota_storage::util::config_util::CONFIG
             .load()
@@ -57,28 +58,48 @@ impl OmikronConnection {
             .ok_or("Iota has no keyring")?;
         let mut replay = CommandReplayGuard;
         let authenticated_key = std::cell::RefCell::new(None);
-        let opened = open_protected_with_checked(
-            frame,
-            &[keyring.as_ref()],
-            None,
-            |signer_id| {
-                let id = i64::try_from(signer_id).ok()?;
-                let (key, generation) =
-                    iota_storage::users::password_credentials::authorization(id).ok()?;
-                *authenticated_key.borrow_mut() = Some((key.clone(), generation));
-                Some(vec![PublicKeyBundle::from_base64(&key).ok()?])
-            },
-            ProtectedOpenOptions::new(
-                Some(iota_id),
-                purpose(PASSWORD_MANAGEMENT_SIGNATURE),
-                purpose(PASSWORD_MANAGEMENT_ENCRYPTION),
-                ProtectionPolicy::dual(),
-            ),
-            &mut replay,
-        )
+        let resolve_signer = |signer_id| {
+            let id = i64::try_from(signer_id).ok()?;
+            let (key, generation) =
+                iota_storage::users::password_credentials::authorization(id).ok()?;
+            *authenticated_key.borrow_mut() = Some((key.clone(), generation));
+            Some(vec![PublicKeyBundle::from_base64(&key).ok()?])
+        };
+        let options = ProtectedOpenOptions::new(
+            Some(iota_id),
+            purpose(PASSWORD_MANAGEMENT_SIGNATURE),
+            purpose(PASSWORD_MANAGEMENT_ENCRYPTION),
+            ProtectionPolicy::dual(),
+        );
+        let opened = if consume_replay {
+            open_protected_with_checked(
+                frame,
+                &[keyring.as_ref()],
+                None,
+                resolve_signer,
+                options,
+                &mut replay,
+            )
+        } else {
+            // Only read-only receipt lookup uses this path. It cannot consume
+            // an enrollment, invoke OPAQUE finish, or mutate a credential.
+            open_protected_with_without_replay(
+                frame,
+                &[keyring.as_ref()],
+                None,
+                resolve_signer,
+                options,
+            )
+        }
         .map_err(|error| error.to_string())?;
         if opened.message_type() != kind {
             return Err("wrong protected command type".into());
+        }
+        if frame
+            .sender()
+            .is_some_and(|sender| sender != opened.signer_id())
+        {
+            return Err("authenticated account does not match protected signer".into());
         }
         let (key, generation) = authenticated_key
             .into_inner()

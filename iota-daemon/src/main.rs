@@ -212,7 +212,7 @@ async fn run() -> ExitCode {
     let lifecycle_runtime = runtime.clone();
     let connector_shutdown = omikron.clone();
     {
-        match services.relay.recover_incomplete(100) {
+        match services.relay.recover_incomplete_authorized(100).await {
             Ok(report) => {
                 log!("Initial relay recovery: {report:?}");
                 if report.health.blocked > 0 || report.health.receipt_backfill_blocked > 0 {
@@ -241,7 +241,7 @@ async fn run() -> ExitCode {
                         _ = recovery_runtime.cancellation.cancelled() => break,
                         _ = tokio::time::sleep(Duration::from_secs(2)) => {},
                     }
-                    match relay_recovery.recover_incomplete(100) {
+                    match relay_recovery.recover_incomplete_authorized(100).await {
                         Ok(report) => {
                             log!("Relay recovery health: {report:?}");
                             if report.health.blocked > 0
@@ -313,9 +313,15 @@ async fn run() -> ExitCode {
                             } else {
                                 "connected (waiting for RTT sample)".into()
                             };
+                            let password_health = tokio::task::spawn_blocking({
+                                let connection = omikron_health.clone();
+                                move || connection.password_health()
+                            })
+                            .await
+                            .map_err(|error| error.to_string())?;
                             let message = format!(
                                 "{message}; password authentication: {:?}",
-                                omikron_health.password_readiness()
+                                password_health
                             );
                             health_runtime.set_component_healthy(
                                 iota_ipc::ComponentId::Omikron,

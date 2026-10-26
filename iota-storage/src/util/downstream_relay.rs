@@ -142,6 +142,10 @@ fn reject_exact_in_tx(
     ) {
         return Err(StorageError::InvalidRelayTransition);
     }
+    let deferred:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM relay_deferred_secrets WHERE signer_principal=?1 AND message_id=?2 AND completed_at IS NULL)",params![signer.0,message_id],|row| row.get(0))?;
+    if deferred {
+        super::chat_secret_recovery::quarantine_pending_escrow_in_tx(tx, signer, message_id)?;
+    }
     if let Some((_, storage_owner)) = origin_message_in_tx(tx, signer, message_id)? {
         chat_files::record_delivery_failure_in_tx(
             tx,

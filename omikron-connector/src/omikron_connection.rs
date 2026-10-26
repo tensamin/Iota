@@ -668,7 +668,12 @@ impl OmikronConnection {
     }
 
     pub fn password_readiness(&self) -> crate::PasswordReadiness {
-        *self.password_auth.readiness.read().unwrap()
+        self.password_health().readiness
+    }
+
+    pub fn password_health(&self) -> crate::PasswordHealth {
+        let _ = self.password_auth.validate_storage();
+        self.password_auth.health()
     }
 
     /// Accepted, rejected, expired and cancelled exchanges, in that order.

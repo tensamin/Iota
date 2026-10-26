@@ -84,9 +84,6 @@ impl ClientConnectionManager {
                         return None;
                     }
                     let signer = signer?;
-                    let recipient = iota_storage::identity::SqlitePrincipalStore
-                        .get_principal(session.principal())
-                        .ok()??;
                     let message_id = pending.relay_message_id.clone()?;
                     let version = mtp::type_map::Version::parse(&pending.type_map_version)?;
                     let frame = CommunicationValue::from_bytes_with(
@@ -94,14 +91,14 @@ impl ClientConnectionManager {
                         &mtp::type_map::TypeMap::new(version),
                     )
                     .ok()?;
-                    let wire = iota_connection::federated_relay::parse_wire(&frame).ok()?;
-                    (wire.signer
-                        == iota_connection::federated_relay::protocol_principal(&signer.principal)
-                        && wire.message_id == message_id
-                        && wire.recipient
-                            == iota_connection::federated_relay::protocol_principal(
-                                &recipient.principal,
-                            ))
+                    iota_connection::relay_service::pending_frame_identity_matches(
+                        &frame,
+                        signer.handle,
+                        session.principal(),
+                        &message_id,
+                        None,
+                    )
+                    .ok()?
                     .then_some((frame, signer, message_id))
                 })();
                 let Some((frame, signer, message_id)) = decoded else {

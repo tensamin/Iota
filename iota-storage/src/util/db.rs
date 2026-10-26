@@ -109,13 +109,26 @@ where
             [],
             |row| row.get(0),
         )?;
+        let secret_before: i64 = tx.query_row(
+            "SELECT sequence FROM chat_secret_changes WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
         let value = f(&tx)?;
+        let secret_changed: bool = tx.query_row(
+            "SELECT sequence FROM chat_secret_changes WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? != secret_before;
         let after: i64 = tx.query_row(
             "SELECT sequence FROM hosted_auth_changes WHERE singleton = 1",
             [],
             |row| row.get(0),
         )?;
         tx.commit()?;
+        if secret_changed {
+            crate::util::chat_secret_recovery::notify_change();
+        }
         if before != after {
             crate::hosted_auth::notify_change();
         }

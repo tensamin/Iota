@@ -52,6 +52,16 @@ impl RemoteIotaResolver {
         locator: &AuthorityLocator,
         allow_network: bool,
     ) -> Result<DiscoveredAuthority, IdentityError> {
+        self.authority_with_refresh(locator, allow_network, false)
+            .await
+    }
+
+    async fn authority_with_refresh(
+        &self,
+        locator: &AuthorityLocator,
+        allow_network: bool,
+        force: bool,
+    ) -> Result<DiscoveredAuthority, IdentityError> {
         let cached = self
             .authorities
             .read()
@@ -61,7 +71,8 @@ impl RemoteIotaResolver {
             if self.nodes.pinned_node(locator)?.as_ref() != Some(&cached.node) {
                 return Err(IdentityError::KeyPinMismatch);
             }
-            if let Ok(node) = self.nodes.resolve_node(&cached.node).await
+            if !force
+                && let Ok(node) = self.nodes.resolve_node(&cached.node).await
                 && node.descriptor_revision == cached.descriptor_revision
                 && node.resolved_at == cached.verified_at
                 && now_millis().saturating_sub(cached.verified_at)
@@ -316,6 +327,73 @@ impl RemoteIotaResolver {
 
 #[async_trait]
 impl IdentityResolver for RemoteIotaResolver {
+    async fn resolve_current_principal(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<ResolvedPrincipal, IdentityError> {
+        let mut locators = match &self.authority_directory {
+            Some(directory) => directory.locators_for(&principal.authority)?,
+            None => Vec::new(),
+        };
+        if let Ok(authorities) = self.authorities.read() {
+            for (locator, authority) in authorities.iter() {
+                if authority.authority.authority_id == principal.authority
+                    && !locators.contains(locator)
+                {
+                    locators.push(locator.clone());
+                }
+            }
+        }
+        // An authenticated peer may ask about its principal before any user
+        // address lookup has populated the authority cache. Only a previously
+        // verified node directory entry supplies bootstrap endpoints here.
+        if let Some(node) = principal
+            .authority
+            .as_str()
+            .strip_prefix("authority:")
+            .and_then(|node| IotaNodeId::new(node).ok())
+            && AuthorityId::for_iota(&node) == principal.authority
+            && let Ok(node) = self.nodes.resolve_node(&node).await
+        {
+            for locator in node
+                .last_successful_endpoint
+                .iter()
+                .chain(node.direct_endpoints.iter())
+            {
+                if !locators.contains(locator) {
+                    locators.push(locator.clone());
+                }
+            }
+        }
+        if locators.is_empty() {
+            return Err(IdentityError::NotFound);
+        }
+        let mut unavailable = None;
+        for locator in locators {
+            let result = async {
+                let authority = self.authority_with_refresh(&locator, true, true).await?;
+                if authority.authority_id != principal.authority {
+                    return Err(IdentityError::KeyPinMismatch);
+                }
+                self.refresh(
+                    &locator,
+                    &authority,
+                    &UserSelector::UserId(principal.user_id),
+                )
+                .await
+            }
+            .await;
+            match result {
+                Ok(found) => return Ok(found),
+                Err(error @ IdentityError::Unavailable(_)) => unavailable = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(unavailable.unwrap_or_else(|| {
+            IdentityError::Unavailable("current Iota home is unavailable".into())
+        }))
+    }
+
     async fn resolve_address(
         &self,
         address: &UserAddress,

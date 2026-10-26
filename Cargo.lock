@@ -272,6 +272,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "annotate-snippets"
+version = "0.12.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a5b0a5ab8561c603f16c3b78c24a386b1f70e7fc1b1b1e8c15738828e4a176"
+dependencies = [
+ "anstyle",
+ "memchr",
+ "unicode-width",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -365,6 +376,12 @@ dependencies = [
  "cpufeatures 0.2.17",
  "password-hash",
 ]
+
+[[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
 
 [[package]]
 name = "asn1-rs"
@@ -1374,6 +1391,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "encoding_rs_io"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fba3fe847045ecff794b9c138293a80db914678c453ad63fbf0c6a9eb6e00b22"
+dependencies = [
+ "encoding_rs",
+]
+
+[[package]]
 name = "enum-as-inner"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1693,6 +1719,16 @@ name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
+name = "granit-parser"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da55feca5d1625466bae068f9fd4b87892caeae70c3fe671ddb0f50d41aebf37"
+dependencies = [
+ "arraydeque",
+ "smallvec",
+]
 
 [[package]]
 name = "group"
@@ -2971,7 +3007,6 @@ dependencies = [
 [[package]]
 name = "mtp"
 version = "0.4.0"
-source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "mtp-client",
  "mtp-codec",
@@ -2989,7 +3024,6 @@ dependencies = [
 [[package]]
 name = "mtp-client"
 version = "0.4.0"
-source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "mtp-codec",
  "mtp-common",
@@ -3003,7 +3037,6 @@ dependencies = [
 [[package]]
 name = "mtp-codec"
 version = "0.4.0"
-source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "base64 0.23.1",
  "byteorder",
@@ -3017,7 +3050,6 @@ dependencies = [
 [[package]]
 name = "mtp-common"
 version = "0.4.0"
-source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "js-sys",
  "rand 0.10.3",
@@ -3027,7 +3059,6 @@ dependencies = [
 [[package]]
 name = "mtp-core"
 version = "0.4.0"
-source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "async-trait",
  "mtp-codec",
@@ -3041,7 +3072,6 @@ dependencies = [
 [[package]]
 name = "mtp-crypto"
 version = "0.4.0"
-source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -3064,7 +3094,6 @@ dependencies = [
 [[package]]
 name = "mtp-files"
 version = "0.4.0"
-source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "mtp-crypto",
  "rand 0.10.3",
@@ -3075,7 +3104,6 @@ dependencies = [
 [[package]]
 name = "mtp-h3"
 version = "0.4.0"
-source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3092,7 +3120,6 @@ dependencies = [
 [[package]]
 name = "mtp-host"
 version = "0.4.0"
-source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "mtp-codec",
  "mtp-common",
@@ -3109,7 +3136,6 @@ dependencies = [
 [[package]]
 name = "mtp-native"
 version = "0.4.0"
-source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "async-trait",
  "mtp-codec",
@@ -3130,7 +3156,6 @@ dependencies = [
 [[package]]
 name = "mtp-pipes"
 version = "0.4.0"
-source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "mtp-codec",
  "mtp-common",
@@ -3146,16 +3171,14 @@ dependencies = [
 [[package]]
 name = "mtp-type-map"
 version = "0.4.0"
-source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "serde",
- "serde_yaml",
+ "serde-saphyr",
 ]
 
 [[package]]
 name = "mtp-webserver"
 version = "0.4.0"
-source = "git+https://github.com/Nonanium/MTP.git?rev=9f7f94e4cbd227610784ae47a1e7a1acf66f8584#9f7f94e4cbd227610784ae47a1e7a1acf66f8584"
 dependencies = [
  "bytes",
  "h3",
@@ -3441,6 +3464,8 @@ name = "other-iota"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
+ "iota-auth",
  "iota-connection",
  "iota-identity",
  "iota-logger",
@@ -3449,11 +3474,13 @@ dependencies = [
  "mtp",
  "rcgen",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
+ "uuid",
  "web-server",
 ]
 
@@ -4471,6 +4498,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-saphyr"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a253edfdea34032da21af84e16fcc94f4c7a6ba237f9f3bc2dbf43cea8535c44"
+dependencies = [
+ "annotate-snippets",
+ "encoding_rs_io",
+ "granit-parser",
+ "num-traits",
+ "serde_core",
+ "smallvec",
+]
+
+[[package]]
 name = "serde_core"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4895,11 +4936,12 @@ dependencies = [
 [[package]]
 name = "tau"
 version = "0.1.0"
-source = "git+https://github.com/TensaminDev/Tau.git?rev=1c9df9f237e72d17752090a1bdffb7340627deae#1c9df9f237e72d17752090a1bdffb7340627deae"
 dependencies = [
  "dashmap",
  "libc",
  "mtp",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "uuid",
@@ -4909,7 +4951,6 @@ dependencies = [
 [[package]]
 name = "tau-relay-protocol"
 version = "0.1.0"
-source = "git+https://github.com/TensaminDev/Tau.git?rev=1c9df9f237e72d17752090a1bdffb7340627deae#1c9df9f237e72d17752090a1bdffb7340627deae"
 dependencies = [
  "base64 0.22.1",
  "mtp",

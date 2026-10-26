@@ -3,7 +3,7 @@ use super::*;
 impl OmikronConnection {
     pub(super) async fn handle_get_chat_secret(self: Arc<Self>, cv: &CommunicationValue) {
         let _ = self
-            .send_message(&message_handlers::handle_get_chat_secret(cv))
+            .send_message(&iota_connection::chat_secret_recovery::handle_get_chat_secret(cv).await)
             .await;
     }
 

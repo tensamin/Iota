@@ -22,7 +22,17 @@ pub fn verify_owner_in_tx(
     owner: i64,
     principal: PrincipalHandle,
 ) -> Result<(), StorageError> {
-    let eligible: bool = tx.query_row(
+    verify_owner_on(tx, owner, principal)
+}
+
+/// Read-only snapshot eligibility. Mutations must check eligibility again in
+/// their write transaction using verify_owner_in_tx.
+pub fn verify_owner_on(
+    connection: &rusqlite::Connection,
+    owner: i64,
+    principal: PrincipalHandle,
+) -> Result<(), StorageError> {
+    let eligible: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM hosted_principals h JOIN users u ON u.user_id = h.local_user_id
          WHERE h.local_user_id = ?1 AND h.principal_handle = ?2
          AND NOT EXISTS(SELECT 1 FROM user_residency r WHERE r.user_id = ?1 AND (r.lifecycle_state <> 'managed' OR r.data_state = 'empty'))
@@ -96,6 +106,26 @@ pub fn complete_deferred_in_tx(
     };
     for action in actions {
         verify_owner_in_tx(tx, action.owner, action.principal)?;
+        // New operations stage the complete original proof. Legacy deferred rows
+        // without it remain unavailable rather than inventing the other copy.
+        let principal = super::chat_secret_recovery::canonical_owner_on(
+            tx,
+            iota_identity::LocalUserId(action.owner),
+        )?;
+        let evidence: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT evidence FROM chat_secret_escrows WHERE signer=?1 AND message_id=?2",
+                params![
+                    super::chat_secret_recovery::principal_key(&principal)?,
+                    message_id
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let escrow: super::chat_secret_recovery::Escrow =
+            serde_json::from_slice(&evidence.ok_or(StorageError::MissingRelayDependency)?)
+                .map_err(|_| StorageError::InvalidRelayPayload("deferred secret evidence"))?;
+        super::chat_secret_recovery::commit_escrow_in_tx(tx, &escrow)?;
         if let Some(legacy_chat_id) = &action.legacy_chat_id {
             e2ee_storage::migrate_chat_secret_namespace_in_tx(
                 tx,
@@ -107,6 +137,11 @@ pub fn complete_deferred_in_tx(
             )?;
         }
         e2ee_storage::put_chat_secret_in_tx(tx, &action.secret)?;
+        super::chat_secret_recovery::enqueue_secret_available_in_tx(
+            tx,
+            iota_identity::LocalUserId(action.owner),
+            &escrow,
+        )?;
         fault_point("after_deferred_secret_application", message_id);
         tx.execute("UPDATE relay_deferred_secrets SET completed_at = ?4 WHERE signer_principal = ?1 AND message_id = ?2 AND storage_owner = ?3 AND completed_at IS NULL",
             params![signer.0, message_id, action.owner, sync::now_millis()])?;

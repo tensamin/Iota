@@ -122,18 +122,26 @@ impl DaemonServices {
             RelayService::new(local_users.clone(), router.clone())
                 .with_federation(identities.clone(), relay_identity),
         );
-        Ok(Self::compose(DaemonServiceComponents {
+        let services = Self::compose(DaemonServiceComponents {
             accounts: Arc::new(LocalIotaAccountAuthority::new(identity.clone())),
             identities,
             principals,
             local_users,
-            node_identities: nodes,
+            node_identities: nodes.clone(),
             relay,
             router,
-            direct_router: Some(direct_router),
+            direct_router: Some(direct_router.clone()),
             relay_routers: Some(relay_routers),
             centralized: None,
-        }))
+        });
+        start_chat_secret_recovery(
+            &services,
+            nodes,
+            &identity,
+            direct_router.clone(),
+            Some(&direct_router),
+        );
+        Ok(services)
     }
 
     pub fn new(
@@ -152,7 +160,14 @@ impl DaemonServices {
             client,
             Some(router),
             Some(omikron.session_manager()),
-            Some(Arc::new(StandaloneRelayIdentity(identity))),
+            Some(Arc::new(StandaloneRelayIdentity(identity.clone()))),
+        );
+        start_chat_secret_recovery(
+            &services,
+            Arc::new(iota_storage::node_directory::SqliteNodeDirectory),
+            &identity,
+            Arc::new(UnsupportedRecoveryTransport),
+            None,
         );
         let _ = omikron.install_relay_service(services.relay.clone());
         Ok(services)
@@ -302,6 +317,64 @@ impl DaemonServices {
 }
 
 struct InactiveIdentityResolver;
+
+struct UnsupportedRecoveryTransport;
+
+#[async_trait]
+impl iota_connection::chat_secret_recovery::RecoveryTransport for UnsupportedRecoveryTransport {
+    async fn request(
+        &self,
+        _: &IotaNodeId,
+        _: &iota_connection::chat_secret_recovery::RecoveryRequest,
+    ) -> Result<
+        iota_connection::chat_secret_recovery::AuthenticatedRecoveryReply,
+        iota_connection::chat_secret_recovery::RecoveryError,
+    > {
+        Err(iota_connection::chat_secret_recovery::RecoveryError::RetryablePeerUnavailable)
+    }
+}
+
+fn start_chat_secret_recovery(
+    services: &DaemonServices,
+    nodes: Arc<dyn NodeIdentityResolver>,
+    identity: &iota_identity::LocalNodeIdentity,
+    transport: Arc<dyn iota_connection::chat_secret_recovery::RecoveryTransport>,
+    direct: Option<&Arc<other_iota::DirectPeerRouter>>,
+) {
+    use iota_connection::chat_secret_recovery::{OriginalOperationVerifier, RecoveryCoordinator};
+    let verifier = Arc::new(OriginalOperationVerifier {
+        relay: services.relay.clone(),
+    });
+    let recovery = Arc::new(RecoveryCoordinator::new(
+        services.identities.clone(),
+        nodes,
+        services.principals.clone(),
+        services.local_users.clone(),
+        identity.node_id().clone(),
+        transport,
+        verifier,
+    ));
+    if let Some(direct) = direct {
+        direct.install_recovery(recovery.clone());
+    }
+    iota_connection::chat_secret_recovery::install_recovery(recovery.clone());
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        let recovery = Arc::downgrade(&recovery);
+        runtime.spawn(async move {
+            // The first tick retries persisted work immediately after startup.
+            // Subsequent ticks also recover after peer reconnect without holding
+            // a SQLite transaction across any network operation.
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                timer.tick().await;
+                let Some(recovery) = recovery.upgrade() else {
+                    break;
+                };
+                recovery.retry_pending().await;
+            }
+        });
+    }
+}
 
 struct InactiveNodeIdentityResolver;
 

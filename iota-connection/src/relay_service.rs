@@ -15,10 +15,23 @@ use std::{sync::Arc, time::Duration};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IngressSource {
-    Omikron { connection_id: String },
-    DirectPeer { node_id: IotaNodeId },
-    RelayRouter { router_id: RelayRouterId },
-    HostedClient { session: AuthenticatedSession },
+    Omikron {
+        connection_id: String,
+    },
+    DirectPeer {
+        node_id: IotaNodeId,
+    },
+    RelayRouter {
+        router_id: RelayRouterId,
+    },
+    HostedClient {
+        session: AuthenticatedSession,
+    },
+    /// Constructed only by the authenticated Omikron connector, never from
+    /// native frame headers. The lease fences the hosted account at commit.
+    OmikronHosted {
+        lease: iota_identity::HostedAuthorizationLease,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +139,9 @@ fn durable_replay(
             "missing relay correlation ID".into(),
         ));
     }
+    if frame.payload().as_encrypted().is_some() {
+        return durable_native_replay(frame);
+    }
     let wire = parse_wire(frame).map_err(|e| RelayServiceError::Rejected(e.to_string()))?;
     let signer_id = canonical_principal(&wire.signer)
         .map_err(|e| RelayServiceError::Rejected(e.to_string()))?;
@@ -198,6 +214,114 @@ fn durable_replay(
             accepted_at,
             unauthorized,
         }),
+    }))
+}
+
+fn durable_native_replay(
+    frame: &CommunicationValue,
+) -> Result<Option<VerifiedRelayEnvelope>, RelayServiceError> {
+    let normalized = frame
+        .clone()
+        .without_id()
+        .to_bytes()
+        .map_err(|error| RelayServiceError::Rejected(error.to_string()))?;
+    let map = frame
+        .type_map()
+        .ok_or_else(|| RelayServiceError::Rejected("missing relay type map".into()))?
+        .version
+        .to_string();
+    let records = db::with_db(|connection| {
+        let mut statement = connection.prepare("SELECT state, accepted_at, COALESCE(rejection_reason = 'unauthorized', 0), prepared_operation FROM relay_inbox WHERE frame = ?1 AND type_map_version = ?2 LIMIT 2")?;
+        Ok(statement.query_map(params![normalized, map], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, bool>(2)?, row.get::<_, Option<Vec<u8>>>(3)?)))?.collect::<Result<Vec<_>, _>>()?)
+    }).map_err(|error| RelayServiceError::Internal(error.to_string()))?;
+    if records.is_empty() {
+        return Ok(None);
+    }
+    if records.len() != 1 {
+        return Err(RelayServiceError::Internal(
+            "ambiguous native durable frame".into(),
+        ));
+    }
+    let (state, accepted_at, unauthorized, prepared) =
+        records.into_iter().next().expect("one record");
+    let Some(prepared) = prepared else {
+        return Ok(None);
+    };
+    let proof = crate::persisted_relay::decode_prepared_operation(&prepared)
+        .map_err(|error| RelayServiceError::Internal(error.to_string()))?;
+    let signer = crate::federated_relay::unique_numeric_principal(proof.signer_identity.user_id)
+        .map_err(|error| RelayServiceError::Rejected(error.to_string()))?;
+    let recipient =
+        crate::federated_relay::unique_numeric_principal(proof.recipient_identity.user_id)
+            .map_err(|error| RelayServiceError::Rejected(error.to_string()))?;
+    if proof.frame != normalized
+        || proof.type_map_version != map
+        || proof.signer != signer.handle
+        || proof.recipient != recipient.handle
+        || proof.signer_identity != crate::federated_relay::protocol_principal(&signer.principal)
+        || proof.recipient_identity
+            != crate::federated_relay::protocol_principal(&recipient.principal)
+        || !proof.message_id.starts_with("mtp-sealed-v1:")
+    {
+        return Err(RelayServiceError::Internal(
+            "persisted native relay identity conflict".into(),
+        ));
+    }
+    let PrincipalHome::Iota(destination) = &recipient.home else {
+        return Err(RelayServiceError::Rejected(
+            "native recipient has no Iota home".into(),
+        ));
+    };
+    Ok(Some(VerifiedRelayEnvelope {
+        destination: destination.clone(),
+        signer,
+        recipient,
+        message_id: proof.message_id,
+        created_at: proof.created_at,
+        content: None,
+        frame: frame.clone(),
+        durable_outcome: Some(DurableOutcome {
+            state: relay_replay::RelayState::try_from(state.as_str())
+                .map_err(|error| RelayServiceError::Internal(error.to_string()))?,
+            accepted_at,
+            unauthorized,
+        }),
+    }))
+}
+
+/// Validate a queued copy against its original durable verified envelope.
+/// Native ciphertext is never interpreted as a Tau JSON signature.
+pub fn pending_frame_identity_matches(
+    frame: &CommunicationValue,
+    signer: iota_identity::PrincipalHandle,
+    recipient: iota_identity::PrincipalHandle,
+    message_id: &str,
+    destination: Option<&IotaNodeId>,
+) -> Result<bool, RelayServiceError> {
+    if frame.payload().as_encrypted().is_some() {
+        return Ok(durable_native_replay(frame)?.is_some_and(|verified| {
+            verified.signer.handle == signer
+                && verified.recipient.handle == recipient
+                && verified.message_id == message_id
+                && destination.is_none_or(|node| node == &verified.destination)
+        }));
+    }
+    let wire = match crate::federated_relay::parse_wire(frame) {
+        Ok(wire) => wire,
+        Err(_) => return Ok(false),
+    };
+    let store = iota_storage::identity::SqlitePrincipalStore;
+    let signer = store
+        .get_principal(signer)
+        .map_err(|error| RelayServiceError::Internal(error.to_string()))?;
+    let recipient = store
+        .get_principal(recipient)
+        .map_err(|error| RelayServiceError::Internal(error.to_string()))?;
+    Ok(signer.zip(recipient).is_some_and(|(signer, recipient)| {
+        wire.signer == crate::federated_relay::protocol_principal(&signer.principal)
+            && wire.recipient == crate::federated_relay::protocol_principal(&recipient.principal)
+            && wire.message_id == message_id
+            && destination.is_none_or(|node| wire.destination == node.as_str())
     }))
 }
 
@@ -274,13 +398,32 @@ impl RelayService {
             }
             _ => {}
         }
-        if !matches!(source, IngressSource::HostedClient { .. })
-            && self
-                .node_identity
-                .as_ref()
-                .and_then(|node| node.node_id())
-                .as_ref()
-                != Some(&verified.destination)
+        if matches!(
+            source,
+            IngressSource::HostedClient { .. } | IngressSource::OmikronHosted { .. }
+        ) && self
+            .node_identity
+            .as_ref()
+            .and_then(|node| node.node_id())
+            .as_ref()
+            != match &verified.signer.home {
+                PrincipalHome::Iota(home) => Some(home),
+                _ => None,
+            }
+        {
+            return Err(RelayServiceError::Rejected(
+                "hosted signer home is not this node".into(),
+            ));
+        }
+        if !matches!(
+            source,
+            IngressSource::HostedClient { .. } | IngressSource::OmikronHosted { .. }
+        ) && self
+            .node_identity
+            .as_ref()
+            .and_then(|node| node.node_id())
+            .as_ref()
+            != Some(&verified.destination)
         {
             return Err(RelayServiceError::Rejected(
                 "relay destination does not match local node".into(),
@@ -308,11 +451,116 @@ impl RelayService {
         self
     }
 
+    /// Authenticate imported evidence independently of this node's relay inbox.
+    /// The caller must retain the exact original dictionary alongside the escrow.
+    /// A peer's transport signature does not authenticate substituted user copies.
+    pub async fn verify_recovery_escrow(
+        &self,
+        escrow: &iota_storage::util::chat_secret_recovery::Escrow,
+        original_type_map: &TypeMap,
+    ) -> Result<(), RelayServiceError> {
+        use iota_storage::util::chat_secret_recovery::RelayFormat;
+        escrow
+            .validate()
+            .map_err(|error| RelayServiceError::Rejected(error.to_string()))?;
+        if escrow.original_type_map_version != original_type_map.version.to_string() {
+            return Err(RelayServiceError::Rejected(
+                "escrow dictionary mismatch".into(),
+            ));
+        }
+        let frame =
+            CommunicationValue::try_from_bytes_with(&escrow.original_frame, original_type_map)
+                .map_err(|error| RelayServiceError::Rejected(error.to_string()))?
+                // This local parser correlation is excluded from signed evidence.
+                // Transport request IDs are not part of a relay's identity.
+                .with_id(1);
+        if !frame.is_type(CommunicationType::Relay)
+            || frame.payload().as_encrypted().is_some()
+                != matches!(escrow.format, RelayFormat::NativeMtpSealedV1)
+        {
+            return Err(RelayServiceError::Rejected(
+                "escrow relay format mismatch".into(),
+            ));
+        }
+        let identities = self.identities.as_ref().ok_or_else(|| {
+            RelayServiceError::Internal("identity resolver is unavailable".into())
+        })?;
+        let keyring = self
+            .node_identity
+            .as_ref()
+            .ok_or_else(|| RelayServiceError::Internal("node identity is unavailable".into()))?
+            .keyring()
+            .await
+            .ok_or_else(|| {
+                RelayServiceError::Internal("recovery decryption key is unavailable".into())
+            })?;
+        let verified = tokio::time::timeout(Duration::from_secs(15), async {
+            match escrow.format {
+                RelayFormat::NativeMtpSealedV1 => {
+                    crate::federated_relay::resolve_and_verify_native_for_ingress(
+                        frame,
+                        identities.as_ref(),
+                        None,
+                        &keyring,
+                    )
+                    .await
+                }
+                RelayFormat::TauSignedRelayV1 => {
+                    crate::federated_relay::decode_and_verify_for_ingress(
+                        frame,
+                        identities.as_ref(),
+                        None,
+                        &keyring,
+                    )
+                    .await
+                }
+            }
+        })
+        .await
+        .map_err(|_| RelayServiceError::Internal("recovery verification timed out".into()))?
+        .map_err(|error| match error {
+            iota_identity::IdentityError::Unavailable(_)
+            | iota_identity::IdentityError::Storage(_) => {
+                RelayServiceError::Internal(error.to_string())
+            }
+            _ => RelayServiceError::Rejected(error.to_string()),
+        })?;
+        let sender = self
+            .local_users
+            .local_user_for_principal(verified.signer.handle)
+            .map_err(|error| RelayServiceError::Internal(error.to_string()))?;
+        let recipient = self
+            .local_users
+            .local_user_for_principal(verified.recipient.handle)
+            .map_err(|error| RelayServiceError::Internal(error.to_string()))?;
+        let operation = prepared_relay::prepare_recovery_application(&verified, sender, recipient)
+            .map_err(|error| RelayServiceError::Rejected(error.to_string()))?;
+        if operation.secret_escrow.as_ref() != Some(escrow) {
+            return Err(RelayServiceError::Rejected(
+                "escrow differs from original signed operation".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn prepare_relay(
         &self,
         source: &IngressSource,
         frame: CommunicationValue,
     ) -> Result<VerifiedRelayEnvelope, RelayServiceError> {
+        let frame = if frame.get_data(DataType::Status).and_then(DataValue::as_str)
+            == Some(crate::federated_relay::NATIVE_PEER_FRAME)
+        {
+            if !matches!(source, IngressSource::DirectPeer { .. }) {
+                return Err(RelayServiceError::Rejected(
+                    "native peer wrapper requires authenticated direct peer".into(),
+                ));
+            }
+            crate::federated_relay::open_native_peer_frame(&frame)
+                .map_err(|error| RelayServiceError::Rejected(error.to_string()))?
+        } else {
+            frame
+        };
         if let Some(verified) = durable_replay(&frame)? {
             self.authorize_source(source, &verified)?;
             return Ok(verified);
@@ -327,7 +575,10 @@ impl RelayService {
             .ok_or_else(|| {
                 RelayServiceError::Internal("local node identity is unavailable".into())
             })?;
-        let destination = if matches!(source, IngressSource::HostedClient { .. }) {
+        let destination = if matches!(
+            source,
+            IngressSource::HostedClient { .. } | IngressSource::OmikronHosted { .. }
+        ) {
             None
         } else {
             Some(&node)
@@ -341,15 +592,25 @@ impl RelayService {
             .ok_or_else(|| {
                 RelayServiceError::Internal("local relay decryption key is unavailable".into())
             })?;
-        tokio::time::timeout(
-            Duration::from_secs(15),
-            crate::federated_relay::decode_and_verify_for_ingress(
-                frame,
-                identities.as_ref(),
-                destination,
-                &keyring,
-            ),
-        )
+        tokio::time::timeout(Duration::from_secs(15), async {
+            if frame.payload().as_encrypted().is_some() {
+                crate::federated_relay::resolve_and_verify_native_for_ingress(
+                    frame,
+                    identities.as_ref(),
+                    destination,
+                    &keyring,
+                )
+                .await
+            } else {
+                crate::federated_relay::decode_and_verify_for_ingress(
+                    frame,
+                    identities.as_ref(),
+                    destination,
+                    &keyring,
+                )
+                .await
+            }
+        })
         .await
         .map_err(|_| RelayServiceError::Internal("identity preparation timed out".into()))?
         .map_err(|error| match error {
@@ -400,6 +661,14 @@ impl RelayService {
                     Some(session.hosted_lease.ok_or_else(|| {
                         RelayServiceError::Rejected("hosted lease is missing".into())
                     })?)
+                }
+                IngressSource::OmikronHosted { lease } => {
+                    if lease.identity.principal != verified.signer.handle {
+                        return Err(RelayServiceError::Rejected(
+                            "forwarded session cannot originate this relay".into(),
+                        ));
+                    }
+                    Some(lease)
                 }
                 IngressSource::DirectPeer { .. }
                 | IngressSource::Omikron { .. }
@@ -471,9 +740,45 @@ impl RelayService {
                 &StorageError::RelayOwnerUnavailable,
             ));
         }
-        let operation = match prepared_relay::prepare_application(&verified, sender, recipient) {
+        let mut operation = match prepared_relay::prepare_application(&verified, sender, recipient)
+        {
             Ok(operation) => operation,
             Err(error) => return Ok(storage_outcome(&verified.frame, &error)),
+        };
+        if let Some(lease) = lease.as_ref()
+            && let Err(error) = operation.bind_origin_lease(lease)
+        {
+            return Ok(storage_outcome(&verified.frame, &error));
+        }
+        let initialization = if matches!(
+            operation.operation,
+            prepared_relay::ApplicationOperation::SetChatSecret { version: 1, .. }
+        ) {
+            let escrow = operation.secret_escrow.as_ref().ok_or_else(|| {
+                RelayServiceError::Internal("initial secret evidence is missing".into())
+            })?;
+            match crate::chat_secret_recovery::gate_initial_set_chat_secret(escrow).await {
+                Ok(guard) => Some(guard),
+                Err(crate::chat_secret_recovery::RecoveryError::Conflict) => {
+                    return Ok(storage_outcome(
+                        &verified.frame,
+                        &StorageError::ChatSecretConflict,
+                    ));
+                }
+                Err(crate::chat_secret_recovery::RecoveryError::Unauthorized) => {
+                    return Ok(storage_outcome(
+                        &verified.frame,
+                        &StorageError::MessageUnauthorized,
+                    ));
+                }
+                Err(error) => {
+                    return Err(RelayServiceError::Internal(format!(
+                        "initial secret authorization unavailable: {error}"
+                    )));
+                }
+            }
+        } else {
+            None
         };
         relay_work::fault_point("after_preparation", &operation.message_id);
         self.accept_prepared_relay(
@@ -481,6 +786,7 @@ impl RelayService {
             lease.as_ref(),
             verified.frame,
             recipient.map(|_| verified.recipient.handle),
+            initialization,
         )
         .await
     }
@@ -491,6 +797,7 @@ impl RelayService {
         lease: Option<&iota_identity::HostedAuthorizationLease>,
         frame: CommunicationValue,
         recipient: Option<iota_identity::PrincipalHandle>,
+        initialization: Option<crate::chat_secret_recovery::InitialSetGuard>,
     ) -> Result<RelayOutcome, RelayServiceError> {
         let serialized = crate::persisted_relay::encode_prepared_operation(&operation)
             .map_err(|e| RelayServiceError::Internal(e.to_string()))?;
@@ -518,13 +825,27 @@ impl RelayService {
         match acquisition {
             relay_replay::AcquireResult::Claimed(claim) => {
                 relay_work::fault_point("after_claim_acquisition", &claim.message_id);
-                if let Err(error) = operation.commit(&claim) {
+                if let Err(error) = operation.commit_checked(&claim, |tx| {
+                    if let Some(guard) = initialization.as_ref() {
+                        guard.recheck_in_tx(tx)?;
+                    }
+                    Ok(())
+                }) {
+                    if matches!(error, StorageError::ChatSecretConflict) {
+                        enqueue_operation_recovery(&operation, true);
+                    }
                     if permanent(&error) {
                         reject_claim(&claim, &error)?;
                     }
                     return Ok(storage_outcome(&frame, &error));
                 }
                 relay_work::fault_point("after_application_commit", &claim.message_id);
+                if matches!(
+                    operation.operation,
+                    prepared_relay::ApplicationOperation::AddConversation { .. }
+                ) {
+                    enqueue_operation_recovery(&operation, false);
+                }
                 // Delivery is supervised separately. Acceptance never depends on transport availability.
                 Ok(success(
                     &frame,
@@ -533,6 +854,12 @@ impl RelayService {
                     "accepted",
                     operation.recipient,
                     recipient
+                        .filter(|_| {
+                            !matches!(
+                                operation.operation,
+                                prepared_relay::ApplicationOperation::SetChatSecret { .. }
+                            )
+                        })
                         .map(|recipient| ClientDelivery {
                             recipient,
                             frame: frame.clone(),
@@ -585,13 +912,57 @@ impl RelayService {
     }
 
     pub fn resume_relay(&self, work: &relay_work::AcceptedWork) -> Result<bool, RelayServiceError> {
-        self.recover_one(work)
+        self.recover_one(work, Ok(None))
             .map(|outcome| matches!(outcome, RecoveryAttempt::Completed))
+    }
+
+    pub async fn resume_relay_authorized(
+        &self,
+        work: &relay_work::AcceptedWork,
+    ) -> Result<bool, RelayServiceError> {
+        let initialization = self.recovery_initialization(work).await;
+        self.recover_one(work, initialization)
+            .map(|outcome| matches!(outcome, RecoveryAttempt::Completed))
+    }
+
+    async fn recovery_initialization(
+        &self,
+        work: &relay_work::AcceptedWork,
+    ) -> Result<Option<crate::chat_secret_recovery::InitialSetGuard>, RecoveryFailure> {
+        if work.state == relay_replay::RelayState::Applied {
+            return Ok(None);
+        }
+        let operation = crate::persisted_relay::decode_prepared_operation(&work.prepared)
+            .map_err(|_| RecoveryFailure::InvalidPersisted)?;
+        if !matches!(
+            operation.operation,
+            prepared_relay::ApplicationOperation::SetChatSecret { version: 1, .. }
+        ) {
+            return Ok(None);
+        }
+        let escrow = operation
+            .secret_escrow
+            .as_ref()
+            .ok_or(RecoveryFailure::InvalidPersisted)?;
+        crate::chat_secret_recovery::gate_initial_set_chat_secret(escrow)
+            .await
+            .map(Some)
+            .map_err(|error| match error {
+                crate::chat_secret_recovery::RecoveryError::Conflict => RecoveryFailure::Invariant,
+                crate::chat_secret_recovery::RecoveryError::Unauthorized => {
+                    RecoveryFailure::AccountUnavailable
+                }
+                _ => RecoveryFailure::MissingDependency,
+            })
     }
 
     fn recover_one(
         &self,
         work: &relay_work::AcceptedWork,
+        initialization: Result<
+            Option<crate::chat_secret_recovery::InitialSetGuard>,
+            RecoveryFailure,
+        >,
     ) -> Result<RecoveryAttempt, RelayServiceError> {
         let mut observed = relay_work::AcceptedWork {
             signer: work.signer,
@@ -602,7 +973,7 @@ impl RelayService {
             prepared: work.prepared.clone(),
             attempts: work.attempts,
         };
-        match self.resume_observed(&mut observed) {
+        match self.resume_observed(&mut observed, initialization) {
             Ok(done) => {
                 if done {
                     relay_work::resolve_outcome(&observed)
@@ -669,6 +1040,10 @@ impl RelayService {
     fn resume_observed(
         &self,
         work: &mut relay_work::AcceptedWork,
+        initialization: Result<
+            Option<crate::chat_secret_recovery::InitialSetGuard>,
+            RecoveryFailure,
+        >,
     ) -> Result<bool, RecoveryFailure> {
         let operation =
             crate::persisted_relay::decode_prepared_operation(&work.prepared).map_err(|error| {
@@ -687,6 +1062,16 @@ impl RelayService {
                 .map_err(|error| RecoveryFailure::from_storage(&error))?;
             return Ok(true);
         }
+        let initialization = initialization?;
+        // A synchronous replay API cannot obtain fresh remote authorization.
+        // It may reschedule, but must never recreate a missing first epoch.
+        if matches!(
+            operation.operation,
+            prepared_relay::ApplicationOperation::SetChatSecret { version: 1, .. }
+        ) && initialization.is_none()
+        {
+            return Err(RecoveryFailure::MissingDependency);
+        }
         let Some(claim) = relay_work::take_over_abandoned_processing(
             work,
             now_millis_i64().saturating_add(30_000),
@@ -698,7 +1083,12 @@ impl RelayService {
         work.state = relay_replay::RelayState::Processing;
         work.generation = claim.generation;
         work.owner = Some(claim.owner.clone());
-        match operation.commit(&claim) {
+        match operation.commit_checked(&claim, |tx| {
+            if let Some(guard) = initialization.as_ref() {
+                guard.recheck_in_tx(tx)?;
+            }
+            Ok(())
+        }) {
             Ok(()) => Ok(true),
             Err(error @ StorageError::RelayOwnerUnavailable) => {
                 reject_claim(&claim, &error).map_err(|_| RecoveryFailure::Invariant)?;
@@ -714,7 +1104,10 @@ impl RelayService {
         }
     }
 
-    pub fn recover_incomplete(&self, limit: i64) -> Result<RecoveryReport, RelayServiceError> {
+    fn recovery_work(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<relay_work::AcceptedWork>, RelayServiceError> {
         if !self
             .persistence_migrated
             .load(std::sync::atomic::Ordering::Acquire)
@@ -724,12 +1117,15 @@ impl RelayService {
             self.persistence_migrated
                 .store(true, std::sync::atomic::Ordering::Release);
         }
+        relay_work::incomplete(limit)
+            .map_err(|error| RelayServiceError::Internal(error.to_string()))
+    }
+
+    pub fn recover_incomplete(&self, limit: i64) -> Result<RecoveryReport, RelayServiceError> {
         let mut report = RecoveryReport::default();
-        for work in
-            relay_work::incomplete(limit).map_err(|e| RelayServiceError::Internal(e.to_string()))?
-        {
+        for work in self.recovery_work(limit)? {
             report.selected += 1;
-            match self.recover_one(&work)? {
+            match self.recover_one(&work, Ok(None))? {
                 RecoveryAttempt::Completed => report.completed += 1,
                 RecoveryAttempt::Superseded => report.superseded += 1,
                 RecoveryAttempt::Rescheduled => report.rescheduled += 1,
@@ -742,8 +1138,70 @@ impl RelayService {
         Ok(report)
     }
 
+    /// Production recovery must refresh initialization authority before replaying
+    /// an uncommitted first epoch. Accepted/applied queue repair needs no probe.
+    pub async fn recover_incomplete_authorized(
+        &self,
+        limit: i64,
+    ) -> Result<RecoveryReport, RelayServiceError> {
+        let mut report = RecoveryReport::default();
+        for work in self.recovery_work(limit)? {
+            let initialization = self.recovery_initialization(&work).await;
+            report.selected += 1;
+            match self.recover_one(&work, initialization)? {
+                RecoveryAttempt::Completed => report.completed += 1,
+                RecoveryAttempt::Superseded => report.superseded += 1,
+                RecoveryAttempt::Rescheduled => report.rescheduled += 1,
+                RecoveryAttempt::Blocked => report.blocked += 1,
+            }
+        }
+        report.health =
+            relay_work::health().map_err(|error| RelayServiceError::Internal(error.to_string()))?;
+        report.remaining_estimate = report.health.remaining;
+        Ok(report)
+    }
+
     pub fn dispatcher(&self) -> PendingRelayDispatcher {
         PendingRelayDispatcher::new(self.router.clone())
+    }
+}
+
+fn enqueue_operation_recovery(operation: &PreparedRelayOperation, conflict: bool) {
+    use iota_storage::util::{chat_secret_recovery, e2ee_storage};
+    let Ok(signer) = crate::federated_relay::canonical_principal(&operation.signer_identity) else {
+        return;
+    };
+    let Ok(recipient) = crate::federated_relay::canonical_principal(&operation.recipient_identity)
+    else {
+        return;
+    };
+    for effect in &operation.effects {
+        let (owner, partner) = if effect.sent_by_self {
+            (&signer, &recipient)
+        } else {
+            (&recipient, &signer)
+        };
+        let present = (|| {
+            let chat_id = chat_secret_recovery::canonical_chat_id(owner, partner)?;
+            let query = e2ee_storage::ChatSecretQuery {
+                user_id: effect.owner.0.to_string(),
+                secret_id: Some(e2ee_storage::principal_secret_id(&chat_id)),
+                chat_id,
+                version: None,
+            };
+            let record =
+                db::with_db(|connection| e2ee_storage::get_chat_secret_on(connection, &query))?;
+            Ok::<_, StorageError>(
+                record.is_some()
+                    && chat_secret_recovery::escrow_for_recovery(owner, partner, owner, None)?
+                        .is_some(),
+            )
+        })();
+        if (conflict || !matches!(present, Ok(true)))
+            && let Err(error) = crate::chat_secret_recovery::enqueue_recovery(owner, partner, None)
+        {
+            iota_logger::log!("Chat secret recovery enqueue failed: {error:?}");
+        }
     }
 }
 
@@ -923,31 +1381,51 @@ impl PendingRelayDispatcher {
                 continue;
             };
             let frame = frame.with_id(pending.frame_id);
-            let matching = match crate::federated_relay::parse_wire(&frame) {
-                Ok(wire)
-                    if wire.destination == node.as_str()
-                        && pending.relay_message_id.as_deref() == Some(&wire.message_id) =>
-                {
-                    let store = iota_storage::identity::SqlitePrincipalStore;
-                    let mut matching = true;
-                    for (identity, expected) in [
-                        (&wire.signer, pending.signer_principal),
-                        (&wire.recipient, pending.destination_principal),
-                    ] {
-                        let Ok(canonical) = crate::federated_relay::canonical_principal(identity)
-                        else {
-                            matching = false;
-                            break;
-                        };
-                        let principal = store
-                            .get_by_canonical_id(&canonical)
-                            .map_err(|error| RelayServiceError::Internal(error.to_string()))?;
-                        matching &= expected.is_some()
-                            && principal.map(|principal| principal.handle) == expected;
+            let matching = if frame.payload().as_encrypted().is_some() {
+                match (
+                    pending.signer_principal,
+                    pending.destination_principal,
+                    pending.relay_message_id.as_deref(),
+                ) {
+                    (Some(signer), Some(recipient), Some(message_id)) => {
+                        pending_frame_identity_matches(
+                            &frame,
+                            signer,
+                            recipient,
+                            message_id,
+                            Some(node),
+                        )?
                     }
-                    matching
+                    _ => false,
                 }
-                _ => false,
+            } else {
+                match crate::federated_relay::parse_wire(&frame) {
+                    Ok(wire)
+                        if wire.destination == node.as_str()
+                            && pending.relay_message_id.as_deref() == Some(&wire.message_id) =>
+                    {
+                        let store = iota_storage::identity::SqlitePrincipalStore;
+                        let mut matching = true;
+                        for (identity, expected) in [
+                            (&wire.signer, pending.signer_principal),
+                            (&wire.recipient, pending.destination_principal),
+                        ] {
+                            let Ok(canonical) =
+                                crate::federated_relay::canonical_principal(identity)
+                            else {
+                                matching = false;
+                                break;
+                            };
+                            let principal = store
+                                .get_by_canonical_id(&canonical)
+                                .map_err(|error| RelayServiceError::Internal(error.to_string()))?;
+                            matching &= expected.is_some()
+                                && principal.map(|principal| principal.handle) == expected;
+                        }
+                        matching
+                    }
+                    _ => false,
+                }
             };
             if !matching {
                 relay_queue::quarantine_claimed(&claimed, "pending_canonical_identity_mismatch")

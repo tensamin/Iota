@@ -86,10 +86,10 @@ mod runtime;
 use error::PasswordFinishError;
 
 pub(crate) use runtime::PasswordAuthRuntime;
-pub use runtime::PasswordReadiness;
 #[cfg(test)]
 use runtime::PasswordRuntimeError;
 use runtime::PendingLogin;
+pub use runtime::{PasswordCredentialCounts, PasswordHealth, PasswordReadiness};
 mod wire;
 #[cfg(test)]
 use wire::{now_millis, typed};
@@ -621,3 +621,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod recovery_tests;

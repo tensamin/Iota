@@ -257,6 +257,14 @@ fn register_in_tx(
     tx: &Transaction<'_>,
     lease: &HostedAuthorizationLease,
 ) -> Result<(), StorageError> {
+    let cancelled: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM hosted_forwarded_revocations WHERE connection_id=?1)",
+        [&lease.connection_id],
+        |row| row.get(0),
+    )?;
+    if cancelled {
+        return Err(StorageError::HostedAuthorizationDenied);
+    }
     let identity = lease.identity;
     let inserted = tx.execute(
         "INSERT INTO hosted_connection_authorizations
@@ -337,6 +345,7 @@ pub fn verify(lease: &HostedAuthorizationLease) -> Result<(), StorageError> {
 
 /// Call from the schema migration after version 54. The caller owns user_version.
 pub fn migrate_server_instances(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch(FORWARDED_REVOCATION_SCHEMA)?;
     let exists: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hosted_server_instances')",
         [], |row| row.get(0),
@@ -465,6 +474,60 @@ pub fn remove(connection_id: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
+pub(crate) const FORWARDED_REVOCATION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS hosted_forwarded_revocations (
+    connection_id TEXT PRIMARY KEY NOT NULL,
+    revoked_at INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS hosted_forwarded_revocations_immutable BEFORE UPDATE ON hosted_forwarded_revocations
+BEGIN SELECT RAISE(ABORT,'forwarded cancellation is permanent'); END;
+CREATE TRIGGER IF NOT EXISTS hosted_forwarded_revocations_delete BEFORE DELETE ON hosted_forwarded_revocations
+BEGIN SELECT RAISE(ABORT,'forwarded cancellation is permanent'); END;";
+
+/// Cancel a server-generated forwarding nonce even if registration has not yet
+/// happened. The tombstone has no account/principal dependency and survives
+/// restart. A successful return fences every subsequent actual application commit.
+pub fn revoke_forwarded(connection_id: &str) -> Result<(), StorageError> {
+    if connection_id
+        .strip_prefix("omikron-relay:")
+        .and_then(|nonce| uuid::Uuid::parse_str(nonce).ok())
+        .is_none_or(|nonce| connection_id != format!("omikron-relay:{nonce}"))
+    {
+        return Err(StorageError::HostedAuthorizationDenied);
+    }
+    REVOKED_CONNECTIONS
+        .lock()
+        .expect("revocation lock poisoned")
+        .insert(connection_id.to_owned());
+    db::with_immediate_transaction(|tx| revoke_forwarded_in_tx(tx, connection_id))?;
+    REVOKED_CONNECTIONS
+        .lock()
+        .expect("revocation lock poisoned")
+        .remove(connection_id);
+    Ok(())
+}
+
+pub fn revoke_forwarded_in_tx(
+    tx: &Transaction<'_>,
+    connection_id: &str,
+) -> Result<(), StorageError> {
+    let nonce = connection_id
+        .strip_prefix("omikron-relay:")
+        .and_then(|nonce| uuid::Uuid::parse_str(nonce).ok())
+        .filter(|nonce| connection_id == format!("omikron-relay:{nonce}"));
+    if nonce.is_none() {
+        return Err(StorageError::HostedAuthorizationDenied);
+    }
+    let inserted=tx.execute("INSERT INTO hosted_forwarded_revocations(connection_id,revoked_at) VALUES(?1,?2) ON CONFLICT(connection_id) DO NOTHING",params![connection_id,crate::util::sync::now_millis()])?;
+    let revoked=tx.execute("UPDATE hosted_connection_authorizations SET revoked=1 WHERE connection_id=?1 AND revoked=0",[connection_id])?;
+    if inserted != 0 || revoked != 0 {
+        tx.execute(
+            "UPDATE hosted_auth_changes SET sequence=sequence+1 WHERE singleton=1",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +573,68 @@ mod tests {
         register_in_tx(&tx, &lease).unwrap();
         tx.commit().unwrap();
         lease
+    }
+
+    #[test]
+    fn forwarded_cancellation_before_registration_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("forwarded.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        setup(&connection);
+        let mut forwarded = lease(&mut connection);
+        forwarded.connection_id = "omikron-relay:00000000-0000-4000-8000-000000000001".into();
+        let tx = connection.transaction().unwrap();
+        revoke_forwarded_in_tx(&tx, &forwarded.connection_id).unwrap();
+        tx.commit().unwrap();
+        drop(connection);
+        let mut connection = Connection::open(path).unwrap();
+        let tx = connection.transaction().unwrap();
+        assert!(matches!(
+            register_in_tx(&tx, &forwarded),
+            Err(StorageError::HostedAuthorizationDenied)
+        ));
+        assert_eq!(
+            tx.query_row(
+                "SELECT COUNT(*) FROM hosted_connection_authorizations WHERE local_user_id=0",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert!(
+            tx.execute("DELETE FROM hosted_forwarded_revocations", [])
+                .is_err()
+        );
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn forwarded_cancellation_fences_existing_exact_lease_and_is_atomic() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        setup(&connection);
+        let mut forwarded = lease(&mut connection);
+        forwarded.connection_id = "omikron-relay:00000000-0000-4000-8000-000000000002".into();
+        let tx = connection.transaction().unwrap();
+        register_in_tx(&tx, &forwarded).unwrap();
+        tx.commit().unwrap();
+        let tx = connection.transaction().unwrap();
+        verify_in_tx(&tx, &forwarded).unwrap();
+        revoke_forwarded_in_tx(&tx, &forwarded.connection_id).unwrap();
+        assert!(matches!(
+            verify_in_tx(&tx, &forwarded),
+            Err(StorageError::HostedAuthorizationDenied)
+        ));
+        tx.rollback().unwrap();
+        let tx = connection.transaction().unwrap();
+        verify_in_tx(&tx, &forwarded).unwrap();
+        revoke_forwarded_in_tx(&tx, &forwarded.connection_id).unwrap();
+        revoke_forwarded_in_tx(&tx, &forwarded.connection_id).unwrap();
+        tx.commit().unwrap();
+        assert!(matches!(
+            verify_in_db(&connection, &forwarded),
+            Err(StorageError::HostedAuthorizationDenied)
+        ));
     }
 
     #[test]

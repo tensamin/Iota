@@ -32,12 +32,19 @@ pub fn principal_chat_id(
     if first.0 <= 0 || second.0 <= 0 || first == second {
         return None;
     }
-    let (first, second) = if first.0 < second.0 {
-        (first.0, second.0)
-    } else {
-        (second.0, first.0)
+    db::with_db(|connection| principal_chat_id_on(connection, first, second)).ok()
+}
+
+pub fn principal_chat_id_on(
+    connection: &Connection,
+    first: iota_identity::PrincipalHandle,
+    second: iota_identity::PrincipalHandle,
+) -> Result<String, TransactionError> {
+    let identity = |handle: iota_identity::PrincipalHandle| -> Result<iota_identity::PrincipalId,TransactionError> {
+        let (authority,user_id): (String,i64)=connection.query_row("SELECT authority_id,remote_user_id FROM principals WHERE principal_pk=?1",[handle.0],|row| Ok((row.get(0)?,row.get(1)?)))?;
+        Ok(iota_identity::PrincipalId {authority:iota_identity::AuthorityId::new(&authority).map_err(|_| TransactionError::InvalidRelayPayload("principal namespace"))?,user_id:u64::try_from(user_id).map_err(|_| TransactionError::InvalidRelayPayload("principal namespace"))?})
     };
-    Some(format!("principal:{first}:{second}"))
+    super::chat_secret_recovery::canonical_chat_id(&identity(first)?, &identity(second)?)
 }
 
 pub fn principal_secret_id(chat_id: &str) -> String {
@@ -143,33 +150,22 @@ pub fn migrate_chat_secret_namespace_in_tx(
             "chat secret namespace is incomplete".into(),
         ));
     }
-    let handles = principal_chat_id
-        .strip_prefix("principal:")
-        .ok_or(TransactionError::InvalidRelayPayload(
-            "principal chat namespace",
-        ))?
-        .split(':')
-        .map(str::parse::<i64>)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| TransactionError::InvalidRelayPayload("principal chat namespace"))?;
-    if handles.len() != 2
-        || handles[0] <= 0
-        || handles[0] >= handles[1]
+    use base64::Engine as _;
+    let encoded = principal_chat_id.strip_prefix("principal:").ok_or(
+        TransactionError::InvalidRelayPayload("principal chat namespace"),
+    )?;
+    let pair: [iota_identity::PrincipalId; 2] = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| TransactionError::InvalidRelayPayload("principal chat namespace"))?,
+    )
+    .map_err(|_| TransactionError::InvalidRelayPayload("principal chat namespace"))?;
+    if super::chat_secret_recovery::canonical_chat_id(&pair[0], &pair[1])? != principal_chat_id
         || principal_secret_id != self::principal_secret_id(principal_chat_id)
     {
         return Err(TransactionError::ChatSecretConflict);
     }
-    let identities = {
-        let mut statement = tx.prepare("SELECT authority_id, remote_user_id FROM principals WHERE principal_pk IN (?1, ?2) ORDER BY principal_pk")?;
-        statement
-            .query_map(params![handles[0], handles[1]], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    if identities.len() != 2 {
-        return Err(TransactionError::MissingRelayDependency);
-    }
+    let identities = pair.map(|id| (id.authority.as_str().to_owned(), id.user_id as i64));
     // Numeric legacy namespaces authenticate a pair only when each numeric ID
     // has one canonical meaning. Never copy another authority's secret by ID.
     if identities[0].0 != identities[1].0 {
@@ -314,6 +310,18 @@ fn insert_chat_secret(
 /// Idempotent account erasure now uses the authoritative database transaction.
 pub fn purge_user(user_id: i64) -> Result<(), StorageError> {
     db::with_immediate_transaction(|tx| {
+        // Hosted mapping may already have been removed by a preceding purge
+        // phase; lifecycle triggers fence it before removal.
+        if tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hosted_principals WHERE local_user_id=?1)",
+            [user_id],
+            |row| row.get::<_, bool>(0),
+        )? {
+            super::chat_secret_recovery::purge_owner_in_tx(
+                tx,
+                iota_identity::LocalUserId(user_id),
+            )?;
+        }
         tx.execute(
             "DELETE FROM chat_secrets WHERE user_id = ?1",
             [user_id.to_string()],
@@ -511,14 +519,18 @@ mod tests {
 
     #[test]
     fn chat_secret_namespace_uses_principals() {
-        let first = principal_chat_id(PrincipalHandle(3), PrincipalHandle(9));
-        let second = principal_chat_id(PrincipalHandle(9), PrincipalHandle(3));
-        assert_eq!(first, Some("principal:3:9".to_string()));
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE principals(principal_pk INTEGER,authority_id TEXT,remote_user_id INTEGER); INSERT INTO principals VALUES(3,'authority-a',11),(9,'authority-b',22);").unwrap();
+        let first =
+            super::principal_chat_id_on(&connection, PrincipalHandle(3), PrincipalHandle(9))
+                .unwrap();
+        let second =
+            super::principal_chat_id_on(&connection, PrincipalHandle(9), PrincipalHandle(3))
+                .unwrap();
+        assert!(first.starts_with("principal:"));
+        assert!(!first.contains("3:9"));
         assert_eq!(first, second);
-        assert_eq!(
-            principal_secret_id("principal:3:9"),
-            "chat:principal:3:9:main"
-        );
+        assert_eq!(principal_secret_id(&first), format!("chat:{first}:main"));
     }
 
     #[test]

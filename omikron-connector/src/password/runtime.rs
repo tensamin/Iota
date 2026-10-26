@@ -15,10 +15,31 @@ use uuid::Uuid;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PasswordReadiness {
     SetupUnavailable,
+    SetupMismatch,
     Initialized,
+    CredentialsInvalid,
+    IdentityUnverified,
     LegacyUnverified,
     StorageValidationFailure,
     ReenrollmentRequired,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PasswordCredentialCounts {
+    pub total: u64,
+    pub validated: u64,
+    pub invalid: u64,
+    pub legacy_unverified: u64,
+    pub identity_unverified: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PasswordHealth {
+    pub setup_available: bool,
+    pub storage_validated: bool,
+    pub readiness: PasswordReadiness,
+    /// None means no successful full scan, not zero credentials.
+    pub credentials: Option<PasswordCredentialCounts>,
 }
 
 #[derive(Default)]
@@ -124,6 +145,7 @@ impl Drop for AttemptLease {
 pub(crate) struct PasswordAuthRuntime {
     pub(crate) metrics: PasswordMetrics,
     pub(crate) readiness: std::sync::RwLock<PasswordReadiness>,
+    credential_counts: std::sync::RwLock<Option<PasswordCredentialCounts>>,
     pub(super) setup: OnceLock<Arc<PasswordServerSetup>>,
     pub(super) omega_authority: OnceLock<String>,
     pub(super) logins: DashMap<Uuid, PendingLogin>,
@@ -138,6 +160,9 @@ pub(crate) struct PasswordAuthRuntime {
     malformed_requests: std::sync::Mutex<(Instant, u32)>,
     pub(super) pending_ttl: Duration,
     pub(super) throttle: PasswordThrottleConfig,
+    #[cfg(test)]
+    pub(super) release_gate:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 fn configured_positive<T: std::str::FromStr + PartialOrd + Default + Copy>(
@@ -167,6 +192,7 @@ impl Default for PasswordAuthRuntime {
             metrics: PasswordMetrics::default(),
             malformed_requests: std::sync::Mutex::new((Instant::now(), 0)),
             readiness: std::sync::RwLock::new(PasswordReadiness::SetupUnavailable),
+            credential_counts: std::sync::RwLock::new(None),
             setup: OnceLock::new(),
             omega_authority: OnceLock::new(),
             logins: DashMap::new(),
@@ -199,6 +225,8 @@ impl Default for PasswordAuthRuntime {
                     5000,
                 )),
             },
+            #[cfg(test)]
+            release_gate: std::sync::Mutex::new(None),
         }
     }
 }
@@ -264,7 +292,10 @@ impl PasswordAuthRuntime {
     }
 
     pub(crate) fn setup(&self) -> Result<Arc<PasswordServerSetup>, PasswordRuntimeError> {
-        if *self.readiness.read().unwrap() == PasswordReadiness::StorageValidationFailure {
+        if matches!(
+            *self.readiness.read().unwrap(),
+            PasswordReadiness::StorageValidationFailure | PasswordReadiness::SetupMismatch
+        ) {
             return Err(PasswordRuntimeError::SetupUnavailable);
         }
         self.setup
@@ -297,40 +328,91 @@ impl PasswordAuthRuntime {
             }
             Err(error) => return Err(error.to_string()),
         };
-        let fingerprint = Sha256::digest(opaque::serialize_server_setup(&setup).as_slice());
-        let verified =
-            password_credentials::validate_setup_binding(&fingerprint).map_err(|error| {
-                *self.readiness.write().unwrap() = PasswordReadiness::StorageValidationFailure;
-                error.to_string()
-            })?;
-        *self.readiness.write().unwrap() = if verified {
-            PasswordReadiness::Initialized
-        } else {
-            PasswordReadiness::LegacyUnverified
-        };
         let _ = self.setup.set(Arc::new(setup));
-        Ok(())
+        self.validate_storage()
     }
 
-    pub(super) fn validate_storage(&self) -> Result<(), String> {
+    pub(crate) fn validate_storage(&self) -> Result<(), String> {
         let setup = self.setup.get().ok_or("OPAQUE setup unavailable")?;
         let fingerprint = Sha256::digest(opaque::serialize_server_setup(setup).as_slice());
-        match password_credentials::validate_setup_binding(&fingerprint) {
-            Ok(verified) => {
+        let mut counts = PasswordCredentialCounts::default();
+        let iota_id = iota_storage::util::config_util::CONFIG.load().iota_id;
+        let authority = self.omega_authority.get();
+        let mut setup_mismatch = false;
+        let result = password_credentials::inspect_all(|credential, public_key| {
+            counts.total += 1;
+            setup_mismatch |= credential
+                .setup_sha256
+                .as_ref()
+                .is_some_and(|stored| stored.as_slice() != fingerprint.as_slice());
+            let principal =
+                authority.map(|authority| format!("{authority}#{}", credential.user_id));
+            let valid = public_key.is_some_and(|key| {
+                super::credential_ready(
+                    credential,
+                    key,
+                    setup,
+                    principal
+                        .as_deref()
+                        .or(credential.password_principal.as_deref())
+                        .unwrap_or(""),
+                    iota_id
+                        .and_then(|id| i64::try_from(id).ok())
+                        .or(credential.password_iota_id)
+                        .unwrap_or(0),
+                )
+            });
+            if !valid {
+                counts.invalid += 1;
+            } else if credential.setup_sha256.is_none() {
+                counts.legacy_unverified += 1;
+            } else if authority.is_none() || iota_id.is_none() {
+                counts.identity_unverified += 1;
+            } else {
+                counts.validated += 1;
+            }
+        });
+        match result {
+            Ok(()) => {
                 let mut readiness = self.readiness.write().unwrap();
+                *self.credential_counts.write().unwrap() = Some(counts);
                 if *readiness != PasswordReadiness::ReenrollmentRequired {
-                    *readiness = if verified {
-                        PasswordReadiness::Initialized
-                    } else {
+                    *readiness = if setup_mismatch {
+                        PasswordReadiness::SetupMismatch
+                    } else if counts.invalid > 0 {
+                        PasswordReadiness::CredentialsInvalid
+                    } else if counts.legacy_unverified > 0 {
                         PasswordReadiness::LegacyUnverified
+                    } else if counts.identity_unverified > 0 {
+                        PasswordReadiness::IdentityUnverified
+                    } else {
+                        PasswordReadiness::Initialized
                     };
                 }
-                Ok(())
+                if setup_mismatch {
+                    Err("OPAQUE setup does not match enrolled credentials".into())
+                } else {
+                    Ok(())
+                }
             }
             Err(error) => {
-                *self.readiness.write().unwrap() = PasswordReadiness::StorageValidationFailure;
+                let mut readiness = self.readiness.write().unwrap();
+                *readiness = PasswordReadiness::StorageValidationFailure;
+                *self.credential_counts.write().unwrap() = None;
                 Err(error.to_string())
             }
+        }
+    }
+
+    pub(crate) fn health(&self) -> PasswordHealth {
+        let readiness = self.readiness.read().unwrap();
+        let credentials = *self.credential_counts.read().unwrap();
+        PasswordHealth {
+            setup_available: self.setup.get().is_some(),
+            storage_validated: credentials.is_some()
+                && *readiness != PasswordReadiness::StorageValidationFailure,
+            readiness: *readiness,
+            credentials,
         }
     }
 

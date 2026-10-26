@@ -2,6 +2,9 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::{storage_error::StorageError, util::db};
 
+mod mutations;
+pub use mutations::{commit_disable, commit_enrollment, mutation_outcome};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PasswordCredential {
     pub user_id: i64,
@@ -17,8 +20,14 @@ pub struct PasswordCredential {
 }
 
 pub fn get(user_id: i64) -> Result<Option<PasswordCredential>, StorageError> {
-    db::with_db(|conn| {
-        conn.query_row(
+    db::with_db(|conn| get_on(conn, user_id))
+}
+
+fn get_on(
+    conn: &rusqlite::Connection,
+    user_id: i64,
+) -> Result<Option<PasswordCredential>, StorageError> {
+    conn.query_row(
             "SELECT user_id, opaque_profile, opaque_record, encrypted_tu_credential, account_public_key_sha256, created_at, updated_at, setup_sha256, password_principal, password_iota_id FROM user_password_credentials WHERE user_id = ?1",
             params![user_id],
             |row| Ok(PasswordCredential {
@@ -27,7 +36,6 @@ pub fn get(user_id: i64) -> Result<Option<PasswordCredential>, StorageError> {
                 setup_sha256: row.get(7)?, password_principal: row.get(8)?, password_iota_id: row.get(9)?,
             }),
         ).optional().map_err(Into::into)
-    })
 }
 
 pub fn exists(user_id: i64) -> Result<bool, StorageError> {
@@ -49,6 +57,39 @@ pub fn any() -> Result<bool, StorageError> {
             |row| row.get(0),
         )
         .map_err(Into::into)
+    })
+}
+
+/// Inspect credential bytes and the current account key in one SQLite snapshot.
+/// The visitor must not perform network I/O or write to the database.
+pub fn inspect_all(
+    mut inspect: impl FnMut(&PasswordCredential, Option<&str>),
+) -> Result<(), StorageError> {
+    db::with_db(|conn| {
+        let mut statement = conn.prepare(
+            "SELECT c.user_id, c.opaque_profile, c.opaque_record, c.encrypted_tu_credential,
+                    c.account_public_key_sha256, c.created_at, c.updated_at, c.setup_sha256,
+                    c.password_principal, c.password_iota_id, u.public_key
+             FROM user_password_credentials c LEFT JOIN users u ON u.user_id = c.user_id",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let credential = PasswordCredential {
+                user_id: row.get(0)?,
+                opaque_profile: row.get(1)?,
+                opaque_record: row.get(2)?,
+                encrypted_tu_credential: row.get(3)?,
+                account_public_key_sha256: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+                setup_sha256: row.get(7)?,
+                password_principal: row.get(8)?,
+                password_iota_id: row.get(9)?,
+            };
+            let public_key: Option<String> = row.get(10)?;
+            inspect(&credential, public_key.as_deref());
+        }
+        Ok(())
     })
 }
 
@@ -103,26 +144,36 @@ fn upsert_checked(
     generation: Option<i64>,
 ) -> Result<(), StorageError> {
     db::with_immediate_transaction(|tx| {
-        let current: Option<String> = tx
-            .query_row(
-                "SELECT public_key FROM users WHERE user_id = ?1",
-                params![credential.user_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if current.as_deref() != Some(expected_public_key) {
-            return Err(StorageError::HostedAuthorizationDenied);
-        }
-        if let Some(generation) = generation {
-            let authorized: bool = tx.query_row(
+        upsert_in_tx(tx, credential, expected_public_key, generation)
+    })
+}
+
+fn upsert_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    credential: &PasswordCredential,
+    expected_public_key: &str,
+    generation: Option<i64>,
+) -> Result<(), StorageError> {
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT public_key FROM users WHERE user_id = ?1",
+            params![credential.user_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if current.as_deref() != Some(expected_public_key) {
+        return Err(StorageError::HostedAuthorizationDenied);
+    }
+    if let Some(generation) = generation {
+        let authorized: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM hosted_auth_state WHERE local_user_id = ?1 AND enabled = 1 AND generation = ?2)",
                 params![credential.user_id, generation], |row| row.get(0),
             )?;
-            if !authorized {
-                return Err(StorageError::HostedAuthorizationDenied);
-            }
+        if !authorized {
+            return Err(StorageError::HostedAuthorizationDenied);
         }
-        tx.execute(
+    }
+    tx.execute(
             "INSERT INTO user_password_credentials (user_id, opaque_profile, opaque_record, encrypted_tu_credential, account_public_key_sha256, created_at, updated_at, setup_sha256, password_principal, password_iota_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(user_id) DO UPDATE SET
@@ -138,6 +189,26 @@ fn upsert_checked(
                 credential.account_public_key_sha256, credential.created_at, credential.updated_at,
                 credential.setup_sha256, credential.password_principal, credential.password_iota_id],
         )?;
+    Ok(())
+}
+
+/// Credential-release linearization point. A successful immediate transaction
+/// grants release of exactly this snapshot, even if disablement commits later.
+/// It does not promise cancellation of ciphertext already in transit.
+pub fn authorize_release(
+    credential: &PasswordCredential,
+    expected_public_key: &str,
+    generation: i64,
+) -> Result<(), StorageError> {
+    db::with_immediate_transaction(|tx| {
+        let authorized: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users u JOIN hosted_auth_state a ON a.local_user_id = u.user_id
+             WHERE u.user_id = ?1 AND u.public_key = ?2 AND a.enabled = 1 AND a.generation = ?3)",
+            params![credential.user_id, expected_public_key, generation], |row| row.get(0),
+        )?;
+        if !authorized || get_on(tx, credential.user_id)?.as_ref() != Some(credential) {
+            return Err(StorageError::HostedAuthorizationDenied);
+        }
         Ok(())
     })
 }

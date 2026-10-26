@@ -67,16 +67,37 @@ impl RouteOutcome {
         request: &CommunicationValue,
         response: CommunicationValue,
     ) -> Result<Self, RouteError> {
-        let Some(DataValue::Bytes(payload)) = request.get_data(DataType::SecurePayload) else {
-            return Err(RouteError::Delivery("missing signed relay request".into()));
+        let original;
+        let request = if request.get_data(DataType::Status).as_str()
+            == Some(crate::federated_relay::NATIVE_PEER_FRAME)
+        {
+            original = crate::federated_relay::open_native_peer_frame(request)
+                .map_err(|error| RouteError::Delivery(error.to_string()))?;
+            &original
+        } else {
+            request
         };
-        let wire = tau_relay_protocol::RelayWire::from_json(payload)
-            .map_err(|_| RouteError::Delivery("invalid signed relay request".into()))?;
+        let message_id = if request.payload().as_encrypted().is_some() {
+            // The transport cannot decrypt sealed metadata. The durable queue must
+            // independently compare this ID with its verified expected message ID.
+            response
+                .get_data(DataType::RelayMessageId)
+                .as_str()
+                .filter(|id| {
+                    id.strip_prefix("mtp-sealed-v1:")
+                        .is_some_and(|id| id.parse::<u128>().is_ok())
+                })
+                .ok_or_else(|| RouteError::Delivery("missing native relay message ID".into()))?
+                .to_owned()
+        } else {
+            crate::federated_relay::parse_wire(request)
+                .map_err(|_| RouteError::Delivery("invalid signed relay request".into()))?
+                .message_id
+        };
         let matching_identity = request.id().is_some()
             && response.id() == request.id()
-            && response.get_data(DataType::RelayMessageId).as_str()
-                == Some(wire.message_id.as_str())
-            && matches!(response.get_data(DataType::SecurePayload), Some(DataValue::Bytes(actual)) if actual == &relay_response_identity(&wire)?);
+            && response.get_data(DataType::RelayMessageId).as_str() == Some(message_id.as_str())
+            && matches!(response.get_data(DataType::SecurePayload), Some(DataValue::Bytes(actual)) if actual == &request_response_identity(request)?);
         let status = response.get_data(DataType::Status).as_str();
         if response.is_type(CommunicationType::Success) {
             if !matching_identity || !matches!(status, Some("accepted" | "already_accepted")) {
@@ -93,7 +114,7 @@ impl RouteOutcome {
                     RouteError::Delivery("relay acceptance omitted its timestamp".into())
                 })?;
             return Ok(Self::Accepted {
-                relay_message_id: wire.message_id,
+                relay_message_id: message_id,
                 destination_accepted_at: accepted_at,
             });
         }
@@ -138,15 +159,41 @@ pub fn bind_relay_response_identity(
     request: &CommunicationValue,
     response: CommunicationValue,
 ) -> Result<CommunicationValue, RouteError> {
-    let Some(DataValue::Bytes(payload)) = request.get_data(DataType::SecurePayload) else {
-        return Err(RouteError::Delivery("missing signed relay request".into()));
-    };
-    let wire = tau_relay_protocol::RelayWire::from_json(payload)
-        .map_err(|_| RouteError::Delivery("invalid signed relay request".into()))?;
     Ok(response.add_typed_default(
         DataType::SecurePayload,
-        DataValue::Bytes(relay_response_identity(&wire)?),
+        DataValue::Bytes(request_response_identity(request)?),
     ))
+}
+
+fn request_response_identity(request: &CommunicationValue) -> Result<Vec<u8>, RouteError> {
+    if request.get_data(DataType::Status).as_str()
+        == Some(crate::federated_relay::NATIVE_PEER_FRAME)
+    {
+        let original = crate::federated_relay::open_native_peer_frame(request)
+            .map_err(|error| RouteError::Delivery(error.to_string()))?;
+        return request_response_identity(&original);
+    }
+    if request.is_type(CommunicationType::Relay) && request.payload().as_encrypted().is_some() {
+        let mut bytes = b"tensamin/native-relay-response/v1\0".to_vec();
+        let map = request
+            .type_map()
+            .ok_or_else(|| RouteError::Delivery("missing relay type map".into()))?;
+        bytes.extend_from_slice(map.version.to_string().as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(
+            &request
+                .clone()
+                .without_id()
+                .to_bytes()
+                .map_err(|_| RouteError::Delivery("cannot encode native relay".into()))?,
+        );
+        let mut identity = b"mtp-sealed-v1\0".to_vec();
+        identity.extend_from_slice(&mtp::crypto::sha256(&bytes));
+        return Ok(identity);
+    }
+    let wire = crate::federated_relay::parse_wire(request)
+        .map_err(|_| RouteError::Delivery("invalid signed relay request".into()))?;
+    relay_response_identity(&wire)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

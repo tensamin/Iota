@@ -1,6 +1,7 @@
 pub mod blocked_users;
 pub mod call_envelopes;
 pub mod chat_files;
+pub mod chat_secret_recovery;
 pub mod chats_util;
 pub mod client_message_delivery;
 pub mod client_relay_delivery;

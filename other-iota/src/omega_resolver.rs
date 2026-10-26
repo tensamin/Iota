@@ -128,6 +128,38 @@ impl RemoteOmegaResolver {
 
 #[async_trait]
 impl IdentityResolver for RemoteOmegaResolver {
+    async fn resolve_current_principal(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<ResolvedPrincipal, IdentityError> {
+        let locator = self.authorities.read().ok().and_then(|authorities| {
+            authorities
+                .iter()
+                .find(|(_, authority)| authority.authority_id == principal.authority)
+                .map(|(locator, _)| locator.clone())
+        });
+        let Some(locator) = locator else {
+            return Err(IdentityError::NotFound);
+        };
+        let authority = self.client.discover(&locator).await?;
+        if authority.service != AuthorityKind::Omega
+            || authority.authority_id != principal.authority
+        {
+            return Err(IdentityError::KeyPinMismatch);
+        }
+        let current = self
+            .refresh(
+                &locator,
+                &authority,
+                &UserSelector::UserId(principal.user_id),
+            )
+            .await?;
+        if let Ok(mut authorities) = self.authorities.write() {
+            authorities.insert(locator, authority);
+        }
+        Ok(current)
+    }
+
     async fn resolve_address(
         &self,
         address: &UserAddress,

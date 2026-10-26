@@ -19,6 +19,10 @@ iota-storage = { path = "../iota-storage" }
 serde_json = "1"
 
 [dev-dependencies]
+base64 = "0.22.1"
+iota-auth = { path = "../iota-auth" }
+rusqlite = "0.40.0"
+uuid = "1"
 iota-storage = { path = "../iota-storage" }
 rcgen = "0.14"
 tempfile = "3"

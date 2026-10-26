@@ -448,6 +448,17 @@ impl std::error::Error for IdentityError {}
 
 #[async_trait]
 pub trait IdentityResolver: Send + Sync {
+    /// Refresh authoritative ownership, home, and keys. A cached descriptor is
+    /// never sufficient for recovery disclosure or an initialization negative.
+    async fn resolve_current_principal(
+        &self,
+        _: &PrincipalId,
+    ) -> Result<ResolvedPrincipal, IdentityError> {
+        Err(IdentityError::Unavailable(
+            "authoritative identity refresh is unsupported".into(),
+        ))
+    }
+
     async fn resolve_address(
         &self,
         address: &UserAddress,

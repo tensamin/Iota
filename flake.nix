@@ -7,7 +7,15 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     type-maps = {
-      url = "git+https://github.com/TensaminDev/MTP-Type-Maps.git?ref=main&rev=f0f856ca1d5fc3ca2b05a71f287c226ea58a6c60";
+      url = "git+file:mtp-type-maps";
+      flake = false;
+    };
+    tau-src = {
+      url = "git+file:../tau";
+      flake = false;
+    };
+    mtp-src = {
+      url = "git+file:../mtp";
       flake = false;
     };
   };
@@ -17,6 +25,8 @@
       nixpkgs,
       rust-overlay,
       type-maps,
+      tau-src,
+      mtp-src,
       ...
     }:
     let
@@ -235,6 +245,12 @@
             chmod -R u+w "$out"
             rm -rf "$out/mtp-type-maps"
             cp -r ${type-maps} "$out/mtp-type-maps"
+            substituteInPlace "$out/Cargo.toml" \
+              --replace-fail 'path = "../tau"' 'path = "${tau-src}"' \
+              --replace-fail 'path = "../tau/relay-protocol"' 'path = "${tau-src}/relay-protocol"' \
+              --replace-fail 'path = "../mtp"' 'path = "${mtp-src}"' \
+              --replace-fail 'path = "../mtp/type-map"' 'path = "${mtp-src}/type-map"' \
+              --replace-fail 'path = "../mtp/crypto"' 'path = "${mtp-src}/crypto"'
           '';
         in
         {
@@ -245,16 +261,22 @@
               pname = "iota";
               version = "0.1.0";
               src = source;
-              hash = "sha256-DPEXa53uivYktolH1MEBrYUVIGMtjnwGPBabJKMLfb4=";
+              hash = "sha256-2qjtZHSfQesKr3Xrgx8KXEILPyZ4W143c8GnOBQvqfc=";
             };
           };
           cli = self.packages.${system}.default.overrideAttrs {
             pname = "iota-cli";
-            cargoBuildFlags = [ "-p" "iota" ];
+            cargoBuildFlags = [
+              "-p"
+              "iota"
+            ];
           };
           daemon = self.packages.${system}.default.overrideAttrs {
             pname = "iota-daemon";
-            cargoBuildFlags = [ "-p" "iota-daemon" ];
+            cargoBuildFlags = [
+              "-p"
+              "iota-daemon"
+            ];
             meta.mainProgram = "iota-daemon";
           };
           portable = self.lib.mkPortable {

@@ -13,6 +13,20 @@ impl CompositeIdentityResolver {
 
 #[async_trait]
 impl IdentityResolver for CompositeIdentityResolver {
+    async fn resolve_current_principal(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<ResolvedPrincipal, IdentityError> {
+        for resolver in &self.resolvers {
+            match resolver.resolve_current_principal(principal).await {
+                Ok(resolved) => return Ok(resolved),
+                Err(IdentityError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(IdentityError::NotFound)
+    }
+
     async fn resolve_address(
         &self,
         address: &UserAddress,

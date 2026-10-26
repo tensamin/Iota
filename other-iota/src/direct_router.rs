@@ -1,6 +1,23 @@
 use super::*;
 
 impl DirectPeerRouter {
+    pub fn install_recovery(
+        &self,
+        recovery: Arc<dyn iota_connection::chat_secret_recovery::PeerRecoveryHandler>,
+    ) {
+        *self
+            .recovery
+            .write()
+            .expect("recovery registry lock poisoned") = Some(Arc::downgrade(&recovery));
+        if let Some(manager) = self
+            .manager
+            .read()
+            .ok()
+            .and_then(|manager| manager.as_ref().and_then(Weak::upgrade))
+        {
+            manager.install_recovery(recovery);
+        }
+    }
     pub fn register(
         &self,
         node: IotaNodeId,
@@ -56,12 +73,80 @@ impl DirectPeerRouter {
         if let Ok(mut current) = self.manager.write() {
             *current = Some(Arc::downgrade(manager));
         }
+        if let Some(recovery) = self
+            .recovery
+            .read()
+            .ok()
+            .and_then(|recovery| recovery.as_ref().and_then(Weak::upgrade))
+        {
+            manager.install_recovery(recovery);
+        }
     }
 
     pub fn has_connection(&self, node: &IotaNodeId) -> bool {
         self.peers
             .read()
             .is_ok_and(|peers| peers.contains_key(node))
+    }
+}
+
+#[async_trait]
+impl iota_connection::chat_secret_recovery::RecoveryTransport for DirectPeerRouter {
+    async fn request(
+        &self,
+        node: &IotaNodeId,
+        request: &iota_connection::chat_secret_recovery::RecoveryRequest,
+    ) -> Result<
+        iota_connection::chat_secret_recovery::AuthenticatedRecoveryReply,
+        iota_connection::chat_secret_recovery::RecoveryError,
+    > {
+        use iota_connection::chat_secret_recovery::*;
+        request.validate()?;
+        let manager = self
+            .manager
+            .read()
+            .ok()
+            .and_then(|manager| manager.as_ref().and_then(Weak::upgrade))
+            .ok_or(RecoveryError::RetryablePeerUnavailable)?;
+        if !self.has_connection(node) {
+            manager
+                .connect_best(node)
+                .await
+                .map_err(|_| RecoveryError::RetryablePeerUnavailable)?;
+        }
+        let (generation, connection) = self
+            .peers
+            .read()
+            .ok()
+            .and_then(|peers| peers.get(node).map(|peer| (peer.0, peer.1.clone())))
+            .ok_or(RecoveryError::RetryablePeerUnavailable)?;
+        let key = connection
+            .authenticated_key()
+            .ok_or(RecoveryError::Unauthorized)?;
+        if manager.validate_established_peer(node, &key).await.is_err() {
+            self.unregister(node, generation);
+            connection.close();
+            return Err(RecoveryError::Unauthorized);
+        }
+        let frame = request_frame(request)?;
+        let id = frame.id();
+        let response = connection
+            .send_peer_control(frame)
+            .await
+            .map_err(|_| RecoveryError::RetryablePeerUnavailable)?;
+        if response.id() != id {
+            return Err(RecoveryError::Conflict);
+        }
+        manager
+            .validate_established_peer(node, &key)
+            .await
+            .map_err(|_| RecoveryError::Unauthorized)?;
+        let reply = decode_reply(&response, request)?;
+        Ok(AuthenticatedRecoveryReply {
+            node: node.clone(),
+            key,
+            reply,
+        })
     }
 }
 
@@ -115,6 +200,12 @@ impl PeerRouter for DirectPeerRouter {
                 return Err(RouteError::Delivery("peer manager is shutting down".into()));
             }
         }
+        let frame = if frame.payload().as_encrypted().is_some() {
+            iota_connection::federated_relay::native_peer_frame(frame)
+                .map_err(|error| RouteError::Delivery(error.to_string()))?
+        } else {
+            frame
+        };
         connection.send_relay(frame).await
     }
 }

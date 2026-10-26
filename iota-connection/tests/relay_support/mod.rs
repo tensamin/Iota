@@ -77,6 +77,12 @@ impl PeerRouter for Router {
 pub struct Resolver;
 #[async_trait]
 impl IdentityResolver for Resolver {
+    async fn resolve_current_principal(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<ResolvedPrincipal, IdentityError> {
+        self.resolve_principal(principal).await
+    }
     async fn resolve_address(
         &self,
         _: &UserAddress,
@@ -112,6 +118,77 @@ impl RelayNodeIdentity for Node {
     }
 }
 
+struct TestPeerAbsence(Vec<LocalNodeIdentity>);
+
+#[async_trait]
+impl NodeIdentityResolver for TestPeerAbsence {
+    async fn resolve_node(&self, node: &IotaNodeId) -> Result<ResolvedNodeIdentity, IdentityError> {
+        let identity = self
+            .0
+            .iter()
+            .find(|identity| identity.node_id() == node)
+            .ok_or(IdentityError::NotFound)?;
+        Ok(ResolvedNodeIdentity {
+            node: node.clone(),
+            public_keys: vec![identity.public_keys()],
+            descriptor_revision: 1,
+            valid_until: None,
+            direct_endpoints: vec![],
+            relay_hints: vec![],
+            last_successful_endpoint: None,
+            resolved_at: iota_storage::util::sync::now_millis(),
+        })
+    }
+}
+
+#[async_trait]
+impl iota_connection::chat_secret_recovery::RecoveryTransport for TestPeerAbsence {
+    async fn request(
+        &self,
+        node: &IotaNodeId,
+        request: &iota_connection::chat_secret_recovery::RecoveryRequest,
+    ) -> Result<
+        iota_connection::chat_secret_recovery::AuthenticatedRecoveryReply,
+        iota_connection::chat_secret_recovery::RecoveryError,
+    > {
+        use iota_connection::chat_secret_recovery::*;
+        assert!(
+            request.proposal_digest.is_some(),
+            "fixture mocks initialization absence only"
+        );
+        let identity = self
+            .0
+            .iter()
+            .find(|identity| identity.node_id() == node)
+            .ok_or(RecoveryError::Unauthorized)?;
+        Ok(AuthenticatedRecoveryReply {
+            node: node.clone(),
+            key: identity.public_keys(),
+            reply: RecoveryReply {
+                request: request.clone(),
+                result: Err(RecoveryError::NoSuchConversation),
+            },
+        })
+    }
+}
+
+pub fn install_test_recovery(
+    service: Arc<RelayService>,
+    local: &LocalNodeIdentity,
+    peers: &[LocalNodeIdentity],
+) {
+    use iota_connection::chat_secret_recovery::*;
+    install_recovery(Arc::new(RecoveryCoordinator::new(
+        Arc::new(Resolver),
+        Arc::new(TestPeerAbsence(peers.to_vec())),
+        Arc::new(SqlitePrincipalStore),
+        Arc::new(SqliteLocalUserStore),
+        local.node_id().clone(),
+        Arc::new(TestPeerAbsence(peers.to_vec())),
+        Arc::new(OriginalOperationVerifier { relay: service }),
+    )));
+}
+
 pub struct Fixture {
     pub service: Arc<RelayService>,
     pub node: LocalNodeIdentity,
@@ -124,10 +201,16 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn destination_service(&self) -> Arc<RelayService> {
-        Arc::new(
+        let service = Arc::new(
             RelayService::new(Arc::new(SqliteLocalUserStore), Arc::new(Router(true)))
                 .with_federation(Arc::new(Resolver), Arc::new(Node(self.destination.clone()))),
-        )
+        );
+        install_test_recovery(
+            service.clone(),
+            &self.destination,
+            &[self.node.clone(), self.destination.clone()],
+        );
+        service
     }
 
     pub fn new(both_local: bool) -> Self {
@@ -218,6 +301,7 @@ impl Fixture {
             RelayService::new(Arc::new(SqliteLocalUserStore), Arc::new(Router(true)))
                 .with_federation(Arc::new(Resolver), Arc::new(Node(node.clone()))),
         );
+        install_test_recovery(service.clone(), &node, &[node.clone(), destination.clone()]);
         Self {
             service,
             node,
@@ -309,8 +393,7 @@ pub fn secret(fixture: &Fixture) -> CommunicationValue {
         .enumerate()
         .map(|(index, principal)| {
             let id = index as u8 + 1;
-            tau::typed_container(
-                map,
+            DataValue::Container(
                 vec![
                     (
                         DataType::UserId,
@@ -318,9 +401,11 @@ pub fn secret(fixture: &Fixture) -> CommunicationValue {
                     ),
                     (DataType::EncryptedSecret, DataValue::Bytes(vec![id])),
                     (DataType::KemCiphertext, DataValue::Bytes(vec![10 + id])),
-                ],
+                ]
+                .into_iter()
+                .map(|(kind, value)| (kind.try_to_id(map).unwrap(), value))
+                .collect(),
             )
-            .unwrap()
         })
         .collect();
     frame

@@ -465,6 +465,45 @@ impl LocalIdentityResolver {
 
 #[async_trait::async_trait]
 impl iota_identity::IdentityResolver for LocalIdentityResolver {
+    async fn resolve_current_principal(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<ResolvedPrincipal, IdentityError> {
+        if principal.authority != self.authority {
+            return Err(IdentityError::NotFound);
+        }
+        if self.authority_kind != AuthorityKind::Iota {
+            return Err(IdentityError::NotFound);
+        }
+        let user =
+            LocalUserId(i64::try_from(principal.user_id).map_err(|_| IdentityError::NotFound)?);
+        if !self.local_users.is_hosted_here(user)? {
+            return Err(IdentityError::NotFound);
+        }
+        let resolved = self.resolve_principal(principal).await?;
+        let handle = self
+            .local_users
+            .principal_for_local_user(user)?
+            .ok_or(IdentityError::NotFound)?;
+        if resolved.principal != *principal
+            || resolved.handle != handle
+            || resolved.home != self.home
+        {
+            return Err(IdentityError::Unavailable(
+                "local principal ownership changed".into(),
+            ));
+        }
+        let current = crate::hosted_auth::resolve(user)
+            .map_err(|error| IdentityError::Unavailable(error.to_string()))?
+            .0;
+        if current.principal != handle {
+            return Err(IdentityError::Unavailable(
+                "local principal ownership changed".into(),
+            ));
+        }
+        Ok(resolved)
+    }
+
     async fn resolve_address(
         &self,
         address: &iota_identity::UserAddress,

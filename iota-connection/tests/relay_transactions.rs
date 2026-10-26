@@ -45,7 +45,11 @@ async fn signed_live_transactions() {
 }
 
 async fn peer() {
-    let f = Fixture::new(false);
+    use iota_identity::{
+        AuthorityKind, PrincipalDescriptor, PrincipalHome, PrincipalStore,
+        SignedPrincipalDescriptor,
+    };
+    let mut f = Fixture::new(false);
     execute("DELETE FROM hosted_principals; DELETE FROM users;");
     db::with_immediate_transaction(|tx| {
         tx.execute("INSERT INTO users(user_id, username, public_key, created_at) VALUES(2, 'recipient', 'test', 1)", [])?;
@@ -56,6 +60,38 @@ async fn peer() {
     let source = IngressSource::DirectPeer {
         node_id: f.node.node_id().clone(),
     };
+    // Deleting the origin's hosted account permanently fences that global
+    // identity. Recreating rows must not resurrect its old secret namespace.
+    assert!(matches!(
+        service
+            .accept_relay(source.clone(), f.frame(0, "erased-peer-secret", secret(&f)))
+            .await
+            .unwrap(),
+        RelayOutcome::Rejected { .. }
+    ));
+    assert_eq!(count("SELECT count(*) FROM chat_secret_erasure_fences"), 1);
+    f.ids[0].user_id = 3;
+    let now = iota_storage::util::sync::now_millis();
+    let fresh = SignedPrincipalDescriptor::sign(
+        PrincipalDescriptor {
+            principal: f.ids[0].clone(),
+            authority_kind: AuthorityKind::Iota,
+            username: Some("fresh-origin".into()),
+            display_name: None,
+            public_keys: vec![f.keys[0].public_key_bundle()],
+            home: PrincipalHome::Iota(f.node.node_id().clone()),
+            revision: 1,
+            valid_until: Some(now + 600_000),
+            issued_at: now,
+        },
+        &f.node.keyring(),
+    )
+    .unwrap()
+    .verify(f.node.authority_id(), &f.node.public_keys(), None, now)
+    .unwrap();
+    f.handles[0] = iota_storage::identity::SqlitePrincipalStore
+        .upsert_remote_descriptor(&fresh)
+        .unwrap();
     accepted(
         service
             .accept_relay(source.clone(), f.frame(0, "peer-secret", secret(&f)))

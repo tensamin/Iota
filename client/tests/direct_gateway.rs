@@ -447,13 +447,16 @@ async fn hosted_client_loads_state_originates_relay_and_receives_delivery() {
         .await
         .unwrap();
     assert!(
-        secret_response.is_type(CommunicationType::ChatSecretResponse),
+        secret_response.is_type(CommunicationType::ErrorInternal),
         "unexpected private secret response: {secret_response:?}"
     );
     assert_eq!(secret_response.receiver(), Some(1));
-    assert_eq!(
-        secret_response.get_data(DataType::EncryptedSecret),
-        Some(&DataValue::Bytes(vec![1]))
+    // This canonical row lacks original wrapping-namespace evidence. The key
+    // change above also permanently fences the old owner's envelopes.
+    assert!(
+        secret_response
+            .get_data(DataType::EncryptedSecret)
+            .is_none()
     );
     iota_storage::util::relay_queue::resume_client_deliveries(1).unwrap();
     LocalDeliverySink::deliver(manager.as_ref(), local_handle, offline.clone()).await;

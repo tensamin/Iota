@@ -262,13 +262,17 @@ impl PeerManager {
         let shutdown = shutdown.child_token();
         let monitor = self.monitor_peer(&node, &key, &shutdown);
         tokio::pin!(monitor);
+        let mut operations = peer_transport::PeerOperations::default();
         loop {
             let frame = tokio::select! {
                 biased;
                 _ = &mut monitor => break,
+                _ = operations.next(), if !operations.is_empty() => continue,
                 frame = connection.receive() => match frame { Ok(frame) => frame, Err(_) => break },
             };
-            if let Some(frame_id) = frame.id()
+            if !frame.is_type(mtp::codec::CommunicationType::Relay)
+                && !frame.is_type(mtp::codec::CommunicationType::ChatSecretRecoveryRequest)
+                && let Some(frame_id) = frame.id()
                 && let Some((_, response)) = pending
                     .lock()
                     .expect("peer response lock poisoned")
@@ -286,17 +290,15 @@ impl PeerManager {
                         .map_err(|error| error.to_string())
                 }
             });
-            tokio::pin!(operation);
-            tokio::select! {
-                _ = &mut operation => {},
-                _ = &mut monitor => {
-                    shutdown.cancel();
-                    pending.lock().expect("peer response lock poisoned").clear();
-                    connection.sender.close(); operation.await;
-                    break;
-                },
+            if !operations.push(operation) {
+                iota_logger::log!("Peer request limit reached: node={}", node.as_str());
+                break;
             }
         }
+        shutdown.cancel();
+        pending.lock().expect("peer response lock poisoned").clear();
+        connection.sender.close();
+        operations.drain().await;
         Ok(())
     }
 }

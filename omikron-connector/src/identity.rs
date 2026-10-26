@@ -176,6 +176,24 @@ pub async fn resolve_omega_principal(
 
 #[async_trait]
 impl IdentityResolver for OmegaIdentityResolver {
+    async fn resolve_current_principal(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<ResolvedPrincipal, IdentityError> {
+        if principal.authority != self.authority {
+            return Err(IdentityError::NotFound);
+        }
+        let resolved = self
+            .resolve_remote(&UserSelector::UserId(principal.user_id))
+            .await?;
+        if resolved.principal != *principal {
+            return Err(IdentityError::InvalidDescriptor(
+                "Omega returned another principal".into(),
+            ));
+        }
+        Ok(resolved)
+    }
+
     async fn resolve_address(
         &self,
         address: &UserAddress,

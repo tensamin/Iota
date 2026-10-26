@@ -157,7 +157,7 @@ fn resumes_migration_when_height_exists_before_its_version() -> Result<(), Stora
     run_migrations_on_connection(&conn)?;
 
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(version, 64);
+    assert_eq!(version, 66);
     for column in ["height", "reply_to", "edited_count", "deleted_by_external"] {
         let mut statement =
             conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1")?;
@@ -176,7 +176,7 @@ fn migrates_version_five_once_and_is_idempotent() -> Result<(), StorageError> {
     run_migrations_on_connection(&conn)?;
     run_migrations_on_connection(&conn)?;
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(version, 64);
+    assert_eq!(version, 66);
     for table in [
         "sync_heads",
         "sync_events",
@@ -265,7 +265,7 @@ fn removes_password_version_columns_without_losing_credentials() -> Result<(), S
     run_migrations_on_connection(&conn)?;
 
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(version, 64);
+    assert_eq!(version, 66);
     let credential: (i64, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64) = conn.query_row(
             "SELECT opaque_profile, opaque_record, encrypted_tu_credential, account_public_key_sha256, created_at, updated_at FROM user_password_credentials WHERE user_id = 7",
             [],
@@ -301,7 +301,7 @@ fn migration_adds_opaque_profile_to_existing_credentials() -> Result<(), Storage
     run_migrations_on_connection(&conn)?;
     run_migrations_on_connection(&conn)?;
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(version, 64);
+    assert_eq!(version, 66);
     let credential: (i64, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64) = conn.query_row(
             "SELECT opaque_profile, opaque_record, encrypted_tu_credential, account_public_key_sha256, created_at, updated_at FROM user_password_credentials WHERE user_id = 7",
             [],
@@ -319,7 +319,7 @@ fn adds_synced_settings_to_a_version_eleven_schema() -> Result<(), StorageError>
     run_migrations_on_connection(&conn)?;
 
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(version, 64);
+    assert_eq!(version, 66);
     for column in [
         "id",
         "user_id",
@@ -414,7 +414,7 @@ fn pending_purge_migration_preserves_lifecycle_operations() -> Result<(), Storag
     )?;
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     assert_eq!(preserved, "remote_committed");
-    assert_eq!(version, 64);
+    assert_eq!(version, 66);
     Ok(())
 }
 
@@ -451,6 +451,6 @@ fn invitation_authority_migration_discards_unmappable_omega_mirrors() -> Result<
     })?;
     assert_eq!(count, 0);
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(version, 64);
+    assert_eq!(version, 66);
     Ok(())
 }

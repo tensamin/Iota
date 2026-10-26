@@ -37,7 +37,7 @@ impl OmikronConnection {
         frame: &CommunicationValue,
     ) -> Result<CommunicationValue, String> {
         let (opened, public_key, authorization_generation) = self
-            .open_password_command(frame, CommunicationType::PasswordEnrollmentStart)
+            .open_password_command(frame, CommunicationType::PasswordEnrollmentStart, true)
             .await?;
         let user_id = i64::try_from(opened.signer_id()).map_err(|error| error.to_string())?;
         let permit = self.password_auth.begin_enrollment()?;
@@ -102,7 +102,7 @@ impl OmikronConnection {
         frame: &CommunicationValue,
     ) -> Result<CommunicationValue, String> {
         let (opened, expected_public_key, authorization_generation) = self
-            .open_password_command(frame, CommunicationType::PasswordEnrollmentFinish)
+            .open_password_command(frame, CommunicationType::PasswordEnrollmentFinish, true)
             .await?;
         let user_id = i64::try_from(opened.signer_id()).map_err(|error| error.to_string())?;
         let enrollment_id = session(opened.content())?;
@@ -139,7 +139,15 @@ impl OmikronConnection {
             .iota_id
             .ok_or("Iota has no identity")? as i64;
         use sha2::{Digest, Sha256};
-        password_credentials::upsert_if_authorized(
+        let operation_id = opened.message_id().to_string();
+        let request_sha256 = Sha256::digest(
+            frame
+                .clone()
+                .without_id()
+                .to_bytes()
+                .map_err(|error| error.to_string())?,
+        );
+        password_credentials::commit_enrollment(
             &PasswordCredential {
                 user_id,
                 opaque_profile: opaque::CURRENT_OPAQUE_PROFILE,
@@ -156,6 +164,7 @@ impl OmikronConnection {
             },
             &expected_public_key,
             authorization_generation,
+            (&operation_id, &request_sha256),
         )
         .map_err(|error| error.to_string())?;
         self.password_auth.cancel_logins_for_user(user_id);
@@ -177,6 +186,19 @@ impl OmikronConnection {
         self: Arc<Self>,
         frame: &CommunicationValue,
     ) {
+        if frame.get_data(DataType::SecurePayload).is_some() {
+            match self.password_mutation_status(frame).await {
+                Ok(response) => {
+                    let _ = self.send_message(&response).await;
+                }
+                Err(error) => {
+                    iota_logger::log!("Password mutation status failed: {error}");
+                    self.password_error(frame, CommunicationType::ErrorInternal)
+                        .await;
+                }
+            }
+            return;
+        }
         if self.password_auth.setup().is_err() {
             self.password_error(frame, CommunicationType::ErrorInternal)
                 .await;
@@ -184,7 +206,7 @@ impl OmikronConnection {
         }
         let result = async {
             let (opened, _, _) = self
-                .open_password_command(frame, CommunicationType::PasswordEnrollmentStatus)
+                .open_password_command(frame, CommunicationType::PasswordEnrollmentStatus, true)
                 .await?;
             let user_id = i64::try_from(opened.signer_id()).map_err(|error| error.to_string())?;
             let setup = self
@@ -239,16 +261,29 @@ impl OmikronConnection {
     ) {
         let result = async {
             let (opened, expected_public_key, authorization_generation) = self
-                .open_password_command(frame, CommunicationType::PasswordEnrollmentDisable)
+                .open_password_command(frame, CommunicationType::PasswordEnrollmentDisable, true)
                 .await?;
             let user_id = i64::try_from(opened.signer_id()).map_err(|error| error.to_string())?;
-            password_credentials::delete_if_authorized(
+            use sha2::{Digest, Sha256};
+            let operation_id = opened.message_id().to_string();
+            let request_sha256 = Sha256::digest(
+                frame
+                    .clone()
+                    .without_id()
+                    .to_bytes()
+                    .map_err(|error| error.to_string())?,
+            );
+            password_credentials::commit_disable(
                 user_id,
                 &expected_public_key,
                 authorization_generation,
+                (&operation_id, &request_sha256),
             )
             .map_err(|error| error.to_string())?;
             self.password_auth.cancel_logins_for_user(user_id);
+            if let Err(error) = self.password_auth.validate_storage() {
+                iota_logger::log!("Password storage validation failed after disablement: {error}");
+            }
             self.protected_response(
                 frame,
                 CommunicationType::PasswordEnrollmentStatus,
@@ -270,5 +305,79 @@ impl OmikronConnection {
                     .await;
             }
         }
+    }
+
+    /// The wrapper carries the original account-protected command unchanged.
+    /// Verifying it authorizes a receipt read, never replay of its mutation.
+    pub(super) async fn password_mutation_status(
+        &self,
+        frame: &CommunicationValue,
+    ) -> Result<CommunicationValue, String> {
+        use sha2::{Digest, Sha256};
+        let original = frame
+            .get_data(DataType::SecurePayload)
+            .and_then(DataValue::as_bytes)
+            .ok_or("missing protected operation")?;
+        if original.len() > 512 * 1024 {
+            return Err("protected operation too large".into());
+        }
+        let version = frame
+            .get_data(DataType::Version)
+            .and_then(DataValue::as_str)
+            .and_then(mtp::type_map::Version::parse)
+            .ok_or("missing operation type map")?;
+        let original =
+            CommunicationValue::try_from_bytes_with(&original, &mtp::codec::TypeMap::new(version))
+                .map_err(|error| error.to_string())?;
+        let kind = original
+            .get_comm_type_enum()
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    CommunicationType::PasswordEnrollmentFinish
+                        | CommunicationType::PasswordEnrollmentDisable
+                )
+            })
+            .ok_or("not a durable password mutation")?;
+        let (opened, key, generation) = self.open_password_command(&original, kind, false).await?;
+        if frame.sender() != Some(opened.signer_id()) {
+            return Err("wrong operation owner".into());
+        }
+        let user_id = i64::try_from(opened.signer_id()).map_err(|error| error.to_string())?;
+        let operation_id = opened.message_id().to_string();
+        let digest = Sha256::digest(
+            original
+                .without_id()
+                .to_bytes()
+                .map_err(|error| error.to_string())?,
+        );
+        let Some(enabled) = password_credentials::mutation_outcome(
+            user_id,
+            &key,
+            generation,
+            (&operation_id, &digest),
+        )
+        .map_err(|error| error.to_string())?
+        else {
+            // Absence does not prove rollback. The sender must retain its uncertain intent.
+            return Ok(CommunicationValue::new_with_type_map(
+                CommunicationType::ErrorInternal,
+                frame.type_map().ok_or("missing type map")?,
+            )
+            .with_id(frame.id().ok_or("missing request ID")?));
+        };
+        self.protected_response(
+            frame,
+            CommunicationType::PasswordEnrollmentStatus,
+            user_id,
+            DataValue::Container(vec![
+                typed(DataType::Enabled, DataValue::Bool(enabled))?,
+                typed(DataType::Status, DataValue::Str("committed".into()))?,
+                typed(DataType::Sha256, DataValue::Bytes(digest.to_vec()))?,
+            ]),
+            PASSWORD_RESPONSE_SIGNATURE,
+            PASSWORD_RESPONSE_ENCRYPTION,
+        )
+        .await
     }
 }

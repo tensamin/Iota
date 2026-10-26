@@ -31,6 +31,7 @@ impl PeerManager {
             authority_resolver: None,
             last_authentication_error: std::sync::Mutex::new(None),
             dials: std::sync::Mutex::new(HashMap::new()),
+            recovery: RwLock::new(None),
         }
     }
 
@@ -122,6 +123,10 @@ impl PeerManager {
     pub fn with_introducer(mut self, introducer: Arc<dyn introduction::PeerIntroducer>) -> Self {
         self.introducer = Some(introducer);
         self
+    }
+
+    pub fn install_recovery(&self, recovery: Arc<dyn iota_connection::chat_secret_recovery::PeerRecoveryHandler>) {
+        *self.recovery.write().expect("peer recovery lock poisoned") = Some(recovery);
     }
 
     pub fn with_authority_resolver(mut self, resolver: Arc<RemoteIotaResolver>) -> Self {

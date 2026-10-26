@@ -20,7 +20,7 @@ pub use setting_handlers::{
 };
 mod chat_secrets;
 use chat_secrets::contact_value;
-pub use chat_secrets::handle_get_chat_secret;
+pub use chat_secrets::{handle_get_chat_secret, validated_chat_secret_read_target};
 mod account_state;
 use account_state::add_receipt_policy_data;
 #[cfg(test)]

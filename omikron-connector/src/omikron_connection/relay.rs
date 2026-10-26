@@ -5,6 +5,22 @@ use iota_identity::PrincipalStore as _;
 // exact claim until the callback finishes, and release only that generation.
 struct ClientDispatch(relay_queue::ClaimedPendingRelay);
 
+struct ForwardedAuthorization(iota_identity::HostedAuthorizationLease);
+
+impl ForwardedAuthorization {
+    fn revoke(&self) -> Result<(), iota_storage::storage_error::StorageError> {
+        iota_storage::hosted_auth::revoke_forwarded(&self.0.connection_id)
+    }
+}
+
+impl Drop for ForwardedAuthorization {
+    fn drop(&mut self) {
+        if let Err(error) = self.revoke() {
+            log!("Forwarded Relay authorization cleanup failed: {error}");
+        }
+    }
+}
+
 impl Drop for ClientDispatch {
     fn drop(&mut self) {
         if let Err(error) = relay_queue::release_claim(&self.0) {
@@ -19,16 +35,124 @@ impl Drop for ClientDispatch {
 impl OmikronConnection {
     pub(super) async fn dispatch_relay(self: Arc<Self>, frame: CommunicationValue) {
         let request = frame.clone();
+        let nonce = frame
+            .get_data(DataType::Uuid)
+            .as_str()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .filter(|nonce| {
+                frame.get_data(DataType::Uuid).as_str() == Some(nonce.to_string().as_str())
+            });
+        if frame.get_data(DataType::Status).as_str() == Some("tensamin-hosted-native-revoke-v1") {
+            if self
+                .bound_attempt
+                .as_ref()
+                .is_none_or(|attempt| attempt.cancellation.is_cancelled())
+            {
+                return;
+            }
+            let Some(nonce) = nonce else {
+                return;
+            };
+            // Removal also tombstones a request that has not registered yet.
+            // Its future commit cannot resurrect this authorization.
+            if iota_storage::hosted_auth::revoke_forwarded(&format!("omikron-relay:{nonce}"))
+                .is_err()
+            {
+                return;
+            }
+            let response = CommunicationValue::new_with_type_map(
+                CommunicationType::Success,
+                frame.type_map().expect("decoded forwarding request"),
+            )
+            .with_id(frame.id().expect("correlated forwarding request"))
+            .add_typed_default(DataType::Status, DataValue::Str("revoked".into()))
+            .add_typed_default(DataType::Uuid, DataValue::Str(nonce.to_string()));
+            self.send_message(&response).await.ok();
+            return;
+        }
         let Some(relay) = self.relay_service() else {
             log!("Rejecting Omikron Relay because the daemon relay service is unavailable");
             return;
         };
-        let source = iota_connection::relay_service::IngressSource::Omikron {
+        let mut authorization = None;
+        let mut source = iota_connection::relay_service::IngressSource::Omikron {
             connection_id: self
                 .bound_attempt
                 .as_ref()
                 .map(|attempt| format!("{}:{}", self.connection_id, attempt.generation))
                 .unwrap_or_else(|| self.connection_id.to_string()),
+        };
+        let frame = if frame.get_data(DataType::Status).as_str()
+            == Some("tensamin-hosted-native-v1")
+        {
+            let forwarded = (|| {
+                let nonce = nonce?;
+                let attempt = self.bound_attempt.as_ref()?;
+                if attempt.cancellation.is_cancelled() {
+                    return None;
+                }
+                let actor = frame.sender().filter(|actor| *actor > 0)?;
+                let generation = frame
+                    .get_data(DataType::VersionNumber)
+                    .and_then(DataValue::as_unsigned_number)
+                    .filter(|value| *value > 0)?;
+                let session = frame
+                    .get_data(DataType::SessionId)
+                    .and_then(DataValue::as_unsigned_number)
+                    .filter(|value| *value > 0)?;
+                let DataValue::Bytes(bytes) = frame.get_data(DataType::SecurePayload)? else {
+                    return None;
+                };
+                let version = frame
+                    .get_data(DataType::Version)
+                    .as_str()
+                    .and_then(mtp::type_map::Version::parse)?;
+                let original =
+                    CommunicationValue::try_from_bytes_with(bytes, &TypeMap::new(version)).ok()?;
+                if !original.is_type(CommunicationType::Relay)
+                    || original.payload().as_encrypted().is_none()
+                    || original.id().is_none()
+                {
+                    return None;
+                }
+                let user = iota_identity::LocalUserId(i64::try_from(actor).ok()?);
+                let identity = iota_storage::hosted_auth::resolve(user).ok()?.0;
+                let principal = iota_storage::identity::SqlitePrincipalStore
+                    .get_principal(identity.principal)
+                    .ok()??;
+                // An Omikron numeric actor cannot select a local alias for a
+                // different canonical user. Native preparation checks collisions.
+                if principal.principal.user_id != actor {
+                    return None;
+                }
+                let lease = iota_identity::HostedAuthorizationLease {
+                    connection_id: format!("omikron-relay:{nonce}"),
+                    server_instance: format!(
+                        "omikron-forward:{}:{}:{generation}:{session}:{nonce}",
+                        self.connection_id, attempt.generation
+                    ),
+                    identity,
+                };
+                iota_storage::hosted_auth::maintain_server(&lease.server_instance, true).ok()?;
+                iota_storage::hosted_auth::register(&lease).ok()?;
+                Some((original, ForwardedAuthorization(lease)))
+            })();
+            let Some((original, lease)) = forwarded else {
+                self.send_message(&error_response(
+                    &request,
+                    CommunicationType::ErrorNotAuthenticated,
+                ))
+                .await
+                .ok();
+                return;
+            };
+            source = iota_connection::relay_service::IngressSource::OmikronHosted {
+                lease: lease.0.clone(),
+            };
+            authorization = Some(lease);
+            original
+        } else {
+            frame
         };
         // Signature/key resolution is disposable. Once acceptance starts, the
         // tracked handler owns the mutation until its durable continuation is
@@ -45,13 +169,36 @@ impl OmikronConnection {
                 Ok(verified) => verified,
                 Err(error) => {
                     log!("Relay preparation failed: {error:?}");
-                    let response = iota_connection::relay_service::relay_error_response(&request, &error);
+                    if let Some(authorization) = authorization.as_ref()
+                        && authorization.revoke().is_err() { return; }
+                    let mut response = iota_connection::relay_service::relay_error_response(&request, &error);
+                    if let Some(nonce) = nonce { response = response.add_typed_default(DataType::Uuid, DataValue::Str(nonce.to_string())); }
                     tokio::select! { _ = cancellation.cancelled() => {}, _ = self.send_message(&response) => {} }
                     return;
                 }
             },
         };
-        match relay.accept_verified_relay(source, verified).await {
+        let acceptance = relay.accept_verified_relay(source, verified);
+        tokio::pin!(acceptance);
+        let outcome = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                if let Some(authorization) = authorization.as_ref() { authorization.revoke().ok(); }
+                // Preserve ownership of any acquired claim, but its persisted
+                // source lease is now fenced inside the application commit.
+                acceptance.await
+            },
+            outcome = &mut acceptance => outcome,
+        };
+        if let Some(authorization) = authorization.as_ref()
+            && authorization.revoke().is_err()
+        {
+            return;
+        }
+        if cancellation.is_cancelled() {
+            return;
+        }
+        match outcome {
             Ok(outcome) => {
                 let (ingress_response, local_deliveries) = outcome.into_parts();
                 self.lifecycle_event(
@@ -65,10 +212,22 @@ impl OmikronConnection {
                         local_deliveries.len()
                     ),
                 );
-                if let Some(response) = ingress_response
-                    && let Err(error) = self.send_message(&response).await
-                {
-                    log!("Relay outcome delivery failed: {error}");
+                if let Some(response) = ingress_response {
+                    let response = if authorization.is_some() {
+                        response
+                            .with_id(request.id().expect("correlated tunnel"))
+                            .add_typed_default(
+                                DataType::Uuid,
+                                DataValue::Str(
+                                    nonce.expect("validated forwarding nonce").to_string(),
+                                ),
+                            )
+                    } else {
+                        response
+                    };
+                    if let Err(error) = self.send_message(&response).await {
+                        log!("Relay outcome delivery failed: {error}");
+                    }
                 }
                 if let Some(sink) = self.local_deliveries.get() {
                     for delivery in local_deliveries {
@@ -81,8 +240,12 @@ impl OmikronConnection {
             }
             Err(error) => {
                 log!("Relay service rejected Omikron ingress: {error:?}");
-                let response =
+                let mut response =
                     iota_connection::relay_service::relay_error_response(&request, &error);
+                if let Some(nonce) = nonce {
+                    response = response
+                        .add_typed_default(DataType::Uuid, DataValue::Str(nonce.to_string()));
+                }
                 tokio::select! { _ = cancellation.cancelled() => {}, _ = self.send_message(&response) => {} }
             }
         }
@@ -174,12 +337,10 @@ impl OmikronConnection {
                 continue;
             };
             let identity_matches=(|| {
-                let wire=iota_connection::federated_relay::parse_wire(&frame).ok()?;
-                let signer=iota_storage::identity::SqlitePrincipalStore.get_principal(record.signer_principal?).ok()??;
-                let recipient=iota_storage::identity::SqlitePrincipalStore.get_principal(record.destination_principal?).ok()??;
-                Some(wire.message_id==*record.relay_message_id.as_ref()?
-                    && wire.signer==iota_connection::federated_relay::protocol_principal(&signer.principal)
-                    && wire.recipient==iota_connection::federated_relay::protocol_principal(&recipient.principal))
+                iota_connection::relay_service::pending_frame_identity_matches(
+                    &frame, record.signer_principal?, record.destination_principal?,
+                    record.relay_message_id.as_deref()?, None,
+                ).ok()
             })().unwrap_or(false);
             if !identity_matches {
                 log!(

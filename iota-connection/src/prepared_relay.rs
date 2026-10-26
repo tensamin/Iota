@@ -3,8 +3,8 @@ use chat_files::MessageState;
 use iota_identity::{LocalUserId, PrincipalHandle, PrincipalHome};
 use iota_storage::storage_error::StorageError;
 use iota_storage::util::{
-    chat_files, chats_util, db, e2ee_storage, outgoing_relay, receipt_policy, relay_queue,
-    relay_replay, relay_work,
+    chat_files, chat_secret_recovery, chats_util, db, e2ee_storage, outgoing_relay, receipt_policy,
+    relay_queue, relay_replay, relay_work,
 };
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use rusqlite::{Transaction, params};
@@ -60,6 +60,9 @@ pub(crate) enum ApplicationOperation {
     },
 }
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SecretCopy {
     pub(crate) encrypted_secret: Vec<u8>,
@@ -79,8 +82,37 @@ pub(crate) enum DeliveryTarget {
     Remote(iota_identity::IotaNodeId),
 }
 
+/// Explicit durable lease fields. The identity crate's runtime authorization
+/// object intentionally has no serde implementation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OriginLease {
+    connection_id: String,
+    server_instance: String,
+    owner: LocalUserId,
+    principal: PrincipalHandle,
+    auth_generation: i64,
+}
+
+impl OriginLease {
+    fn authorization(&self) -> iota_identity::HostedAuthorizationLease {
+        iota_identity::HostedAuthorizationLease {
+            connection_id: self.connection_id.clone(),
+            server_instance: self.server_instance.clone(),
+            identity: iota_identity::ValidatedHostedIdentity {
+                local_user: self.owner,
+                principal: self.principal,
+                auth_generation: self.auth_generation,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PreparedRelayOperation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) origin_lease: Option<OriginLease>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) secret_escrow: Option<chat_secret_recovery::Escrow>,
     pub signer: PrincipalHandle,
     pub recipient: PrincipalHandle,
     pub message_id: String,
@@ -162,6 +194,32 @@ pub(crate) fn prepare_application(
     sender: Option<LocalUserId>,
     recipient: Option<LocalUserId>,
 ) -> Result<PreparedRelayOperation, StorageError> {
+    prepare_application_inner(verified, sender, recipient, false)
+}
+
+/// For re-verifying an already accepted epoch, never for fresh relay ingress.
+/// Historical proof is independent of replay retention and current co-hosting.
+pub(crate) fn prepare_recovery_application(
+    verified: &crate::federated_relay::VerifiedFederatedRelay,
+    sender: Option<LocalUserId>,
+    recipient: Option<LocalUserId>,
+) -> Result<PreparedRelayOperation, StorageError> {
+    if !verified
+        .content
+        .as_ref()
+        .is_some_and(|frame| frame.is_type(CommunicationType::SetChatSecret))
+    {
+        return Err(StorageError::UnsupportedRelayOperation);
+    }
+    prepare_application_inner(verified, sender, recipient, true)
+}
+
+fn prepare_application_inner(
+    verified: &crate::federated_relay::VerifiedFederatedRelay,
+    sender: Option<LocalUserId>,
+    recipient: Option<LocalUserId>,
+    historical: bool,
+) -> Result<PreparedRelayOperation, StorageError> {
     let frame = verified
         .content
         .as_ref()
@@ -171,7 +229,8 @@ pub(crate) fn prepare_application(
     let signer_identity = crate::federated_relay::protocol_principal(&verified.signer.principal);
     let recipient_identity =
         crate::federated_relay::protocol_principal(&verified.recipient.principal);
-    if let Some(value) = frame.get_data(DataType::ChatId)
+    if frame.get_comm_type_enum() != Some(CommunicationType::SetChatSecret)
+        && let Some(value) = frame.get_data(DataType::ChatId)
         && value.as_str()
             != Some(
                 tau_relay_protocol::canonical_chat_id(&signer_identity, &recipient_identity)
@@ -188,9 +247,10 @@ pub(crate) fn prepare_application(
     let created_at =
         i64::try_from(verified.created_at).map_err(|_| invalid("creation time range"))?;
     let accepted_at = now_millis_i64();
-    if created_at < accepted_at.saturating_sub(relay_replay::RELAY_RETENTION_MILLIS)
-        || created_at
-            > accepted_at.saturating_add(relay_replay::MAX_RELAY_FUTURE_SKEW_MILLIS as i64)
+    if !historical
+        && (created_at < accepted_at.saturating_sub(relay_replay::RELAY_RETENTION_MILLIS)
+            || created_at
+                > accepted_at.saturating_add(relay_replay::MAX_RELAY_FUTURE_SKEW_MILLIS as i64))
     {
         return Err(invalid("creation time outside retention window"));
     }
@@ -223,6 +283,7 @@ pub(crate) fn prepare_application(
             }
         })
     };
+    let mut secret_recipient_ids = None;
     let operation = match frame
         .get_comm_type_enum()
         .ok_or(StorageError::UnsupportedRelayOperation)?
@@ -306,20 +367,62 @@ pub(crate) fn prepare_application(
             }
         }
         CommunicationType::SetChatSecret => {
+            let mut seen = std::collections::HashSet::new();
+            for (field, _) in frame.iter_typed_data() {
+                if !matches!(
+                    field,
+                    Some(
+                        DataType::ChatId
+                            | DataType::SecretId
+                            | DataType::VersionNumber
+                            | DataType::WrappingScheme
+                            | DataType::Recipients
+                            | DataType::CreatedAt
+                            | DataType::SenderId
+                            | DataType::ReceiverId
+                    )
+                ) || !seen.insert(field)
+                {
+                    return Err(invalid("secret operation fields"));
+                }
+            }
             let version = positive_version()?;
             // A shared Iota commits both initial envelopes in the same transaction.
-            let shared_initializer = sender.is_some() && recipient.is_some() && version == 1;
+            let shared_initializer =
+                (historical || (sender.is_some() && recipient.is_some())) && version == 1;
             if signer_identity == recipient_identity
                 || (signer_identity > recipient_identity && !shared_initializer)
             {
                 return Err(StorageError::MessageUnauthorized);
             }
             let chat_id = text(frame, DataType::ChatId)?;
-            if chat_id
+            let numeric_chat_id = format!(
+                "{}:{}",
+                signer_id.min(recipient_id),
+                signer_id.max(recipient_id)
+            );
+            let numeric_namespace = chat_id == numeric_chat_id;
+            if (chat_id
                 != tau_relay_protocol::canonical_chat_id(&signer_identity, &recipient_identity)
+                && !numeric_namespace)
                 || text(frame, DataType::SecretId)? != tau_relay_protocol::chat_secret_id(&chat_id)
+                || (numeric_namespace && signer_id == recipient_id)
             {
                 return Err(invalid("secret namespace"));
+            }
+            if numeric_namespace {
+                // A numeric namespace must have exactly one meaning in this
+                // database, including all other known authorities.
+                let unambiguous = db::with_db(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT COUNT(*) FROM principals WHERE remote_user_id IN (?1,?2)",
+                        params![signer_id as i64, recipient_id as i64],
+                        |row| row.get::<_, i64>(0),
+                    )? == 2)
+                })?;
+                if !unambiguous {
+                    return Err(StorageError::MessageUnauthorized);
+                }
             }
             let values = frame
                 .get_data(DataType::Recipients)
@@ -331,17 +434,62 @@ pub(crate) fn prepare_application(
             let map = frame.type_map().ok_or_else(|| invalid("type map"))?;
             let mut copies = Vec::new();
             for value in values {
-                let field = |key: DataType| value.get_field(key.try_to_id(map)?);
-                let encoded_identity = field(DataType::UserId)
-                    .and_then(DataValue::as_str)
-                    .ok_or_else(|| invalid("secret recipient identity"))?;
-                let id: tau_relay_protocol::Principal = serde_json::from_str(encoded_identity)
-                    .map_err(|_| invalid("secret recipient identity"))?;
-                if serde_json::to_string(&id).map_err(|_| invalid("secret recipient identity"))?
-                    != encoded_identity
+                let DataValue::Container(ref fields) = value else {
+                    return Err(invalid("secret recipient fields"));
+                };
+                let expected = [
+                    DataType::UserId,
+                    DataType::EncryptedSecret,
+                    DataType::KemCiphertext,
+                ]
+                .map(|kind| kind.try_to_id(map));
+                if fields.len() != 3
+                    || fields
+                        .iter()
+                        .any(|(key, _)| !expected.contains(&Some(*key)))
+                    || fields.iter().enumerate().any(|(index, (key, _))| {
+                        fields[..index].iter().any(|(other, _)| key == other)
+                    })
                 {
-                    return Err(invalid("noncanonical secret recipient identity"));
+                    return Err(invalid("secret recipient fields"));
                 }
+                let field = |key: DataType| value.get_field(key.try_to_id(map)?);
+                let value =
+                    field(DataType::UserId).ok_or_else(|| invalid("secret recipient identity"))?;
+                let id = if numeric_namespace {
+                    let id = value
+                        .as_number()
+                        .and_then(|id| u64::try_from(id).ok())
+                        .or_else(|| {
+                            value.as_str().and_then(|value| {
+                                value
+                                    .parse::<u64>()
+                                    .ok()
+                                    .filter(|id| value == id.to_string())
+                            })
+                        })
+                        .ok_or_else(|| invalid("numeric secret recipient identity"))?;
+                    if id == signer_id {
+                        signer_identity.clone()
+                    } else if id == recipient_id {
+                        recipient_identity.clone()
+                    } else {
+                        return Err(StorageError::MessageUnauthorized);
+                    }
+                } else {
+                    let encoded = value
+                        .as_str()
+                        .ok_or_else(|| invalid("secret recipient identity"))?;
+                    let id: tau_relay_protocol::Principal = serde_json::from_str(encoded)
+                        .map_err(|_| invalid("secret recipient identity"))?;
+                    if serde_json::to_string(&id)
+                        .map_err(|_| invalid("secret recipient identity"))?
+                        != encoded
+                    {
+                        return Err(invalid("noncanonical secret recipient identity"));
+                    }
+                    id
+                };
                 let copy = SecretCopy {
                     encrypted_secret: field(DataType::EncryptedSecret)
                         .and_then(DataValue::as_bytes)
@@ -350,17 +498,31 @@ pub(crate) fn prepare_application(
                         .and_then(DataValue::as_bytes)
                         .ok_or_else(|| invalid("secret KEM"))?,
                 };
-                copies.push((id, copy));
+                let original_id = match value.as_str() {
+                    Some(encoded)
+                        if encoded
+                            == serde_json::to_string(&id)
+                                .map_err(|_| invalid("secret recipient identity"))? =>
+                    {
+                        chat_secret_recovery::OriginalRecipientId::Principal(encoded.to_owned())
+                    }
+                    _ => chat_secret_recovery::OriginalRecipientId::Numeric(id.user_id),
+                };
+                if copies.iter().any(|(existing, _, _)| *existing == id) {
+                    return Err(StorageError::MessageUnauthorized);
+                }
+                copies.push((id, copy, original_id));
             }
             let sender_index = copies
                 .iter()
-                .position(|(identity, _)| *identity == signer_identity)
+                .position(|(identity, _, _)| *identity == signer_identity)
                 .ok_or(StorageError::MessageUnauthorized)?;
-            let sender_copy = copies.remove(sender_index).1;
-            let (identity, recipient_copy) = copies.remove(0);
+            let (_, sender_copy, sender_original_id) = copies.remove(sender_index);
+            let (identity, recipient_copy, recipient_original_id) = copies.remove(0);
             if identity != recipient_identity {
                 return Err(StorageError::MessageUnauthorized);
             }
+            secret_recipient_ids = Some([sender_original_id, recipient_original_id]);
             ApplicationOperation::SetChatSecret {
                 chat_id,
                 legacy_chat_id: (signer_identity.authority == recipient_identity.authority).then(
@@ -407,7 +569,75 @@ pub(crate) fn prepare_application(
             _ => return Err(invalid("recipient has no canonical Iota route")),
         },
     };
+    let secret_escrow = if let ApplicationOperation::SetChatSecret {
+        chat_id,
+        version,
+        wrapping_scheme,
+        sender,
+        recipient,
+        ..
+    } = &operation
+    {
+        let first = verified.signer.principal.clone();
+        let second = verified.recipient.principal.clone();
+        let pair = chat_secret_recovery::sorted_pair(&first, &second)?;
+        let [sender_original_id, recipient_original_id] =
+            secret_recipient_ids.ok_or_else(|| invalid("original secret recipient identities"))?;
+        let copy = |owner: &iota_identity::PrincipalId, secret: &SecretCopy, recipient_id| {
+            chat_secret_recovery::RecipientEnvelope {
+                owner: owner.clone(),
+                recipient_id,
+                encrypted_secret: secret.encrypted_secret.clone(),
+                kem_ciphertext: secret.kem_ciphertext.clone(),
+            }
+        };
+        let sender_copy = copy(&first, sender, sender_original_id);
+        let recipient_copy = copy(&second, recipient, recipient_original_id);
+        let envelopes = if pair[0] == first {
+            [sender_copy, recipient_copy]
+        } else {
+            [recipient_copy, sender_copy]
+        };
+        let original_frame = verified
+            .frame
+            .clone()
+            .without_id()
+            .to_bytes()
+            .map_err(|_| invalid("original verified frame"))?;
+        let format = if crate::federated_relay::parse_wire(&verified.frame).is_ok() {
+            chat_secret_recovery::RelayFormat::TauSignedRelayV1
+        } else {
+            chat_secret_recovery::RelayFormat::NativeMtpSealedV1
+        };
+        Some(chat_secret_recovery::Escrow {
+            first: pair[0].clone(),
+            second: pair[1].clone(),
+            version: *version,
+            namespace: chat_secret_recovery::WrappingNamespace {
+                chat_id: chat_id.clone(),
+                secret_id: text(frame, DataType::SecretId)?,
+            },
+            wrapping_scheme: wrapping_scheme.clone(),
+            signer: first,
+            message_id: verified.message_id.clone(),
+            operation_digest: chat_secret_recovery::operation_digest(format, &original_frame),
+            original_frame,
+            original_type_map_version: verified
+                .frame
+                .type_map()
+                .ok_or_else(|| invalid("original verified type map"))?
+                .version
+                .to_string(),
+            format,
+            envelopes,
+            created_at,
+        })
+    } else {
+        None
+    };
     Ok(PreparedRelayOperation {
+        origin_lease: None,
+        secret_escrow,
         signer: verified.signer.handle,
         recipient: verified.recipient.handle,
         signer_id,
@@ -440,6 +670,53 @@ pub(crate) fn prepare_application(
 }
 
 impl PreparedRelayOperation {
+    pub(crate) fn validate_origin_lease(&self) -> Result<(), StorageError> {
+        if let Some(lease) = &self.origin_lease
+            && (lease.connection_id.is_empty()
+                || lease.server_instance.is_empty()
+                || lease.auth_generation < 0
+                || lease.principal != self.signer
+                || !self.effects.iter().any(|effect| {
+                    effect.sent_by_self
+                        && effect.owner == lease.owner
+                        && effect.principal == lease.principal
+                }))
+        {
+            return Err(StorageError::HostedAuthorizationDenied);
+        }
+        Ok(())
+    }
+    pub fn bind_origin_lease(
+        &mut self,
+        lease: &iota_identity::HostedAuthorizationLease,
+    ) -> Result<(), StorageError> {
+        if !self.effects.iter().any(|effect| {
+            effect.sent_by_self
+                && effect.owner == lease.identity.local_user
+                && effect.principal == lease.identity.principal
+        }) || lease.identity.principal != self.signer
+            || lease.connection_id.is_empty()
+            || lease.server_instance.is_empty()
+        {
+            return Err(StorageError::HostedAuthorizationDenied);
+        }
+        let origin = OriginLease {
+            connection_id: lease.connection_id.clone(),
+            server_instance: lease.server_instance.clone(),
+            owner: lease.identity.local_user,
+            principal: lease.identity.principal,
+            auth_generation: lease.identity.auth_generation,
+        };
+        if self
+            .origin_lease
+            .as_ref()
+            .is_some_and(|current| *current != origin)
+        {
+            return Err(StorageError::HostedAuthorizationDenied);
+        }
+        self.origin_lease = Some(origin);
+        Ok(())
+    }
     pub fn request(&self) -> relay_replay::RelayReservationRequest<'_> {
         relay_replay::RelayReservationRequest {
             signer_principal: self.signer,
@@ -469,8 +746,12 @@ impl PreparedRelayOperation {
         } else {
             self.signer
         };
-        let chat_id = e2ee_storage::principal_chat_id(self.signer, self.recipient)
-            .ok_or_else(|| invalid("principal pair"))?;
+        let chat_id = chat_secret_recovery::canonical_chat_id(
+            &crate::federated_relay::canonical_principal(&self.signer_identity)
+                .map_err(|_| invalid("signer principal"))?,
+            &crate::federated_relay::canonical_principal(&self.recipient_identity)
+                .map_err(|_| invalid("recipient principal"))?,
+        )?;
         match &self.operation {
             ApplicationOperation::MessageSend {
                 content,
@@ -644,6 +925,11 @@ impl PreparedRelayOperation {
                 name.as_deref(),
             )?,
             ApplicationOperation::SetChatSecret { legacy_chat_id, .. } => {
+                let escrow = self
+                    .secret_escrow
+                    .as_ref()
+                    .ok_or(StorageError::MissingRelayDependency)?;
+                chat_secret_recovery::commit_escrow_in_tx(tx, escrow)?;
                 let secret = self.secret_for(effect)?;
                 if let Some(legacy_chat_id) = legacy_chat_id {
                     e2ee_storage::migrate_chat_secret_namespace_in_tx(
@@ -656,6 +942,7 @@ impl PreparedRelayOperation {
                     )?;
                 }
                 e2ee_storage::put_chat_secret_in_tx(tx, &secret)?;
+                chat_secret_recovery::enqueue_secret_available_in_tx(tx, effect.owner, escrow)?;
             }
         }
         Ok(())
@@ -716,8 +1003,12 @@ impl PreparedRelayOperation {
         else {
             return Err(invalid("secret operation"));
         };
-        let chat_id = e2ee_storage::principal_chat_id(self.signer, self.recipient)
-            .ok_or_else(|| invalid("principal pair"))?;
+        let chat_id = chat_secret_recovery::canonical_chat_id(
+            &crate::federated_relay::canonical_principal(&self.signer_identity)
+                .map_err(|_| invalid("signer principal"))?,
+            &crate::federated_relay::canonical_principal(&self.recipient_identity)
+                .map_err(|_| invalid("recipient principal"))?,
+        )?;
         let copy = if effect.sent_by_self {
             sender
         } else {
@@ -736,12 +1027,21 @@ impl PreparedRelayOperation {
         })
     }
 
-    pub fn commit(&self, claim: &relay_replay::ProcessingClaim) -> Result<(), StorageError> {
+    pub fn commit_checked(
+        &self,
+        claim: &relay_replay::ProcessingClaim,
+        check: impl FnOnce(&Transaction<'_>) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
         if claim.signer != self.signer || claim.message_id != self.message_id {
             return Err(StorageError::StaleRelayClaim);
         }
         db::with_immediate_transaction(|tx| {
             relay_replay::verify_claim_in_tx(tx, claim)?;
+            self.validate_origin_lease()?;
+            if let Some(lease) = &self.origin_lease {
+                iota_storage::hosted_auth::verify_in_tx(tx, &lease.authorization())?;
+            }
+            check(tx)?;
             for (handle, identity) in [
                 (self.signer, &self.signer_identity),
                 (self.recipient, &self.recipient_identity),
@@ -763,6 +1063,12 @@ impl PreparedRelayOperation {
                     && effect.sent_by_self
                     && matches!(self.delivery, DeliveryTarget::Remote(_))
                 {
+                    chat_secret_recovery::stage_escrow_in_tx(
+                        tx,
+                        self.secret_escrow
+                            .as_ref()
+                            .ok_or(StorageError::MissingRelayDependency)?,
+                    )?;
                     relay_work::defer_secret_in_tx(
                         tx,
                         claim,
@@ -807,6 +1113,13 @@ impl PreparedRelayOperation {
     }
 
     fn publish_delivery_in_tx(&self, tx: &Transaction<'_>) -> Result<(), StorageError> {
+        if matches!(self.operation, ApplicationOperation::SetChatSecret { .. })
+            && matches!(self.delivery, DeliveryTarget::Local(_))
+        {
+            // The unchanged Client consumes metadata-only availability hints.
+            // It cannot acknowledge this server-to-server sealed operation.
+            return Ok(());
+        }
         let identity = relay_queue::RelayIdentity {
             signer: self.signer,
             recipient: self.recipient,

@@ -1,5 +1,5 @@
 [env]
-MTP_TYPE_MAPS = { value = "mtp-type-maps/type-maps.yaml", relative = true }
+MTP_TYPE_MAPS = { value = "mtp-type-maps/type-maps.yaml", relative = true, force = true }
 
 [net]
 git-fetch-with-cli = true
