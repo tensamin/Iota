@@ -59,7 +59,13 @@ async fn reconnect_uses_the_injected_client() {
     let fake = Arc::new(FakeOmikron {
         reconnects: AtomicUsize::new(0),
     });
-    let services = DaemonServices::with_centralized_client(fake.clone());
+    let services = DaemonServices::with_centralized_client(
+        fake.clone(),
+        iota_identity::AuthorityId::for_omega(
+            &mtp::crypto::Keyring::generate().public_key_bundle(),
+        )
+        .unwrap(),
+    );
     let router = CommandRouter::new(
         Arc::new(DaemonRuntime::new()),
         services,
@@ -80,7 +86,13 @@ async fn identity_rotation_is_available_while_omikron_is_offline() {
     let fake = Arc::new(FakeOmikron {
         reconnects: AtomicUsize::new(0),
     });
-    let services = DaemonServices::with_centralized_client(fake.clone());
+    let services = DaemonServices::with_centralized_client(
+        fake.clone(),
+        iota_identity::AuthorityId::for_omega(
+            &mtp::crypto::Keyring::generate().public_key_bundle(),
+        )
+        .unwrap(),
+    );
     let router = CommandRouter::new(
         Arc::new(DaemonRuntime::new()),
         services,
@@ -101,7 +113,13 @@ async fn read_role_cannot_execute_an_administrative_request() {
     let fake = Arc::new(FakeOmikron {
         reconnects: AtomicUsize::new(0),
     });
-    let services = DaemonServices::with_centralized_client(fake.clone());
+    let services = DaemonServices::with_centralized_client(
+        fake.clone(),
+        iota_identity::AuthorityId::for_omega(
+            &mtp::crypto::Keyring::generate().public_key_bundle(),
+        )
+        .unwrap(),
+    );
     let router = CommandRouter::new(
         Arc::new(DaemonRuntime::new()),
         services,

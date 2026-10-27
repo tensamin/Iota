@@ -1,6 +1,36 @@
 use super::*;
 
 impl SignedPrincipalDescriptor {
+    pub fn verify_snapshot(
+        self,
+        authority_keys: &PublicKeyBundle,
+        current_revision: Option<i64>,
+        home: SignedNodeDescriptor,
+        current_home_revision: Option<i64>,
+        now: i64,
+    ) -> Result<VerifiedPrincipalSnapshot, IdentityError> {
+        let authority = match self.descriptor.authority_kind {
+            AuthorityKind::Omega => AuthorityId::for_omega(authority_keys)?,
+            AuthorityKind::Iota => {
+                AuthorityId::for_iota(&IotaNodeId::from_public_keys(authority_keys)?)
+            }
+        };
+        let principal = self
+            .clone()
+            .verify(&authority, authority_keys, current_revision, now)?;
+        let home = home.verify(current_home_revision, now)?;
+        if principal.descriptor().home != PrincipalHome::Iota(home.descriptor().node.clone()) {
+            return Err(IdentityError::InvalidDescriptor(
+                "principal snapshot home proof mismatch".into(),
+            ));
+        }
+        Ok(VerifiedPrincipalSnapshot {
+            principal,
+            principal_proof: self,
+            authority_keys: authority_keys.clone(),
+            home,
+        })
+    }
     pub fn to_wire_v1(&self) -> Result<PrincipalDescriptorWireV1, IdentityError> {
         Ok(PrincipalDescriptorWireV1 {
             version: 1,
@@ -88,6 +118,44 @@ impl SignedPrincipalDescriptor {
             descriptor: self.descriptor,
             resolved_at: now,
         })
+    }
+}
+
+impl VerifiedPrincipalSnapshot {
+    pub fn principal_descriptor(&self) -> &VerifiedPrincipalDescriptor {
+        &self.principal
+    }
+    pub fn home_descriptor(&self) -> &VerifiedNodeDescriptor {
+        &self.home
+    }
+    pub fn authority_keys(&self) -> &PublicKeyBundle {
+        &self.authority_keys
+    }
+    pub fn principal_proof(&self) -> &SignedPrincipalDescriptor {
+        &self.principal_proof
+    }
+
+    pub fn fresh_for_read(&self, now: i64) -> bool {
+        self.fresh_at(now, 15 * 60 * 1000)
+    }
+    pub fn fresh_for_mutation(&self, now: i64) -> bool {
+        self.fresh_at(now, 30_000)
+    }
+
+    fn fresh_at(&self, now: i64, age: i64) -> bool {
+        let resolved = self.principal.resolved_at();
+        now >= resolved
+            && now.saturating_sub(resolved) <= age
+            && self
+                .principal
+                .descriptor()
+                .valid_until
+                .is_none_or(|expiry| now < expiry)
+            && self
+                .home
+                .descriptor()
+                .valid_until
+                .is_none_or(|expiry| now < expiry)
     }
 }
 

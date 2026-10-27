@@ -2,13 +2,18 @@ use super::*;
 use iota_identity::{AuthorityId, HostedAuthorizationLease, IotaNodeId, PrincipalId};
 use iota_storage::hosted_auth;
 
+const AUTHORITY_A: &str =
+    "omega-key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const AUTHORITY_B: &str =
+    "omega-key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
 fn operation(message_id: &str) -> PreparedRelayOperation {
     let signer = PrincipalId {
-        authority: AuthorityId::new("authority-a").unwrap(),
+        authority: AuthorityId::new(AUTHORITY_A).unwrap(),
         user_id: 11,
     };
     let recipient = PrincipalId {
-        authority: AuthorityId::new("authority-b").unwrap(),
+        authority: AuthorityId::new(AUTHORITY_B).unwrap(),
         user_id: 22,
     };
     let frame = CommunicationValue::new(CommunicationType::Relay).with_id(1);
@@ -40,6 +45,8 @@ fn operation(message_id: &str) -> PreparedRelayOperation {
         message_id: message_id.into(),
         original_frame: frame.clone(),
         original_type_map_version: map_version.clone(),
+        original_type_map_fingerprint: tau_relay_protocol::dictionary_fingerprint(&map_version)
+            .unwrap(),
         format,
         operation_digest: chat_secret_recovery::operation_digest(format, &frame),
         envelopes: [(&signer, &sender_copy), (&recipient, &recipient_copy)].map(|(owner, copy)| {
@@ -55,6 +62,14 @@ fn operation(message_id: &str) -> PreparedRelayOperation {
         created_at,
     };
     PreparedRelayOperation {
+        principal_fences: [101, 202].map(|handle| {
+            use iota_identity::PrincipalStore;
+            let principal = iota_storage::identity::SqlitePrincipalStore
+                .get_principal(PrincipalHandle(handle))
+                .unwrap()
+                .unwrap();
+            iota_storage::identity::PrincipalCommitFence::capture(&principal).unwrap()
+        }),
         origin_lease: None,
         secret_escrow: Some(escrow),
         signer: PrincipalHandle(101),
@@ -69,9 +84,9 @@ fn operation(message_id: &str) -> PreparedRelayOperation {
         frame,
         frame_id: 1,
         type_map_version: map_version,
+        type_map_fingerprint: mtp::codec::TypeMap::latest().fingerprint_hex().unwrap(),
         operation: ApplicationOperation::SetChatSecret {
             chat_id,
-            legacy_chat_id: None,
             version: 1,
             wrapping_scheme: "fixture".into(),
             sender: sender_copy,
@@ -149,8 +164,10 @@ fn actual_commit_and_recovery_recheck_origin_lease() {
     iota_util::file_util::configure_storage_directory(path.clone());
     db::initialize_database().unwrap();
     db::with_immediate_transaction(|tx| {
-        tx.execute_batch("INSERT INTO principals(principal_pk,authority_kind,authority_id,remote_user_id,home,last_resolved_at) VALUES(101,'iota','authority-a',11,'local',1),(202,'iota','authority-b',22,'remote',1);
-            INSERT INTO users(user_id,username,public_key,created_at) VALUES(7,'owner','fixture-key',1);
+        tx.execute("INSERT INTO principals(principal_pk,authority_kind,authority_id,remote_user_id,home,last_resolved_at) VALUES(101,'omega',?1,11,?3,1),(202,'omega',?2,22,?3,1)", params![AUTHORITY_A, AUTHORITY_B, format!("iota:iota:v1:{}", "0".repeat(64))])?;
+        let key = mtp::crypto::Keyring::generate().public_key_bundle().try_to_base64().unwrap();
+        tx.execute("INSERT INTO principal_keys(principal_pk,public_key,valid_from,source_revision) VALUES(101,?1,0,0),(202,?1,0,0)", [key])?;
+        tx.execute_batch("INSERT INTO users(user_id,username,public_key,created_at) VALUES(7,'owner','fixture-key',1);
             INSERT INTO hosted_principals(local_user_id,principal_handle) VALUES(7,101);
             CREATE TABLE commit_guard_probe(id INTEGER);")?;
         Ok(())
@@ -210,6 +227,37 @@ fn actual_commit_and_recovery_recheck_origin_lease() {
         Err(StorageError::MessageUnauthorized)
     ));
     assert!(invoked);
+    assert_no_application_writes();
+
+    let changed = operation("descriptor-changed-after-acquire");
+    let claim = acquire(&changed, &active);
+    db::with_immediate_transaction(|tx| {
+        tx.execute("UPDATE principals SET descriptor_revision=descriptor_revision+1 WHERE principal_pk=202", [])?;
+        Ok(())
+    }).unwrap();
+    assert!(matches!(
+        changed.commit_checked(&claim, |_| Ok(())),
+        Err(StorageError::MessageUnauthorized)
+    ));
+    assert_no_application_writes();
+
+    let rekeyed = operation("key-changed-after-acquire");
+    let claim = acquire(&rekeyed, &active);
+    db::with_immediate_transaction(|tx| {
+        tx.execute(
+            "UPDATE principal_keys SET public_key=?1 WHERE principal_pk=202",
+            [mtp::crypto::Keyring::generate()
+                .public_key_bundle()
+                .try_to_base64()
+                .unwrap()],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(matches!(
+        rekeyed.commit_checked(&claim, |_| Ok(())),
+        Err(StorageError::MessageUnauthorized)
+    ));
     assert_no_application_writes();
     std::fs::remove_dir_all(path).unwrap();
 }

@@ -350,7 +350,12 @@ impl ClientConnectionManager {
                 || frame.is_type(CommunicationType::MessageGet)
                 || frame.is_type(CommunicationType::GetChatSecret)
                 || frame.is_type(CommunicationType::GetChats);
-            let account_applied = frame.is_type(CommunicationType::AccountStateApplied);
+            let scoped_ack = matches!(
+                tau::sync::decode_request(&frame),
+                Ok(tau::sync::Request::Acknowledge { .. })
+            );
+            let account_applied =
+                frame.is_type(CommunicationType::AccountStateApplied) || scoped_ack;
             let handling = self.handle(&current_session, &verified_key, &shutdown, frame);
             tokio::pin!(handling);
             let responses = tokio::select! {
@@ -385,7 +390,16 @@ impl ClientConnectionManager {
                 ) {
                     break 'receive;
                 }
-                if account_applied && response.is_type(CommunicationType::Success) {
+                let acknowledged = scoped_ack
+                    && response
+                        .get_data(DataType::Json)
+                        .and_then(DataValue::as_bytes_slice)
+                        .and_then(|bytes| serde_json::from_slice::<tau::sync::Response>(bytes).ok())
+                        .is_some_and(|outcome| {
+                            matches!(outcome, tau::sync::Response::Acknowledged { .. })
+                        });
+                if account_applied && (response.is_type(CommunicationType::Success) || acknowledged)
+                {
                     active
                         .state_applied
                         .store(true, std::sync::atomic::Ordering::Release);

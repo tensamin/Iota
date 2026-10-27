@@ -114,7 +114,9 @@ where
             [],
             |row| row.get(0),
         )?;
+        let sync_heads = crate::util::sync::paged::transaction_heads(&tx)?;
         let value = f(&tx)?;
+        crate::util::sync::paged::capture_transaction_events(&tx, &sync_heads)?;
         let secret_changed: bool = tx.query_row(
             "SELECT sequence FROM chat_secret_changes WHERE singleton = 1",
             [],

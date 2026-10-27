@@ -6,7 +6,7 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1.89"
-mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "9f7f94e4cbd227610784ae47a1e7a1acf66f8584", features = ["web-server", "crypto", "pipes"] }
+mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "db3125809293e462ec1593704e9c4d2172437533", features = ["web-server", "crypto", "pipes"] }
 bytes = "1"
 http = "1"
 iota-logger = { path = "../iota-logger" }

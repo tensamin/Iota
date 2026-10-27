@@ -153,10 +153,42 @@ impl OmikronConnection {
 
     pub(super) async fn handle_account_state_request(self: Arc<Self>, cv: &CommunicationValue) {
         let response = message_handlers::handle_account_state_request(cv);
+        let scoped_ack = matches!(
+            tau::sync::decode_request(cv),
+            Ok(tau::sync::Request::Acknowledge { .. })
+        );
+        let acknowledged = scoped_ack
+            && response
+                .get_data(DataType::Json)
+                .and_then(DataValue::as_bytes_slice)
+                .and_then(|bytes| serde_json::from_slice::<tau::sync::Response>(bytes).ok())
+                .is_some_and(|outcome| matches!(outcome, tau::sync::Response::Acknowledged { .. }));
         let user_id = cv
             .require_sender()
             .ok()
             .and_then(|id| i64::try_from(id).ok());
+        if response
+            .get_data(DataType::Json)
+            .and_then(DataValue::as_bytes_slice)
+            .and_then(|bytes| serde_json::from_slice::<tau::sync::Response>(bytes).ok())
+            .is_some_and(|outcome| matches!(outcome, tau::sync::Response::Unavailable { .. }))
+        {
+            let _ = self.send_message(&response).await;
+            return;
+        }
+        if acknowledged {
+            // The checkpoint already committed. A lost response does not roll
+            // it back or leave delivery paused until a second legacy ack.
+            let _ = self.send_message(&response).await;
+            if let Some(user_id) = user_id {
+                if let Err(error) = relay_queue::resume_client_deliveries(user_id) {
+                    log!("Scoped sync delivery resume failed: {}", error);
+                } else {
+                    self.flush_pending_relays_for_user(Some(user_id)).await;
+                }
+            }
+            return;
+        }
         if response.is_type(CommunicationType::AccountStateSnapshot) {
             log!("AccountStateSnapshot user={:?} stage=generated", user_id);
             if let Some(user_id) = user_id

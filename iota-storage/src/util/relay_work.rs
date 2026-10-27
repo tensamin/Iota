@@ -49,7 +49,6 @@ pub fn verify_owner_on(
 pub struct DeferredSecret {
     pub owner: i64,
     pub principal: PrincipalHandle,
-    pub legacy_chat_id: Option<String>,
     pub secret: e2ee_storage::StoredChatSecret,
 }
 
@@ -62,9 +61,9 @@ pub fn defer_secret_in_tx(
     let secret = &action.secret;
     tx.execute(
         "INSERT INTO relay_deferred_secrets(signer_principal, message_id, storage_owner, owner_principal,
-         legacy_chat_id, chat_id, secret_id, version, encrypted_secret, kem_ciphertext, wrapping_scheme, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![claim.signer.0, claim.message_id, action.owner, action.principal.0, action.legacy_chat_id,
+         chat_id, secret_id, version, encrypted_secret, kem_ciphertext, wrapping_scheme, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         params![claim.signer.0, claim.message_id, action.owner, action.principal.0,
         secret.chat_id, secret.secret_id, secret.version, secret.encrypted_secret, secret.kem_ciphertext,
         secret.wrapping_scheme, secret.created_at],
     )?;
@@ -78,7 +77,7 @@ pub fn complete_deferred_in_tx(
 ) -> Result<(), StorageError> {
     let actions = {
         let mut statement = tx.prepare(
-            "SELECT storage_owner, owner_principal, legacy_chat_id, chat_id, secret_id, version,
+            "SELECT storage_owner, owner_principal, chat_id, secret_id, version,
              encrypted_secret, kem_ciphertext, wrapping_scheme, created_at FROM relay_deferred_secrets
              WHERE signer_principal = ?1 AND message_id = ?2 AND completed_at IS NULL",
         )?;
@@ -88,16 +87,15 @@ pub fn complete_deferred_in_tx(
                 Ok(DeferredSecret {
                     owner,
                     principal: PrincipalHandle(row.get(1)?),
-                    legacy_chat_id: row.get(2)?,
                     secret: e2ee_storage::StoredChatSecret {
                         user_id: owner.to_string(),
-                        chat_id: row.get(3)?,
-                        secret_id: row.get(4)?,
-                        version: row.get(5)?,
-                        encrypted_secret: row.get(6)?,
-                        kem_ciphertext: row.get(7)?,
-                        wrapping_scheme: row.get(8)?,
-                        created_at: row.get(9)?,
+                        chat_id: row.get(2)?,
+                        secret_id: row.get(3)?,
+                        version: row.get(4)?,
+                        encrypted_secret: row.get(5)?,
+                        kem_ciphertext: row.get(6)?,
+                        wrapping_scheme: row.get(7)?,
+                        created_at: row.get(8)?,
                         updated_at: sync::now_millis(),
                     },
                 })
@@ -106,8 +104,6 @@ pub fn complete_deferred_in_tx(
     };
     for action in actions {
         verify_owner_in_tx(tx, action.owner, action.principal)?;
-        // New operations stage the complete original proof. Legacy deferred rows
-        // without it remain unavailable rather than inventing the other copy.
         let principal = super::chat_secret_recovery::canonical_owner_on(
             tx,
             iota_identity::LocalUserId(action.owner),
@@ -126,16 +122,6 @@ pub fn complete_deferred_in_tx(
             serde_json::from_slice(&evidence.ok_or(StorageError::MissingRelayDependency)?)
                 .map_err(|_| StorageError::InvalidRelayPayload("deferred secret evidence"))?;
         super::chat_secret_recovery::commit_escrow_in_tx(tx, &escrow)?;
-        if let Some(legacy_chat_id) = &action.legacy_chat_id {
-            e2ee_storage::migrate_chat_secret_namespace_in_tx(
-                tx,
-                &action.secret.user_id,
-                legacy_chat_id,
-                &format!("chat:{legacy_chat_id}:main"),
-                &action.secret.chat_id,
-                &action.secret.secret_id,
-            )?;
-        }
         e2ee_storage::put_chat_secret_in_tx(tx, &action.secret)?;
         super::chat_secret_recovery::enqueue_secret_available_in_tx(
             tx,

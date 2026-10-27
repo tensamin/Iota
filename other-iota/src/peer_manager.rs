@@ -125,7 +125,10 @@ impl PeerManager {
         self
     }
 
-    pub fn install_recovery(&self, recovery: Arc<dyn iota_connection::chat_secret_recovery::PeerRecoveryHandler>) {
+    pub fn install_recovery(
+        &self,
+        recovery: Arc<dyn iota_connection::chat_secret_recovery::PeerRecoveryHandler>,
+    ) {
         *self.recovery.write().expect("peer recovery lock poisoned") = Some(recovery);
     }
 

@@ -2,15 +2,17 @@
 //! original sealed operation before staging or importing an escrow.
 use super::{db, e2ee_storage, relay_work, sync};
 use crate::storage_error::StorageError;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use iota_identity::relay_protocol::{ConversationPair, Principal};
 use iota_identity::{AuthorityId, LocalUserId, PrincipalId};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const SCHEMA: &str = include_str!("chat_secret_recovery/schema.sql");
+pub mod initial_proposals;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WrappingNamespace {
     pub chat_id: String,
     pub secret_id: String,
@@ -18,7 +20,6 @@ pub struct WrappingNamespace {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OriginalRecipientId {
-    Numeric(u64),
     Principal(String),
 }
 
@@ -29,6 +30,7 @@ pub enum RelayFormat {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecipientEnvelope {
     pub owner: PrincipalId,
     pub recipient_id: OriginalRecipientId,
@@ -37,6 +39,7 @@ pub struct RecipientEnvelope {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Escrow {
     pub first: PrincipalId,
     pub second: PrincipalId,
@@ -47,6 +50,7 @@ pub struct Escrow {
     pub message_id: String,
     pub original_frame: Vec<u8>,
     pub original_type_map_version: String,
+    pub original_type_map_fingerprint: String,
     pub format: RelayFormat,
     pub operation_digest: Vec<u8>,
     pub envelopes: [RecipientEnvelope; 2],
@@ -59,32 +63,30 @@ fn invalid() -> StorageError {
 
 /// Canonical JSON global key, never a database-local principal handle.
 pub fn principal_key(principal: &PrincipalId) -> Result<String, StorageError> {
-    if principal.user_id == 0
-        || i64::try_from(principal.user_id).is_err()
-        || AuthorityId::new(principal.authority.as_str()).map_err(|_| invalid())?
-            != principal.authority
-    {
-        return Err(invalid());
-    }
-    serde_json::to_string(principal).map_err(|_| invalid())
+    let principal = Principal::try_from(principal).map_err(|_| invalid())?;
+    serde_json::to_string(&principal).map_err(|_| invalid())
 }
 
 pub fn sorted_pair(
     first: &PrincipalId,
     second: &PrincipalId,
 ) -> Result<[PrincipalId; 2], StorageError> {
-    principal_key(first)?;
-    principal_key(second)?;
-    if first == second {
-        return Err(invalid());
-    }
-    Ok(
-        if (first.authority.as_str(), first.user_id) < (second.authority.as_str(), second.user_id) {
-            [first.clone(), second.clone()]
-        } else {
-            [second.clone(), first.clone()]
-        },
+    let pair = protocol_pair(first, second)?;
+    Ok([
+        PrincipalId::try_from(pair.first).map_err(|_| invalid())?,
+        PrincipalId::try_from(pair.second).map_err(|_| invalid())?,
+    ])
+}
+
+fn protocol_pair(
+    first: &PrincipalId,
+    second: &PrincipalId,
+) -> Result<ConversationPair, StorageError> {
+    ConversationPair::new(
+        Principal::try_from(first).map_err(|_| invalid())?,
+        Principal::try_from(second).map_err(|_| invalid())?,
     )
+    .map_err(|_| invalid())
 }
 
 /// Matches Tau's global principal namespace across independent SQLite databases.
@@ -92,11 +94,9 @@ pub fn canonical_chat_id(
     first: &PrincipalId,
     second: &PrincipalId,
 ) -> Result<String, StorageError> {
-    Ok(format!(
-        "principal:{}",
-        URL_SAFE_NO_PAD
-            .encode(serde_json::to_vec(&sorted_pair(first, second)?).map_err(|_| invalid())?)
-    ))
+    protocol_pair(first, second)?
+        .chat_id()
+        .map_err(|_| invalid())
 }
 
 /// The format tag prevents interpreting a native sealed frame as Tau signed JSON.
@@ -112,6 +112,13 @@ pub fn operation_digest(format: RelayFormat, original_frame: &[u8]) -> Vec<u8> {
 
 impl Escrow {
     pub fn validate(&self) -> Result<(), StorageError> {
+        if iota_identity::relay_protocol::dictionary_fingerprint(&self.original_type_map_version)
+            .ok()
+            .as_deref()
+            != Some(self.original_type_map_fingerprint.as_str())
+        {
+            return Err(invalid());
+        }
         let version_valid = self
             .original_type_map_version
             .split_once('.')
@@ -138,13 +145,7 @@ impl Escrow {
         {
             return Err(invalid());
         }
-        let numeric_chat = format!(
-            "{}:{}",
-            self.first.user_id.min(self.second.user_id),
-            self.first.user_id.max(self.second.user_id)
-        );
-        let numeric = self.namespace.chat_id == numeric_chat;
-        if (!numeric && self.namespace.chat_id != canonical_chat_id(&self.first, &self.second)?)
+        if self.namespace.chat_id != canonical_chat_id(&self.first, &self.second)?
             || self.namespace.secret_id
                 != e2ee_storage::principal_secret_id(&self.namespace.chat_id)
         {
@@ -155,12 +156,8 @@ impl Escrow {
                 return Err(invalid());
             }
             match &envelope.recipient_id {
-                OriginalRecipientId::Numeric(id)
-                    if numeric
-                        && *id == envelope.owner.user_id
-                        && self.first.user_id != self.second.user_id => {}
                 OriginalRecipientId::Principal(value)
-                    if !numeric && *value == principal_key(&envelope.owner)? => {}
+                    if *value == principal_key(&envelope.owner)? => {}
                 _ => return Err(invalid()),
             }
         }
@@ -187,19 +184,6 @@ pub fn stage_escrow_in_tx(tx: &Transaction<'_>, escrow: &Escrow) -> Result<(), S
     let first = principal_key(&escrow.first)?;
     let second = principal_key(&escrow.second)?;
     check_fences(tx, &first, &second)?;
-    if matches!(
-        escrow.envelopes[0].recipient_id,
-        OriginalRecipientId::Numeric(_)
-    ) {
-        let count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM principals WHERE remote_user_id IN (?1,?2)",
-            params![escrow.first.user_id as i64, escrow.second.user_id as i64],
-            |row| row.get(0),
-        )?;
-        if count != 2 {
-            return Err(StorageError::MessageUnauthorized);
-        }
-    }
     let bytes = serde_json::to_vec(escrow).map_err(|_| invalid())?;
     let evidence_digest = Sha256::digest(&bytes).to_vec();
     let marker:Option<Vec<u8>>=tx.query_row("SELECT evidence_digest FROM chat_secret_epochs WHERE first_principal=?1 AND second_principal=?2 AND version=?3",params![first,second,escrow.version],|row| row.get(0)).optional()?;
@@ -340,6 +324,40 @@ pub fn pair_acceptance_on(
     Ok(connection.query_row("SELECT MAX(CASE WHEN state='committed' THEN version END),COALESCE(MAX(state='pending'),0) FROM chat_secret_epochs WHERE first_principal=?1 AND second_principal=?2",params![first,second],|row| Ok(PairAcceptance{latest_committed_version:row.get(0)?,has_pending:row.get(1)?}))?)
 }
 
+pub fn pending_initial_proposal_on(
+    connection: &Connection,
+    first: &PrincipalId,
+    second: &PrincipalId,
+) -> Result<bool, StorageError> {
+    let pair = sorted_pair(first, second)?;
+    Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM initial_secret_proposals WHERE first_principal=?1 AND second_principal=?2 AND state IN ('awaiting_peer_proof','verifying'))", params![principal_key(&pair[0])?, principal_key(&pair[1])?], |row| row.get(0))?)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochState {
+    Pending,
+    Committed,
+}
+
+pub fn epoch_state_on(
+    connection: &Connection,
+    first: &PrincipalId,
+    second: &PrincipalId,
+    epoch: i64,
+) -> Result<Option<EpochState>, StorageError> {
+    if epoch <= 0 {
+        return Err(invalid());
+    }
+    let pair = sorted_pair(first, second)?;
+    let state: Option<String> = connection.query_row("SELECT state FROM chat_secret_epochs WHERE first_principal=?1 AND second_principal=?2 AND version=?3", params![principal_key(&pair[0])?, principal_key(&pair[1])?, epoch], |row| row.get(0)).optional()?;
+    match state.as_deref() {
+        None => Ok(None),
+        Some("pending") => Ok(Some(EpochState::Pending)),
+        Some("committed") => Ok(Some(EpochState::Committed)),
+        Some(_) => Err(invalid()),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitializationState {
     Empty,
@@ -353,7 +371,7 @@ pub enum InitializationState {
 const INITIALIZATION_INBOX_SQL: &str =
     "SELECT signer_principal,message_id,state,prepared_operation,initial_secret_ambiguous
     FROM relay_inbox INDEXED BY relay_inbox_initial_secret
-    WHERE signer_principal IN (?1,?2) AND initial_secret_chat_id IN ('',?3,?4,?5)
+    WHERE signer_principal IN (?1,?2) AND initial_secret_chat_id IN ('',?3)
         AND prepared_operation IS NOT NULL AND state!='rejected'
     LIMIT 501";
 
@@ -389,6 +407,14 @@ pub fn initialization_state_on(
     }
     let mut pending = false;
     let mut conflict = false;
+    let proposal: Option<Vec<u8>> = connection.query_row(
+        "SELECT operation_digest FROM initial_secret_proposals WHERE first_principal=?1 AND second_principal=?2 AND state IN ('awaiting_peer_proof','verifying')",
+        params![first_key, second_key], |row| row.get(0),
+    ).optional()?;
+    if let Some(digest) = proposal {
+        pending = true;
+        conflict = proposal_digest != Some(digest.as_slice());
+    }
     let mut statement=connection.prepare("SELECT evidence,state FROM chat_secret_escrows WHERE first_principal=?1 AND second_principal=?2 ORDER BY version")?;
     let rows = statement
         .query_map(params![first_key, second_key], |row| {
@@ -431,66 +457,17 @@ pub fn initialization_state_on(
     if handles.len() != 2 {
         return Ok(InitializationState::Conflict);
     }
-    // Old handle namespaces can be recognized in this database, but are never
-    // exported or used to reconstruct an absent recipient envelope.
-    let local_namespace = format!("principal:{}:{}", handles[0], handles[1]);
-    let legacy_row: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM chat_secrets WHERE chat_id=?1 AND secret_id=?2)",
-        params![
-            local_namespace,
-            e2ee_storage::principal_secret_id(&local_namespace)
-        ],
-        |row| row.get(0),
-    )?;
-    if legacy_row {
-        return Ok(InitializationState::Accepted);
-    }
-    let numeric_meanings: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM principals WHERE remote_user_id IN (?1,?2)",
-        params![pair[0].user_id as i64, pair[1].user_id as i64],
-        |row| row.get(0),
-    )?;
-    if pair[0].user_id != pair[1].user_id && numeric_meanings == 2 {
-        let legacy = format!(
-            "{}:{}",
-            pair[0].user_id.min(pair[1].user_id),
-            pair[0].user_id.max(pair[1].user_id)
-        );
-        let legacy_row: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM chat_secrets WHERE chat_id=?1 AND secret_id=?2)",
-            params![legacy, e2ee_storage::principal_secret_id(&legacy)],
-            |row| row.get(0),
-        )?;
-        if legacy_row {
-            return Ok(InitializationState::Accepted);
-        }
-    }
-
-    let numeric_namespace = format!(
-        "{}:{}",
-        pair[0].user_id.min(pair[1].user_id),
-        pair[0].user_id.max(pair[1].user_id)
-    );
     let mut statement = connection.prepare(INITIALIZATION_INBOX_SQL)?;
     let rows = statement
-        .query_map(
-            params![
-                handles[0],
-                handles[1],
-                chat_id,
-                local_namespace,
-                numeric_namespace
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, bool>(4)?,
-                ))
-            },
-        )?
+        .query_map(params![handles[0], handles[1], chat_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     if rows.len() > 500 {
         return Err(StorageError::Other(
@@ -928,37 +905,82 @@ pub fn recovery_jobs(limit: usize) -> Result<Vec<RecoveryJob>, StorageError> {
         let rows = statement
             .query_map(
                 params![sync::now_millis(), limit.clamp(1, 500) as i64],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, Vec<u8>>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, i64>(7)?,
-                    ))
-                },
+                recovery_job_row,
             )?
             .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(
-                |(id, owner, first, second, version, nonce, attempts, next_at)| {
-                    Ok(RecoveryJob {
-                        id,
-                        owner: LocalUserId(owner),
-                        first: serde_json::from_str(&first).map_err(|_| invalid())?,
-                        second: serde_json::from_str(&second).map_err(|_| invalid())?,
-                        version: (version != 0).then_some(version),
-                        nonce,
-                        attempts,
-                        next_at,
-                    })
-                },
-            )
-            .collect()
+        Ok(rows)
     })
+}
+
+#[derive(Debug)]
+pub struct RecoveryHealth {
+    pub queue_depth: i64,
+    pub oldest_due_age_ms: Option<i64>,
+    pub deferred_initial_proposals: i64,
+    pub rejected_initial_proposals: i64,
+    pub pending_notifications: i64,
+}
+
+pub fn recovery_health() -> Result<RecoveryHealth, StorageError> {
+    db::with_db(|connection| {
+        let tx = connection.unchecked_transaction()?;
+        let now = sync::now_millis();
+        let (queue_depth, oldest): (i64, Option<i64>) = tx.query_row(
+            "SELECT count(*),MIN(CASE WHEN next_at<=?1 THEN next_at END) FROM chat_secret_recovery_jobs WHERE done_at IS NULL", [now],
+            |row| Ok((row.get(0)?,row.get(1)?)))?;
+        let (deferred_initial_proposals,rejected_initial_proposals) = tx.query_row(
+            "SELECT COALESCE(SUM(state IN ('awaiting_peer_proof','verifying')),0),COALESCE(SUM(state='rejected'),0) FROM initial_secret_proposals", [],
+            |row| Ok((row.get(0)?,row.get(1)?)))?;
+        Ok(RecoveryHealth {
+            queue_depth,
+            oldest_due_age_ms: oldest.map(|oldest| now.saturating_sub(oldest)),
+            deferred_initial_proposals,
+            rejected_initial_proposals,
+            pending_notifications: tx.query_row(
+                "SELECT count(*) FROM chat_secret_outbox WHERE dispatched_at IS NULL",
+                [],
+                |row| row.get(0),
+            )?,
+        })
+    })
+}
+
+fn recovery_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecoveryJob> {
+    let principal = |column| {
+        let value: String = row.get(column)?;
+        serde_json::from_str(&value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+    };
+    let version: i64 = row.get(4)?;
+    Ok(RecoveryJob {
+        id: row.get(0)?,
+        owner: LocalUserId(row.get(1)?),
+        first: principal(2)?,
+        second: principal(3)?,
+        version: (version != 0).then_some(version),
+        nonce: row.get(5)?,
+        attempts: row.get(6)?,
+        next_at: row.get(7)?,
+    })
+}
+
+pub fn recovery_job_by_id(id: i64) -> Result<Option<RecoveryJob>, StorageError> {
+    db::with_db(|connection| recovery_job_by_id_on(connection, id))
+}
+
+fn recovery_job_by_id_on(
+    connection: &Connection,
+    id: i64,
+) -> Result<Option<RecoveryJob>, StorageError> {
+    Ok(connection.query_row(
+        "SELECT id,storage_owner,first_principal,second_principal,version,nonce,attempts,next_at FROM chat_secret_recovery_jobs WHERE id=?1 AND done_at IS NULL",
+        [id], recovery_job_row,
+    ).optional()?)
 }
 
 pub fn retry_recovery_job(
@@ -968,7 +990,23 @@ pub fn retry_recovery_job(
 ) -> Result<bool, StorageError> {
     db::with_immediate_transaction(|tx| {
         let principal = verify_local_owner(tx, job.owner)?;
-        Ok(tx.execute("UPDATE chat_secret_recovery_jobs SET attempts=attempts+1,next_at=?4,last_error=?5 WHERE id=?1 AND nonce=?2 AND attempts=?3 AND done_at IS NULL AND attempts<9223372036854775807 AND storage_owner=?6 AND owner_principal=?7",params![job.id,job.nonce,job.attempts,next_at,error,job.owner.0,principal_key(&principal)?])?==1)
+        Ok(tx.execute("UPDATE chat_secret_recovery_jobs SET attempts=attempts+1,next_at=?4,last_error=?5 WHERE id=?1 AND nonce=?2 AND attempts=?3 AND done_at IS NULL AND attempts<9223372036854775807 AND storage_owner=?6 AND owner_principal=?7 AND next_at=?8",params![job.id,job.nonce,job.attempts,next_at,error,job.owner.0,principal_key(&principal)?,job.next_at])?==1)
+    })
+}
+
+/// Reserve a due attempt across workers/processes. Cancellation or crash leaves
+/// the same nonce resumable after the bounded processing deadline.
+pub fn begin_recovery_attempt(job: &RecoveryJob) -> Result<Option<RecoveryJob>, StorageError> {
+    db::with_immediate_transaction(|tx| {
+        let principal = verify_local_owner(tx, job.owner)?;
+        let now = sync::now_millis();
+        let deadline = now.saturating_add(30_000);
+        let changed = tx.execute("UPDATE chat_secret_recovery_jobs SET next_at=?4 WHERE id=?1 AND nonce=?2 AND attempts=?3 AND next_at=?5 AND next_at<=?6 AND done_at IS NULL AND storage_owner=?7 AND owner_principal=?8",
+            params![job.id,job.nonce,job.attempts,deadline,job.next_at,now,job.owner.0,principal_key(&principal)?])?;
+        Ok((changed == 1).then(|| RecoveryJob {
+            next_at: deadline,
+            ..job.clone()
+        }))
     })
 }
 
@@ -977,7 +1015,7 @@ pub fn complete_recovery_job_in_tx(
     job: &RecoveryJob,
 ) -> Result<bool, StorageError> {
     let principal = verify_local_owner(tx, job.owner)?;
-    Ok(tx.execute("UPDATE chat_secret_recovery_jobs SET done_at=?4 WHERE id=?1 AND nonce=?2 AND attempts=?3 AND done_at IS NULL AND storage_owner=?5 AND owner_principal=?6",params![job.id,job.nonce,job.attempts,sync::now_millis(),job.owner.0,principal_key(&principal)?])?==1)
+    Ok(tx.execute("UPDATE chat_secret_recovery_jobs SET done_at=?4 WHERE id=?1 AND nonce=?2 AND attempts=?3 AND done_at IS NULL AND storage_owner=?5 AND owner_principal=?6 AND next_at=?7",params![job.id,job.nonce,job.attempts,sync::now_millis(),job.owner.0,principal_key(&principal)?,job.next_at])?==1)
 }
 
 /// Erasure is a permanent global-principal fence. Old peer proofs cannot
@@ -998,6 +1036,10 @@ pub fn purge_owner_in_tx(tx: &Transaction<'_>, owner: LocalUserId) -> Result<(),
         [&key],
     )?;
     tx.execute("DELETE FROM chat_secret_recovery_jobs WHERE storage_owner=?1 OR first_principal=?2 OR second_principal=?2",params![owner.0,key])?;
+    tx.execute(
+        "DELETE FROM initial_secret_proposals WHERE first_principal=?1 OR second_principal=?1",
+        [&key],
+    )?;
     tx.execute("DELETE FROM chat_secret_outbox WHERE storage_owner=?1 OR owner_principal=?2 OR peer_principal=?2",params![owner.0,key])?;
     tx.execute("DELETE FROM chat_secret_rejected_proposals WHERE first_principal=?1 OR second_principal=?1",[key])?;
     Ok(())

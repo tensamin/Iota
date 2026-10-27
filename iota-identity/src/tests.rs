@@ -1,6 +1,40 @@
 use super::*;
 
 #[test]
+fn tau_principal_adapter_preserves_pinned_identity_and_rejects_invalid_values() {
+    let authority = format!("omega-key:{}", "a".repeat(64));
+    let wire = tau::relay_protocol::Principal::new(authority.clone(), 42).unwrap();
+    let identity = PrincipalId::try_from(wire.clone()).unwrap();
+    assert_eq!(identity.authority.as_str(), authority);
+    assert_eq!(identity.user_id, 42);
+    assert_eq!(
+        tau::relay_protocol::Principal::try_from(&identity).unwrap(),
+        wire
+    );
+    assert_eq!(
+        serde_json::to_vec(&identity).unwrap(),
+        serde_json::to_vec(&wire).unwrap()
+    );
+    assert_eq!(
+        serde_json::from_slice::<PrincipalId>(&serde_json::to_vec(&wire).unwrap()).unwrap(),
+        identity
+    );
+    for (authority, user_id) in [
+        ("omega:example.org".to_owned(), 42),
+        (authority.clone(), 0),
+        (authority.clone(), u64::MAX),
+    ] {
+        let wire = tau::relay_protocol::Principal { authority, user_id };
+        assert!(PrincipalId::try_from(wire.clone()).is_err());
+        assert!(
+            serde_json::from_slice::<PrincipalId>(&serde_json::to_vec(&wire).unwrap()).is_err()
+        );
+    }
+    let duplicate = format!(r#"{{"authority":"{authority}","user_id":42,"user_id":43}}"#);
+    assert!(serde_json::from_str::<PrincipalId>(&duplicate).is_err());
+}
+
+#[test]
 fn authority_scopes_equal_numeric_user_ids() {
     let first = PrincipalId {
         authority: AuthorityId::new("omega:first").unwrap(),

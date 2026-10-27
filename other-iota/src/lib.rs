@@ -124,8 +124,13 @@ fn now_millis() -> i64 {
 #[async_trait]
 pub trait DirectPeerConnection: Send + Sync {
     async fn send_relay(&self, frame: CommunicationValue) -> Result<RouteOutcome, RouteError>;
-    async fn send_peer_control(&self, _frame: CommunicationValue) -> Result<CommunicationValue, RouteError> {
-        Err(RouteError::Delivery("direct peer control is unsupported".into()))
+    async fn send_peer_control(
+        &self,
+        _frame: CommunicationValue,
+    ) -> Result<CommunicationValue, RouteError> {
+        Err(RouteError::Delivery(
+            "direct peer control is unsupported".into(),
+        ))
     }
     fn authenticated_key(&self) -> Option<PublicKeyBundle> {
         None

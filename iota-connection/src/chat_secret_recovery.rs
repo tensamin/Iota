@@ -86,6 +86,14 @@ impl InitialSetGuard {
         &self,
         tx: &rusqlite::Transaction<'_>,
     ) -> Result<(), iota_storage::storage_error::StorageError> {
+        let now = sync::now_millis();
+        if !self.homes.0.is_valid_at(now)
+            || !self.homes.1.is_valid_at(now)
+            || now.saturating_sub(self.homes.0.resolved_at) > 30_000
+            || now.saturating_sub(self.homes.1.resolved_at) > 30_000
+        {
+            return Err(iota_storage::storage_error::StorageError::RelayOwnerUnavailable);
+        }
         recheck_homes_in_tx(tx, self.owner, &self.homes.0, &self.homes.1)?;
         let state = storage::initialization_state_on(
             tx,
@@ -448,20 +456,12 @@ impl RecoveryCoordinator {
             } else {
                 &job.first
             };
-            let result = tokio::time::timeout(
+            let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(20),
                 self.recover_job(&owner, partner, job.version, Some(&job)),
             )
             .await
             .unwrap_or(Err(RecoveryError::RetryablePeerUnavailable));
-            if let Err(error) = result {
-                let delay = 1_000i64.saturating_mul(1i64 << job.attempts.clamp(0, 6));
-                let _ = storage::retry_recovery_job(
-                    &job,
-                    sync::now_millis().saturating_add(delay),
-                    &error.to_string(),
-                );
-            }
         }
     }
 
@@ -476,6 +476,50 @@ impl RecoveryCoordinator {
         let lock = self.pair_lock(&pair).await?;
         let _guard = lock.lock().await;
         let local = self.owner(owner)?;
+        if let Some(job) = job {
+            let current = storage::recovery_job_by_id(job.id)
+                .map_err(storage_error)?
+                .ok_or(RecoveryError::RetryablePeerUnavailable)?;
+            validate_recovery_job(&current, local, owner, partner, epoch)?;
+            if current.nonce != job.nonce
+                || current.attempts != job.attempts
+                || current.next_at > sync::now_millis()
+            {
+                return Err(RecoveryError::RetryablePeerUnavailable);
+            }
+        }
+        let claimed = match job {
+            Some(job) => Some(
+                storage::begin_recovery_attempt(job)
+                    .map_err(storage_error)?
+                    .ok_or(RecoveryError::RetryablePeerUnavailable)?,
+            ),
+            None => None,
+        };
+        let result = self
+            .recover_pair(owner, partner, epoch, claimed.as_ref(), local, pair)
+            .await;
+        if let (Err(error), Some(job)) = (&result, claimed.as_ref()) {
+            let delay = 1_000i64.saturating_mul(1i64 << job.attempts.clamp(0, 6));
+            storage::retry_recovery_job(
+                job,
+                sync::now_millis().saturating_add(delay),
+                &error.to_string(),
+            )
+            .map_err(storage_error)?;
+        }
+        result
+    }
+
+    async fn recover_pair(
+        &self,
+        owner: &PrincipalId,
+        partner: &PrincipalId,
+        epoch: Option<i64>,
+        job: Option<&storage::RecoveryJob>,
+        local: LocalUserId,
+        pair: ConversationPair,
+    ) -> Result<(), RecoveryError> {
         // Local committed evidence is authoritative and needs no network. Fences
         // and exact immutable comparison run again inside the write transaction.
         if let Some(escrow) = self
@@ -746,12 +790,34 @@ impl ChatSecretRecovery for RecoveryCoordinator {
         let id = self.enqueue(owner, partner, epoch)?;
         // Request-triggered work uses the persisted nonce too, so a cancelled
         // client read leaves resumable work for the startup/reconnect worker.
-        let job = storage::recovery_jobs(500)
+        let job = storage::recovery_job_by_id(id)
             .map_err(storage_error)?
-            .into_iter()
-            .find(|job| job.id == id)
             .ok_or(RecoveryError::RetryablePeerUnavailable)?;
+        validate_recovery_job(&job, self.owner(owner)?, owner, partner, epoch)?;
+        // Explicit reads honor persistent worker backoff. Polling never changes
+        // the original nonce or moves a scheduled retry earlier.
+        if job.next_at > sync::now_millis() {
+            EXPLICIT_DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(RecoveryError::RetryablePeerUnavailable);
+        }
+        EXPLICIT_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.recover_job(owner, partner, epoch, Some(&job)).await
+    }
+}
+
+fn validate_recovery_job(
+    job: &storage::RecoveryJob,
+    local: LocalUserId,
+    owner: &PrincipalId,
+    partner: &PrincipalId,
+    epoch: Option<i64>,
+) -> Result<(), RecoveryError> {
+    let same_pair = (job.first == *owner && job.second == *partner)
+        || (job.first == *partner && job.second == *owner);
+    if job.owner != local || job.version != epoch || !same_pair {
+        Err(RecoveryError::Unauthorized)
+    } else {
+        Ok(())
     }
 }
 
@@ -784,26 +850,17 @@ fn recheck_homes_in_tx(
     first: &iota_identity::ResolvedPrincipal,
     second: &iota_identity::ResolvedPrincipal,
 ) -> Result<(), iota_storage::storage_error::StorageError> {
-    use rusqlite::OptionalExtension;
     iota_storage::util::relay_work::verify_owner_in_tx(tx, owner.0, first.handle)?;
     if storage::canonical_owner_on(tx, owner)? != first.principal {
         return Err(iota_storage::storage_error::StorageError::RelayOwnerUnavailable);
     }
     for principal in [first, second] {
-        let current: Option<(i64, String)> = tx.query_row("SELECT descriptor_revision,home FROM principals WHERE authority_id=?1 AND remote_user_id=?2",
-            rusqlite::params![principal.principal.authority.as_str(), principal.principal.user_id as i64],
-            |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
-        let PrincipalHome::Iota(node) = &principal.home else {
+        let PrincipalHome::Iota(_) = &principal.home else {
             return Err(iota_storage::storage_error::StorageError::MessageUnauthorized);
         };
-        if current
-            != Some((
-                principal.descriptor_revision,
-                format!("iota:{}", node.as_str()),
-            ))
-        {
-            return Err(iota_storage::storage_error::StorageError::RelayOwnerUnavailable);
-        }
+        iota_storage::identity::PrincipalCommitFence::capture(principal)
+            .map_err(|_| iota_storage::storage_error::StorageError::RelayOwnerUnavailable)?
+            .verify_on(tx)?;
     }
     Ok(())
 }
@@ -816,16 +873,7 @@ fn protocol_principal(principal: &PrincipalId) -> Principal {
 }
 
 fn identity_principal(principal: &Principal) -> Result<PrincipalId, RecoveryError> {
-    principal.validate()?;
-    let authority = iota_identity::AuthorityId::new(&principal.authority)
-        .map_err(|_| RecoveryError::Unauthorized)?;
-    if authority.as_str() != principal.authority || i64::try_from(principal.user_id).is_err() {
-        return Err(RecoveryError::Unauthorized);
-    }
-    Ok(PrincipalId {
-        authority,
-        user_id: principal.user_id,
-    })
+    PrincipalId::try_from(principal.clone()).map_err(|_| RecoveryError::Unauthorized)
 }
 
 fn new_nonce() -> [u8; 32] {
@@ -883,6 +931,7 @@ pub fn encode_evidence(
             .collect(),
         original_operation: escrow.original_frame.clone(),
         original_type_map_version: escrow.original_type_map_version.clone(),
+        original_type_map_fingerprint: escrow.original_type_map_fingerprint.clone(),
         recipient_envelope: serde_json::to_vec(envelope).map_err(|_| RecoveryError::Conflict)?,
         provenance: serde_json::to_vec(escrow).map_err(|_| RecoveryError::Conflict)?,
     };
@@ -959,6 +1008,17 @@ pub trait ChatSecretRecovery: PeerRecoveryHandler {
 
 static RECOVERY: std::sync::RwLock<Option<std::sync::Arc<dyn ChatSecretRecovery>>> =
     std::sync::RwLock::new(None);
+
+static EXPLICIT_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EXPLICIT_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn explicit_recovery_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        EXPLICIT_ATTEMPTS.load(Ordering::Relaxed),
+        EXPLICIT_DEFERRED.load(Ordering::Relaxed),
+    )
+}
 
 pub fn install_recovery(service: std::sync::Arc<dyn ChatSecretRecovery>) {
     *RECOVERY.write().expect("recovery service lock poisoned") = Some(service);

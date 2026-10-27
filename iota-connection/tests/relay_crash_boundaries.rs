@@ -182,6 +182,114 @@ async fn ingress_crash_boundaries() {
 }
 
 #[tokio::test]
+async fn first_secret_proposal_crash_boundaries() {
+    if let Some(phase) = phase() {
+        let boundary = std::env::var("RELAY_CRASH_BOUNDARY").unwrap();
+        let directory = PathBuf::from(std::env::var("RELAY_TEST_STORAGE").unwrap());
+        if phase == "apply" {
+            let fixture = Fixture::new(false);
+            std::fs::write(
+                directory.join("node"),
+                fixture.node.keyring().try_to_bytes().unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                directory.join("peer"),
+                fixture.destination.keyring().try_to_bytes().unwrap(),
+            )
+            .unwrap();
+            let _ = fixture.accept(0, "fault", secret(&fixture)).await;
+            panic!("proposal fault hook did not terminate process");
+        }
+        let node = iota_identity::LocalNodeIdentity::from_keyring(
+            mtp::crypto::Keyring::from_bytes(&std::fs::read(directory.join("node")).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let peer = iota_identity::LocalNodeIdentity::from_keyring(
+            mtp::crypto::Keyring::from_bytes(&std::fs::read(directory.join("peer")).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let service =
+            Arc::new(service().with_federation(Arc::new(Resolver), Arc::new(Node(node.clone()))));
+        install_test_recovery(service.clone(), &node, &[node.clone(), peer]);
+        if boundary == "before_proposal_persistence" {
+            assert_eq!(count("SELECT count(*) FROM initial_secret_proposals"), 0);
+            service.retry_initial_secret_proposals().await.unwrap();
+            assert_eq!(count("SELECT count(*) FROM relay_inbox"), 0);
+            return;
+        }
+        if phase == "recover" {
+            if boundary != "after_proposal_commit" {
+                assert_eq!(
+                    count(
+                        "SELECT count(*) FROM initial_secret_proposals WHERE state IN ('awaiting_peer_proof','verifying')"
+                    ),
+                    1
+                );
+                assert_eq!(count("SELECT count(*) FROM relay_inbox"), 0);
+                assert_eq!(count("SELECT count(*) FROM chat_secret_escrows"), 0);
+                assert_eq!(count("SELECT count(*) FROM pending_relays"), 0);
+                execute("UPDATE initial_secret_proposals SET claim_deadline=0,next_at=0;");
+            }
+            // Expired server/session leases must not discard already verified
+            // durable work. Account authorization generation remains mandatory.
+            execute("UPDATE hosted_server_instances SET expires_at=0");
+            service.retry_initial_secret_proposals().await.unwrap();
+        }
+        assert_eq!(
+            count("SELECT count(*) FROM initial_secret_proposals WHERE state='committed'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM relay_inbox WHERE state='queued'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM chat_secret_escrows WHERE state='pending'"),
+            1
+        );
+        assert_eq!(count("SELECT count(*) FROM chat_secrets"), 0);
+        assert_eq!(count("SELECT count(*) FROM pending_relays"), 1);
+        service.retry_initial_secret_proposals().await.unwrap();
+        assert_eq!(count("SELECT count(*) FROM pending_relays"), 1);
+        return;
+    }
+    for boundary in [
+        "before_proposal_persistence",
+        "after_proposal_persistence",
+        "after_proposal_peer_proof",
+        "before_proposal_commit",
+        "after_proposal_commit",
+    ] {
+        let path = storage(boundary);
+        child(
+            "first_secret_proposal_crash_boundaries",
+            "apply",
+            &path,
+            boundary,
+            true,
+        );
+        child(
+            "first_secret_proposal_crash_boundaries",
+            "recover",
+            &path,
+            boundary,
+            false,
+        );
+        child(
+            "first_secret_proposal_crash_boundaries",
+            "verify",
+            &path,
+            boundary,
+            false,
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn deferred_acknowledgement_crash_boundaries() {
     if let Some(phase) = phase() {
         match phase.as_str() {

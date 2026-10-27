@@ -1,4 +1,44 @@
 use super::*;
+
+const AUTHORITY_A: &str =
+    "omega-key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const AUTHORITY_B: &str =
+    "omega-key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+#[test]
+fn persisted_recovery_job_requires_exact_owner_pair_and_epoch() {
+    let escrow = escrow();
+    let job = storage::RecoveryJob {
+        id: 1,
+        owner: LocalUserId(7),
+        first: escrow.first.clone(),
+        second: escrow.second.clone(),
+        version: Some(1),
+        nonce: vec![1; 32],
+        attempts: 0,
+        next_at: 0,
+    };
+    assert!(
+        validate_recovery_job(&job, LocalUserId(7), &escrow.first, &escrow.second, Some(1)).is_ok()
+    );
+    assert!(
+        validate_recovery_job(&job, LocalUserId(7), &escrow.second, &escrow.first, Some(1)).is_ok()
+    );
+    assert_eq!(
+        validate_recovery_job(&job, LocalUserId(8), &escrow.first, &escrow.second, Some(1)),
+        Err(RecoveryError::Unauthorized)
+    );
+    assert_eq!(
+        validate_recovery_job(&job, LocalUserId(7), &escrow.first, &escrow.second, None),
+        Err(RecoveryError::Unauthorized)
+    );
+    let mut other = escrow.second.clone();
+    other.user_id += 1;
+    assert_eq!(
+        validate_recovery_job(&job, LocalUserId(7), &escrow.first, &other, Some(1)),
+        Err(RecoveryError::Unauthorized)
+    );
+}
 use iota_identity::{
     IdentityError, PrincipalHandle, ResolutionContext, ResolvedPrincipal, UserAddress,
 };
@@ -168,11 +208,11 @@ fn setup(
     let peer =
         iota_identity::LocalNodeIdentity::from_keyring(mtp::crypto::Keyring::generate()).unwrap();
     let first = PrincipalId {
-        authority: iota_identity::AuthorityId::new("authority-a").unwrap(),
+        authority: iota_identity::AuthorityId::new(AUTHORITY_A).unwrap(),
         user_id: 1,
     };
     let second = PrincipalId {
-        authority: iota_identity::AuthorityId::new("authority-b").unwrap(),
+        authority: iota_identity::AuthorityId::new(AUTHORITY_B).unwrap(),
         user_id: 1,
     };
     let resolved = |principal: PrincipalId, home: IotaNodeId| ResolvedPrincipal {
@@ -281,11 +321,11 @@ async fn recovery_pair_limits_are_bounded_and_pair_serialization_is_shared() {
 
 fn escrow() -> storage::Escrow {
     let first = PrincipalId {
-        authority: iota_identity::AuthorityId::new("authority-a").unwrap(),
+        authority: iota_identity::AuthorityId::new(AUTHORITY_A).unwrap(),
         user_id: 11,
     };
     let second = PrincipalId {
-        authority: iota_identity::AuthorityId::new("authority-b").unwrap(),
+        authority: iota_identity::AuthorityId::new(AUTHORITY_B).unwrap(),
         user_id: 22,
     };
     let frame = vec![1, 2, 3];
@@ -294,8 +334,11 @@ fn escrow() -> storage::Escrow {
         second: second.clone(),
         version: 1,
         namespace: storage::WrappingNamespace {
-            chat_id: "11:22".into(),
-            secret_id: "chat:11:22:main".into(),
+            chat_id: storage::canonical_chat_id(&first, &second).unwrap(),
+            secret_id: format!(
+                "chat:{}:main",
+                storage::canonical_chat_id(&first, &second).unwrap()
+            ),
         },
         wrapping_scheme: "scheme".into(),
         signer: first.clone(),
@@ -306,17 +349,22 @@ fn escrow() -> storage::Escrow {
         ),
         original_frame: frame,
         original_type_map_version: "1.0".into(),
+        original_type_map_fingerprint: tau_relay_protocol::dictionary_fingerprint("1.0").unwrap(),
         format: storage::RelayFormat::NativeMtpSealedV1,
         envelopes: [
             storage::RecipientEnvelope {
+                recipient_id: storage::OriginalRecipientId::Principal(
+                    storage::principal_key(&first).unwrap(),
+                ),
                 owner: first,
-                recipient_id: storage::OriginalRecipientId::Numeric(11),
                 encrypted_secret: vec![11],
                 kem_ciphertext: vec![1],
             },
             storage::RecipientEnvelope {
+                recipient_id: storage::OriginalRecipientId::Principal(
+                    storage::principal_key(&second).unwrap(),
+                ),
                 owner: second,
-                recipient_id: storage::OriginalRecipientId::Numeric(22),
                 encrypted_secret: vec![22],
                 kem_ciphertext: vec![2],
             },

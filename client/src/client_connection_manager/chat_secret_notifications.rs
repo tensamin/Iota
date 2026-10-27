@@ -1,6 +1,9 @@
 use super::*;
 use iota_storage::util::chat_secret_recovery::{self as recovery, SecretAvailable};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static PREPARATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static RECOVERY_ENQUEUE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 impl ClientConnectionManager {
     /// Outbox events are retained and paged independently by each admitted session.
@@ -18,7 +21,20 @@ impl ClientConnectionManager {
         let mut changes = recovery::subscribe_changes();
         let mut retry = tokio::time::interval(std::time::Duration::from_secs(5));
         let mut cursor = 0;
+        let mut failures = 0u32;
         loop {
+            if failures >= 12 {
+                iota_logger::log!(
+                    "ChatSecret notification retry budget exhausted; cooling down: preparation_failures={} enqueue_failures={}",
+                    PREPARATION_FAILURES.load(Ordering::Relaxed),
+                    RECOVERY_ENQUEUE_FAILURES.load(Ordering::Relaxed)
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {},
+                }
+                failures = 0;
+            }
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return,
@@ -38,7 +54,13 @@ impl ClientConnectionManager {
                 match recovery::events_for_owner_after(lease.identity.local_user, cursor, 100) {
                     Ok(events) => events,
                     Err(error) => {
-                        iota_logger::log!("Cannot read ChatSecret notification outbox: {}", error);
+                        let count = PREPARATION_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                        iota_logger::log!(
+                            "Cannot read ChatSecret notification outbox: failures={} error={}",
+                            count,
+                            error
+                        );
+                        failures += 1;
                         continue;
                     }
                 };
@@ -46,8 +68,46 @@ impl ClientConnectionManager {
             for event in events {
                 let frame = match secret_available_frame(&event) {
                     Ok(frame) => frame,
-                    Err(error) => {
-                        iota_logger::log!("Cannot prepare ChatSecret notification: {}", error);
+                    Err(HintError::EnvelopeUnavailable) => {
+                        let count = PREPARATION_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                        match iota_connection::chat_secret_recovery::enqueue_recovery(
+                            &event.principal,
+                            &event.peer,
+                            Some(event.version),
+                        ) {
+                            Ok(_) => {
+                                iota_logger::log!(
+                                    "ChatSecret notification recovery queued: event={} preparation_failures={}",
+                                    event.id,
+                                    count
+                                );
+                                cursor = event.id;
+                                failures = 0;
+                                continue;
+                            }
+                            Err(error) => {
+                                let count =
+                                    RECOVERY_ENQUEUE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                                iota_logger::log!(
+                                    "ChatSecret notification recovery enqueue failed: event={} failures={} error={}",
+                                    event.id,
+                                    count,
+                                    error
+                                );
+                            }
+                        }
+                        failures += 1;
+                        full_page = false;
+                        break;
+                    }
+                    Err(HintError::StorageUnavailable) => {
+                        let count = PREPARATION_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                        iota_logger::log!(
+                            "ChatSecret notification storage unavailable: event={} preparation_failures={}",
+                            event.id,
+                            count
+                        );
+                        failures += 1;
                         full_page = false;
                         break;
                     }
@@ -76,6 +136,7 @@ impl ClientConnectionManager {
                     }
                 }
                 cursor = event.id;
+                failures = 0;
             }
             if full_page {
                 active.secret_ready.notify_one();
@@ -84,25 +145,21 @@ impl ClientConnectionManager {
     }
 }
 
+enum HintError {
+    StorageUnavailable,
+    EnvelopeUnavailable,
+}
+
 fn secret_available_frame(
     event: &SecretAvailable,
-) -> Result<Option<CommunicationValue>, &'static str> {
-    // The unchanged Client addresses peers numerically. Do not publish an
-    // ambiguous numeric peer, even when its canonical envelope is available.
-    let first = event.principal.user_id.min(event.peer.user_id);
-    let second = event.principal.user_id.max(event.peer.user_id);
-    let chat = format!("{first}:{second}");
+) -> Result<Option<CommunicationValue>, HintError> {
+    let owner_key =
+        recovery::principal_key(&event.principal).map_err(|_| HintError::StorageUnavailable)?;
     let request = CommunicationValue::new(CommunicationType::GetChatSecret)
-        .with_sender(u64::try_from(event.owner.0).map_err(|_| "invalid storage owner")?)
-        .add_typed_default(
-            DataType::UserId,
-            DataValue::Str(event.principal.user_id.to_string()),
-        )
-        .add_typed_default(DataType::ChatId, DataValue::Str(chat.clone()))
-        .add_typed_default(
-            DataType::SecretId,
-            DataValue::Str(format!("chat:{chat}:main")),
-        )
+        .with_sender(u64::try_from(event.owner.0).map_err(|_| HintError::StorageUnavailable)?)
+        .add_typed_default(DataType::UserId, DataValue::Str(owner_key.clone()))
+        .add_typed_default(DataType::ChatId, DataValue::Str(event.chat_id.clone()))
+        .add_typed_default(DataType::SecretId, DataValue::Str(event.secret_id.clone()))
         .add_typed_default(
             DataType::VersionNumber,
             DataValue::SignedNumber(event.version.into()),
@@ -110,50 +167,55 @@ fn secret_available_frame(
     let (owner, peer, _) = match message_handlers::validated_chat_secret_read_target(&request) {
         Ok(target) => target,
         Err(response) if response.is_type(CommunicationType::ErrorInternal) => {
-            return Err("identity storage unavailable");
+            return Err(HintError::StorageUnavailable);
         }
-        Err(_) => return Ok(None),
+        Err(response) if response.is_type(CommunicationType::ErrorInvalidData) => return Ok(None),
+        Err(_) => return Err(HintError::StorageUnavailable),
     };
     if owner != event.principal || peer != event.peer {
         return Ok(None);
     }
-    // Read through the accepted-row/evidence gate using its original namespace.
-    let request = request
-        .with_data(
-            DataType::UserId,
-            DataValue::Str(serde_json::to_string(&owner).map_err(|_| "invalid owner principal")?),
-        )
-        .with_data(DataType::ChatId, DataValue::Str(event.chat_id.clone()))
-        .with_data(DataType::SecretId, DataValue::Str(event.secret_id.clone()));
-    if !message_handlers::handle_get_chat_secret(&request)
-        .is_type(CommunicationType::ChatSecretResponse)
-    {
-        return Err("accepted envelope unavailable");
+    // The hint exposes availability only after the accepted-row/evidence gate.
+    match message_handlers::read_chat_secret(&request) {
+        Ok(_) => {}
+        Err(message_handlers::ChatSecretReadError::Unavailable(_)) => {
+            return Err(HintError::EnvelopeUnavailable);
+        }
+        Err(message_handlers::ChatSecretReadError::Storage(error)) => {
+            iota_logger::log!(
+                "ChatSecret notification read failed: event={} error={}",
+                event.id,
+                error
+            );
+            return Err(HintError::StorageUnavailable);
+        }
+        Err(_) => return Err(HintError::StorageUnavailable),
     }
     Ok(Some(
-        CommunicationValue::new(CommunicationType::ChatSecretForward)
-            .with_sender(peer.user_id)
-            .with_receiver(owner.user_id)
-            .add_typed_default(
-                DataType::SenderUserId,
-                DataValue::UnsignedNumber(peer.user_id.into()),
-            )
-            .add_typed_default(
-                DataType::RecipientUserId,
-                DataValue::UnsignedNumber(owner.user_id.into()),
-            )
-            .add_typed_default(
-                DataType::ChatId,
-                DataValue::Str(event.namespace.chat_id.clone()),
-            )
-            .add_typed_default(
-                DataType::SecretId,
-                DataValue::Str(event.namespace.secret_id.clone()),
-            )
-            .add_typed_default(
-                DataType::VersionNumber,
-                DataValue::SignedNumber(event.version.into()),
-            )
-            .add_typed_default(DataType::Payload, DataValue::Str("available".into())),
+        CommunicationValue::new_with_type_map(
+            CommunicationType::ChatSecretForward,
+            request.type_map().ok_or(HintError::StorageUnavailable)?,
+        )
+        .with_receiver(u64::try_from(event.owner.0).map_err(|_| HintError::StorageUnavailable)?)
+        .add_typed_default(DataType::Principal, DataValue::Str(owner_key))
+        .add_typed_default(
+            DataType::UserAddress,
+            DataValue::Str(
+                recovery::principal_key(&peer).map_err(|_| HintError::StorageUnavailable)?,
+            ),
+        )
+        .add_typed_default(
+            DataType::ChatId,
+            DataValue::Str(event.namespace.chat_id.clone()),
+        )
+        .add_typed_default(
+            DataType::SecretId,
+            DataValue::Str(event.namespace.secret_id.clone()),
+        )
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::SignedNumber(event.version.into()),
+        )
+        .add_typed_default(DataType::Payload, DataValue::Str("available".into())),
     ))
 }

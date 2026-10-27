@@ -90,12 +90,15 @@ pub(crate) use runtime::PasswordAuthRuntime;
 use runtime::PasswordRuntimeError;
 use runtime::PendingLogin;
 pub use runtime::{PasswordCredentialCounts, PasswordHealth, PasswordReadiness};
+mod timing;
 mod wire;
+pub use timing::snapshot as password_stage_counts;
 #[cfg(test)]
 use wire::{now_millis, typed};
 
 impl OmikronConnection {
     async fn validate_password_hosting(&self, user_id: i64) -> Result<String, String> {
+        let mut timing = timing::Timing::start(timing::Stage::Account);
         let url = format!(
             "{}/api/get/user/{user_id}",
             crate::omega_discovery::api_base().trim_end_matches('/')
@@ -133,13 +136,19 @@ impl OmikronConnection {
         if wire::key_fingerprint(advertised)? != wire::key_fingerprint(&hosted)? {
             return Err("hosted account identity differs from Omega".into());
         }
+        timing.success();
         Ok(hosted)
     }
     // Password login uses Omega's key-scoped principal, including for accounts
     // whose older hosted-principal record still uses the legacy host locator.
-    pub(crate) async fn password_principal(&self, user_id: i64) -> Result<String, String> {
+    pub(crate) async fn password_principal(
+        &self,
+        user_id: i64,
+    ) -> Result<String, tau::password::Failure> {
+        use tau::password::Failure;
+        let mut timing = timing::Timing::start(timing::Stage::Authority);
         if user_id <= 0 {
-            return Err("invalid user ID".into());
+            return Err(Failure::InvalidRequest);
         }
         let authority = {
             let url = format!(
@@ -149,21 +158,21 @@ impl OmikronConnection {
             let cancellation = self.preparation_cancellation();
             let discovery: serde_json::Value = tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Err("connection closed".into()),
+                _ = cancellation.cancelled() => return Err(Failure::Cancelled),
                 result = tokio::time::timeout(Duration::from_secs(5), async {
                     self.http_client.get(url).send().await
-                        .map_err(|error| error.to_string())?
-                        .error_for_status().map_err(|error| error.to_string())?
-                        .json().await.map_err(|error| error.to_string())
-                }) => result.map_err(|_| "Omega identity lookup timed out")??,
+                        .map_err(|_| Failure::DependencyUnavailable)?
+                        .error_for_status().map_err(|_| Failure::DependencyUnavailable)?
+                        .json().await.map_err(|_| Failure::DependencyUnavailable)
+                }) => result.map_err(|_| Failure::DependencyUnavailable)??,
             };
             let key = discovery
                 .get("public_key")
                 .and_then(serde_json::Value::as_str)
-                .ok_or("Omega discovery is missing its key")?;
-            let key = PublicKeyBundle::from_base64(key).map_err(|error| error.to_string())?;
+                .ok_or(Failure::DependencyUnavailable)?;
+            let key = PublicKeyBundle::from_base64(key).map_err(|_| Failure::Unauthorized)?;
             let authority = iota_identity::AuthorityId::for_omega(&key)
-                .map_err(|error| error.to_string())?
+                .map_err(|_| Failure::Unauthorized)?
                 .as_str()
                 .to_owned();
             if discovery
@@ -171,16 +180,17 @@ impl OmikronConnection {
                 .and_then(serde_json::Value::as_str)
                 != Some(authority.as_str())
             {
-                return Err("Omega discovery identity mismatch".into());
+                return Err(Failure::Unauthorized);
             }
             let _ = self.password_auth.omega_authority.set(authority.clone());
             if self.password_auth.omega_authority.get() != Some(&authority) {
                 *self.password_auth.readiness.write().unwrap() =
                     PasswordReadiness::ReenrollmentRequired;
-                return Err("Omega authority changed, authenticated re-enrollment required".into());
+                return Err(Failure::Unauthorized);
             }
             authority
         };
+        timing.success();
         Ok(format!("{authority}#{user_id}"))
     }
 }

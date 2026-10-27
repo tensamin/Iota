@@ -107,7 +107,7 @@ impl IdentityResolver for Resolver {
     }
 }
 
-struct Node(LocalNodeIdentity);
+pub struct Node(pub LocalNodeIdentity);
 #[async_trait]
 impl RelayNodeIdentity for Node {
     async fn keyring(&self) -> Option<Arc<Keyring>> {
@@ -214,6 +214,10 @@ impl Fixture {
     }
 
     pub fn new(both_local: bool) -> Self {
+        Self::new_hosting(both_local, 0)
+    }
+
+    pub fn new_hosting(both_local: bool, local_index: usize) -> Self {
         let mut node = LocalNodeIdentity::from_keyring(Keyring::generate()).unwrap();
         let mut destination = if both_local {
             node.clone()
@@ -268,7 +272,7 @@ impl Fixture {
         for (i, handle) in handles
             .iter()
             .enumerate()
-            .take(if both_local { 2 } else { 1 })
+            .filter(|(index, _)| both_local || *index == local_index)
         {
             db::with_immediate_transaction(|tx| {
                 tx.execute("INSERT INTO users(user_id, username, public_key, created_at) VALUES(?1, ?2, 'test', 1)", rusqlite::params![i as i64 + 1, format!("user{i}")])?;

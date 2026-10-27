@@ -183,6 +183,7 @@ async fn pinned_native_client_over_authenticated_mtp() {
                 "--nocapture",
             ])
             .env("NATIVE_RELAY_TEST_STAGE", "destination")
+            .env("RELAY_NATIVE_CLIENT_FIXTURE", pinned::fixture_path())
             .env("NATIVE_MTP_RENDEZVOUS", temporary.path())
             .spawn()
             .unwrap();
@@ -200,6 +201,7 @@ async fn pinned_native_client_over_authenticated_mtp() {
                 "--nocapture",
             ])
             .env("NATIVE_RELAY_TEST_STAGE", "origin")
+            .env("RELAY_NATIVE_CLIENT_FIXTURE", pinned::fixture_path())
             .env("NATIVE_MTP_RENDEZVOUS", temporary.path())
             .status()
             .unwrap();

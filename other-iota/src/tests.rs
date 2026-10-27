@@ -68,13 +68,32 @@ async fn recovery_never_uses_an_unmanaged_or_unauthenticated_relay_route() {
     use iota_connection::chat_secret_recovery::*;
     let router = DirectPeerRouter::default();
     let remote = node();
-    router.register(remote.clone(), Arc::new(AcceptingPeer)).unwrap();
-    let owner = Principal { authority: "authority-a".into(), user_id: 1 };
-    let request = RecoveryRequest { version: 1,
-        pair: ConversationPair::new(owner.clone(), Principal { authority: "authority-b".into(), user_id: 1 }).unwrap(),
-        owner, epoch: None, nonce: [1;32], proposal_digest: None };
-    assert!(matches!(RecoveryTransport::request(&router, &remote, &request).await,
-        Err(RecoveryError::RetryablePeerUnavailable)));
+    router
+        .register(remote.clone(), Arc::new(AcceptingPeer))
+        .unwrap();
+    let owner = Principal {
+        authority: format!("omega-key:{}", "a".repeat(64)),
+        user_id: 1,
+    };
+    let request = RecoveryRequest {
+        version: 1,
+        pair: ConversationPair::new(
+            owner.clone(),
+            Principal {
+                authority: format!("omega-key:{}", "b".repeat(64)),
+                user_id: 1,
+            },
+        )
+        .unwrap(),
+        owner,
+        epoch: None,
+        nonce: [1; 32],
+        proposal_digest: None,
+    };
+    assert!(matches!(
+        RecoveryTransport::request(&router, &remote, &request).await,
+        Err(RecoveryError::RetryablePeerUnavailable)
+    ));
 }
 
 #[async_trait]
@@ -690,13 +709,28 @@ async fn remote_iota_uses_valid_cached_descriptor_offline() {
 
 #[tokio::test]
 async fn current_iota_resolution_bootstraps_from_verified_node_after_resolver_restart() {
-    let (resolver,client,principals,nodes,locator,principal,_)=remote_fixture(1);
-    resolver.resolve_address(&UserAddress {selector:UserSelector::UserId(principal.user_id),public_key_pin:None,authority:Some(locator)},
-        &ResolutionContext {allow_network:true,..Default::default()}).await.unwrap();
-    let restarted=RemoteIotaResolver::new(client,principals,nodes);
-    let current=restarted.resolve_current_principal(&principal).await.unwrap();
-    assert_eq!(current.principal,principal);
-    assert_eq!(current.descriptor_revision,1);
+    let (resolver, client, principals, nodes, locator, principal, _) = remote_fixture(1);
+    resolver
+        .resolve_address(
+            &UserAddress {
+                selector: UserSelector::UserId(principal.user_id),
+                public_key_pin: None,
+                authority: Some(locator),
+            },
+            &ResolutionContext {
+                allow_network: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let restarted = RemoteIotaResolver::new(client, principals, nodes);
+    let current = restarted
+        .resolve_current_principal(&principal)
+        .await
+        .unwrap();
+    assert_eq!(current.principal, principal);
+    assert_eq!(current.descriptor_revision, 1);
 }
 
 #[tokio::test]
@@ -896,21 +930,56 @@ async fn remote_omega_current_resolution_bypasses_fresh_cache_after_reassignment
     // still fresh. Recovery must use the new signed home and keys, not that cache.
     let next_home = LocalNodeIdentity::from_keyring(mtp::crypto::Keyring::generate()).unwrap();
     let next_key = mtp::crypto::Keyring::generate().public_key_bundle();
-    let next_node = SignedNodeDescriptor::sign(NodeDescriptor {
-        node: next_home.node_id().clone(), public_keys: next_home.public_keys(),
-        direct_endpoints: Vec::new(), relay_hints: Vec::new(), revision: 1,
-        valid_until: Some(now_millis() + 60_000),
-    }, &next_home).unwrap().to_wire_v1().unwrap();
-    let mut reassigned = client.principal.lock().unwrap().clone().parse().unwrap().descriptor;
+    let next_node = SignedNodeDescriptor::sign(
+        NodeDescriptor {
+            node: next_home.node_id().clone(),
+            public_keys: next_home.public_keys(),
+            direct_endpoints: Vec::new(),
+            relay_hints: Vec::new(),
+            revision: 1,
+            valid_until: Some(now_millis() + 60_000),
+        },
+        &next_home,
+    )
+    .unwrap()
+    .to_wire_v1()
+    .unwrap();
+    let mut reassigned = client
+        .principal
+        .lock()
+        .unwrap()
+        .clone()
+        .parse()
+        .unwrap()
+        .descriptor;
     reassigned.home = PrincipalHome::Iota(next_home.node_id().clone());
     reassigned.public_keys = vec![next_key.clone()];
     reassigned.revision = 2;
     reassigned.issued_at = now_millis();
     *client.principal.lock().unwrap() = SignedPrincipalDescriptor::sign(reassigned, &omega)
-        .unwrap().to_wire_v1().unwrap().with_home_node(next_node);
-    assert_eq!(resolver.resolve_principal(&principal_id).await.unwrap().home, resolved.home);
-    let current = resolver.resolve_current_principal(&principal_id).await.unwrap();
-    assert_eq!(current.home, PrincipalHome::Iota(next_home.node_id().clone()));
-    assert_eq!(current.public_keys[0].try_as_bytes().unwrap(), next_key.try_as_bytes().unwrap());
+        .unwrap()
+        .to_wire_v1()
+        .unwrap()
+        .with_home_node(next_node);
+    assert_eq!(
+        resolver
+            .resolve_principal(&principal_id)
+            .await
+            .unwrap()
+            .home,
+        resolved.home
+    );
+    let current = resolver
+        .resolve_current_principal(&principal_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        current.home,
+        PrincipalHome::Iota(next_home.node_id().clone())
+    );
+    assert_eq!(
+        current.public_keys[0].try_as_bytes().unwrap(),
+        next_key.try_as_bytes().unwrap()
+    );
     assert_eq!(current.descriptor_revision, 2);
 }

@@ -3,6 +3,7 @@ use crate::storage_error::StorageError;
 use crate::util::db;
 use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
+pub mod paged;
 
 pub const CACHE_SCHEMA_VERSION: i64 = 5;
 pub const STALE_CLIENT_SYNC_STATE_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
@@ -174,6 +175,7 @@ pub fn compact_user_sync_state(user_id: i64) -> Result<SyncCompactionResult, Sto
             "DELETE FROM sync_events WHERE user_id = ?1 AND version <= ?2",
             params![user_id, revision],
         )?;
+        tx.execute("INSERT INTO account_sync_floors(user_id,sequence) VALUES(?1,?2) ON CONFLICT(user_id) DO UPDATE SET sequence=MAX(sequence,excluded.sequence)", params![user_id,revision])?;
         let removed_blob_tombstones = tx.execute(
             "DELETE FROM user_blobs WHERE user_id = ?1 AND deleted = 1 AND revision <= ?2",
             params![user_id, revision],

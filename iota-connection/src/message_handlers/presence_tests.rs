@@ -1,17 +1,5 @@
-use super::{contact_ids_value, handle_get_chats, message_mutation};
-use mtp::codec::{CommunicationType, CommunicationValue, DataValue};
-
-#[test]
-fn contact_snapshot_is_sorted_and_deduplicated() {
-    assert_eq!(
-        contact_ids_value([9, 3, 9, 4, 3]),
-        DataValue::Array(vec![
-            DataValue::SignedNumber(3),
-            DataValue::SignedNumber(4),
-            DataValue::SignedNumber(9),
-        ])
-    );
-}
+use super::{handle_get_chats, message_mutation};
+use mtp::codec::{CommunicationType, CommunicationValue};
 
 #[test]
 fn message_mutation_rejects_a_missing_authenticated_sender() {

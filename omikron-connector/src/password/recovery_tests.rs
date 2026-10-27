@@ -205,12 +205,36 @@ async fn committed_password_receipts_and_health_survive_lost_responses() {
         password_credentials::mutation_outcome(7, &key, generation, (&operation, &digest)).unwrap(),
         Some(true)
     );
-    // No acknowledgment was delivered. Retrying the mutation still fails;
-    // the separately authenticated status query recovers its committed result.
+    // The single-use guard still rejects executing the command again, but the
+    // mutation handler serves its durable receipt before consuming that guard.
     assert!(
         connection
             .open_password_command(&original, CommunicationType::PasswordEnrollmentFinish, true)
             .await
+            .is_err()
+    );
+    let replay = connection
+        .enrollment_finish(&original.clone().with_id(99))
+        .await
+        .unwrap();
+    assert_eq!(replay.id(), Some(99));
+    assert_eq!(
+        password_credentials::get(7).unwrap().as_ref(),
+        Some(&credential)
+    );
+    password_credentials::commit_enrollment(&credential, &key, generation, (&operation, &digest))
+        .unwrap();
+    assert!(
+        password_credentials::commit_enrollment(
+            &credential,
+            &key,
+            generation,
+            ("competing-enrollment", &[7; 32])
+        )
+        .is_err()
+    );
+    assert!(
+        password_credentials::mutation_outcome(7, &key, generation, (&operation, &[7; 32]))
             .is_err()
     );
     let response = connection.password_mutation_status(&query).await.unwrap();

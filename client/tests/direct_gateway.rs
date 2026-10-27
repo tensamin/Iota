@@ -405,12 +405,7 @@ async fn hosted_client_loads_state_originates_relay_and_receives_delivery() {
     admissions.recv().await.unwrap().send(()).unwrap();
 
     let snapshot = client
-        .request(
-            &CommunicationValue::new(CommunicationType::AccountStateRequest)
-                .with_id(3)
-                .with_sender(99),
-            None,
-        )
+        .request(&sync_support::snapshot(1, 3).with_sender(99), None)
         .await
         .unwrap();
     assert!(snapshot.is_type(CommunicationType::AccountStateSnapshot));
@@ -447,7 +442,7 @@ async fn hosted_client_loads_state_originates_relay_and_receives_delivery() {
         .await
         .unwrap();
     assert!(
-        secret_response.is_type(CommunicationType::ErrorInternal),
+        secret_response.is_type(CommunicationType::ErrorNotAuthenticated),
         "unexpected private secret response: {secret_response:?}"
     );
     assert_eq!(secret_response.receiver(), Some(1));
@@ -469,13 +464,10 @@ async fn hosted_client_loads_state_originates_relay_and_receives_delivery() {
     assert_eq!(pending_offline(), 1);
     assert!(
         client
-            .request(
-                &CommunicationValue::new(CommunicationType::AccountStateApplied).with_id(32),
-                None
-            )
+            .request(&sync_support::acknowledge(&snapshot, 32), None)
             .await
             .unwrap()
-            .is_type(CommunicationType::Success)
+            .is_type(CommunicationType::AccountStateSnapshot)
     );
 
     let content = CommunicationValue::new(CommunicationType::MessageSend)
@@ -1019,3 +1011,4 @@ async fn hosted_client_loads_state_originates_relay_and_receives_delivery() {
         }
     }
 }
+mod sync_support;

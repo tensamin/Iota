@@ -9,7 +9,7 @@ async-trait = "0.1.89"
 iota-connection = { path = "../iota-connection" }
 iota-identity = { path = "../iota-identity" }
 iota-util = { path = "../iota-util" }
-mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "9f7f94e4cbd227610784ae47a1e7a1acf66f8584", features = ["client", "crypto", "pipes", "web-server"] }
+mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "db3125809293e462ec1593704e9c4d2172437533", features = ["client", "crypto", "pipes", "web-server"] }
 tokio-util = "0.7"
 reqwest = { version = "0.13", features = ["json"] }
 serde = "1"

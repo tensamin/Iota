@@ -7,15 +7,15 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     type-maps = {
-      url = "git+file:mtp-type-maps";
+      url = "github:TensaminDev/Mtp-Type-Maps/6d0f1dee1391417b7f364189e03a39b17b01ce36";
       flake = false;
     };
     tau-src = {
-      url = "git+file:../tau";
+      url = "github:TensaminDev/Tau/57096c5341f5196ea953788ab8fd3c60ca920817";
       flake = false;
     };
     mtp-src = {
-      url = "git+file:../mtp";
+      url = "github:Nonanium/MTP/db3125809293e462ec1593704e9c4d2172437533";
       flake = false;
     };
   };
@@ -245,12 +245,6 @@
             chmod -R u+w "$out"
             rm -rf "$out/mtp-type-maps"
             cp -r ${type-maps} "$out/mtp-type-maps"
-            substituteInPlace "$out/Cargo.toml" \
-              --replace-fail 'path = "../tau"' 'path = "${tau-src}"' \
-              --replace-fail 'path = "../tau/relay-protocol"' 'path = "${tau-src}/relay-protocol"' \
-              --replace-fail 'path = "../mtp"' 'path = "${mtp-src}"' \
-              --replace-fail 'path = "../mtp/type-map"' 'path = "${mtp-src}/type-map"' \
-              --replace-fail 'path = "../mtp/crypto"' 'path = "${mtp-src}/crypto"'
           '';
         in
         {
@@ -261,7 +255,7 @@
               pname = "iota";
               version = "0.1.0";
               src = source;
-              hash = "sha256-2qjtZHSfQesKr3Xrgx8KXEILPyZ4W143c8GnOBQvqfc=";
+              hash = "sha256-Yvthehdmnbi9KduaitPrclaoVcA9QwTODww6iRpNCw4=";
             };
           };
           cli = self.packages.${system}.default.overrideAttrs {

@@ -146,10 +146,26 @@ async fn missing_local_escrow_uses_exact_independently_verified_peer_operation_a
             .await,
         Err(RecoveryError::RetryablePeerUnavailable)
     );
-    let jobs = storage::recovery_jobs(10).unwrap();
-    assert_eq!(jobs.len(), 1);
+    assert!(storage::recovery_jobs(10).unwrap().is_empty());
+    let id = service
+        .enqueue(&fixture.ids[0], &fixture.ids[1], Some(1))
+        .unwrap();
+    let jobs = [storage::recovery_job_by_id(id).unwrap().unwrap()];
     let nonce = jobs[0].nonce.clone();
     assert!(e2ee_storage::get_chat_secret(query()).unwrap().is_none());
+    execute("UPDATE chat_secret_recovery_jobs SET next_at=9223372036854775807");
+    for _ in 0..20 {
+        assert_eq!(
+            service
+                .recover(&fixture.ids[0], &fixture.ids[1], Some(1))
+                .await,
+            Err(RecoveryError::RetryablePeerUnavailable)
+        );
+    }
+    let deferred = storage::recovery_job_by_id(jobs[0].id).unwrap().unwrap();
+    assert_eq!(deferred.attempts, 1);
+    assert_eq!(deferred.nonce, nonce);
+    execute("UPDATE chat_secret_recovery_jobs SET next_at=0");
     peer.offline.store(false, Ordering::SeqCst);
     peer.tamper.store(true, Ordering::SeqCst);
     assert_eq!(
@@ -164,8 +180,15 @@ async fn missing_local_escrow_uses_exact_independently_verified_peer_operation_a
             .unwrap()
             .is_none()
     );
-    assert_eq!(storage::recovery_jobs(10).unwrap()[0].nonce, nonce);
+    assert_eq!(
+        storage::recovery_job_by_id(jobs[0].id)
+            .unwrap()
+            .unwrap()
+            .nonce,
+        nonce
+    );
     peer.tamper.store(false, Ordering::SeqCst);
+    execute("UPDATE chat_secret_recovery_jobs SET next_at=0");
     service.retry_pending().await;
     let restored = e2ee_storage::get_chat_secret(query()).unwrap().unwrap();
     assert_eq!(restored.encrypted_secret, original.encrypted_secret);

@@ -27,12 +27,3 @@ members = [
 ]
 exclude = ["communities"]
 resolver = "3"
-
-[patch."https://github.com/TensaminDev/Tau.git"]
-tau = { path = "../tau" }
-tau-relay-protocol = { path = "../tau/relay-protocol" }
-
-[patch."https://github.com/Nonanium/MTP.git"]
-mtp = { path = "../mtp" }
-mtp-type-map = { path = "../mtp/type-map" }
-mtp-crypto = { path = "../mtp/crypto" }

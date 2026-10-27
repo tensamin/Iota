@@ -7,7 +7,7 @@ edition = "2024"
 async-trait = "0.1.89"
 dashmap = "6.2.1"
 iota-identity = { path = "../iota-identity" }
-mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "9f7f94e4cbd227610784ae47a1e7a1acf66f8584", features = ["crypto"] }
+mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "db3125809293e462ec1593704e9c4d2172437533", features = ["crypto"] }
 rand_core = { version = "0.6", features = ["getrandom", "std"] }
 uuid = { version = "*", features = ["v4"] }
 

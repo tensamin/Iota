@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use iota_identity::{
-    AuthorityId, AuthorityKind, AuthorityLocator, IdentityError, IdentityResolver,
-    PrincipalDescriptor, PrincipalHome, PrincipalId, PrincipalStore, ResolutionContext,
-    ResolvedPrincipal, UserAddress, UserSelector,
+    AuthorityId, AuthorityKind, AuthorityLocator, IdentityError, IdentityResolver, PrincipalId,
+    PrincipalStore, ResolutionContext, ResolvedPrincipal, UserAddress, UserSelector,
 };
 use iota_util::crypto_helper::public_key_bundle_from_base64;
 use iota_util::mtp_compat::OptionalDataValueExt;
@@ -122,53 +121,53 @@ pub async fn resolve_omega_principal(
             "Omega returned an unexpected identity response".into(),
         ));
     }
-    let user_id = response
-        .get_data(DataType::UserId)
-        .as_number()
-        .and_then(|value| u64::try_from(value).ok())
-        .or(match selector {
-            UserSelector::UserId(user_id) => Some(*user_id),
-            UserSelector::Username(_) => None,
-        })
-        .ok_or_else(|| IdentityError::InvalidDescriptor("Omega returned no user ID".into()))?;
-    let public_key = response
-        .get_data(DataType::PublicKey)
+    let _ = locator; // A locator is never evidence of authority.
+    let authority_keys = response
+        .get_data(DataType::PublicKeys)
         .as_str()
         .and_then(public_key_bundle_from_base64)
-        .ok_or_else(|| {
-            IdentityError::InvalidDescriptor("Omega returned no valid user key".into())
-        })?;
-    let username = response
-        .get_data(DataType::Username)
-        .as_str()
-        .map(str::to_owned);
-    let home = response
-        .get_data(DataType::IotaId)
-        .as_number()
-        .and_then(|value| u64::try_from(value).ok())
-        .filter(|value| *value > 0)
-        .map(|iota_id| PrincipalHome::LegacyOmegaIota {
-            omega: authority.clone(),
-            iota_id,
-        })
-        .unwrap_or_else(|| PrincipalHome::Omega(locator.clone()));
-    let principal = PrincipalId {
-        authority: authority.clone(),
-        user_id,
-    };
-    let descriptor =
-        iota_identity::VerifiedPrincipalDescriptor::from_trusted_authority(PrincipalDescriptor {
-            principal: principal.clone(),
-            authority_kind: AuthorityKind::Omega,
-            username: username.clone(),
-            display_name: None,
-            public_keys: vec![public_key],
-            home,
-            revision: 0,
-            valid_until: None,
-            issued_at: now_millis(),
-        })?;
-    let handle = principals.upsert_remote_descriptor(&descriptor)?;
+        .ok_or_else(|| IdentityError::Unavailable("Omega signed identity is unavailable".into()))?;
+    if AuthorityId::for_omega(&authority_keys)? != *authority {
+        return Err(IdentityError::KeyPinMismatch);
+    }
+    let bytes = response
+        .get_data(DataType::Json)
+        .and_then(DataValue::as_bytes_slice)
+        .filter(|bytes| bytes.len() <= 256 * 1024)
+        .ok_or_else(|| IdentityError::Unavailable("Omega signed identity is unavailable".into()))?;
+    let wire: iota_identity::PrincipalDescriptorWireV1 = serde_json::from_slice(bytes)
+        .map_err(|error| IdentityError::InvalidDescriptor(error.to_string()))?;
+    let home_node = wire
+        .home_node
+        .clone()
+        .ok_or_else(|| IdentityError::InvalidDescriptor("missing signed home node".into()))?;
+    let signed = wire.parse()?;
+    if signed.descriptor.authority_kind != AuthorityKind::Omega
+        || match selector {
+            UserSelector::UserId(id) => signed.descriptor.principal.user_id != *id,
+            UserSelector::Username(username) => {
+                signed.descriptor.username.as_deref() != Some(username.as_str())
+            }
+        }
+    {
+        return Err(IdentityError::InvalidDescriptor(
+            "Omega descriptor subject mismatch".into(),
+        ));
+    }
+    let current = principals
+        .get_by_canonical_id(&signed.descriptor.principal)?
+        .map(|value| value.descriptor_revision);
+    let snapshot = signed.verify_snapshot(
+        &authority_keys,
+        current,
+        home_node.parse()?,
+        None,
+        now_millis(),
+    )?;
+    use iota_identity::NodeDirectory;
+    iota_storage::node_directory::SqliteNodeDirectory
+        .upsert_node_descriptor(snapshot.home_descriptor())?;
+    let handle = principals.upsert_remote_descriptor(snapshot.principal_descriptor())?;
     principals
         .get_principal(handle)?
         .ok_or(IdentityError::NotFound)
@@ -310,7 +309,7 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iota_identity::{OfflineResolutionPolicy, PrincipalHandle};
+    use iota_identity::{OfflineResolutionPolicy, PrincipalHandle, PrincipalHome};
     use mtp::crypto::Keyring;
 
     struct CachedStore {
@@ -361,10 +360,10 @@ mod tests {
         }
     }
 
-    struct OfflineClient;
+    struct LookupClient(Option<CommunicationValue>);
 
     #[async_trait]
-    impl OmikronClient for OfflineClient {
+    impl OmikronClient for LookupClient {
         async fn send_message(&self, _: &CommunicationValue) -> Result<(), crate::OmikronError> {
             Err(crate::OmikronError::Disconnected("offline".into()))
         }
@@ -374,7 +373,9 @@ mod tests {
             _: &CommunicationValue,
             _: Duration,
         ) -> Result<CommunicationValue, crate::OmikronError> {
-            Err(crate::OmikronError::Disconnected("offline".into()))
+            self.0
+                .clone()
+                .ok_or_else(|| crate::OmikronError::Disconnected("offline".into()))
         }
 
         async fn reconnect(&self) -> Result<(), crate::OmikronError> {
@@ -408,7 +409,7 @@ mod tests {
             resolved_at: now_millis().saturating_sub(16 * 60 * 1000),
         };
         let resolver = OmegaIdentityResolver::new(
-            Arc::new(OfflineClient),
+            Arc::new(LookupClient(None)),
             authority,
             AuthorityLocator::new("remote.example").unwrap(),
             Arc::new(CachedStore { resolved }),
@@ -428,5 +429,69 @@ mod tests {
             .unwrap();
 
         assert_eq!(cached.handle, PrincipalHandle(9));
+    }
+
+    #[tokio::test]
+    async fn unsigned_omega_profile_cannot_authorize_a_principal_snapshot() {
+        let authority_keys = Keyring::generate().public_key_bundle();
+        let authority = AuthorityId::for_omega(&authority_keys).unwrap();
+        let profile = CommunicationValue::new(CommunicationType::GetUserData)
+            .add_typed_default(DataType::UserId, DataValue::UnsignedNumber(7))
+            .add_typed_default(
+                DataType::PublicKey,
+                DataValue::Str(
+                    Keyring::generate()
+                        .public_key_bundle()
+                        .try_to_base64()
+                        .unwrap(),
+                ),
+            );
+        let store = CachedStore {
+            resolved: ResolvedPrincipal {
+                principal: PrincipalId {
+                    authority: authority.clone(),
+                    user_id: 7,
+                },
+                handle: PrincipalHandle(9),
+                username: None,
+                public_keys: vec![authority_keys.clone()],
+                home: PrincipalHome::Unknown,
+                descriptor_revision: 1,
+                valid_until: None,
+                resolved_at: 0,
+            },
+        };
+        let locator = AuthorityLocator::new("remote.example").unwrap();
+        assert!(matches!(
+            resolve_omega_principal(
+                &LookupClient(Some(profile.clone())),
+                &store,
+                &authority,
+                &locator,
+                &UserSelector::UserId(7)
+            )
+            .await,
+            Err(IdentityError::Unavailable(_))
+        ));
+        let wrong_authority = profile.add_typed_default(
+            DataType::PublicKeys,
+            DataValue::Str(
+                Keyring::generate()
+                    .public_key_bundle()
+                    .try_to_base64()
+                    .unwrap(),
+            ),
+        );
+        assert!(matches!(
+            resolve_omega_principal(
+                &LookupClient(Some(wrong_authority)),
+                &store,
+                &authority,
+                &locator,
+                &UserSelector::UserId(7)
+            )
+            .await,
+            Err(IdentityError::KeyPinMismatch)
+        ));
     }
 }

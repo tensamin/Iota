@@ -10,13 +10,16 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "schema_version", content = "operation")]
+#[serde(deny_unknown_fields)]
 enum StoredPreparedRelay {
     #[serde(rename = "1")]
     V1(PreparedRelayV1),
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PreparedRelayV1 {
+    principal_fences: [iota_storage::identity::PrincipalCommitFence; 2],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     origin_lease: Option<crate::prepared_relay::OriginLease>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,18 +36,21 @@ struct PreparedRelayV1 {
     frame: Vec<u8>,
     frame_id: u32,
     type_map_version: String,
+    type_map_fingerprint: String,
     operation: OperationV1,
     effects: Vec<EffectV1>,
     delivery: DeliveryV1,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PrincipalV1 {
     authority: String,
     user_id: u64,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EffectV1 {
     owner: i64,
     principal: i64,
@@ -58,6 +64,7 @@ enum DeliveryV1 {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SecretV1 {
     encrypted_secret: Vec<u8>,
     kem_ciphertext: Vec<u8>,
@@ -72,6 +79,7 @@ enum StateV1 {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 enum OperationV1 {
     MessageSend {
         content: String,
@@ -110,7 +118,6 @@ enum OperationV1 {
     },
     SetChatSecret {
         chat_id: String,
-        legacy_chat_id: Option<String>,
         version: i64,
         wrapping_scheme: String,
         sender: SecretV1,
@@ -182,14 +189,12 @@ macro_rules! convert_operation {
             },
             $from::SetChatSecret {
                 chat_id,
-                legacy_chat_id,
                 version,
                 wrapping_scheme,
                 sender,
                 recipient,
             } => $to::SetChatSecret {
                 chat_id,
-                legacy_chat_id,
                 version,
                 wrapping_scheme,
                 sender: ($secret)(sender),
@@ -203,6 +208,7 @@ macro_rules! convert_operation {
 impl From<PreparedRelayOperation> for PreparedRelayV1 {
     fn from(value: PreparedRelayOperation) -> Self {
         Self {
+            principal_fences: value.principal_fences,
             origin_lease: value.origin_lease,
             secret_escrow: value.secret_escrow,
             signer: value.signer.0,
@@ -223,6 +229,7 @@ impl From<PreparedRelayOperation> for PreparedRelayV1 {
             frame: value.frame,
             frame_id: value.frame_id,
             type_map_version: value.type_map_version,
+            type_map_fingerprint: value.type_map_fingerprint,
             operation: convert_operation!(
                 value.operation,
                 ApplicationOperation,
@@ -259,6 +266,7 @@ impl TryFrom<PreparedRelayV1> for PreparedRelayOperation {
     type Error = StorageError;
     fn try_from(value: PreparedRelayV1) -> Result<Self, Self::Error> {
         let operation = Self {
+            principal_fences: value.principal_fences,
             origin_lease: value.origin_lease,
             secret_escrow: value.secret_escrow,
             signer: PrincipalHandle(value.signer),
@@ -279,6 +287,7 @@ impl TryFrom<PreparedRelayV1> for PreparedRelayOperation {
             frame: value.frame,
             frame_id: value.frame_id,
             type_map_version: value.type_map_version,
+            type_map_fingerprint: value.type_map_fingerprint,
             operation: convert_operation!(
                 value.operation,
                 OperationV1,
@@ -342,10 +351,10 @@ pub(crate) fn decode_prepared_operation(
             return Err(invalid("unsupported persisted relay schema version"));
         }
         let StoredPreparedRelay::V1(dto) =
-            serde_json::from_value(value).map_err(|_| invalid("invalid persisted relay V1"))?;
+            serde_json::from_slice(bytes).map_err(|_| invalid("invalid persisted relay V1"))?;
         dto
     } else {
-        serde_json::from_value(value).map_err(|_| invalid("invalid legacy persisted relay"))?
+        serde_json::from_slice(bytes).map_err(|_| invalid("invalid legacy persisted relay"))?
     };
     dto.try_into()
 }
@@ -354,6 +363,19 @@ pub(crate) fn validate_persisted_operation_identity(
     operation: &PreparedRelayOperation,
 ) -> Result<(), StorageError> {
     let p = operation;
+    p.signer_identity
+        .validate()
+        .map_err(|_| invalid("persisted signer principal"))?;
+    p.recipient_identity
+        .validate()
+        .map_err(|_| invalid("persisted recipient principal"))?;
+    if tau_relay_protocol::dictionary_fingerprint(&p.type_map_version)
+        .ok()
+        .as_deref()
+        != Some(p.type_map_fingerprint.as_str())
+    {
+        return Err(invalid("persisted dictionary fingerprint"));
+    }
     p.validate_origin_lease()?;
     if let Some(escrow) = &p.secret_escrow {
         escrow.validate()?;
@@ -384,6 +406,7 @@ pub(crate) fn validate_persisted_operation_identity(
             .ok_or_else(|| invalid("persisted escrow recipient"))?;
         if escrow.signer != signer
             || escrow.original_type_map_version != p.type_map_version
+            || escrow.original_type_map_fingerprint != p.type_map_fingerprint
             || escrow.message_id != p.message_id
             || escrow.version != *version
             || escrow.created_at != p.created_at as i64
@@ -649,9 +672,10 @@ pub(crate) fn accepted_escrow_candidates_on(
         ORDER BY accepted_at DESC LIMIT ?3"))?;
     let limit = limit.clamp(1, 500);
     let rows = statement
-        .query_map(params![chat_id, numeric, limit as i64 + 1, version], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
-        })?
+        .query_map(
+            params![chat_id, numeric, limit as i64 + 1, version],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     if rows.len() > limit {
         return Err(StorageError::Other(
@@ -766,6 +790,10 @@ pub(crate) fn accepted_escrow_candidates_on(
                 message_id: operation.message_id,
                 operation_digest: recovery::operation_digest(format, &operation.frame),
                 original_frame: operation.frame,
+                original_type_map_fingerprint: tau_relay_protocol::dictionary_fingerprint(
+                    &operation.type_map_version,
+                )
+                .map_err(|_| invalid("original dictionary"))?,
                 original_type_map_version: operation.type_map_version,
                 format,
                 envelopes,
@@ -785,6 +813,10 @@ pub(crate) fn accepted_escrow_candidates_on(
 mod tests {
     use super::*;
     use serde_json::json;
+    const AUTHORITY_A: &str =
+        "omega-key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const AUTHORITY_B: &str =
+        "omega-key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     #[test]
     fn accepted_evidence_scan_never_treats_a_truncated_result_as_complete() {
@@ -794,17 +826,21 @@ mod tests {
             .unwrap();
         connection.execute_batch("CREATE TABLE relay_inbox(prepared_operation BLOB,state TEXT,recovery_status TEXT,accepted_at INTEGER)").unwrap();
         let first = iota_identity::PrincipalId {
-            authority: iota_identity::AuthorityId::new("authority-a").unwrap(),
+            authority: iota_identity::AuthorityId::new(format!("omega-key:{}", "a".repeat(64)))
+                .unwrap(),
             user_id: 11,
         };
         let second = iota_identity::PrincipalId {
-            authority: iota_identity::AuthorityId::new("authority-b").unwrap(),
+            authority: iota_identity::AuthorityId::new(format!("omega-key:{}", "b".repeat(64)))
+                .unwrap(),
             user_id: 22,
         };
         let chat =
             iota_storage::util::chat_secret_recovery::canonical_chat_id(&first, &second).unwrap();
-        let document =
-            serde_json::to_vec(&json!({"operation":{"SetChatSecret":{"chat_id":chat,"version":1}}})).unwrap();
+        let document = serde_json::to_vec(
+            &json!({"operation":{"SetChatSecret":{"chat_id":chat,"version":1}}}),
+        )
+        .unwrap();
         for accepted_at in [1, 2] {
             connection
                 .execute(
@@ -823,10 +859,15 @@ mod tests {
         serde_json::to_vec(&json!({
             "signer": 1, "recipient": 2, "message_id": message_id,
             "signer_id": 11, "recipient_id": 22,
-            "signer_identity": {"authority": "authority-a", "user_id": 11},
-            "recipient_identity": {"authority": "authority-b", "user_id": 22},
+            "signer_identity": {"authority": AUTHORITY_A, "user_id": 11},
+            "recipient_identity": {"authority": AUTHORITY_B, "user_id": 22},
+            "principal_fences": [
+                {"principal":{"authority":AUTHORITY_A,"user_id":11},"handle":1,"revision":1,"home":"unknown","valid_until":null,"keys":[]},
+                {"principal":{"authority":AUTHORITY_B,"user_id":22},"handle":2,"revision":1,"home":"unknown","valid_until":null,"keys":[]}
+            ],
             "created_at": 100, "accepted_at": 101, "frame": [1,2,3],
-            "frame_id": 7, "type_map_version": "0.1.0",
+            "frame_id": 7, "type_map_version": "1.0",
+            "type_map_fingerprint": tau_relay_protocol::dictionary_fingerprint("1.0").unwrap(),
             "operation": {"MessageSend": {"content": "ciphertext", "send_time": 100,
                 "height": 0, "version": 1, "reply_to": null}},
             "effects": [{"owner": 5, "principal": 2, "sent_by_self": false}],
@@ -939,7 +980,7 @@ mod tests {
             json!({"MessageDeleteLive":{"send_time":100}}),
             json!({"MessageState":{"message_id":"target","state":"Read","event_at":101}}),
             json!({"MessageReceived":{"message_id":"target","event_at":101}}),
-            json!({"SetChatSecret":{"chat_id":"chat","legacy_chat_id":null,"version":1,
+            json!({"SetChatSecret":{"chat_id":"chat","version":1,
                 "wrapping_scheme":"kem","sender":{"encrypted_secret":[1],"kem_ciphertext":[2]},
                 "recipient":{"encrypted_secret":[3],"kem_ciphertext":[4]}}}),
             json!({"AddConversation":{"name":null}}),
@@ -960,11 +1001,10 @@ mod tests {
     fn database() -> Connection {
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE TABLE principals(principal_pk INTEGER PRIMARY KEY, authority_id TEXT, remote_user_id INTEGER);
-            INSERT INTO principals VALUES (1, 'authority-a', 11), (2, 'authority-b', 22);
             CREATE TABLE relay_inbox(signer_principal INTEGER, message_id TEXT, prepared_operation BLOB,
             processing_generation INTEGER DEFAULT 0, state TEXT DEFAULT 'received', signer_id INTEGER DEFAULT 11,
             destination_id INTEGER DEFAULT 22, frame BLOB DEFAULT X'010203', created_at INTEGER DEFAULT 100,
-            type_map_version TEXT DEFAULT '0.1.0', frame_id INTEGER DEFAULT 7,
+            type_map_version TEXT DEFAULT '1.0', frame_id INTEGER DEFAULT 7,
             recovery_status TEXT DEFAULT 'ready', recovery_error_code TEXT,
             recovery_attempts INTEGER DEFAULT 0, processing_owner TEXT, processing_deadline INTEGER,
             recovery_next_at INTEGER DEFAULT 0, recovery_last_attempt_at INTEGER,
@@ -972,6 +1012,11 @@ mod tests {
             PRIMARY KEY(signer_principal, message_id));").unwrap();
         c.execute_batch(iota_storage::util::relay_acceptance_receipts::SCHEMA)
             .unwrap();
+        c.execute(
+            "INSERT INTO principals VALUES(1,?1,11),(2,?2,22)",
+            params![AUTHORITY_A, AUTHORITY_B],
+        )
+        .unwrap();
         c
     }
 

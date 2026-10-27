@@ -19,6 +19,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+pub use tau::relay_protocol;
 
 pub mod node_transition;
 pub mod peer_introduction;
@@ -94,9 +95,33 @@ pub struct DiscoveredAuthority {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "tau::relay_protocol::Principal")]
 pub struct PrincipalId {
     pub authority: AuthorityId,
     pub user_id: u64,
+}
+
+impl TryFrom<tau::relay_protocol::Principal> for PrincipalId {
+    type Error = IdentityError;
+
+    fn try_from(principal: tau::relay_protocol::Principal) -> Result<Self, Self::Error> {
+        principal
+            .validate()
+            .map_err(|error| IdentityError::InvalidIdentifier(error.to_string()))?;
+        Ok(Self {
+            authority: AuthorityId::new(principal.authority)?,
+            user_id: principal.user_id,
+        })
+    }
+}
+
+impl TryFrom<&PrincipalId> for tau::relay_protocol::Principal {
+    type Error = IdentityError;
+
+    fn try_from(principal: &PrincipalId) -> Result<Self, Self::Error> {
+        Self::new(principal.authority.as_str().to_owned(), principal.user_id)
+            .map_err(|error| IdentityError::InvalidIdentifier(error.to_string()))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -198,6 +223,7 @@ pub struct SignedPrincipalDescriptor {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrincipalDescriptorWireV1 {
     pub version: u32,
     pub principal: PrincipalId,
@@ -218,6 +244,16 @@ pub struct PrincipalDescriptorWireV1 {
 pub struct VerifiedPrincipalDescriptor {
     descriptor: PrincipalDescriptor,
     resolved_at: i64,
+}
+
+/// A principal proof and its hosting-node proof, verified as one binding.
+/// Unsigned profile JSON and trusted-local descriptors cannot construct this.
+#[derive(Clone, Debug)]
+pub struct VerifiedPrincipalSnapshot {
+    principal: VerifiedPrincipalDescriptor,
+    principal_proof: SignedPrincipalDescriptor,
+    authority_keys: PublicKeyBundle,
+    home: VerifiedNodeDescriptor,
 }
 
 pub trait LocalDescriptorPublisher: Send + Sync {

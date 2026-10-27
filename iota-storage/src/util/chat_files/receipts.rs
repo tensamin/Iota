@@ -282,8 +282,8 @@ pub fn change_message_state(
     external_user: i64,
     new_state: MessageState,
 ) -> std::io::Result<()> {
-    db::with_db(|conn| {
-        let current: Option<String> = match conn.query_row(
+    db::with_immediate_transaction(|tx| {
+        let current: Option<String> = match tx.query_row(
             r#"
             SELECT message_state
             FROM messages
@@ -307,7 +307,6 @@ pub fn change_message_state(
             .as_str()
             .to_string();
 
-        let tx = conn.unchecked_transaction()?;
         tx.execute(
             r#"
             UPDATE messages
@@ -325,8 +324,7 @@ pub fn change_message_state(
             params![storage_owner, external_user, timestamp],
             |row| row.get(0),
         )?;
-        sync::record_event(&tx, storage_owner, EntityType::Message, msg_id, Operation::Upsert)?;
-        tx.commit()?;
+        sync::record_event(tx, storage_owner, EntityType::Message, msg_id, Operation::Upsert)?;
         Ok(())
     })
     .map_err(|e: StorageError| std::io::Error::other(e.to_string()))

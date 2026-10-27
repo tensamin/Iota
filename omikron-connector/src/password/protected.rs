@@ -40,6 +40,44 @@ impl ReplayGuard for CommandReplayGuard {
 }
 
 impl OmikronConnection {
+    pub(super) async fn password_management_error(
+        &self,
+        frame: &CommunicationValue,
+        kind: CommunicationType,
+        failure: tau::password::Failure,
+    ) {
+        let Some(map) = frame.type_map() else {
+            return;
+        };
+        let Ok(payload) = failure.payload(map) else {
+            return;
+        };
+        if let Ok((opened, _, _)) = self.open_password_command(frame, kind, false).await
+            && let Ok(user_id) = i64::try_from(opened.signer_id())
+        {
+            if let Ok(response) = self
+                .protected_response(
+                    frame,
+                    failure.message_type(),
+                    user_id,
+                    payload,
+                    super::app_protection::PASSWORD_RESPONSE_SIGNATURE,
+                    super::app_protection::PASSWORD_RESPONSE_ENCRYPTION,
+                )
+                .await
+            {
+                let _ = self.send_message(&response).await;
+            }
+        } else {
+            let mut response = CommunicationValue::new_with_type_map(failure.message_type(), map)
+                .with_payload(payload);
+            if let Some(id) = frame.id() {
+                response = response.with_id(id);
+            }
+            let _ = self.send_message(&response).await;
+        }
+    }
+
     pub(super) async fn open_password_command(
         &self,
         frame: &CommunicationValue,
@@ -159,6 +197,7 @@ impl OmikronConnection {
         encryption: u8,
         keyring: &mtp::crypto::Keyring,
     ) -> Result<CommunicationValue, String> {
+        let mut timing = super::timing::Timing::start(super::timing::Stage::ProtectedResponse);
         let signer = DualSigner::new(
             &keyring.sig_cl_secret_key,
             &keyring.sig_pq_secret_key,
@@ -167,7 +206,7 @@ impl OmikronConnection {
         .map_err(|error| error.to_string())?;
         let mut rng = OsRng;
         let id = ((rng.next_u64() as u128) << 64) | rng.next_u64() as u128;
-        ProtectedMessageBuilder::new(
+        let response = ProtectedMessageBuilder::new(
             kind,
             content,
             signer_id,
@@ -181,16 +220,28 @@ impl OmikronConnection {
         .recipients(vec![recipient])
         .frame_id(frame.id().ok_or("missing request ID")?)
         .build()
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        timing.success();
+        Ok(response)
     }
 
     pub(super) async fn password_error(&self, frame: &CommunicationValue, kind: CommunicationType) {
-        let mut response = CommunicationValue::new_with_type_map(
-            kind,
-            frame
-                .type_map()
-                .expect("handler request has a negotiated type map"),
-        );
+        let Some(map) = frame.type_map() else {
+            return;
+        };
+        if kind.try_to_id(map).is_none() {
+            return;
+        }
+        let mut response = CommunicationValue::new_with_type_map(kind, map);
+        let failure = match kind {
+            CommunicationType::ErrorNotAuthenticated => tau::password::Failure::Unauthorized,
+            CommunicationType::ErrorInternal => tau::password::Failure::DependencyUnavailable,
+            _ => tau::password::Failure::InvalidRequest,
+        };
+        let Ok(payload) = failure.payload(map) else {
+            return;
+        };
+        response = response.with_payload(payload);
         if let Some(id) = frame.id() {
             response = response.with_id(id);
         }

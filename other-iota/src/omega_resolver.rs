@@ -70,18 +70,14 @@ impl RemoteOmegaResolver {
             .principals
             .get_by_canonical_id(&signed.descriptor.principal)?
             .map(|principal| principal.descriptor_revision);
-        let verified = signed.verify(
-            &authority.authority_id,
-            &authority.public_keys,
-            current_revision,
-            now_millis(),
-        )?;
-        if verified.descriptor().authority_kind != AuthorityKind::Omega {
+        if signed.descriptor.authority_kind != AuthorityKind::Omega
+            || signed.descriptor.principal.authority != authority.authority_id
+        {
             return Err(IdentityError::InvalidDescriptor(
                 "remote Omega returned a non-Omega principal".into(),
             ));
         }
-        if let iota_identity::PrincipalHome::Iota(home) = &verified.descriptor().home {
+        let verified = if let iota_identity::PrincipalHome::Iota(home) = &signed.descriptor.home {
             let signed_node = home_node
                 .ok_or_else(|| {
                     IdentityError::InvalidDescriptor(
@@ -100,9 +96,26 @@ impl RemoteOmegaResolver {
                 .await
                 .ok()
                 .map(|node| node.descriptor_revision);
-            let verified_node = signed_node.verify(current_node_revision, now_millis())?;
-            self.nodes.upsert_node_descriptor(&verified_node)?;
-        }
+            let snapshot = signed.verify_snapshot(
+                &authority.public_keys,
+                current_revision,
+                signed_node,
+                current_node_revision,
+                now_millis(),
+            )?;
+            self.nodes
+                .upsert_node_descriptor(snapshot.home_descriptor())?;
+            snapshot.principal_descriptor().clone()
+        } else {
+            // An authenticated profile without a hosting Iota can be read, but
+            // cannot produce a mutation-authorizing principal/home snapshot.
+            signed.verify(
+                &authority.authority_id,
+                &authority.public_keys,
+                current_revision,
+                now_millis(),
+            )?
+        };
         let handle = self.principals.upsert_remote_descriptor(&verified)?;
         self.principals
             .get_principal(handle)?

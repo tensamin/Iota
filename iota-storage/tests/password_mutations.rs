@@ -39,11 +39,10 @@ fn lost_ack_receipts_and_release_snapshots_are_atomic_and_erasure_fenced() {
             .unwrap(),
         Some(true)
     );
-    assert_eq!(
-        password_credentials::mutation_outcome(7, &key, generation, ("finish-1", &[2; 32]))
-            .unwrap(),
-        None
-    );
+    assert!(matches!(
+        password_credentials::mutation_outcome(7, &key, generation, ("finish-1", &[2; 32])),
+        Err(iota_storage::storage_error::StorageError::PendingRelayConflict)
+    ));
     assert_eq!(
         password_credentials::mutation_outcome(7, &key, generation, ("unknown", &[1; 32])).unwrap(),
         None
@@ -90,26 +89,20 @@ fn lost_ack_receipts_and_release_snapshots_are_atomic_and_erasure_fenced() {
         Some(false)
     );
     assert!(password_credentials::get(7).unwrap().is_none());
-    assert!(
-        password_credentials::commit_enrollment(
-            &credential,
-            &key,
-            generation,
-            ("finish-1", &[1; 32])
-        )
-        .is_err()
-    );
+    // Replaying the earlier receipt reports its historical committed outcome,
+    // but cannot restore the credential that a later disable removed.
+    password_credentials::commit_enrollment(&credential, &key, generation, ("finish-1", &[1; 32]))
+        .unwrap();
     assert!(password_credentials::get(7).unwrap().is_none());
     // A key rotation fences both release and historical receipt disclosure.
     let mut profile = user_manager::get_user(7).unwrap().unwrap();
     profile.public_key = "rotated-key".into();
     user_manager::update_user(profile).unwrap();
     assert!(password_credentials::authorize_release(&credential, &key, generation).is_err());
-    assert_eq!(
-        password_credentials::mutation_outcome(7, &key, generation, ("finish-1", &[1; 32]))
-            .unwrap(),
-        None
-    );
+    assert!(matches!(
+        password_credentials::mutation_outcome(7, &key, generation, ("finish-1", &[1; 32])),
+        Err(iota_storage::storage_error::StorageError::HostedAuthorizationDenied)
+    ));
     assert_eq!(
         db::with_db(|conn| Ok(conn.query_row(
             "SELECT count(*) FROM user_password_mutations",

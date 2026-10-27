@@ -12,6 +12,7 @@ use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, Typ
 use mtp::crypto::Keyring;
 use rusqlite::{OptionalExtension, params};
 use std::{sync::Arc, time::Duration};
+mod initial_secret_proposals;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IngressSource {
@@ -249,11 +250,17 @@ fn durable_native_replay(
     };
     let proof = crate::persisted_relay::decode_prepared_operation(&prepared)
         .map_err(|error| RelayServiceError::Internal(error.to_string()))?;
-    let signer = crate::federated_relay::unique_numeric_principal(proof.signer_identity.user_id)
-        .map_err(|error| RelayServiceError::Rejected(error.to_string()))?;
-    let recipient =
-        crate::federated_relay::unique_numeric_principal(proof.recipient_identity.user_id)
+    let store = iota_storage::identity::SqlitePrincipalStore;
+    let resolve = |principal: &tau_relay_protocol::Principal| {
+        let principal = crate::federated_relay::canonical_principal(principal)
             .map_err(|error| RelayServiceError::Rejected(error.to_string()))?;
+        store
+            .get_by_canonical_id(&principal)
+            .map_err(|error| RelayServiceError::Internal(error.to_string()))?
+            .ok_or_else(|| RelayServiceError::Rejected("unknown canonical native principal".into()))
+    };
+    let signer = resolve(&proof.signer_identity)?;
+    let recipient = resolve(&proof.recipient_identity)?;
     if proof.frame != normalized
         || proof.type_map_version != map
         || proof.signer != signer.handle
@@ -750,43 +757,21 @@ impl RelayService {
         {
             return Ok(storage_outcome(&verified.frame, &error));
         }
-        let initialization = if matches!(
+        if matches!(
             operation.operation,
             prepared_relay::ApplicationOperation::SetChatSecret { version: 1, .. }
         ) {
-            let escrow = operation.secret_escrow.as_ref().ok_or_else(|| {
-                RelayServiceError::Internal("initial secret evidence is missing".into())
-            })?;
-            match crate::chat_secret_recovery::gate_initial_set_chat_secret(escrow).await {
-                Ok(guard) => Some(guard),
-                Err(crate::chat_secret_recovery::RecoveryError::Conflict) => {
-                    return Ok(storage_outcome(
-                        &verified.frame,
-                        &StorageError::ChatSecretConflict,
-                    ));
-                }
-                Err(crate::chat_secret_recovery::RecoveryError::Unauthorized) => {
-                    return Ok(storage_outcome(
-                        &verified.frame,
-                        &StorageError::MessageUnauthorized,
-                    ));
-                }
-                Err(error) => {
-                    return Err(RelayServiceError::Internal(format!(
-                        "initial secret authorization unavailable: {error}"
-                    )));
-                }
-            }
-        } else {
-            None
-        };
+            return self
+                .accept_initial_proposal(operation, lease.as_ref(), &verified)
+                .await;
+        }
         relay_work::fault_point("after_preparation", &operation.message_id);
         self.accept_prepared_relay(
             operation,
             lease.as_ref(),
             verified.frame,
             recipient.map(|_| verified.recipient.handle),
-            initialization,
+            None,
         )
         .await
     }
@@ -813,6 +798,7 @@ impl RelayService {
                 None => relay_replay::acquire_in_tx(tx, operation.request(), deadline),
             }?;
             if let relay_replay::AcquireResult::Claimed(claim) = &result {
+                operation.verify_principal_fences_on(tx)?;
                 // The parsed operation and its original verified envelope become recovery work together.
                 tx.execute("UPDATE relay_inbox SET prepared_operation = COALESCE(prepared_operation, ?3) WHERE signer_principal = ?1 AND message_id = ?2", params![claim.signer.0, claim.message_id, serialized])?;
             }

@@ -58,21 +58,47 @@ impl PeerRouter for NoRoute {
     }
 }
 
+struct Offline;
+#[async_trait]
+impl iota_connection::chat_secret_recovery::RecoveryTransport for Offline {
+    async fn request(
+        &self,
+        _: &IotaNodeId,
+        _: &iota_connection::chat_secret_recovery::RecoveryRequest,
+    ) -> Result<
+        iota_connection::chat_secret_recovery::AuthenticatedRecoveryReply,
+        iota_connection::chat_secret_recovery::RecoveryError,
+    > {
+        Err(iota_connection::chat_secret_recovery::RecoveryError::RetryablePeerUnavailable)
+    }
+}
+#[async_trait]
+impl NodeIdentityResolver for Offline {
+    async fn resolve_node(&self, _: &IotaNodeId) -> Result<ResolvedNodeIdentity, IdentityError> {
+        Err(IdentityError::NotFound)
+    }
+}
+
 fn assert_hint(frame: CommunicationValue, version: i128) {
     assert!(
         frame.is_type(CommunicationType::ChatSecretForward),
         "{frame:?}"
     );
-    assert_eq!(frame.sender(), Some(22));
+    assert_eq!(frame.sender(), None);
     assert_eq!(frame.receiver(), Some(11));
-    assert_eq!(
-        frame.get_data(DataType::SenderUserId),
-        Some(&DataValue::UnsignedNumber(22))
-    );
-    assert_eq!(
-        frame.get_data(DataType::RecipientUserId),
-        Some(&DataValue::UnsignedNumber(11))
-    );
+    assert!(frame.get_data(DataType::SenderUserId).is_none());
+    assert!(frame.get_data(DataType::RecipientUserId).is_none());
+    let principal = |field| {
+        serde_json::from_str::<iota_identity::relay_protocol::Principal>(
+            frame.get_data(field).unwrap().as_str().unwrap(),
+        )
+        .unwrap()
+    };
+    let owner = principal(DataType::Principal);
+    let peer = principal(DataType::UserAddress);
+    assert_eq!(owner.user_id, 11);
+    assert_eq!(peer.user_id, 22);
+    assert_eq!(owner.authority, peer.authority);
     assert_eq!(
         frame.get_data(DataType::Payload),
         Some(&DataValue::Str("available".into()))
@@ -83,7 +109,9 @@ fn assert_hint(frame: CommunicationValue, version: i128) {
     );
     assert_eq!(
         frame.get_data(DataType::ChatId),
-        Some(&DataValue::Str("11:22".into()))
+        Some(&DataValue::Str(
+            iota_identity::relay_protocol::canonical_chat_id(&owner, &peer)
+        ))
     );
     assert!(frame.get_data(DataType::EncryptedSecret).is_none());
     assert!(frame.get_data(DataType::KemCiphertext).is_none());
@@ -126,33 +154,41 @@ async fn committed_hints_fan_out_reconcile_reconnect_dedup_and_obey_revocation()
         authority: node.authority_id().clone(),
         user_id,
     });
-    let escrow = |version| {
-        let format = recovery::RelayFormat::NativeMtpSealedV1;
-        let frame = vec![version as u8, 8];
-        recovery::Escrow {
-            original_type_map_version: "1.0".into(),
-            first: ids[0].clone(),
-            second: ids[1].clone(),
-            version,
-            namespace: recovery::WrappingNamespace {
-                chat_id: "11:22".into(),
-                secret_id: "chat:11:22:main".into(),
-            },
-            wrapping_scheme: "fixture".into(),
-            signer: ids[0].clone(),
-            message_id: format!("notification-{version}"),
-            operation_digest: recovery::operation_digest(format, &frame),
-            original_frame: frame,
-            format,
-            envelopes: std::array::from_fn(|index| recovery::RecipientEnvelope {
-                owner: ids[index].clone(),
-                recipient_id: recovery::OriginalRecipientId::Numeric(ids[index].user_id),
-                encrypted_secret: vec![version as u8, index as u8],
-                kem_ciphertext: vec![version as u8, index as u8, 1],
-            }),
-            created_at: 1,
-        }
-    };
+    let escrow =
+        |version| {
+            let format = recovery::RelayFormat::NativeMtpSealedV1;
+            let frame = vec![version as u8, 8];
+            recovery::Escrow {
+                original_type_map_version: "1.0".into(),
+                original_type_map_fingerprint:
+                    iota_identity::relay_protocol::dictionary_fingerprint("1.0").unwrap(),
+                first: ids[0].clone(),
+                second: ids[1].clone(),
+                version,
+                namespace: recovery::WrappingNamespace {
+                    chat_id: recovery::canonical_chat_id(&ids[0], &ids[1]).unwrap(),
+                    secret_id: format!(
+                        "chat:{}:main",
+                        recovery::canonical_chat_id(&ids[0], &ids[1]).unwrap()
+                    ),
+                },
+                wrapping_scheme: "fixture".into(),
+                signer: ids[0].clone(),
+                message_id: format!("notification-{version}"),
+                operation_digest: recovery::operation_digest(format, &frame),
+                original_frame: frame,
+                format,
+                envelopes: std::array::from_fn(|index| recovery::RecipientEnvelope {
+                    owner: ids[index].clone(),
+                    recipient_id: recovery::OriginalRecipientId::Principal(
+                        recovery::principal_key(&ids[index]).unwrap(),
+                    ),
+                    encrypted_secret: vec![version as u8, index as u8],
+                    kem_ciphertext: vec![version as u8, index as u8, 1],
+                }),
+                created_at: 1,
+            }
+        };
     let commit = |e: &recovery::Escrow| {
         db::with_immediate_transaction(|tx| {
             recovery::commit_escrow_in_tx(tx, e)?;
@@ -162,14 +198,30 @@ async fn committed_hints_fan_out_reconcile_reconnect_dedup_and_obey_revocation()
         .unwrap()
     };
     let sessions = Arc::new(SessionManager::default());
+    let relay = Arc::new(RelayService::new(
+        Arc::new(SqliteLocalUserStore),
+        Arc::new(NoRoute),
+    ));
+    iota_connection::chat_secret_recovery::install_recovery(Arc::new(
+        iota_connection::chat_secret_recovery::RecoveryCoordinator::new(
+            Arc::new(Resolver),
+            Arc::new(Offline),
+            Arc::new(SqlitePrincipalStore),
+            Arc::new(SqliteLocalUserStore),
+            node.node_id().clone(),
+            Arc::new(Offline),
+            Arc::new(
+                iota_connection::chat_secret_recovery::OriginalOperationVerifier {
+                    relay: relay.clone(),
+                },
+            ),
+        ),
+    ));
     let manager = Arc::new(ClientConnectionManager::new(
         Arc::new(Resolver),
         Arc::new(HostedSessionRegistrar::new(sessions.clone())),
         sessions.clone(),
-        Arc::new(RelayService::new(
-            Arc::new(SqliteLocalUserStore),
-            Arc::new(NoRoute),
-        )),
+        relay,
     ));
     let certificate_key = rcgen::KeyPair::generate().unwrap();
     let certificate = rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()])
@@ -234,17 +286,14 @@ async fn committed_hints_fan_out_reconcile_reconnect_dedup_and_obey_revocation()
     let second = mtp::client::MTPClient::auth_connect(config(), &keys[0], &node.public_keys())
         .await
         .unwrap();
+    let mut snapshots = Vec::new();
     for client in [&first, &second] {
-        assert!(
-            client
-                .request(
-                    &CommunicationValue::new(CommunicationType::AccountStateRequest).with_id(1),
-                    None
-                )
-                .await
-                .unwrap()
-                .is_type(CommunicationType::AccountStateSnapshot)
-        );
+        let snapshot = client
+            .request(&sync_support::snapshot(11, 1), None)
+            .await
+            .unwrap();
+        assert!(snapshot.is_type(CommunicationType::AccountStateSnapshot));
+        snapshots.push(snapshot);
     }
     // A staged but uncommitted transaction must not publish a hint.
     let initial = escrow(1);
@@ -266,16 +315,13 @@ async fn committed_hints_fan_out_reconcile_reconnect_dedup_and_obey_revocation()
             .is_err(),
         "snapshot application gates delivery"
     );
-    for client in [&first, &second] {
+    for (client, snapshot) in [&first, &second].into_iter().zip(&snapshots) {
         assert!(
             client
-                .request(
-                    &CommunicationValue::new(CommunicationType::AccountStateApplied).with_id(2),
-                    None
-                )
+                .request(&sync_support::acknowledge(snapshot, 2), None)
                 .await
                 .unwrap()
-                .is_type(CommunicationType::Success)
+                .is_type(CommunicationType::AccountStateSnapshot)
         );
         assert_hint(
             tokio::time::timeout(Duration::from_secs(2), client.receive())
@@ -288,14 +334,23 @@ async fn committed_hints_fan_out_reconcile_reconnect_dedup_and_obey_revocation()
     let read = CommunicationValue::new(CommunicationType::GetChatSecret)
         .with_id(15)
         .with_sender(999)
-        .add_typed_default(DataType::UserId, DataValue::Str("11".into()))
-        .add_typed_default(DataType::ChatId, DataValue::Str("11:22".into()))
-        .add_typed_default(DataType::SecretId, DataValue::Str("chat:11:22:main".into()));
+        .add_typed_default(
+            DataType::UserId,
+            DataValue::Str(recovery::principal_key(&ids[0]).unwrap()),
+        )
+        .add_typed_default(
+            DataType::ChatId,
+            DataValue::Str(initial.namespace.chat_id.clone()),
+        )
+        .add_typed_default(
+            DataType::SecretId,
+            DataValue::Str(initial.namespace.secret_id.clone()),
+        );
     let response = first.request(&read, None).await.unwrap();
     assert!(response.is_type(CommunicationType::ChatSecretResponse));
     assert_eq!(
         response.get_data(DataType::UserId),
-        Some(&DataValue::Str("11".into()))
+        Some(&DataValue::Str(recovery::principal_key(&ids[0]).unwrap()))
     );
     assert_eq!(
         response.get_data(DataType::EncryptedSecret),
@@ -304,7 +359,10 @@ async fn committed_hints_fan_out_reconcile_reconnect_dedup_and_obey_revocation()
     assert!(
         first
             .request(
-                &read.with_data(DataType::UserId, DataValue::Str("22".into())),
+                &read.with_data(
+                    DataType::UserId,
+                    DataValue::Str(recovery::principal_key(&ids[1]).unwrap())
+                ),
                 None
             )
             .await
@@ -335,11 +393,15 @@ async fn committed_hints_fan_out_reconcile_reconnect_dedup_and_obey_revocation()
         db::with_immediate_transaction(|tx| {
             recovery::commit_escrow_in_tx(tx, &pending_rotation)?;
             recovery::recover_owner_envelope_in_tx(tx, LocalUserId(11), &pending_rotation)?;
+            // Losing the projection source before commit must roll back both
+            // the application write and its immutable journal payload.
+            tx.execute_batch(
+                "ALTER TABLE chat_secrets RENAME TO chat_secrets_temporarily_unavailable",
+            )?;
             entered.send(()).unwrap();
             resume.recv().unwrap();
             Ok(())
         })
-        .unwrap();
     });
     ready.await.unwrap();
     // Even an explicit wake cannot expose a transaction's uncommitted outbox.
@@ -352,7 +414,39 @@ async fn committed_hints_fan_out_reconcile_reconnect_dedup_and_obey_revocation()
         );
     }
     release.send(()).unwrap();
-    transaction.await.unwrap();
+    assert!(transaction.await.unwrap().is_err());
+    recovery::notify_change();
+    for client in [&first, &second] {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), client.receive())
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        recovery::recovery_jobs(10).unwrap().is_empty(),
+        "storage failure must not enqueue envelope recovery"
+    );
+    db::with_db(|connection| {
+        let pending: i64 = connection.query_row(
+            "SELECT count(*) FROM chat_secret_outbox WHERE version=2 AND dispatched_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(pending, 0, "failed commit must not leave an outbox entry");
+        let restored: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_secrets')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            restored,
+            "schema change must roll back with the application write"
+        );
+        Ok(())
+    })
+    .unwrap();
+    commit(&rotation);
     for client in [&first, &second] {
         assert_hint(
             tokio::time::timeout(Duration::from_secs(2), client.receive())
@@ -382,30 +476,27 @@ async fn committed_hints_fan_out_reconcile_reconnect_dedup_and_obey_revocation()
         );
     }
     // A new session reconciles even globally dispatched outbox records.
+    // Its first historical hint is unreadable. Durable recovery must let the
+    // second valid hint pass without falsely acknowledging the missing copy.
+    db::with_db(|connection| {
+        connection.execute(
+            "DELETE FROM chat_secrets WHERE user_id='11' AND version=1",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
     let third = mtp::client::MTPClient::auth_connect(config(), &keys[0], &node.public_keys())
         .await
         .unwrap();
-    third
-        .request(
-            &CommunicationValue::new(CommunicationType::AccountStateRequest).with_id(3),
-            None,
-        )
+    let snapshot = third
+        .request(&sync_support::snapshot(11, 3), None)
         .await
         .unwrap();
     third
-        .request(
-            &CommunicationValue::new(CommunicationType::AccountStateApplied).with_id(4),
-            None,
-        )
+        .request(&sync_support::acknowledge(&snapshot, 4), None)
         .await
         .unwrap();
-    assert_hint(
-        tokio::time::timeout(Duration::from_secs(2), third.receive())
-            .await
-            .unwrap()
-            .unwrap(),
-        1,
-    );
     assert_hint(
         tokio::time::timeout(Duration::from_secs(2), third.receive())
             .await
@@ -413,9 +504,47 @@ async fn committed_hints_fan_out_reconcile_reconnect_dedup_and_obey_revocation()
             .unwrap(),
         2,
     );
+    let jobs = recovery::recovery_jobs(10).unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].version, Some(1));
+    commit(&initial);
+    for client in [&first, &second, &third] {
+        assert_hint(
+            tokio::time::timeout(Duration::from_secs(2), client.receive())
+                .await
+                .unwrap()
+                .unwrap(),
+            1,
+        );
+    }
+    let fourth = mtp::client::MTPClient::auth_connect(config(), &keys[0], &node.public_keys())
+        .await
+        .unwrap();
+    let snapshot = fourth
+        .request(&sync_support::snapshot(11, 5), None)
+        .await
+        .unwrap();
+    fourth
+        .request(&sync_support::acknowledge(&snapshot, 6), None)
+        .await
+        .unwrap();
+    assert_hint(
+        tokio::time::timeout(Duration::from_secs(2), fourth.receive())
+            .await
+            .unwrap()
+            .unwrap(),
+        2,
+    );
+    assert_hint(
+        tokio::time::timeout(Duration::from_secs(2), fourth.receive())
+            .await
+            .unwrap()
+            .unwrap(),
+        1,
+    );
     manager.revoke_principal(handles[0]).unwrap();
     commit(&escrow(3));
-    for client in [&first, &second, &third] {
+    for client in [&first, &second, &third, &fourth] {
         assert!(
             !matches!(tokio::time::timeout(Duration::from_millis(200),client.receive()).await,Ok(Ok(frame)) if frame.is_type(CommunicationType::ChatSecretForward))
         );
@@ -423,3 +552,5 @@ async fn committed_hints_fan_out_reconcile_reconnect_dedup_and_obey_revocation()
     shutdown.cancel();
     server_task.await.unwrap();
 }
+
+mod sync_support;

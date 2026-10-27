@@ -168,7 +168,7 @@ async fn run() -> ExitCode {
             runtime.state.active_tasks.clone(),
             runtime.state.app.clone(),
         ));
-        let services = match DaemonServices::new(omikron.clone(), node_identity.clone()) {
+        let services = match DaemonServices::new(omikron.clone(), node_identity.clone()).await {
             Ok(services) => services,
             Err(error) => {
                 eprintln!("Cannot initialize daemon identity services: {error}");
@@ -320,8 +320,8 @@ async fn run() -> ExitCode {
                             .await
                             .map_err(|error| error.to_string())?;
                             let message = format!(
-                                "{message}; password authentication: {:?}",
-                                password_health
+                                "{message}; password authentication: {:?}; password stages [name,count,failures,total_ms]: {:?}",
+                                password_health, omikron_connector::password_stage_counts()
                             );
                             health_runtime.set_component_healthy(
                                 iota_ipc::ComponentId::Omikron,

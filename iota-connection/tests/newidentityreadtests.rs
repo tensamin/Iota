@@ -5,7 +5,7 @@
 
 mod relay_support;
 
-use iota_connection::message_handlers::handle_account_state_request;
+use iota_connection::message_handlers::{handle_account_state_request, handle_relay_receipt_page};
 use mtp::codec::{CommunicationType as C, CommunicationValue, DataType as D, DataValue};
 use relay_support::{Fixture, accepted, initialize, secret, send};
 
@@ -54,29 +54,62 @@ async fn snapshots_cover_accepted_edits_and_reactions_but_not_bootstrap_notifica
     );
 
     for owner in [1, 2] {
-        let request = CommunicationValue::new(C::AccountStateRequest).with_sender(owner);
+        let principal = &fixture.ids[owner as usize - 1];
+        let map = mtp::codec::TypeMap::new(mtp::type_map::Version(1, 0));
+        let request = tau::sync::encode_request(
+            &tau::sync::Request::Snapshot {
+                scope: tau::sync::Scope {
+                    principal: tau_relay_protocol::Principal::try_from(principal).unwrap(),
+                    device_id: "snapshot-test".into(),
+                    authorization_generation: iota_storage::hosted_auth::resolve(
+                        iota_identity::LocalUserId(owner as i64),
+                    )
+                    .unwrap()
+                    .0
+                    .auth_generation,
+                    schema: tau::sync::SCHEMA.into(),
+                    dictionary: tau_relay_protocol::dictionary_fingerprint("1.0").unwrap(),
+                },
+                page: None,
+                limit: 128,
+            },
+            &map,
+            7,
+        )
+        .unwrap()
+        .with_sender(owner);
         let snapshot = handle_account_state_request(&request);
         assert!(snapshot.is_type(C::AccountStateSnapshot), "{snapshot:?}");
         let map = request.type_map().unwrap();
         let field =
             |value: &DataValue, ty: D| value.get_field(ty.try_to_id(map).unwrap()).unwrap().clone();
-        let messages = snapshot.get_data(D::Messages).unwrap().as_array().unwrap();
+        let tau::sync::Response::Snapshot { records, .. } =
+            tau::sync::decode_response(&snapshot, &request).unwrap()
+        else {
+            panic!("expected snapshot");
+        };
+        let messages = records
+            .iter()
+            .filter(|record| record.entity == tau::sync::Entity::Message)
+            .collect::<Vec<_>>();
         assert_eq!(messages.len(), 1);
-        assert_eq!(field(&messages[0], D::Content).as_str(), Some("newest"));
+        assert_eq!(messages[0].value["content"], "newest");
         assert_eq!(
-            field(&messages[0], D::Principal).as_str(),
-            Some(serde_json::to_string(&fixture.ids[0]).unwrap().as_str())
+            messages[0].value["relay_signer_principal_identity"],
+            serde_json::to_value(&fixture.ids[0]).unwrap()
         );
-        let reactions = field(&messages[0], D::Reactions)
-            .as_array()
-            .unwrap()
-            .to_vec();
+        let reactions = messages[0].value["reactions"].as_array().unwrap();
         assert_eq!(reactions.len(), 1);
         assert_eq!(
-            field(&reactions[0], D::Principal).as_str(),
-            Some(serde_json::to_string(&fixture.ids[1]).unwrap().as_str())
+            reactions[0]["principal"],
+            serde_json::to_value(&fixture.ids[1]).unwrap()
         );
-        let receipts = snapshot
+        let receipt_page = handle_relay_receipt_page(
+            &CommunicationValue::new(C::RelayReceiptPage)
+                .with_sender(owner)
+                .add_typed_default(D::ReceiptCursor, DataValue::SignedNumber(0)),
+        );
+        let receipts = receipt_page
             .get_data(D::AcceptedIds)
             .unwrap()
             .as_array()

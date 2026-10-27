@@ -130,11 +130,11 @@ mod tests {
         let keys = KEYS.get_or_init(|| [Keyring::generate(), Keyring::generate()]);
         let frame = FederatedRelay::sign(
             PrincipalId {
-                authority: AuthorityId::new("authority:origin").unwrap(),
+                authority: AuthorityId::for_omega(&keys[0].public_key_bundle()).unwrap(),
                 user_id: 1,
             },
             PrincipalId {
-                authority: AuthorityId::new("authority:recipient").unwrap(),
+                authority: AuthorityId::for_omega(&keys[1].public_key_bundle()).unwrap(),
                 user_id: 2,
             },
             destination.clone(),

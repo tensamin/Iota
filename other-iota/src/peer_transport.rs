@@ -43,33 +43,6 @@ impl<'a> PeerOperations<'a> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn scoped_peer_operations_bound_work_and_drain_every_started_operation() {
-        let mut operations = PeerOperations::default();
-        let permits = Arc::new(tokio::sync::Semaphore::new(0));
-        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        for _ in 0..16 {
-            let permits = permits.clone();
-            let completed = completed.clone();
-            assert!(operations.push(async move {
-                permits.acquire().await.unwrap().forget();
-                completed.fetch_add(1, Ordering::SeqCst);
-            }));
-        }
-        assert!(!operations.push(async {}));
-        tokio::join!(operations.drain(), async {
-            tokio::task::yield_now().await;
-            permits.add_permits(16);
-        });
-        assert!(operations.is_empty());
-        assert_eq!(completed.load(Ordering::SeqCst), 16);
-    }
-}
-
 impl PeerManager {
     pub(super) async fn outgoing_read_loop(
         self: Arc<Self>,
@@ -338,5 +311,32 @@ impl DirectPeerConnection for IncomingPeer {
             .map_err(|_| RouteError::Delivery("peer relay request timed out".into()))?
             .map_err(|_| RouteError::Delivery("peer relay connection closed".into()))?;
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn scoped_peer_operations_bound_work_and_drain_every_started_operation() {
+        let mut operations = PeerOperations::default();
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..16 {
+            let permits = permits.clone();
+            let completed = completed.clone();
+            assert!(operations.push(async move {
+                permits.acquire().await.unwrap().forget();
+                completed.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        assert!(!operations.push(async {}));
+        tokio::join!(operations.drain(), async {
+            tokio::task::yield_now().await;
+            permits.add_permits(16);
+        });
+        assert!(operations.is_empty());
+        assert_eq!(completed.load(Ordering::SeqCst), 16);
     }
 }

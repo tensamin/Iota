@@ -25,10 +25,102 @@ fn subprocess_test_name() -> &'static str {
 }
 
 fn fixture() -> serde_json::Value {
-    let bytes = std::env::var_os("RELAY_NATIVE_CLIENT_FIXTURE")
-        .map(|path| std::fs::read(path).unwrap())
-        .unwrap_or_else(|| include_bytes!("fixtures/relay_native_client.json").to_vec());
+    let bytes = std::fs::read(fixture_path()).unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+pub fn fixture_path() -> &'static std::path::Path {
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        if let Some(path) = std::env::var_os("RELAY_NATIVE_CLIENT_FIXTURE") {
+            return path.into();
+        }
+        use mtp::codec::relay::SealedRelayBuilder;
+        let map = TypeMap::new(mtp::type_map::Version(1, 0));
+        let nodes = [Keyring::generate(), Keyring::generate()];
+        let signer = Keyring::generate();
+        let authority = AuthorityId::for_omega(&nodes[0].public_key_bundle()).unwrap();
+        let ids = [11, 22].map(|user_id| PrincipalId {
+            authority: authority.clone(),
+            user_id,
+        });
+        let principals = ids
+            .each_ref()
+            .map(|id| iota_identity::relay_protocol::Principal::try_from(id).unwrap());
+        let chat = iota_identity::relay_protocol::canonical_chat_id(&principals[0], &principals[1]);
+        let secret = iota_identity::relay_protocol::chat_secret_id(&chat);
+        let envelopes = [vec![11, 1], vec![22, 2]];
+        let kems = [vec![11, 3], vec![22, 4]];
+        let recipients = (0..2)
+            .map(|index| {
+                DataValue::Container(
+                    vec![
+                        (
+                            DataType::UserId,
+                            DataValue::Str(serde_json::to_string(&principals[index]).unwrap()),
+                        ),
+                        (
+                            DataType::EncryptedSecret,
+                            DataValue::Bytes(envelopes[index].clone()),
+                        ),
+                        (
+                            DataType::KemCiphertext,
+                            DataValue::Bytes(kems[index].clone()),
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(kind, value)| (kind.try_to_id(&map).unwrap(), value))
+                    .collect(),
+                )
+            })
+            .collect();
+        let application =
+            CommunicationValue::new_with_type_map(CommunicationType::SetChatSecret, &map)
+                .add_typed_default(DataType::ChatId, DataValue::Str(chat))
+                .add_typed_default(DataType::SecretId, DataValue::Str(secret))
+                .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(1))
+                .add_typed_default(DataType::WrappingScheme, DataValue::Str("fixture".into()))
+                .add_typed_default(DataType::Recipients, DataValue::Array(recipients));
+        let destination = IotaNodeId::from_public_keys(&nodes[1].public_key_bundle()).unwrap();
+        let route = iota_identity::relay_protocol::NativeRelayRoute {
+            signer: principals[0].clone(),
+            recipient: principals[1].clone(),
+            destination: destination.as_str().into(),
+            type_map_version: "1.0".into(),
+            type_map_fingerprint: map.fingerprint_hex().unwrap(),
+        };
+        let signing = mtp::crypto::Ed25519Signer::new(&signer.sig_cl_secret_key).unwrap();
+        let keys = nodes.each_ref().map(Keyring::public_key_bundle).to_vec();
+        let frame = SealedRelayBuilder::new(
+            CommunicationType::SetChatSecret,
+            application.payload().clone(),
+            11,
+            22,
+            IotaNodeId::from_public_keys(&nodes[0].public_key_bundle())
+                .unwrap()
+                .mtp_authentication_hint(),
+            &signing,
+        )
+        .type_map(&map)
+        .message_id(1u128)
+        .created_at(iota_storage::util::sync::now_millis() as u64)
+        .metadata(route.to_metadata(&map).unwrap())
+        .metadata_recipients(keys.clone())
+        .content_recipients(keys)
+        .build()
+        .unwrap();
+        let fixture = serde_json::json!({
+            "nodeKeys": nodes.each_ref().map(|key| STANDARD.encode(key.try_to_bytes().unwrap())),
+            "signerPublicKey": signer.public_key_bundle().try_to_base64().unwrap(),
+            "frame": STANDARD.encode(frame.to_bytes().unwrap()),
+            "encryptedSecrets": envelopes.map(|bytes| STANDARD.encode(bytes)),
+            "kemCiphertexts": kems.map(|bytes| STANDARD.encode(bytes)),
+        });
+        let path = std::path::Path::new("/tmp/opencode")
+            .join(format!("native-relay-peer-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+        path
+    })
 }
 
 // The real-MTP integration harness reuses these pinned Client assertions while
@@ -41,7 +133,10 @@ pub static STAGE_HOOK: std::sync::OnceLock<StageHook> = std::sync::OnceLock::new
 struct Resolver;
 #[async_trait]
 impl IdentityResolver for Resolver {
-    async fn resolve_current_principal(&self, id: &PrincipalId) -> Result<ResolvedPrincipal, IdentityError> {
+    async fn resolve_current_principal(
+        &self,
+        id: &PrincipalId,
+    ) -> Result<ResolvedPrincipal, IdentityError> {
         self.resolve_principal(id).await
     }
     async fn resolve_address(
@@ -99,6 +194,7 @@ impl PeerRouter for TestTransport {
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", subprocess_test_name(), "--nocapture"])
                 .env("NATIVE_RELAY_TEST_STAGE", "destination")
+                .env("RELAY_NATIVE_CLIENT_FIXTURE", fixture_path())
                 .env(
                     "NATIVE_RELAY_TEST_REQUEST",
                     STANDARD.encode(frame.to_bytes().unwrap())
@@ -131,6 +227,7 @@ pub async fn run_native_stage() {
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", subprocess_test_name(), "--nocapture"])
                 .env("NATIVE_RELAY_TEST_STAGE", "origin")
+                .env("RELAY_NATIVE_CLIENT_FIXTURE", fixture_path())
                 .status()
                 .unwrap()
                 .success()
@@ -161,7 +258,7 @@ pub async fn run_native_stage() {
     let signer_key =
         PublicKeyBundle::from_base64(fixture["signerPublicKey"].as_str().unwrap()).unwrap();
     let ids = [11, 22].map(|user_id| PrincipalId {
-        authority: AuthorityId::new("omega:central").unwrap(),
+        authority: AuthorityId::for_omega(&nodes[0].public_keys()).unwrap(),
         user_id,
     });
     let now = iota_storage::util::sync::now_millis();
@@ -311,15 +408,21 @@ pub async fn run_native_stage() {
             std::fs::write(path, ingress_response.to_bytes().unwrap()).unwrap();
         }
     }
+    let chat_id =
+        iota_storage::util::chat_secret_recovery::canonical_chat_id(&ids[0], &ids[1]).unwrap();
+    let secret_id = iota_identity::relay_protocol::chat_secret_id(&chat_id);
     let read = CommunicationValue::new_with_type_map(
         CommunicationType::GetChatSecret,
         frame.type_map().unwrap(),
     )
     .with_id(992)
     .with_sender(local as u64)
-    .add_typed_default(DataType::UserId, DataValue::UnsignedNumber(local as u128))
-    .add_typed_default(DataType::ChatId, DataValue::Str("11:22".into()))
-    .add_typed_default(DataType::SecretId, DataValue::Str("chat:11:22:main".into()))
+    .add_typed_default(
+        DataType::UserId,
+        DataValue::Str(serde_json::to_string(&ids[index]).unwrap()),
+    )
+    .add_typed_default(DataType::ChatId, DataValue::Str(chat_id.clone()))
+    .add_typed_default(DataType::SecretId, DataValue::Str(secret_id.clone()))
     .add_typed_default(DataType::VersionNumber, DataValue::UnsignedNumber(1));
     let read = iota_connection::message_handlers::handle_get_chat_secret(&read);
     if let Some(directory) = std::env::var_os("RELAY_NATIVE_RESPONSES") {
@@ -337,16 +440,16 @@ pub async fn run_native_stage() {
     }
     assert!(
         read.is_type(CommunicationType::ChatSecretResponse),
-        "native numeric read failed: {read:?}"
+        "native canonical read failed: {read:?}"
     );
     assert_eq!(
         read.get_data(DataType::ChatId).and_then(DataValue::as_str),
-        Some("11:22")
+        Some(chat_id.as_str())
     );
     assert_eq!(
         read.get_data(DataType::SecretId)
             .and_then(DataValue::as_str),
-        Some("chat:11:22:main")
+        Some(secret_id.as_str())
     );
     assert_eq!(
         read.get_data(DataType::EncryptedSecret),
@@ -446,12 +549,14 @@ pub async fn run_native_stage() {
             RelayOutcome::Accepted { .. }
         ));
     }
-    // A second authority with the same numeric ID invalidates even exact replay.
+    // Another authority's numeric ID cannot alter a canonical native replay.
     db::with_db(|connection| {
-        connection.execute("INSERT INTO principals(authority_kind, authority_id, remote_user_id, descriptor_revision, last_resolved_at) VALUES ('omega', 'omega:collision', 11, 0, 0)", [])?;
+        connection.execute("INSERT INTO principals(authority_kind, authority_id, remote_user_id, descriptor_revision, last_resolved_at) VALUES ('omega', ?1, 11, 1, 0)", [format!("omega-key:{}", "c".repeat(64))])?;
         Ok(())
     }).unwrap();
-    assert!(service.prepare_relay(&source, frame).await.is_err());
+    let replay = service.prepare_relay(&source, frame).await.unwrap();
+    assert_eq!(replay.signer.principal, ids[0]);
+    assert_eq!(replay.recipient.principal, ids[1]);
     std::fs::remove_dir_all(directory).unwrap();
 }
 

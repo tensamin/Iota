@@ -86,7 +86,7 @@ async fn offline_shared_iota_initialization_preserves_identity_versions_and_exis
         .accept(1, "non-authoritative-rotation", proposal(&fixture, 2, 8))
         .await;
     assert!(matches!(rotation, RelayOutcome::Rejected { .. }));
-    assert!(read(1, 2).is_type(CommunicationType::ErrorInternal));
+    assert!(read(1, 2).is_type(CommunicationType::ErrorNotSet));
 
     // Reconnect the authoritative participant for subsequent rotations.
     session.connection_id = uuid::Uuid::new_v4();
@@ -113,6 +113,10 @@ async fn offline_shared_iota_initialization_preserves_identity_versions_and_exis
         .add_typed_default(
             DataType::UserId,
             DataValue::Str(serde_json::to_string(&fixture.ids[1]).unwrap()),
+        )
+        .add_typed_default(
+            DataType::SecretId,
+            DataValue::Str(tau_relay_protocol::chat_secret_id(&chat_id)),
         )
         .add_typed_default(DataType::ChatId, DataValue::Str(chat_id));
     assert!(handle_get_chat_secret(&impersonation).is_type(CommunicationType::ErrorNotFound));

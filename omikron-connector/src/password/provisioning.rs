@@ -19,6 +19,10 @@ use super::{
 
 const PASSWORD_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[cfg(test)]
+#[path = "lookup_tests.rs"]
+mod lookup_tests;
+
 struct PreparedPasswordStart {
     connection_generation: u64,
     request_id: u32,
@@ -191,8 +195,14 @@ impl OmikronConnection {
                 _ = tokio::time::sleep(delay) => {},
             }
         }
-        let principal = self.password_principal(user_id).await?;
-        let discovered_key = self.validate_password_hosting(user_id).await?;
+        let (principal, discovered_key) = tokio::try_join!(
+            async {
+                self.password_principal(user_id)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+            self.validate_password_hosting(user_id),
+        )?;
         let discovered_fingerprint = super::wire::key_fingerprint(&discovered_key)?;
         if self
             .password_auth
@@ -208,6 +218,7 @@ impl OmikronConnection {
             return Err("discovered account key changed".into());
         }
         let runtime = self.password_auth.clone();
+        let mut ke1_timing = super::timing::Timing::start(super::timing::Stage::Ke1);
         let (response, state, real_record, record_hash) =
             self.password_auth
                 .run_blocking(move || {
@@ -257,6 +268,8 @@ impl OmikronConnection {
                     ))
                 })
                 .await??;
+        ke1_timing.success();
+        drop(ke1_timing);
         let mut pending = self
             .password_auth
             .logins
@@ -397,14 +410,15 @@ impl OmikronConnection {
             .map_err(|_| PasswordFinishError::InvalidClientMessage)?;
         opaque::validate_login_finalization(&ke3)
             .map_err(|_| PasswordFinishError::InvalidClientMessage)?;
-        let principal = self
-            .password_principal(pending.user_id)
-            .await
-            .map_err(|_| PasswordFinishError::CredentialUnavailable)?;
-        let discovered_key = self
-            .validate_password_hosting(pending.user_id)
-            .await
-            .map_err(|_| PasswordFinishError::CredentialUnavailable)?;
+        let (principal, discovered_key) = tokio::try_join!(
+            async {
+                self.password_principal(pending.user_id)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+            self.validate_password_hosting(pending.user_id),
+        )
+        .map_err(|_| PasswordFinishError::CredentialUnavailable)?;
         let discovered_fingerprint = super::wire::key_fingerprint(&discovered_key)
             .map_err(|_| PasswordFinishError::CredentialUnavailable)?;
         let (release_key, authorization_generation) =
@@ -429,6 +443,7 @@ impl OmikronConnection {
             .password_auth
             .setup()
             .map_err(|_| PasswordFinishError::CredentialUnavailable)?;
+        let mut ke3_timing = super::timing::Timing::start(super::timing::Stage::Ke3);
         let credential = self
             .password_auth
             .run_blocking(move || {
@@ -486,6 +501,8 @@ impl OmikronConnection {
             })
             .await
             .map_err(|_| PasswordFinishError::Storage)??;
+        ke3_timing.success();
+        drop(ke3_timing);
         let wire =
             |kind, value| typed(kind, value).map_err(|_| PasswordFinishError::InvalidClientMessage);
         let content = DataValue::Container(vec![

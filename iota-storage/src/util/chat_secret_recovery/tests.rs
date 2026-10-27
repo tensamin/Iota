@@ -1,5 +1,10 @@
 use super::*;
 
+const AUTHORITY_A: &str =
+    "omega-key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const AUTHORITY_B: &str =
+    "omega-key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
 fn principal(authority: &str, user_id: u64) -> PrincipalId {
     PrincipalId {
         authority: AuthorityId::new(authority).unwrap(),
@@ -10,7 +15,6 @@ fn principal(authority: &str, user_id: u64) -> PrincipalId {
 pub(crate) fn database() -> Connection {
     let connection = Connection::open_in_memory().unwrap();
     connection.execute_batch("CREATE TABLE principals(principal_pk INTEGER PRIMARY KEY,authority_id TEXT,remote_user_id INTEGER);
-        INSERT INTO principals VALUES(101,'authority-a',11),(202,'authority-b',22);
         CREATE TABLE users(user_id INTEGER PRIMARY KEY,public_key TEXT);
         INSERT INTO users VALUES(7,'key-a'),(8,'key-b');
         CREATE TABLE hosted_principals(local_user_id INTEGER PRIMARY KEY,principal_handle INTEGER);
@@ -22,7 +26,16 @@ pub(crate) fn database() -> Connection {
         CREATE TABLE chat_secrets(user_id TEXT,chat_id TEXT,secret_id TEXT,version INTEGER,
             encrypted_secret BLOB,kem_ciphertext BLOB,wrapping_scheme TEXT,created_at INTEGER,updated_at INTEGER,
             PRIMARY KEY(user_id,chat_id,secret_id,version));").unwrap();
+    connection
+        .execute(
+            "INSERT INTO principals VALUES(101,?1,11),(202,?2,22)",
+            params![AUTHORITY_A, AUTHORITY_B],
+        )
+        .unwrap();
     connection.execute_batch(SCHEMA).unwrap();
+    connection
+        .execute_batch(include_str!("initial_proposals.sql"))
+        .unwrap();
     connection
         .execute_batch(include_str!("relay_initialization.sql"))
         .unwrap();
@@ -30,16 +43,17 @@ pub(crate) fn database() -> Connection {
 }
 
 pub(crate) fn escrow(version: i64) -> Escrow {
-    let first = principal("authority-a", 11);
-    let second = principal("authority-b", 22);
+    let first = principal(AUTHORITY_A, 11);
+    let second = principal(AUTHORITY_B, 22);
+    let chat_id = canonical_chat_id(&first, &second).unwrap();
     let original_frame = vec![5, 6, version as u8];
     Escrow {
         first: first.clone(),
         second: second.clone(),
         version,
         namespace: WrappingNamespace {
-            chat_id: "11:22".into(),
-            secret_id: "chat:11:22:main".into(),
+            secret_id: e2ee_storage::principal_secret_id(&chat_id),
+            chat_id,
         },
         wrapping_scheme: "ml-kem-test".into(),
         signer: first.clone(),
@@ -47,17 +61,19 @@ pub(crate) fn escrow(version: i64) -> Escrow {
         operation_digest: operation_digest(RelayFormat::NativeMtpSealedV1, &original_frame),
         original_frame,
         original_type_map_version: "1.0".into(),
+        original_type_map_fingerprint: iota_identity::relay_protocol::dictionary_fingerprint("1.0")
+            .unwrap(),
         format: RelayFormat::NativeMtpSealedV1,
         envelopes: [
             RecipientEnvelope {
+                recipient_id: OriginalRecipientId::Principal(principal_key(&first).unwrap()),
                 owner: first,
-                recipient_id: OriginalRecipientId::Numeric(11),
                 encrypted_secret: vec![version as u8, 11],
                 kem_ciphertext: vec![11, 1],
             },
             RecipientEnvelope {
+                recipient_id: OriginalRecipientId::Principal(principal_key(&second).unwrap()),
                 owner: second,
-                recipient_id: OriginalRecipientId::Numeric(22),
                 encrypted_secret: vec![version as u8, 22],
                 kem_ciphertext: vec![22, 2],
             },
@@ -180,7 +196,10 @@ fn exact_owner_copy_restores_deleted_historical_epoch_without_rewrapping() {
     .unwrap()
     .unwrap();
     assert_eq!(read, evidence);
-    assert_eq!(read.namespace.chat_id, "11:22");
+    assert_eq!(
+        read.namespace.chat_id,
+        canonical_chat_id(&read.first, &read.second).unwrap()
+    );
     tx.commit().unwrap();
 }
 
@@ -395,6 +414,68 @@ fn recovery_jobs_deduplicate_latest_and_exact_versions_with_durable_nonces() {
 }
 
 #[test]
+fn exact_recovery_job_read_ignores_schedule_and_queue_size_but_not_completion() {
+    let mut connection = database();
+    let evidence = escrow(1);
+    let tx = connection.transaction().unwrap();
+    for version in 1..=501 {
+        let mut nonce = [0; 32];
+        nonce[..8].copy_from_slice(&i64::to_be_bytes(version));
+        enqueue_recovery_in_tx(
+            &tx,
+            LocalUserId(7),
+            &evidence.first,
+            &evidence.second,
+            Some(version),
+            &nonce,
+            0,
+        )
+        .unwrap();
+    }
+    let id = enqueue_recovery_in_tx(
+        &tx,
+        LocalUserId(7),
+        &evidence.first,
+        &evidence.second,
+        None,
+        &[9; 32],
+        i64::MAX,
+    )
+    .unwrap();
+    let duplicate = enqueue_recovery_in_tx(
+        &tx,
+        LocalUserId(7),
+        &evidence.second,
+        &evidence.first,
+        None,
+        &[8; 32],
+        0,
+    )
+    .unwrap();
+    assert_eq!(id, duplicate);
+    tx.commit().unwrap();
+    let job = recovery_job_by_id_on(&connection, id).unwrap().unwrap();
+    assert_eq!(job.nonce, vec![9; 32]);
+    assert_eq!(job.next_at, i64::MAX);
+    let due: Vec<_> = connection.prepare("SELECT id,storage_owner,first_principal,second_principal,version,nonce,attempts,next_at FROM chat_secret_recovery_jobs WHERE done_at IS NULL AND next_at<=?1 ORDER BY next_at,id LIMIT 500").unwrap()
+        .query_map([sync::now_millis()], recovery_job_row).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(due.len(), 500);
+    assert!(!due.iter().any(|candidate| candidate.id == id));
+    connection
+        .execute(
+            "UPDATE chat_secret_recovery_jobs SET next_at=0 WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+    let job = recovery_job_by_id_on(&connection, id).unwrap().unwrap();
+    assert_eq!(job.nonce, vec![9; 32]);
+    let tx = connection.transaction().unwrap();
+    assert!(complete_recovery_job_in_tx(&tx, &job).unwrap());
+    tx.commit().unwrap();
+    assert!(recovery_job_by_id_on(&connection, id).unwrap().is_none());
+}
+
+#[test]
 fn missing_hosted_state_and_purge_intent_fail_closed() {
     let mut connection = database();
     let evidence = escrow(1);
@@ -448,7 +529,8 @@ fn digest_is_format_bound_and_each_original_recipient_is_checked() {
         operation_digest(RelayFormat::TauSignedRelayV1, &evidence.original_frame)
     );
     let mut changed = evidence.clone();
-    changed.envelopes[1].recipient_id = OriginalRecipientId::Numeric(11);
+    changed.envelopes[1].recipient_id =
+        OriginalRecipientId::Principal(principal_key(&changed.first).unwrap());
     assert!(changed.validate().is_err());
     let mut changed = evidence;
     changed.envelopes.swap(0, 1);
@@ -509,19 +591,73 @@ fn acceptance_marker_survives_lost_escrow_and_rejects_reinitialization() {
 }
 
 #[test]
-fn legacy_numeric_collisions_fail_without_partially_staged_evidence() {
+fn canonical_epochs_remain_separate_when_numeric_ids_collide() {
     let mut connection = database();
+    let authority_c = "omega-key:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     connection
-        .execute("INSERT INTO principals VALUES(303,'authority-c',11)", [])
+        .execute("INSERT INTO principals VALUES(303,?1,11)", [authority_c])
         .unwrap();
     let evidence = escrow(1);
+    let mut other = evidence.clone();
+    other.first = evidence.second.clone();
+    other.second = principal(authority_c, evidence.first.user_id);
+    other.signer = other.second.clone();
+    other.namespace.chat_id = canonical_chat_id(&other.first, &other.second).unwrap();
+    other.namespace.secret_id = e2ee_storage::principal_secret_id(&other.namespace.chat_id);
+    other.message_id = "another-conversation".into();
+    other.original_frame.push(99);
+    other.operation_digest = operation_digest(other.format, &other.original_frame);
+    for (copy, owner) in other
+        .envelopes
+        .iter_mut()
+        .zip([&other.first, &other.second])
+    {
+        copy.owner = owner.clone();
+        copy.recipient_id = OriginalRecipientId::Principal(principal_key(owner).unwrap());
+    }
     let tx = connection.transaction().unwrap();
-    assert!(matches!(
-        stage_escrow_in_tx(&tx, &evidence),
-        Err(StorageError::MessageUnauthorized)
-    ));
+    commit_escrow_in_tx(&tx, &evidence).unwrap();
+    commit_escrow_in_tx(&tx, &other).unwrap();
+    assert_eq!(count(&tx, "chat_secret_epochs"), 2);
+    for expected in [&evidence, &other] {
+        assert_eq!(
+            escrow_for_recovery_on(
+                &tx,
+                &expected.first,
+                &expected.second,
+                &expected.first,
+                Some(1)
+            )
+            .unwrap()
+            .as_ref(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn numeric_namespaces_and_numeric_recipient_evidence_are_rejected() {
+    let mut connection = database();
+    let mut evidence = escrow(1);
+    evidence.namespace.chat_id = "11:22".into();
+    evidence.namespace.secret_id = "chat:11:22:main".into();
+    let tx = connection.transaction().unwrap();
+    assert!(stage_escrow_in_tx(&tx, &evidence).is_err());
     assert_eq!(count(&tx, "chat_secret_epochs"), 0);
     assert_eq!(count(&tx, "chat_secret_escrows"), 0);
+    assert!(serde_json::from_str::<OriginalRecipientId>(r#"{"Numeric":11}"#).is_err());
+}
+
+#[test]
+fn escrow_rejects_unknown_evidence_fields() {
+    let evidence = serde_json::to_value(escrow(1)).unwrap();
+    let mut changes = [evidence.clone(), evidence.clone(), evidence];
+    changes[0]["unexpected"] = true.into();
+    changes[1]["namespace"]["unexpected"] = true.into();
+    changes[2]["envelopes"][0]["unexpected"] = true.into();
+    for changed in changes {
+        assert!(serde_json::from_value::<Escrow>(changed).is_err());
+    }
 }
 
 #[test]
@@ -676,7 +812,7 @@ fn initialization_history_scan_filters_unrelated_work_and_rejects_overflow() {
             let mut statement = tx.prepare(INITIALIZATION_INBOX_SQL).unwrap();
             assert!(
                 !statement
-                    .query(params![101, 202, chat_id, "principal:101:202", "11:22"])
+                    .query(params![101, 202, chat_id])
                     .unwrap()
                     .next()
                     .unwrap()
@@ -700,10 +836,7 @@ fn initialization_history_scan_filters_unrelated_work_and_rejects_overflow() {
     let plan: Vec<String> = connection
         .prepare(&format!("EXPLAIN QUERY PLAN {INITIALIZATION_INBOX_SQL}"))
         .unwrap()
-        .query_map(
-            params![101, 202, chat_id, "principal:101:202", "11:22"],
-            |row| row.get(3),
-        )
+        .query_map(params![101, 202, chat_id], |row| row.get(3))
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
@@ -712,10 +845,7 @@ fn initialization_history_scan_filters_unrelated_work_and_rejects_overflow() {
     let functions: Vec<String> = connection
         .prepare(&format!("EXPLAIN {INITIALIZATION_INBOX_SQL}"))
         .unwrap()
-        .query_map(
-            params![101, 202, chat_id, "principal:101:202", "11:22"],
-            |row| row.get(1),
-        )
+        .query_map(params![101, 202, chat_id], |row| row.get(1))
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();

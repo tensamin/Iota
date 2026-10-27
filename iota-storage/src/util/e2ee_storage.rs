@@ -108,122 +108,6 @@ pub(crate) fn import_legacy_database(
     Ok(())
 }
 
-pub fn migrate_chat_secret_namespace(
-    user_id: &str,
-    legacy_chat_id: &str,
-    legacy_secret_id: &str,
-    principal_chat_id: &str,
-    principal_secret_id: &str,
-) -> Result<(), StorageError> {
-    db::with_immediate_transaction(|tx| {
-        migrate_chat_secret_namespace_in_tx(
-            tx,
-            user_id,
-            legacy_chat_id,
-            legacy_secret_id,
-            principal_chat_id,
-            principal_secret_id,
-        )
-    })
-    .map_err(|error| error.to_string())
-}
-
-pub fn migrate_chat_secret_namespace_in_tx(
-    tx: &Transaction<'_>,
-    user_id: &str,
-    legacy_chat_id: &str,
-    legacy_secret_id: &str,
-    principal_chat_id: &str,
-    principal_secret_id: &str,
-) -> Result<(), TransactionError> {
-    if [
-        user_id,
-        legacy_chat_id,
-        legacy_secret_id,
-        principal_chat_id,
-        principal_secret_id,
-    ]
-    .iter()
-    .any(|value| value.is_empty())
-    {
-        return Err(TransactionError::Other(
-            "chat secret namespace is incomplete".into(),
-        ));
-    }
-    use base64::Engine as _;
-    let encoded = principal_chat_id.strip_prefix("principal:").ok_or(
-        TransactionError::InvalidRelayPayload("principal chat namespace"),
-    )?;
-    let pair: [iota_identity::PrincipalId; 2] = serde_json::from_slice(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(encoded)
-            .map_err(|_| TransactionError::InvalidRelayPayload("principal chat namespace"))?,
-    )
-    .map_err(|_| TransactionError::InvalidRelayPayload("principal chat namespace"))?;
-    if super::chat_secret_recovery::canonical_chat_id(&pair[0], &pair[1])? != principal_chat_id
-        || principal_secret_id != self::principal_secret_id(principal_chat_id)
-    {
-        return Err(TransactionError::ChatSecretConflict);
-    }
-    let identities = pair.map(|id| (id.authority.as_str().to_owned(), id.user_id as i64));
-    // Numeric legacy namespaces authenticate a pair only when each numeric ID
-    // has one canonical meaning. Never copy another authority's secret by ID.
-    if identities[0].0 != identities[1].0 {
-        return Ok(());
-    }
-    let first = identities[0].1.min(identities[1].1);
-    let second = identities[0].1.max(identities[1].1);
-    if legacy_chat_id != format!("{first}:{second}")
-        || legacy_secret_id != format!("chat:{legacy_chat_id}:main")
-    {
-        return Err(TransactionError::ChatSecretConflict);
-    }
-    let meanings: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM principals WHERE remote_user_id IN (?1, ?2)",
-        params![first, second],
-        |row| row.get(0),
-    )?;
-    if meanings != 2 {
-        return Ok(());
-    }
-    let conflict: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM chat_secrets legacy JOIN chat_secrets canonical
-            ON canonical.user_id = legacy.user_id AND canonical.version = legacy.version
-            AND canonical.chat_id = ?4 AND canonical.secret_id = ?5
-         WHERE legacy.user_id = ?1 AND legacy.chat_id = ?2 AND legacy.secret_id = ?3
-            AND (canonical.encrypted_secret <> legacy.encrypted_secret
-                OR canonical.kem_ciphertext <> legacy.kem_ciphertext
-                OR canonical.wrapping_scheme <> legacy.wrapping_scheme))",
-        params![
-            user_id,
-            legacy_chat_id,
-            legacy_secret_id,
-            principal_chat_id,
-            principal_secret_id
-        ],
-        |row| row.get(0),
-    )?;
-    if conflict {
-        return Err(TransactionError::ChatSecretConflict);
-    }
-    tx.execute(
-        "INSERT OR IGNORE INTO chat_secrets (
-            user_id, chat_id, secret_id, version, encrypted_secret, kem_ciphertext,
-            wrapping_scheme, created_at, updated_at
-         ) SELECT user_id, ?4, ?5, version, encrypted_secret, kem_ciphertext,
-            wrapping_scheme, created_at, updated_at FROM chat_secrets
-         WHERE user_id = ?1 AND chat_id = ?2 AND secret_id = ?3",
-        params![
-            user_id,
-            legacy_chat_id,
-            legacy_secret_id,
-            principal_chat_id,
-            principal_secret_id
-        ],
-    )?;
-    Ok(())
-}
-
 pub fn put_chat_secret(record: StoredChatSecret) -> Result<(), StorageError> {
     put_chat_secrets(&[record])
 }
@@ -520,7 +404,16 @@ mod tests {
     #[test]
     fn chat_secret_namespace_uses_principals() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
-        connection.execute_batch("CREATE TABLE principals(principal_pk INTEGER,authority_id TEXT,remote_user_id INTEGER); INSERT INTO principals VALUES(3,'authority-a',11),(9,'authority-b',22);").unwrap();
+        connection.execute_batch("CREATE TABLE principals(principal_pk INTEGER,authority_id TEXT,remote_user_id INTEGER);").unwrap();
+        connection
+            .execute(
+                "INSERT INTO principals VALUES(3,?1,11),(9,?2,22)",
+                rusqlite::params![
+                    format!("omega-key:{}", "a".repeat(64)),
+                    format!("omega-key:{}", "b".repeat(64))
+                ],
+            )
+            .unwrap();
         let first =
             super::principal_chat_id_on(&connection, PrincipalHandle(3), PrincipalHandle(9))
                 .unwrap();

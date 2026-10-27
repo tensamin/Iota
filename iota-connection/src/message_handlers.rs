@@ -12,7 +12,6 @@ pub use messages::{
 mod setting_handlers;
 #[cfg(test)]
 use setting_handlers::parse_setting_locator;
-use setting_handlers::synced_setting_value;
 pub use setting_handlers::{
     handle_global_settings_load, handle_global_settings_save, handle_settings_list,
     handle_settings_load, handle_settings_save, handle_synced_setting_delete,
@@ -20,11 +19,12 @@ pub use setting_handlers::{
 };
 mod chat_secrets;
 use chat_secrets::contact_value;
-pub use chat_secrets::{handle_get_chat_secret, validated_chat_secret_read_target};
+pub use chat_secrets::{
+    ChatSecretReadError, handle_get_chat_secret, read_chat_secret,
+    validated_chat_secret_read_target,
+};
 mod account_state;
 use account_state::add_receipt_policy_data;
-#[cfg(test)]
-use account_state::{contact_ids_value, read_fenced_snapshot};
 pub use account_state::{
     handle_account_state_applied, handle_account_state_request, handle_relay_receipt_page,
 };
@@ -33,7 +33,6 @@ pub use identity::handle_user_resolve;
 mod notifications;
 pub use notifications::handle_read_notification;
 mod communities;
-use communities::community_values;
 pub use communities::{handle_add_community, handle_get_communities, handle_remove_community};
 mod blobs;
 pub use blobs::{
@@ -61,7 +60,6 @@ pub use calls::{
 };
 
 use crate::message_common::*;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use iota_identity::{NodeIdentityResolver, PrincipalStore};
 use iota_logger::{LogLevel, PrintType, log_event};
 use iota_storage::storage_error::StorageError;

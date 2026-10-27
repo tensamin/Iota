@@ -10,64 +10,10 @@ use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use rusqlite::{Transaction, params};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) enum ApplicationOperation {
-    MessageSend {
-        content: String,
-        send_time: i64,
-        height: i64,
-        version: i64,
-        reply_to: Option<i64>,
-    },
-    MessageEdit {
-        content: String,
-        send_time: i64,
-        version: i64,
-    },
-    MessageReactionAdd {
-        reaction: String,
-        send_time: i64,
-    },
-    MessageReactionRemove {
-        reaction: String,
-        send_time: i64,
-    },
-    MessageDelete {
-        send_time: i64,
-    },
-    MessageDeleteLive {
-        send_time: i64,
-    },
-    MessageState {
-        message_id: String,
-        state: MessageState,
-        event_at: i64,
-    },
-    MessageReceived {
-        message_id: String,
-        event_at: i64,
-    },
-    SetChatSecret {
-        chat_id: String,
-        legacy_chat_id: Option<String>,
-        version: i64,
-        wrapping_scheme: String,
-        sender: SecretCopy,
-        recipient: SecretCopy,
-    },
-    AddConversation {
-        name: Option<String>,
-    },
-}
+pub(crate) use tau_relay_protocol::application::{ApplicationOperation, SecretCopy};
 
 #[cfg(test)]
 mod tests;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct SecretCopy {
-    pub(crate) encrypted_secret: Vec<u8>,
-    pub(crate) kem_ciphertext: Vec<u8>,
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct LocalEffect {
@@ -109,6 +55,7 @@ impl OriginLease {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PreparedRelayOperation {
+    pub(crate) principal_fences: [iota_storage::identity::PrincipalCommitFence; 2],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) origin_lease: Option<OriginLease>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,6 +72,7 @@ pub(crate) struct PreparedRelayOperation {
     pub frame: Vec<u8>,
     pub frame_id: u32,
     pub type_map_version: String,
+    pub type_map_fingerprint: String,
     pub(crate) operation: ApplicationOperation,
     pub(crate) effects: Vec<LocalEffect>,
     pub(crate) delivery: DeliveryTarget,
@@ -224,6 +172,8 @@ fn prepare_application_inner(
         .content
         .as_ref()
         .ok_or_else(|| invalid("durable replay has no fresh application"))?;
+    ApplicationOperation::validate_frame_shape(frame)
+        .map_err(|_| invalid("application field schema"))?;
     let signer_id = verified.signer.principal.user_id;
     let recipient_id = verified.recipient.principal.user_id;
     let signer_identity = crate::federated_relay::protocol_principal(&verified.signer.principal);
@@ -267,7 +217,6 @@ fn prepare_application_inner(
             let actual = value
                 .as_number()
                 .and_then(|v| u64::try_from(v).ok())
-                .or_else(|| value.as_str().and_then(|v| v.parse::<u64>().ok()))
                 .ok_or_else(|| invalid("inner identity"))?;
             if actual != expected {
                 return Err(StorageError::MessageUnauthorized);
@@ -396,33 +345,17 @@ fn prepare_application_inner(
                 return Err(StorageError::MessageUnauthorized);
             }
             let chat_id = text(frame, DataType::ChatId)?;
-            let numeric_chat_id = format!(
-                "{}:{}",
-                signer_id.min(recipient_id),
-                signer_id.max(recipient_id)
-            );
-            let numeric_namespace = chat_id == numeric_chat_id;
-            if (chat_id
-                != tau_relay_protocol::canonical_chat_id(&signer_identity, &recipient_identity)
-                && !numeric_namespace)
+            let pair = tau_relay_protocol::ConversationPair::from_chat_id(&chat_id)
+                .map_err(|_| invalid("secret namespace"))?;
+            if pair
+                != tau_relay_protocol::ConversationPair::new(
+                    signer_identity.clone(),
+                    recipient_identity.clone(),
+                )
+                .map_err(|_| invalid("secret principals"))?
                 || text(frame, DataType::SecretId)? != tau_relay_protocol::chat_secret_id(&chat_id)
-                || (numeric_namespace && signer_id == recipient_id)
             {
                 return Err(invalid("secret namespace"));
-            }
-            if numeric_namespace {
-                // A numeric namespace must have exactly one meaning in this
-                // database, including all other known authorities.
-                let unambiguous = db::with_db(|connection| {
-                    Ok(connection.query_row(
-                        "SELECT COUNT(*) FROM principals WHERE remote_user_id IN (?1,?2)",
-                        params![signer_id as i64, recipient_id as i64],
-                        |row| row.get::<_, i64>(0),
-                    )? == 2)
-                })?;
-                if !unambiguous {
-                    return Err(StorageError::MessageUnauthorized);
-                }
             }
             let values = frame
                 .get_data(DataType::Recipients)
@@ -456,27 +389,7 @@ fn prepare_application_inner(
                 let field = |key: DataType| value.get_field(key.try_to_id(map)?);
                 let value =
                     field(DataType::UserId).ok_or_else(|| invalid("secret recipient identity"))?;
-                let id = if numeric_namespace {
-                    let id = value
-                        .as_number()
-                        .and_then(|id| u64::try_from(id).ok())
-                        .or_else(|| {
-                            value.as_str().and_then(|value| {
-                                value
-                                    .parse::<u64>()
-                                    .ok()
-                                    .filter(|id| value == id.to_string())
-                            })
-                        })
-                        .ok_or_else(|| invalid("numeric secret recipient identity"))?;
-                    if id == signer_id {
-                        signer_identity.clone()
-                    } else if id == recipient_id {
-                        recipient_identity.clone()
-                    } else {
-                        return Err(StorageError::MessageUnauthorized);
-                    }
-                } else {
+                let id = {
                     let encoded = value
                         .as_str()
                         .ok_or_else(|| invalid("secret recipient identity"))?;
@@ -498,16 +411,9 @@ fn prepare_application_inner(
                         .and_then(DataValue::as_bytes)
                         .ok_or_else(|| invalid("secret KEM"))?,
                 };
-                let original_id = match value.as_str() {
-                    Some(encoded)
-                        if encoded
-                            == serde_json::to_string(&id)
-                                .map_err(|_| invalid("secret recipient identity"))? =>
-                    {
-                        chat_secret_recovery::OriginalRecipientId::Principal(encoded.to_owned())
-                    }
-                    _ => chat_secret_recovery::OriginalRecipientId::Numeric(id.user_id),
-                };
+                let original_id = chat_secret_recovery::OriginalRecipientId::Principal(
+                    serde_json::to_string(&id).map_err(|_| invalid("secret recipient identity"))?,
+                );
                 if copies.iter().any(|(existing, _, _)| *existing == id) {
                     return Err(StorageError::MessageUnauthorized);
                 }
@@ -525,15 +431,6 @@ fn prepare_application_inner(
             secret_recipient_ids = Some([sender_original_id, recipient_original_id]);
             ApplicationOperation::SetChatSecret {
                 chat_id,
-                legacy_chat_id: (signer_identity.authority == recipient_identity.authority).then(
-                    || {
-                        format!(
-                            "{}:{}",
-                            signer_id.min(recipient_id),
-                            signer_id.max(recipient_id)
-                        )
-                    },
-                ),
                 version,
                 wrapping_scheme: text(frame, DataType::WrappingScheme)?,
                 sender: sender_copy,
@@ -622,6 +519,11 @@ fn prepare_application_inner(
             message_id: verified.message_id.clone(),
             operation_digest: chat_secret_recovery::operation_digest(format, &original_frame),
             original_frame,
+            original_type_map_fingerprint: verified
+                .frame
+                .type_map()
+                .and_then(|map| map.fingerprint_hex())
+                .ok_or_else(|| invalid("original verified dictionary"))?,
             original_type_map_version: verified
                 .frame
                 .type_map()
@@ -636,6 +538,17 @@ fn prepare_application_inner(
         None
     };
     Ok(PreparedRelayOperation {
+        principal_fences: [
+            iota_storage::identity::PrincipalCommitFence::capture(&verified.signer)
+                .map_err(|_| StorageError::MessageUnauthorized)?,
+            iota_storage::identity::PrincipalCommitFence::capture(&verified.recipient)
+                .map_err(|_| StorageError::MessageUnauthorized)?,
+        ],
+        type_map_fingerprint: verified
+            .frame
+            .type_map()
+            .and_then(|map| map.fingerprint_hex())
+            .ok_or_else(|| invalid("verified dictionary identity"))?,
         origin_lease: None,
         secret_escrow,
         signer: verified.signer.handle,
@@ -760,21 +673,6 @@ impl PreparedRelayOperation {
                 version,
                 reply_to,
             } => {
-                let legacy = if sender < recipient {
-                    format!("{sender}:{recipient}")
-                } else {
-                    format!("{recipient}:{sender}")
-                };
-                if self.signer_identity.authority == self.recipient_identity.authority {
-                    e2ee_storage::migrate_chat_secret_namespace_in_tx(
-                        tx,
-                        &owner.to_string(),
-                        &legacy,
-                        &format!("chat:{legacy}:main"),
-                        &chat_id,
-                        &e2ee_storage::principal_secret_id(&chat_id),
-                    )?;
-                }
                 let secret = e2ee_storage::get_chat_secret_on(
                     tx,
                     &e2ee_storage::ChatSecretQuery {
@@ -825,17 +723,6 @@ impl PreparedRelayOperation {
             } => {
                 // Edits carry the replacement ciphertext's epoch, including
                 // historical epochs. Do not require the latest/original key.
-                let legacy = format!("{}:{}", sender.min(recipient), sender.max(recipient));
-                if self.signer_identity.authority == self.recipient_identity.authority {
-                    e2ee_storage::migrate_chat_secret_namespace_in_tx(
-                        tx,
-                        &owner.to_string(),
-                        &legacy,
-                        &format!("chat:{legacy}:main"),
-                        &chat_id,
-                        &e2ee_storage::principal_secret_id(&chat_id),
-                    )?;
-                }
                 chat_files::require_edit_key_in_tx(tx, owner, &chat_id, *version)?;
                 if effect.sent_by_self {
                     chat_files::edit_message_for_principal_versioned_in_tx(
@@ -924,23 +811,13 @@ impl PreparedRelayOperation {
                 external_principal,
                 name.as_deref(),
             )?,
-            ApplicationOperation::SetChatSecret { legacy_chat_id, .. } => {
+            ApplicationOperation::SetChatSecret { .. } => {
                 let escrow = self
                     .secret_escrow
                     .as_ref()
                     .ok_or(StorageError::MissingRelayDependency)?;
                 chat_secret_recovery::commit_escrow_in_tx(tx, escrow)?;
                 let secret = self.secret_for(effect)?;
-                if let Some(legacy_chat_id) = legacy_chat_id {
-                    e2ee_storage::migrate_chat_secret_namespace_in_tx(
-                        tx,
-                        &owner.to_string(),
-                        legacy_chat_id,
-                        &format!("chat:{legacy_chat_id}:main"),
-                        &secret.chat_id,
-                        &secret.secret_id,
-                    )?;
-                }
                 e2ee_storage::put_chat_secret_in_tx(tx, &secret)?;
                 chat_secret_recovery::enqueue_secret_available_in_tx(tx, effect.owner, escrow)?;
             }
@@ -1032,84 +909,103 @@ impl PreparedRelayOperation {
         claim: &relay_replay::ProcessingClaim,
         check: impl FnOnce(&Transaction<'_>) -> Result<(), StorageError>,
     ) -> Result<(), StorageError> {
+        db::with_immediate_transaction(|tx| self.commit_in_tx(tx, claim, false, check))
+    }
+
+    pub(crate) fn commit_in_tx(
+        &self,
+        tx: &Transaction<'_>,
+        claim: &relay_replay::ProcessingClaim,
+        durable_origin: bool,
+        check: impl FnOnce(&Transaction<'_>) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
         if claim.signer != self.signer || claim.message_id != self.message_id {
             return Err(StorageError::StaleRelayClaim);
         }
-        db::with_immediate_transaction(|tx| {
-            relay_replay::verify_claim_in_tx(tx, claim)?;
-            self.validate_origin_lease()?;
-            if let Some(lease) = &self.origin_lease {
+        relay_replay::verify_claim_in_tx(tx, claim)?;
+        self.verify_principal_fences_on(tx)?;
+        self.validate_origin_lease()?;
+        if let Some(lease) = &self.origin_lease {
+            if durable_origin {
+                // Proposal persistence already verified the live session.
+                // Restart may retire that session, but not account authority.
+                let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM hosted_auth_state a JOIN hosted_principals h ON h.local_user_id=a.local_user_id JOIN principals p ON p.principal_pk=h.principal_handle WHERE a.local_user_id=?1 AND a.generation=?2 AND a.enabled=1 AND h.principal_handle=?3 AND p.retired_at IS NULL)",
+                        params![lease.owner.0,lease.auth_generation,lease.principal.0], |row| row.get(0))?;
+                if !valid {
+                    return Err(StorageError::HostedAuthorizationDenied);
+                }
+                relay_work::verify_owner_in_tx(tx, lease.owner.0, lease.principal)?;
+            } else {
                 iota_storage::hosted_auth::verify_in_tx(tx, &lease.authorization())?;
             }
-            check(tx)?;
-            for (handle, identity) in [
-                (self.signer, &self.signer_identity),
-                (self.recipient, &self.recipient_identity),
-            ] {
-                let matches: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM principals WHERE principal_pk = ?1 AND authority_id = ?2 AND remote_user_id = ?3)",
+        }
+        check(tx)?;
+        for (handle, identity) in [
+            (self.signer, &self.signer_identity),
+            (self.recipient, &self.recipient_identity),
+        ] {
+            let matches: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM principals WHERE principal_pk = ?1 AND authority_id = ?2 AND remote_user_id = ?3)",
                     params![handle.0, identity.authority, identity.user_id as i64], |row| row.get(0))?;
-                if !matches {
-                    return Err(StorageError::PendingRelayConflict);
+            if !matches {
+                return Err(StorageError::PendingRelayConflict);
+            }
+        }
+        for effect in &self.effects {
+            if !effect.sent_by_self {
+                let blocked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM blocked_users WHERE user_id = ?1 AND blocked_principal = ?2)", params![effect.owner.0, self.signer.0], |r| r.get(0))?;
+                if blocked {
+                    return Err(StorageError::MessageUnauthorized);
                 }
             }
-            for effect in &self.effects {
-                if !effect.sent_by_self {
-                    let blocked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM blocked_users WHERE user_id = ?1 AND blocked_principal = ?2)", params![effect.owner.0, self.signer.0], |r| r.get(0))?;
-                    if blocked {
-                        return Err(StorageError::MessageUnauthorized);
-                    }
-                }
-                if let ApplicationOperation::SetChatSecret { legacy_chat_id, .. } = &self.operation
-                    && effect.sent_by_self
-                    && matches!(self.delivery, DeliveryTarget::Remote(_))
-                {
-                    chat_secret_recovery::stage_escrow_in_tx(
-                        tx,
-                        self.secret_escrow
-                            .as_ref()
-                            .ok_or(StorageError::MissingRelayDependency)?,
-                    )?;
-                    relay_work::defer_secret_in_tx(
-                        tx,
-                        claim,
-                        &relay_work::DeferredSecret {
-                            owner: effect.owner.0,
-                            principal: effect.principal,
-                            legacy_chat_id: legacy_chat_id.clone(),
-                            secret: self.secret_for(effect)?,
-                        },
-                    )?;
-                    continue;
-                }
-                self.apply_in_tx(tx, effect)?;
-                if !matches!(
-                    self.operation,
-                    ApplicationOperation::SetChatSecret { .. }
-                        | ApplicationOperation::AddConversation { .. }
-                ) {
-                    iota_storage::util::relay_acceptance_receipts::insert_in_tx(
-                        tx,
-                        effect.owner.0,
-                        self.signer.0,
-                        &self.message_id,
-                        self.accepted_at,
-                    )?;
-                }
-                relay_work::fault_point("after_local_mutation", &self.message_id);
+            if let ApplicationOperation::SetChatSecret { .. } = &self.operation
+                && effect.sent_by_self
+                && matches!(self.delivery, DeliveryTarget::Remote(_))
+            {
+                chat_secret_recovery::stage_escrow_in_tx(
+                    tx,
+                    self.secret_escrow
+                        .as_ref()
+                        .ok_or(StorageError::MissingRelayDependency)?,
+                )?;
+                relay_work::defer_secret_in_tx(
+                    tx,
+                    claim,
+                    &relay_work::DeferredSecret {
+                        owner: effect.owner.0,
+                        principal: effect.principal,
+                        secret: self.secret_for(effect)?,
+                    },
+                )?;
+                continue;
             }
-            self.publish_delivery_in_tx(tx)?;
-            relay_work::fault_point("after_queue_publication", &self.message_id);
-            for effect in self.effects.iter().filter(|effect| effect.sent_by_self) {
-                outgoing_relay::apply_outgoing_history_policy_in_tx(
+            self.apply_in_tx(tx, effect)?;
+            if !matches!(
+                self.operation,
+                ApplicationOperation::SetChatSecret { .. }
+                    | ApplicationOperation::AddConversation { .. }
+            ) {
+                iota_storage::util::relay_acceptance_receipts::insert_in_tx(
                     tx,
                     effect.owner.0,
-                    self.signer,
+                    self.signer.0,
                     &self.message_id,
+                    self.accepted_at,
                 )?;
             }
-            relay_replay::complete_application_in_tx(tx, claim)?;
-            relay_replay::mark_queued_in_tx(tx, self.signer, &self.message_id)
-        })
+            relay_work::fault_point("after_local_mutation", &self.message_id);
+        }
+        self.publish_delivery_in_tx(tx)?;
+        relay_work::fault_point("after_queue_publication", &self.message_id);
+        for effect in self.effects.iter().filter(|effect| effect.sent_by_self) {
+            outgoing_relay::apply_outgoing_history_policy_in_tx(
+                tx,
+                effect.owner.0,
+                self.signer,
+                &self.message_id,
+            )?;
+        }
+        relay_replay::complete_application_in_tx(tx, claim)?;
+        relay_replay::mark_queued_in_tx(tx, self.signer, &self.message_id)
     }
 
     fn publish_delivery_in_tx(&self, tx: &Transaction<'_>) -> Result<(), StorageError> {
@@ -1148,6 +1044,32 @@ impl PreparedRelayOperation {
             self.frame_id,
             &self.type_map_version,
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn verify_principal_fences_on(
+        &self,
+        connection: &rusqlite::Connection,
+    ) -> Result<(), StorageError> {
+        for (fence, handle, identity) in [
+            (
+                &self.principal_fences[0],
+                self.signer,
+                &self.signer_identity,
+            ),
+            (
+                &self.principal_fences[1],
+                self.recipient,
+                &self.recipient_identity,
+            ),
+        ] {
+            if fence.handle != handle
+                || crate::federated_relay::protocol_principal(&fence.principal) != *identity
+            {
+                return Err(StorageError::MessageUnauthorized);
+            }
+            fence.verify_on(connection)?;
+        }
         Ok(())
     }
 

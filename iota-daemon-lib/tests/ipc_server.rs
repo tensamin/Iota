@@ -182,7 +182,13 @@ impl OmikronClient for TestOmikron {
 }
 
 fn active_services() -> Arc<DaemonServices> {
-    DaemonServices::with_centralized_client(Arc::new(TestOmikron))
+    DaemonServices::with_centralized_client(
+        Arc::new(TestOmikron),
+        iota_identity::AuthorityId::for_omega(
+            &mtp::crypto::Keyring::generate().public_key_bundle(),
+        )
+        .unwrap(),
+    )
 }
 
 #[tokio::test]

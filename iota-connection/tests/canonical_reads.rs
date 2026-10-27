@@ -3,7 +3,7 @@ use iota_connection::message_handlers::*;
 use iota_identity::*;
 use iota_storage::{
     identity::SqlitePrincipalStore,
-    util::{db, e2ee_storage},
+    util::{chat_secret_recovery as recovery, db, e2ee_storage},
 };
 use iota_util::mtp_compat::OptionalDataValueExt;
 use mtp::{
@@ -67,7 +67,7 @@ async fn canonical_reads_bind_owner_aliases_secrets_and_node_keys() {
             user_id: 7,
         },
         PrincipalId {
-            authority: AuthorityId::new("other-authority").unwrap(),
+            authority: AuthorityId::new(format!("omega-key:{}", "c".repeat(64))).unwrap(),
             user_id: 7,
         },
     ];
@@ -110,32 +110,55 @@ async fn canonical_reads_bind_owner_aliases_secrets_and_node_keys() {
     )
     .unwrap();
     let owner_json = serde_json::to_string(&ids[0]).unwrap();
-    let snapshot = handle_account_state_request(&request(C::AccountStateRequest));
-    assert!(snapshot.is_type(C::AccountStateSnapshot), "{snapshot:?}");
-    assert_eq!(string(&snapshot, D::Principal), owner_json);
-    assert_eq!(string(&snapshot, D::UserAddress), owner_json);
+    let map = mtp::codec::TypeMap::new(mtp::type_map::Version(1, 0));
+    let snapshot_request = tau::sync::encode_request(
+        &tau::sync::Request::Snapshot {
+            scope: tau::sync::Scope {
+                principal: tau_relay_protocol::Principal::try_from(&ids[0]).unwrap(),
+                device_id: "canonical-reads".into(),
+                authorization_generation: iota_storage::hosted_auth::resolve(LocalUserId(1))
+                    .unwrap()
+                    .0
+                    .auth_generation,
+                schema: tau::sync::SCHEMA.into(),
+                dictionary: tau_relay_protocol::dictionary_fingerprint("1.0").unwrap(),
+            },
+            page: None,
+            limit: 128,
+        },
+        &map,
+        7,
+    )
+    .unwrap()
+    .with_sender(1);
+    let snapshot = handle_account_state_request(&snapshot_request);
+    let tau::sync::Response::Snapshot { scope, records, .. } =
+        tau::sync::decode_response(&snapshot, &snapshot_request).unwrap()
+    else {
+        panic!("expected scoped snapshot: {snapshot:?}");
+    };
+    assert_eq!(serde_json::to_string(&scope.principal).unwrap(), owner_json);
     assert_eq!(
-        snapshot
-            .get_data(D::AcceptedIds)
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .len(),
-        0
+        records
+            .iter()
+            .filter(|record| record.entity == tau::sync::Entity::Contact)
+            .count(),
+        2
     );
-    let contacts = snapshot.get_data(D::Contacts).unwrap().as_array().unwrap();
-    assert_eq!(contacts.len(), 2);
-    let map = mtp::codec::TypeMap::latest();
-    for contact in contacts {
-        let field = |ty: D| contact.get_field(ty.try_to_id(&map).unwrap()).unwrap();
-        let alias = field(D::UserId).as_signed_number().unwrap() as i64;
-        let index = handles.iter().position(|handle| handle.0 == alias).unwrap();
+    for (index, handle) in handles.iter().enumerate().skip(1) {
+        let alias = handle.0;
+        let alias_text = alias.to_string();
+        let contact = records
+            .iter()
+            .find(|record| {
+                record.entity == tau::sync::Entity::Contact
+                    && record.value["principal_handle"] == alias_text
+            })
+            .unwrap();
         assert_eq!(
-            field(D::Principal).as_str().unwrap(),
-            serde_json::to_string(&ids[index]).unwrap()
+            contact.value["principal_handle_identity"],
+            serde_json::to_value(&ids[index]).unwrap()
         );
-        assert_eq!(field(D::Principal), field(D::UserAddress));
-        assert_eq!(field(D::Messages).as_array().unwrap().len(), 1);
         let expected_principal = serde_json::to_string(&ids[index]).unwrap();
         let assert_message = |message: &DataValue| {
             assert_eq!(
@@ -173,19 +196,17 @@ async fn canonical_reads_bind_owner_aliases_secrets_and_node_keys() {
                 }
             }
         };
-        assert_message(&field(D::Messages).as_array().unwrap()[0]);
-        let snapshot_messages = snapshot.get_data(D::Messages).unwrap().as_array().unwrap();
-        let snapshot_message = snapshot_messages
+        let snapshot_message = records
             .iter()
-            .find(|message| {
-                message
-                    .get_field(D::ChatPartnerId.try_to_id(&map).unwrap())
-                    .unwrap()
-                    .as_signed_number()
-                    == Some(alias.into())
+            .find(|record| {
+                record.entity == tau::sync::Entity::Message
+                    && record.value["external_principal"] == alias_text
             })
             .unwrap();
-        assert_message(snapshot_message);
+        assert_eq!(
+            snapshot_message.value["external_principal_identity"],
+            serde_json::to_value(&ids[index]).unwrap()
+        );
         let history = handle_messages_get(
             &request(C::MessagesGet)
                 .add_typed_default(D::UserId, DataValue::SignedNumber(alias.into()))
@@ -248,9 +269,16 @@ async fn canonical_reads_bind_owner_aliases_secrets_and_node_keys() {
         )
         .is_type(C::ErrorInternal)
     );
-    assert!(
-        handle_account_state_request(&request(C::AccountStateRequest)).is_type(C::ErrorInternal)
-    );
+    assert!(matches!(
+        tau::sync::decode_response(
+            &handle_account_state_request(&snapshot_request),
+            &snapshot_request
+        )
+        .unwrap(),
+        tau::sync::Response::Unavailable {
+            error: tau::sync::SyncError::Retryable
+        }
+    ));
     let wire = |index: usize| tau_relay_protocol::Principal {
         authority: ids[index].authority.as_str().into(),
         user_id: ids[index].user_id,
@@ -270,6 +298,36 @@ async fn canonical_reads_bind_owner_aliases_secrets_and_node_keys() {
         updated_at: now,
     })
     .unwrap();
+    let pair = recovery::sorted_pair(&ids[0], &ids[2]).unwrap();
+    let original_frame = vec![1, 2, 3];
+    let format = recovery::RelayFormat::NativeMtpSealedV1;
+    let escrow = recovery::Escrow {
+        first: pair[0].clone(),
+        second: pair[1].clone(),
+        version: 1,
+        namespace: recovery::WrappingNamespace {
+            chat_id: chat.clone(),
+            secret_id: secret.clone(),
+        },
+        wrapping_scheme: "test".into(),
+        signer: ids[0].clone(),
+        message_id: "canonical-read".into(),
+        operation_digest: recovery::operation_digest(format, &original_frame),
+        original_frame,
+        original_type_map_version: "1.0".into(),
+        original_type_map_fingerprint: tau_relay_protocol::dictionary_fingerprint("1.0").unwrap(),
+        format,
+        envelopes: pair.map(|owner| recovery::RecipientEnvelope {
+            recipient_id: recovery::OriginalRecipientId::Principal(
+                recovery::principal_key(&owner).unwrap(),
+            ),
+            owner,
+            encrypted_secret: vec![1, 2],
+            kem_ciphertext: vec![3, 4],
+        }),
+        created_at: now,
+    };
+    db::with_immediate_transaction(|tx| recovery::commit_escrow_in_tx(tx, &escrow)).unwrap();
     let read = request(C::GetChatSecret)
         .add_typed_default(D::UserId, DataValue::Str(owner_json.clone()))
         .add_typed_default(D::ChatId, DataValue::Str(chat.clone()))
@@ -281,7 +339,7 @@ async fn canonical_reads_bind_owner_aliases_secrets_and_node_keys() {
     assert_eq!(string(&response, D::UserId), owner_json);
     let wrong_owner = read.clone().with_sender(7);
     assert!(!handle_get_chat_secret(&wrong_owner).is_type(C::ChatSecretResponse));
-    let forged_owner = read.clone().add_typed_default(
+    let forged_owner = read.clone().with_data(
         D::UserId,
         DataValue::Str(serde_json::to_string(&ids[2]).unwrap()),
     );
@@ -298,7 +356,7 @@ async fn canonical_reads_bind_owner_aliases_secrets_and_node_keys() {
             D::SecretId,
             DataValue::Str(tau_relay_protocol::chat_secret_id(&not_owner_chat)),
         );
-    assert!(handle_get_chat_secret(&not_owner_read).is_type(C::ErrorNotFound));
+    assert!(handle_get_chat_secret(&not_owner_read).is_type(C::ErrorInvalidData));
     let other_chat = tau_relay_protocol::canonical_chat_id(&wire(0), &wire(1));
     let other_read = request(C::GetChatSecret)
         .add_typed_default(D::UserId, DataValue::Str(owner_json.clone()))

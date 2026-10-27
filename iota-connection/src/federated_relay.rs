@@ -1,6 +1,5 @@
 use iota_identity::{
-    AuthorityId, IdentityError, IdentityResolver, IotaNodeId, PrincipalId, ResolutionContext,
-    ResolvedPrincipal,
+    IdentityError, IdentityResolver, IotaNodeId, PrincipalId, ResolutionContext, ResolvedPrincipal,
 };
 use mtp::codec::{CommunicationValue, DataType, DataValue};
 use mtp::crypto::{Keyring, PublicKeyBundle};
@@ -101,15 +100,7 @@ pub fn protocol_principal(principal: &PrincipalId) -> tau_relay_protocol::Princi
 pub(crate) fn canonical_principal(
     principal: &tau_relay_protocol::Principal,
 ) -> Result<PrincipalId, IdentityError> {
-    if principal.user_id == 0 {
-        return Err(IdentityError::InvalidIdentifier(
-            "zero principal user ID".into(),
-        ));
-    }
-    Ok(PrincipalId {
-        authority: AuthorityId::new(&principal.authority)?,
-        user_id: principal.user_id,
-    })
+    PrincipalId::try_from(principal.clone())
 }
 
 fn protocol_error(error: tau_relay_protocol::Error) -> IdentityError {
@@ -135,32 +126,6 @@ fn native_error(error: mtp::codec::relay::RelayError) -> IdentityError {
     }
 }
 
-/// Native frames contain numeric principals only. Never guess an authority or
-/// reinterpret a numeric principal as an application-local database handle.
-pub(crate) fn unique_numeric_principal(id: u64) -> Result<ResolvedPrincipal, IdentityError> {
-    use iota_identity::PrincipalStore;
-    let id = i64::try_from(id)
-        .ok()
-        .filter(|id| *id > 0)
-        .ok_or_else(|| IdentityError::InvalidIdentifier("invalid native principal".into()))?;
-    let handles = iota_storage::util::db::with_db(|connection| {
-        let mut statement = connection
-            .prepare("SELECT principal_pk FROM principals WHERE remote_user_id = ?1 LIMIT 2")?;
-        Ok(statement
-            .query_map([id], |row| row.get::<_, i64>(0))?
-            .collect::<Result<Vec<_>, _>>()?)
-    })
-    .map_err(|error| IdentityError::Storage(error.to_string()))?;
-    if handles.len() != 1 {
-        return Err(IdentityError::InvalidDescriptor(
-            "native numeric principal is unknown or ambiguous".into(),
-        ));
-    }
-    iota_storage::identity::SqlitePrincipalStore
-        .get_principal(iota_identity::PrincipalHandle(handles[0]))?
-        .ok_or(IdentityError::NotFound)
-}
-
 pub(crate) async fn resolve_and_verify_native_for_ingress(
     frame: CommunicationValue,
     identities: &dyn IdentityResolver,
@@ -169,40 +134,18 @@ pub(crate) async fn resolve_and_verify_native_for_ingress(
 ) -> Result<VerifiedFederatedRelay, IdentityError> {
     use mtp::codec::{ProtectionPolicy, relay::*};
     let options = RelayOpenOptions::new(ProtectionPolicy::ed25519());
-    let invalid = native_error;
-    let claimed = relay_metadata_claimed_signer_id_with_options(
-        &frame,
-        &[keyring],
-        options.decode_limits,
-        options.protected_limits,
-    )
-    .map_err(invalid)?;
-    let context = ResolutionContext {
-        allow_network: true,
-        ..ResolutionContext::default()
-    };
-    let candidate = unique_numeric_principal(claimed)?;
-    let signer = identities
-        .resolve_principal_with_context(&candidate.principal, &context)
-        .await?;
-    if signer.principal != candidate.principal || signer.handle != candidate.handle {
+    let route =
+        tau_relay_protocol::unverified_native_route(&frame, keyring).map_err(protocol_error)?;
+    let signer_id = canonical_principal(&route.signer)?;
+    let signer = identities.resolve_current_principal(&signer_id).await?;
+    if signer.principal != signer_id {
         return Err(IdentityError::InvalidDescriptor(
             "native signer resolution changed identity".into(),
         ));
     }
-    let metadata = open_relay_metadata_with_limits_without_replay(
-        &frame,
-        &[keyring],
-        Some(claimed),
-        |id| (id == claimed).then(|| signer.public_keys.clone()),
-        options,
-    )
-    .map_err(invalid)?;
-    let candidate = unique_numeric_principal(metadata.final_recipient_id())?;
-    let recipient = identities
-        .resolve_principal_with_context(&candidate.principal, &context)
-        .await?;
-    if recipient.principal != candidate.principal || recipient.handle != candidate.handle {
+    let recipient_id = canonical_principal(&route.recipient)?;
+    let recipient = identities.resolve_current_principal(&recipient_id).await?;
+    if recipient.principal != recipient_id {
         return Err(IdentityError::InvalidDescriptor(
             "native recipient resolution changed identity".into(),
         ));
@@ -212,7 +155,9 @@ pub(crate) async fn resolve_and_verify_native_for_ingress(
             "native recipient has no Iota home".into(),
         ));
     };
-    if expected_destination.is_some_and(|expected| expected != destination) {
+    if destination.as_str() != route.destination
+        || expected_destination.is_some_and(|expected| expected != destination)
+    {
         return Err(IdentityError::InvalidDescriptor(
             "native destination is not this node".into(),
         ));
@@ -335,7 +280,6 @@ pub fn decode_and_verify_native_for_ingress(
         || signer.handle == recipient.handle
         || signer.principal.user_id == 0
         || recipient.principal.user_id == 0
-        || signer.principal.user_id == recipient.principal.user_id
         || !matches!(&recipient.home, iota_identity::PrincipalHome::Iota(home) if home == expected_destination)
     {
         return Err(IdentityError::InvalidDescriptor(
@@ -351,6 +295,24 @@ pub fn decode_and_verify_native_for_ingress(
         options,
     )
     .map_err(relay_error)?;
+    let map = frame
+        .type_map()
+        .ok_or_else(|| IdentityError::InvalidDescriptor("missing native dictionary".into()))?;
+    let route = tau_relay_protocol::NativeRelayRoute::from_metadata(
+        metadata.metadata().ok_or_else(|| {
+            IdentityError::InvalidDescriptor("missing canonical native route".into())
+        })?,
+        map,
+    )
+    .map_err(protocol_error)?;
+    if route.signer != protocol_principal(&signer.principal)
+        || route.recipient != protocol_principal(&recipient.principal)
+        || route.destination != expected_destination.as_str()
+    {
+        return Err(IdentityError::InvalidDescriptor(
+            "native canonical route mismatch".into(),
+        ));
+    }
     let content = open_relay_content_with_limits_without_replay(
         &metadata,
         &[keyring],

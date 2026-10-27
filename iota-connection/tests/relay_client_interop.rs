@@ -194,11 +194,11 @@ struct NativeClientFixture {
 }
 
 #[test]
-fn pinned_native_client_metadata_and_content_open_at_both_iotas() {
+fn native_rust_peer_metadata_and_content_open_at_both_iotas() {
     use iota_connection::federated_relay::decode_and_verify_native_for_ingress;
     use mtp::codec::{CommunicationType, ProtectionPolicy, relay::RelayOpenOptions};
 
-    let fixture: NativeClientFixture =
+    let mut fixture: NativeClientFixture =
         serde_json::from_slice(include_bytes!("fixtures/relay_native_client.json")).unwrap();
     assert_eq!(fixture.producer, "pinned-MTPClient.sendSealedRelay");
     assert_eq!(
@@ -211,10 +211,15 @@ fn pinned_native_client_metadata_and_content_open_at_both_iotas() {
         )
         .unwrap()
     });
+    // Keep the fixture's opaque recipient bytes, but generate a new operation
+    // with current Rust codecs. This is not a migration of its old signed frame.
+    let signing_keys = Keyring::generate();
+    fixture.signer_public_key = signing_keys.public_key_bundle().try_to_base64().unwrap();
     let signer_key = PublicKeyBundle::from_base64(&fixture.signer_public_key).unwrap();
+    let authority = AuthorityId::for_omega(&nodes[0].public_keys()).unwrap();
     let principal = |user_id, handle, home, keys| ResolvedPrincipal {
         principal: PrincipalId {
-            authority: AuthorityId::new("omega:central").unwrap(),
+            authority: authority.clone(),
             user_id,
         },
         handle: PrincipalHandle(handle),
@@ -228,6 +233,81 @@ fn pinned_native_client_metadata_and_content_open_at_both_iotas() {
     let signer = principal(11, 91, nodes[0].node_id().clone(), vec![signer_key]);
     let recipient = principal(22, 92, nodes[1].node_id().clone(), Vec::new());
     let map = TypeMap::new(mtp::type_map::Version::parse("1.0").unwrap());
+    let principals = [&signer.principal, &recipient.principal]
+        .map(|principal| tau_relay_protocol::Principal::try_from(principal).unwrap());
+    fixture.chat_id = tau_relay_protocol::canonical_chat_id(&principals[0], &principals[1]);
+    fixture.secret_id = tau_relay_protocol::chat_secret_id(&fixture.chat_id);
+    let copies = (0..2)
+        .map(|index| {
+            tau::typed_container(
+                &map,
+                vec![
+                    (
+                        DataType::UserId,
+                        DataValue::Str(serde_json::to_string(&principals[index]).unwrap()),
+                    ),
+                    (
+                        DataType::EncryptedSecret,
+                        DataValue::Bytes(
+                            STANDARD.decode(&fixture.encrypted_secrets[index]).unwrap(),
+                        ),
+                    ),
+                    (
+                        DataType::KemCiphertext,
+                        DataValue::Bytes(STANDARD.decode(&fixture.kem_ciphertexts[index]).unwrap()),
+                    ),
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+    let application = CommunicationValue::new_with_type_map(CommunicationType::SetChatSecret, &map)
+        .add_typed_default(DataType::ChatId, DataValue::Str(fixture.chat_id.clone()))
+        .add_typed_default(
+            DataType::SecretId,
+            DataValue::Str(fixture.secret_id.clone()),
+        )
+        .add_typed_default(DataType::VersionNumber, DataValue::UnsignedNumber(1))
+        .add_typed_default(DataType::WrappingScheme, DataValue::Str("fixture".into()))
+        .add_typed_default(DataType::Recipients, DataValue::Array(copies));
+    let route = tau_relay_protocol::NativeRelayRoute {
+        signer: principals[0].clone(),
+        recipient: principals[1].clone(),
+        destination: nodes[1].node_id().as_str().into(),
+        type_map_version: "1.0".into(),
+        type_map_fingerprint: map.fingerprint_hex().unwrap(),
+    };
+    let signing = mtp::crypto::Ed25519Signer::new(&signing_keys.sig_cl_secret_key).unwrap();
+    fixture.frame = STANDARD.encode(
+        mtp::codec::relay::SealedRelayBuilder::new(
+            CommunicationType::SetChatSecret,
+            application.payload().clone(),
+            11,
+            22,
+            nodes[0].node_id().mtp_authentication_hint(),
+            &signing,
+        )
+        .type_map(&map)
+        .message_id(1u128)
+        .created_at(iota_storage::util::sync::now_millis() as u64)
+        .metadata(route.to_metadata(&map).unwrap())
+        .metadata_recipients(
+            nodes
+                .each_ref()
+                .map(LocalNodeIdentity::public_keys)
+                .to_vec(),
+        )
+        .content_recipients(
+            nodes
+                .each_ref()
+                .map(LocalNodeIdentity::public_keys)
+                .to_vec(),
+        )
+        .build()
+        .unwrap()
+        .to_bytes()
+        .unwrap(),
+    );
     let bytes = STANDARD.decode(&fixture.frame).unwrap();
     let frame = CommunicationValue::try_from_bytes_with(&bytes, &map).unwrap();
     assert!(frame.payload().as_encrypted().is_some());

@@ -144,20 +144,31 @@ impl DaemonServices {
         Ok(services)
     }
 
-    pub fn new(
+    pub async fn new(
         omikron: Arc<OmikronConnection>,
         identity: iota_identity::LocalNodeIdentity,
     ) -> Result<Arc<Self>, IdentityError> {
         let client: Arc<dyn OmikronClient> = omikron.clone();
-        let authority =
-            AuthorityId::omega_legacy(&omikron_connector::omega_discovery::omega_host())
-                .map_err(|error| IdentityError::InvalidIdentifier(error.to_string()))?;
-        iota_storage::identity::SqlitePrincipalStore.migrate_legacy_omega_authority(&authority)?;
+        use other_iota::FederationIdentityClient;
+        let locator = AuthorityLocator::new(omikron_connector::omega_discovery::omega_host())?;
+        let web = iota_storage::util::config_util::CONFIG.load().web.clone();
+        let discovered = other_iota::HttpFederationIdentityClient::new(
+            web.allow_lan_federation,
+            web.allow_raw_ip_federation,
+        )
+        .discover(&locator)
+        .await?;
+        if discovered.service != AuthorityKind::Omega {
+            return Err(IdentityError::KeyPinMismatch);
+        }
+        let authority = discovered.authority_id;
+        iota_storage::identity::bind_omega_authority(&authority)?;
         let router: Arc<dyn PeerRouter> = Arc::new(
             omikron_connector::router::OmikronPeerRouter::new(client.clone()),
         );
         let services = Self::centralized(
             client,
+            authority,
             Some(router),
             Some(omikron.session_manager()),
             Some(Arc::new(StandaloneRelayIdentity(identity.clone()))),
@@ -173,13 +184,17 @@ impl DaemonServices {
         Ok(services)
     }
 
-    pub fn with_centralized_client(client: Arc<dyn OmikronClient>) -> Arc<Self> {
+    pub fn with_centralized_client(
+        client: Arc<dyn OmikronClient>,
+        authority: AuthorityId,
+    ) -> Arc<Self> {
         let inactive = Arc::new(InactiveServices);
-        Self::centralized(client, None, None, Some(inactive))
+        Self::centralized(client, authority, None, None, Some(inactive))
     }
 
     fn centralized(
         client: Arc<dyn OmikronClient>,
+        authority: AuthorityId,
         router: Option<Arc<dyn PeerRouter>>,
         sessions: Option<Arc<SessionManager>>,
         node_identity: Option<Arc<dyn RelayNodeIdentity>>,
@@ -189,8 +204,6 @@ impl DaemonServices {
         let local_users: Arc<dyn LocalUserStore> =
             Arc::new(iota_storage::identity::SqliteLocalUserStore);
         let omega_host = omikron_connector::omega_discovery::omega_host();
-        let authority = AuthorityId::omega_legacy(&omega_host)
-            .expect("the configured Omega authority ID is valid");
         let locator = AuthorityLocator::new(omega_host)
             .expect("the configured Omega host is a valid authority locator");
         let local_identity: Arc<dyn IdentityResolver> =
@@ -365,12 +378,40 @@ fn start_chat_secret_recovery(
             // Subsequent ticks also recover after peer reconnect without holding
             // a SQLite transaction across any network operation.
             let mut timer = tokio::time::interval(std::time::Duration::from_secs(2));
+            let mut ticks = 0u32;
             loop {
                 timer.tick().await;
                 let Some(recovery) = recovery.upgrade() else {
                     break;
                 };
                 recovery.retry_pending().await;
+                if ticks.is_multiple_of(30) {
+                    match iota_storage::util::chat_secret_recovery::recovery_health() {
+                        Ok(health) => iota_logger::log!(
+                            "Chat secret recovery health: {:?}; explicit [attempted,deferred]={:?}",
+                            health,
+                            iota_connection::chat_secret_recovery::explicit_recovery_counts()
+                        ),
+                        Err(error) => {
+                            iota_logger::log!("Cannot read chat secret recovery health: {}", error)
+                        }
+                    }
+                }
+                ticks = ticks.wrapping_add(1);
+            }
+        });
+        let relay = Arc::downgrade(&services.relay);
+        runtime.spawn(async move {
+            // A backlog of missing-envelope jobs must not delay proposal proofs.
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                timer.tick().await;
+                let Some(relay) = relay.upgrade() else {
+                    break;
+                };
+                if let Err(error) = relay.retry_initial_secret_proposals().await {
+                    iota_logger::log!("Initial secret proposal worker failed: {:?}", error);
+                }
             }
         });
     }

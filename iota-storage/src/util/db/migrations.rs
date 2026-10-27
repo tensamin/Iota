@@ -4,6 +4,9 @@ mod v31_to_v40;
 mod v41_to_v64;
 mod v65_password_operations;
 mod v66_chat_secret_recovery;
+mod v67_initial_secret_proposals;
+mod v68_paged_sync;
+mod v69_sync_event_payloads;
 
 use super::*;
 
@@ -59,5 +62,8 @@ pub(super) fn run_migrations_on_connection(conn: &Connection) -> Result<(), Stor
     }
     v65_password_operations::migrate(conn, current_version)?;
     v66_chat_secret_recovery::migrate(conn, current_version)?;
+    v67_initial_secret_proposals::migrate(conn, current_version)?;
+    v68_paged_sync::migrate(conn, current_version)?;
+    v69_sync_event_payloads::migrate(conn, current_version)?;
     Ok(())
 }

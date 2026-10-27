@@ -651,14 +651,9 @@ async fn accepted_replay_checks_direct_peer_after_signing_key_rotation() {
     ) else {
         return;
     };
-    let fixture = Fixture::new(false);
-    // Model this database as the destination, with only the recipient hosted here.
-    execute("DELETE FROM hosted_principals; DELETE FROM users;");
-    db::with_immediate_transaction(|tx| {
-        tx.execute("INSERT INTO users(user_id, username, public_key, created_at) VALUES(2, 'recipient', 'test', 1)", [])?;
-        tx.execute("INSERT INTO hosted_principals(local_user_id, principal_handle) VALUES(2, ?1)", [fixture.handles[1].0])?;
-        Ok(())
-    }).unwrap();
+    // Start as the destination. Deleting an already-hosted origin would retire
+    // that principal and permanently fence its secrets, not simulate a remote account.
+    let fixture = Fixture::new_hosting(false, 1);
     let service = fixture.destination_service();
     let legitimate = IngressSource::DirectPeer {
         node_id: fixture.node.node_id().clone(),

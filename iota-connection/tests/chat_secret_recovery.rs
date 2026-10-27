@@ -104,8 +104,16 @@ async fn deleted_owner_row_restores_original_copy_without_network_or_peer_copy_e
     // A single lost escrow row can also be rebuilt from the accepted inbox's
     // original signed DTO. The verifier runs before the recovery write starts.
     execute("DROP TRIGGER chat_secret_escrows_accepted_delete; DELETE FROM chat_secret_escrows");
-    service.recover(&fixture.ids[0], &fixture.ids[1], Some(1)).await.unwrap();
-    assert_eq!(storage::escrow_for_recovery(&fixture.ids[0], &fixture.ids[1], &fixture.ids[0], Some(1)).unwrap().unwrap(), escrow);
+    service
+        .recover(&fixture.ids[0], &fixture.ids[1], Some(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        storage::escrow_for_recovery(&fixture.ids[0], &fixture.ids[1], &fixture.ids[0], Some(1))
+            .unwrap()
+            .unwrap(),
+        escrow
+    );
     // Simulate a crash after durable enqueue but before processing. The startup
     // worker resumes the same nonce and fills only the deleted owner's row.
     execute("DELETE FROM chat_secrets WHERE user_id='1'");

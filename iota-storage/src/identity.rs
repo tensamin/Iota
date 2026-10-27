@@ -17,6 +17,22 @@ const LOCAL_DESCRIPTOR_RENEWAL_MILLIS: i64 = 7 * 24 * 60 * 60 * 1_000;
 #[derive(Default)]
 pub struct SqliteLocalUserStore;
 
+/// Pin a fresh centralized deployment. Never rename an existing account or its
+/// signed/encrypted history when replacing a locator with a cryptographic ID.
+pub fn bind_omega_authority(authority: &AuthorityId) -> Result<(), IdentityError> {
+    iota_identity::relay_protocol::Principal::validate_authority(authority.as_str())
+        .map_err(|error| IdentityError::InvalidIdentifier(error.to_string()))?;
+    db::with_immediate_transaction(|tx| {
+        let previous: Option<String> = tx.query_row("SELECT omega_authority_id FROM identity_configuration WHERE singleton=1", [], |row| row.get(0)).optional()?;
+        let conflicting: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM hosted_principals h JOIN principals p ON p.principal_pk=h.principal_handle WHERE p.authority_id!=?1)", [authority.as_str()], |row| row.get(0))?;
+        if conflicting || previous.as_ref().is_some_and(|previous| previous.starts_with("omega-key:") && previous != authority.as_str()) {
+            return Err(crate::storage_error::StorageError::Other("configured Omega authority differs from stored identities; existing encrypted records cannot be renamed".into()));
+        }
+        tx.execute("INSERT INTO identity_configuration(singleton,omega_authority_id) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET omega_authority_id=excluded.omega_authority_id", [authority.as_str()])?;
+        Ok(())
+    }).map_err(storage_error)
+}
+
 impl LocalUserStore for SqliteLocalUserStore {
     fn get_local_user(
         &self,
@@ -91,84 +107,6 @@ impl SqlitePrincipalStore {
                 )
                 .optional()
                 .map_err(Into::into)
-        })
-        .map_err(storage_error)
-    }
-
-    pub fn migrate_legacy_omega_authority(
-        &self,
-        authority: &AuthorityId,
-    ) -> Result<(), IdentityError> {
-        db::with_immediate_transaction(|transaction| {
-            transaction.execute(
-                "INSERT INTO identity_configuration (singleton, omega_authority_id) VALUES (1, ?1) ON CONFLICT(singleton) DO UPDATE SET omega_authority_id = excluded.omega_authority_id",
-                [authority.as_str()],
-            )?;
-            let mut statement = transaction.prepare(
-                "SELECT principal_pk, remote_user_id FROM principals WHERE authority_id = 'omega:central'",
-            )?;
-            let legacy = statement
-                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(statement);
-            for (legacy_handle, user_id) in legacy {
-                let current_handle = transaction
-                    .query_row(
-                        "SELECT principal_pk FROM principals WHERE authority_id = ?1 AND remote_user_id = ?2",
-                        params![authority.as_str(), user_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()?;
-                if let Some(current_handle) = current_handle {
-                    transaction.execute(
-                        "INSERT OR IGNORE INTO principal_keys (principal_pk, public_key, valid_from, valid_until, source_revision) SELECT ?1, public_key, valid_from, valid_until, source_revision FROM principal_keys WHERE principal_pk = ?2",
-                        params![current_handle, legacy_handle],
-                    )?;
-                    for (table, column) in [
-                        ("contacts", "principal_handle"),
-                        ("messages", "external_principal"),
-                        ("relay_replay", "signer_principal"),
-                        ("relay_inbox", "signer_principal"),
-                        ("pending_relays", "destination_principal"),
-                        ("blocked_users", "blocked_principal"),
-                    ] {
-                        transaction.execute(
-                            &format!("UPDATE {table} SET {column} = ?1 WHERE {column} = ?2"),
-                            params![current_handle, legacy_handle],
-                        )?;
-                    }
-                    transaction.execute(
-                        "DELETE FROM principals WHERE principal_pk = ?1",
-                        [legacy_handle],
-                    )?;
-                } else {
-                    transaction.execute(
-                        "UPDATE principals SET authority_id = ?1 WHERE principal_pk = ?2",
-                        params![authority.as_str(), legacy_handle],
-                    )?;
-                }
-            }
-            transaction.execute_batch(
-                "CREATE TEMP TABLE IF NOT EXISTS observed_omega_users (user_id INTEGER PRIMARY KEY); DELETE FROM observed_omega_users; INSERT OR IGNORE INTO observed_omega_users SELECT user_id FROM users WHERE user_id > 0; INSERT OR IGNORE INTO observed_omega_users SELECT user_id FROM contacts WHERE user_id > 0; INSERT OR IGNORE INTO observed_omega_users SELECT external_user FROM messages WHERE external_user > 0; INSERT OR IGNORE INTO observed_omega_users SELECT signer_id FROM relay_replay WHERE signer_id > 0; INSERT OR IGNORE INTO observed_omega_users SELECT signer_id FROM relay_inbox WHERE signer_id > 0; INSERT OR IGNORE INTO observed_omega_users SELECT destination_id FROM relay_inbox WHERE destination_id > 0; INSERT OR IGNORE INTO observed_omega_users SELECT relay_signer_id FROM pending_relays WHERE relay_signer_id > 0; INSERT OR IGNORE INTO observed_omega_users SELECT relay_destination_user_id FROM pending_relays WHERE relay_destination_user_id > 0; INSERT OR IGNORE INTO observed_omega_users SELECT blocked_user_id FROM blocked_users WHERE blocked_user_id > 0;"
-            )?;
-            transaction.execute(
-                "INSERT OR IGNORE INTO principals (authority_kind, authority_id, remote_user_id, descriptor_revision, last_resolved_at) SELECT 'omega', ?1, user_id, 0, 0 FROM observed_omega_users",
-                [authority.as_str()],
-            )?;
-            for (table, principal_column, user_column) in [
-                ("contacts", "principal_handle", "user_id"),
-                ("messages", "external_principal", "external_user"),
-                ("relay_replay", "signer_principal", "signer_id"),
-                ("relay_inbox", "signer_principal", "signer_id"),
-                ("pending_relays", "destination_principal", "relay_destination_user_id"),
-                ("blocked_users", "blocked_principal", "blocked_user_id"),
-            ] {
-                transaction.execute(
-                    &format!("UPDATE {table} SET {principal_column} = (SELECT principal_pk FROM principals WHERE authority_id = ?1 AND remote_user_id = {table}.{user_column}) WHERE {principal_column} IS NULL AND {user_column} IS NOT NULL"),
-                    [authority.as_str()],
-                )?;
-            }
-            Ok(())
         })
         .map_err(storage_error)
     }
@@ -887,6 +825,69 @@ fn encode_home(home: &PrincipalHome) -> Option<String> {
         }
         PrincipalHome::Omega(locator) => Some(format!("omega:{}", locator.as_str())),
         PrincipalHome::Unknown => None,
+    }
+}
+
+/// Immutable inputs captured after authenticated resolution. This fences a
+/// transaction against local authorization changes, not descriptor verification.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalCommitFence {
+    pub principal: PrincipalId,
+    pub handle: PrincipalHandle,
+    pub revision: i64,
+    pub home: PrincipalHome,
+    pub valid_until: Option<i64>,
+    pub keys: Vec<String>,
+}
+
+impl PrincipalCommitFence {
+    pub fn capture(principal: &ResolvedPrincipal) -> Result<Self, IdentityError> {
+        iota_identity::relay_protocol::Principal::try_from(&principal.principal)?;
+        if principal.descriptor_revision < 0
+            || !principal.is_valid_at(now_millis())
+            || principal.public_keys.is_empty()
+        {
+            return Err(IdentityError::Unavailable(
+                "principal authorization is not current".into(),
+            ));
+        }
+        let mut keys = principal
+            .public_keys
+            .iter()
+            .map(|key| {
+                key.try_to_base64()
+                    .map_err(|error| IdentityError::InvalidDescriptor(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        keys.sort();
+        keys.dedup();
+        Ok(Self {
+            principal: principal.principal.clone(),
+            handle: principal.handle,
+            revision: principal.descriptor_revision,
+            home: principal.home.clone(),
+            valid_until: principal.valid_until,
+            keys,
+        })
+    }
+
+    pub fn verify_on(
+        &self,
+        connection: &rusqlite::Connection,
+    ) -> Result<(), crate::storage_error::StorageError> {
+        use crate::storage_error::StorageError;
+        let current = load_principal(
+            connection,
+            "p.principal_pk = ?1 AND p.retired_at IS NULL",
+            self.handle.0,
+        )?
+        .ok_or(StorageError::MessageUnauthorized)?;
+        let current = Self::capture(&current).map_err(|_| StorageError::MessageUnauthorized)?;
+        if current != *self {
+            return Err(StorageError::MessageUnauthorized);
+        }
+        Ok(())
     }
 }
 

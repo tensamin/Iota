@@ -37,54 +37,12 @@ use rusqlite::{OptionalExtension, Transaction, params};
 
 pub const MAX_UNIQUE_REACTIONS_PER_MESSAGE: usize = 10;
 
-#[derive(PartialEq, Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum MessageState {
-    Read,
-    Received,
-    Sent,
-    Sending,
-}
+pub use iota_identity::relay_protocol::application::MessageState;
 
 #[derive(Clone, Debug)]
 pub struct MessageStateUpdate {
     pub send_time: i64,
     pub state: MessageState,
-}
-
-impl MessageState {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            MessageState::Read => "read",
-            MessageState::Received => "received",
-            MessageState::Sent => "sent",
-            MessageState::Sending => "sending",
-        }
-    }
-
-    #[expect(
-        clippy::should_implement_trait,
-        reason = "unknown stored states fall back rather than fail parsing"
-    )]
-    pub fn from_str(value: &str) -> Self {
-        match value.to_lowercase().as_str() {
-            "read" => MessageState::Read,
-            "received" => MessageState::Received,
-            "sent" => MessageState::Sent,
-            _ => MessageState::Sending,
-        }
-    }
-
-    pub fn upgrade(self, other: Self) -> Self {
-        if other == Self::Read || self == Self::Read {
-            Self::Read
-        } else if other == Self::Received || self == Self::Received {
-            Self::Received
-        } else if other == Self::Sent || self == Self::Sent {
-            Self::Sent
-        } else {
-            Self::Sending
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

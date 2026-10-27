@@ -92,10 +92,12 @@ async fn live_receipt_publication_and_snapshot_pagination() {
     .unwrap();
     // Receipt reads must be independent of historical operation decoding.
     execute("UPDATE relay_inbox SET prepared_operation=x'ffff' WHERE message_id='message';");
-    let snapshot = message_handlers::handle_account_state_request(
-        &V::new(C::AccountStateRequest).with_sender(1),
+    let snapshot = message_handlers::handle_relay_receipt_page(
+        &V::new(C::RelayReceiptPage)
+            .with_sender(1)
+            .add_typed_default(D::ReceiptCursor, W::SignedNumber(0)),
     );
-    assert!(snapshot.is_type(C::AccountStateSnapshot), "{snapshot:?}");
+    assert!(snapshot.is_type(C::RelayReceiptPage), "{snapshot:?}");
     let first = snapshot
         .get_data(D::AcceptedIds)
         .and_then(W::as_array)
