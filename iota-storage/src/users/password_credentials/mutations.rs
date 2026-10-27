@@ -28,6 +28,7 @@ pub fn commit_enrollment(
     public_key: &str,
     generation: i64,
     operation: (&str, &[u8]),
+    fence: &PasswordAuthorization,
 ) -> Result<(), StorageError> {
     db::with_immediate_transaction(|tx| {
         if let Some(enabled) =
@@ -41,6 +42,19 @@ pub fn commit_enrollment(
         }
         if super::get_on(tx, credential.user_id)?.is_some() {
             return Err(StorageError::PendingRelayConflict);
+        }
+        verify_principal_on(tx, credential.user_id, public_key, fence)?;
+        if credential.password_principal.as_deref()
+            != Some(
+                format!(
+                    "{}#{}",
+                    fence.principal.principal.authority.as_str(),
+                    fence.principal.principal.user_id
+                )
+                .as_str(),
+            )
+        {
+            return Err(StorageError::HostedAuthorizationDenied);
         }
         super::upsert_in_tx(tx, credential, public_key, Some(generation))?;
         record_in_tx(
@@ -59,6 +73,7 @@ pub fn commit_disable(
     public_key: &str,
     generation: i64,
     operation: (&str, &[u8]),
+    fence: &PasswordAuthorization,
 ) -> Result<(), StorageError> {
     db::with_immediate_transaction(|tx| {
         if let Some(enabled) = outcome_on(tx, user_id, public_key, generation, operation)? {
@@ -68,6 +83,7 @@ pub fn commit_disable(
                 Err(StorageError::PendingRelayConflict)
             };
         }
+        verify_principal_on(tx, user_id, public_key, fence)?;
         tx.execute(
             "DELETE FROM user_password_credentials WHERE user_id = ?1",
             [user_id],

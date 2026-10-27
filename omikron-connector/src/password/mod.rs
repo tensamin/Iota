@@ -96,103 +96,238 @@ pub use timing::snapshot as password_stage_counts;
 #[cfg(test)]
 use wire::{now_millis, typed};
 
+pub(crate) struct PasswordIdentity {
+    pub(crate) principal: String,
+    public_key: String,
+    fence: iota_storage::users::password_credentials::PasswordAuthorization,
+}
+
 impl OmikronConnection {
-    async fn validate_password_hosting(&self, user_id: i64) -> Result<String, String> {
-        let mut timing = timing::Timing::start(timing::Stage::Account);
-        let url = format!(
-            "{}/api/get/user/{user_id}",
-            crate::omega_discovery::api_base().trim_end_matches('/')
-        );
-        let discovery: serde_json::Value = tokio::time::timeout(Duration::from_secs(5), async {
-            self.http_client
-                .get(url)
-                .send()
-                .await
-                .map_err(|error| error.to_string())?
-                .error_for_status()
-                .map_err(|error| error.to_string())?
-                .json()
-                .await
-                .map_err(|error| error.to_string())
-        })
-        .await
-        .map_err(|_| "Omega account lookup timed out")??;
-        let iota_id = iota_storage::util::config_util::CONFIG
-            .load()
-            .iota_id
-            .ok_or("Iota has no identity")?;
-        if discovery.get("user_id").and_then(serde_json::Value::as_i64) != Some(user_id)
-            || discovery.get("iota_id").and_then(serde_json::Value::as_u64) != Some(iota_id)
+    async fn password_document<T: serde::de::DeserializeOwned>(
+        &self,
+        url: String,
+        limit: usize,
+        stage: timing::Stage,
+    ) -> Result<T, tau::password::Failure> {
+        use tau::password::Failure;
+        let mut timing = timing::Timing::start(stage);
+        let mut response = self
+            .http_client
+            .get(url)
+            .send()
+            .await
+            .map_err(|_| Failure::DependencyUnavailable)?
+            .error_for_status()
+            .map_err(|_| Failure::DependencyUnavailable)?;
+        if response
+            .content_length()
+            .is_some_and(|size| size > limit as u64)
         {
-            return Err("account hosting changed".into());
+            return Err(Failure::Unauthorized);
         }
-        let advertised = discovery
-            .get("public_key")
-            .and_then(serde_json::Value::as_str)
-            .ok_or("missing account key")?;
-        let hosted = iota_storage::users::password_credentials::authorization(user_id)
-            .map_err(|error| error.to_string())?
-            .0;
-        if wire::key_fingerprint(advertised)? != wire::key_fingerprint(&hosted)? {
-            return Err("hosted account identity differs from Omega".into());
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| Failure::DependencyUnavailable)?
+        {
+            if chunk.len() > limit.saturating_sub(bytes.len()) {
+                return Err(Failure::Unauthorized);
+            }
+            bytes.extend_from_slice(&chunk);
         }
+        let document = serde_json::from_slice(&bytes).map_err(|_| Failure::Unauthorized)?;
         timing.success();
-        Ok(hosted)
+        Ok(document)
     }
-    // Password login uses Omega's key-scoped principal, including for accounts
-    // whose older hosted-principal record still uses the legacy host locator.
-    pub(crate) async fn password_principal(
+
+    pub(crate) async fn password_identity(
         &self,
         user_id: i64,
-    ) -> Result<String, tau::password::Failure> {
+    ) -> Result<PasswordIdentity, tau::password::Failure> {
+        use iota_identity::{
+            AuthorityId, AuthorityKind, IotaNodeId, NodeDirectory, PrincipalStore,
+        };
         use tau::password::Failure;
-        let mut timing = timing::Timing::start(timing::Stage::Authority);
         if user_id <= 0 {
             return Err(Failure::InvalidRequest);
         }
-        let authority = {
-            let url = format!(
-                "{}/.well-known/tensamin",
-                crate::omega_discovery::api_base()
-            );
-            let cancellation = self.preparation_cancellation();
-            let discovery: serde_json::Value = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return Err(Failure::Cancelled),
-                result = tokio::time::timeout(Duration::from_secs(5), async {
-                    self.http_client.get(url).send().await
-                        .map_err(|_| Failure::DependencyUnavailable)?
-                        .error_for_status().map_err(|_| Failure::DependencyUnavailable)?
-                        .json().await.map_err(|_| Failure::DependencyUnavailable)
-                }) => result.map_err(|_| Failure::DependencyUnavailable)??,
-            };
-            let key = discovery
-                .get("public_key")
-                .and_then(serde_json::Value::as_str)
-                .ok_or(Failure::DependencyUnavailable)?;
-            let key = PublicKeyBundle::from_base64(key).map_err(|_| Failure::Unauthorized)?;
-            let authority = iota_identity::AuthorityId::for_omega(&key)
-                .map_err(|_| Failure::Unauthorized)?
-                .as_str()
-                .to_owned();
-            if discovery
-                .get("authority_id")
-                .and_then(serde_json::Value::as_str)
-                != Some(authority.as_str())
-            {
-                return Err(Failure::Unauthorized);
-            }
-            let _ = self.password_auth.omega_authority.set(authority.clone());
-            if self.password_auth.omega_authority.get() != Some(&authority) {
-                *self.password_auth.readiness.write().unwrap() =
-                    PasswordReadiness::ReenrollmentRequired;
-                return Err(Failure::Unauthorized);
-            }
-            authority
+        let pinned: String = iota_storage::util::db::with_db(|connection| {
+            Ok(connection.query_row(
+                "SELECT omega_authority_id FROM identity_configuration WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .map_err(|_| Failure::DependencyUnavailable)?;
+        let base = crate::omega_discovery::api_base();
+        #[derive(serde::Deserialize)]
+        struct Discovery {
+            authority_id: String,
+            public_key: String,
+        }
+        let cancellation = self.preparation_cancellation();
+        let (discovery, wire): (Discovery, iota_identity::PrincipalDescriptorWireV1) = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(Failure::Cancelled),
+            result = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::try_join!(
+                    self.password_document(format!("{}/.well-known/tensamin",base.trim_end_matches('/')),64*1024,timing::Stage::Authority),
+                    self.password_document(format!("{}/federation/v1/users/id/{user_id}",base.trim_end_matches('/')),256*1024,timing::Stage::Account),
+                )
+            }) => result.map_err(|_| Failure::DependencyUnavailable)??,
         };
-        timing.success();
-        Ok(format!("{authority}#{user_id}"))
+        let keys = PublicKeyBundle::from_base64(&discovery.public_key)
+            .map_err(|_| Failure::Unauthorized)?;
+        let authority = AuthorityId::for_omega(&keys).map_err(|_| Failure::Unauthorized)?;
+        if authority.as_str() != pinned || discovery.authority_id != authority.as_str() {
+            *self.password_auth.readiness.write().unwrap() =
+                PasswordReadiness::ReenrollmentRequired;
+            return Err(Failure::Unauthorized);
+        }
+        let _ = self
+            .password_auth
+            .omega_authority
+            .set(authority.as_str().to_owned());
+        if self.password_auth.omega_authority.get().map(String::as_str) != Some(authority.as_str())
+        {
+            *self.password_auth.readiness.write().unwrap() =
+                PasswordReadiness::ReenrollmentRequired;
+            return Err(Failure::Unauthorized);
+        }
+        let home = wire
+            .home_node
+            .clone()
+            .ok_or(Failure::Unauthorized)?
+            .parse()
+            .map_err(|_| Failure::Unauthorized)?;
+        let signed = wire.parse().map_err(|_| Failure::Unauthorized)?;
+        if signed.descriptor.authority_kind != AuthorityKind::Omega
+            || signed.descriptor.principal.authority != authority
+            || signed.descriptor.principal.user_id != user_id as u64
+        {
+            return Err(Failure::Unauthorized);
+        }
+        let local_keys = self
+            .keyring
+            .read()
+            .await
+            .clone()
+            .ok_or(Failure::DependencyUnavailable)?;
+        let local_node = IotaNodeId::from_public_keys(&local_keys.public_key_bundle())
+            .map_err(|_| Failure::Unauthorized)?;
+        if home.descriptor.node != local_node {
+            return Err(Failure::Unauthorized);
+        }
+        let store = iota_storage::identity::SqlitePrincipalStore;
+        let revision = store
+            .get_by_canonical_id(&signed.descriptor.principal)
+            .map_err(|_| Failure::DependencyUnavailable)?
+            .map(|principal| principal.descriptor_revision);
+        let now = wire::now_millis() as i64;
+        let snapshot = signed
+            .verify_snapshot(&keys, revision, home, None, now)
+            .map_err(|_| Failure::Unauthorized)?;
+        if !snapshot.fresh_for_mutation(now) {
+            return Err(Failure::Expired);
+        }
+        let local_key = iota_storage::users::password_credentials::authorization(user_id)
+            .map_err(|_| Failure::Unauthorized)?
+            .0;
+        if !snapshot
+            .principal_descriptor()
+            .descriptor()
+            .public_keys
+            .iter()
+            .any(|key| key.try_to_base64().ok().as_deref() == Some(local_key.as_str()))
+        {
+            return Err(Failure::Unauthorized);
+        }
+        iota_storage::node_directory::SqliteNodeDirectory
+            .upsert_node_descriptor(snapshot.home_descriptor())
+            .map_err(|_| Failure::Unauthorized)?;
+        let handle = store
+            .upsert_remote_descriptor(snapshot.principal_descriptor())
+            .map_err(|_| Failure::Unauthorized)?;
+        iota_storage::identity::bind_verified_omega_hosted_principal(&snapshot, &local_node)
+            .map_err(|_| Failure::Unauthorized)?;
+        let resolved = store
+            .get_principal(handle)
+            .map_err(|_| Failure::DependencyUnavailable)?
+            .ok_or(Failure::Unauthorized)?;
+        let fence = iota_storage::identity::PrincipalCommitFence::capture(&resolved)
+            .map_err(|_| Failure::Unauthorized)?;
+        let public_key = iota_storage::users::password_credentials::authorization(user_id)
+            .map_err(|_| Failure::Unauthorized)?
+            .0;
+        if !fence.keys.contains(&public_key)
+            || store
+                .principal_for_local_user(iota_identity::LocalUserId(user_id))
+                .map_err(|_| Failure::DependencyUnavailable)?
+                != Some(handle)
+        {
+            return Err(Failure::Unauthorized);
+        }
+        let principal = format!("{}#{user_id}", authority.as_str());
+        let fence =
+            iota_storage::users::password_credentials::PasswordAuthorization::from_snapshot(
+                snapshot,
+            )
+            .map_err(|_| Failure::Unauthorized)?;
+        Ok(PasswordIdentity {
+            principal,
+            public_key,
+            fence,
+        })
     }
+}
+
+#[cfg(test)]
+fn password_identity_fixture(
+    authority: &mtp::crypto::Keyring,
+    home: &iota_identity::LocalNodeIdentity,
+    account: PublicKeyBundle,
+    revision: i64,
+) -> String {
+    use iota_identity::*;
+    let now = wire::now_millis() as i64;
+    let node = SignedNodeDescriptor::sign(
+        NodeDescriptor {
+            node: home.node_id().clone(),
+            public_keys: home.public_keys(),
+            direct_endpoints: vec![],
+            relay_hints: vec![],
+            revision: 1,
+            valid_until: Some(now + 300_000),
+        },
+        home,
+    )
+    .unwrap();
+    let descriptor = SignedPrincipalDescriptor::sign(
+        PrincipalDescriptor {
+            principal: PrincipalId {
+                authority: AuthorityId::for_omega(&authority.public_key_bundle()).unwrap(),
+                user_id: 7,
+            },
+            authority_kind: AuthorityKind::Omega,
+            username: Some("alice".into()),
+            display_name: None,
+            public_keys: vec![account],
+            home: PrincipalHome::Iota(home.node_id().clone()),
+            revision,
+            issued_at: now,
+            valid_until: Some(now + 300_000),
+        },
+        authority,
+    )
+    .unwrap();
+    serde_json::to_string(
+        &descriptor
+            .to_wire_v1()
+            .unwrap()
+            .with_home_node(node.to_wire_v1().unwrap()),
+    )
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -229,6 +364,7 @@ mod tests {
         created: Instant,
     ) -> PendingLogin {
         PendingLogin {
+            principal_fence: None,
             connection_generation: 0,
             user_id,
             participant_id: 1,
@@ -504,6 +640,7 @@ mod tests {
         runtime.logins.insert(
             id,
             PendingLogin {
+                principal_fence: None,
                 connection_generation: 0,
                 user_id: 7,
                 participant_id: 1,

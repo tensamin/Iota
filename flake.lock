@@ -65,17 +65,17 @@
     "tau-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1793116202,
-        "narHash": "sha256-6ah5yU2rfrZOX5m3l4+zpAcd6CXJ6h7JLtK+vLK/goo=",
+        "lastModified": 1793139251,
+        "narHash": "sha256-qn8X9hX9/fv7AEbl0cbtrpisdvam6h1fzEEbIObrDhU=",
         "owner": "TensaminDev",
         "repo": "Tau",
-        "rev": "57096c5341f5196ea953788ab8fd3c60ca920817",
+        "rev": "714968acb05a2e877f03690028ae604afcbbc701",
         "type": "github"
       },
       "original": {
         "owner": "TensaminDev",
         "repo": "Tau",
-        "rev": "57096c5341f5196ea953788ab8fd3c60ca920817",
+        "rev": "714968acb05a2e877f03690028ae604afcbbc701",
         "type": "github"
       }
     },

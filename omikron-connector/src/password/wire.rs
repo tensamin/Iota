@@ -23,6 +23,12 @@ pub(super) fn field(content: &DataValue, kind: DataType) -> Result<&DataValue, S
     let DataValue::Container(fields) = content else {
         return Err("content is not a container".into());
     };
+    let mut seen = std::collections::BTreeSet::new();
+    for (field_id, _) in fields {
+        if !seen.insert(field_id.0) {
+            return Err("duplicate password field".into());
+        }
+    }
     fields
         .iter()
         .find_map(|(field_id, value)| (*field_id == id).then_some(value))

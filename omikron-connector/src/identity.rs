@@ -16,6 +16,7 @@ pub struct OmegaIdentityResolver {
     authority: AuthorityId,
     locator: AuthorityLocator,
     principals: Arc<dyn PrincipalStore>,
+    local_node: Option<iota_identity::IotaNodeId>,
 }
 
 impl OmegaIdentityResolver {
@@ -24,12 +25,14 @@ impl OmegaIdentityResolver {
         authority: AuthorityId,
         locator: AuthorityLocator,
         principals: Arc<dyn PrincipalStore>,
+        local_node: Option<iota_identity::IotaNodeId>,
     ) -> Self {
         Self {
             client,
             authority,
             locator,
             principals,
+            local_node,
         }
     }
 
@@ -47,6 +50,7 @@ impl OmegaIdentityResolver {
             &self.authority,
             &self.locator,
             selector,
+            self.local_node.as_ref(),
         )
         .await
     }
@@ -102,6 +106,7 @@ pub async fn resolve_omega_principal(
     authority: &AuthorityId,
     locator: &AuthorityLocator,
     selector: &UserSelector,
+    local_node: Option<&iota_identity::IotaNodeId>,
 ) -> Result<ResolvedPrincipal, IdentityError> {
     let request = match selector {
         UserSelector::UserId(user_id) => CommunicationValue::new(CommunicationType::GetUserData)
@@ -168,6 +173,11 @@ pub async fn resolve_omega_principal(
     iota_storage::node_directory::SqliteNodeDirectory
         .upsert_node_descriptor(snapshot.home_descriptor())?;
     let handle = principals.upsert_remote_descriptor(snapshot.principal_descriptor())?;
+    if let Some(node) =
+        local_node.filter(|node| snapshot.home_descriptor().descriptor().node == **node)
+    {
+        iota_storage::identity::bind_verified_omega_hosted_principal(&snapshot, node)?;
+    }
     principals
         .get_principal(handle)?
         .ok_or(IdentityError::NotFound)
@@ -413,6 +423,7 @@ mod tests {
             authority,
             AuthorityLocator::new("remote.example").unwrap(),
             Arc::new(CachedStore { resolved }),
+            None,
         );
 
         let cached = resolver
@@ -468,7 +479,8 @@ mod tests {
                 &store,
                 &authority,
                 &locator,
-                &UserSelector::UserId(7)
+                &UserSelector::UserId(7),
+                None,
             )
             .await,
             Err(IdentityError::Unavailable(_))
@@ -488,7 +500,8 @@ mod tests {
                 &store,
                 &authority,
                 &locator,
-                &UserSelector::UserId(7)
+                &UserSelector::UserId(7),
+                None,
             )
             .await,
             Err(IdentityError::KeyPinMismatch)

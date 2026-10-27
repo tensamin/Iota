@@ -11,7 +11,7 @@
       flake = false;
     };
     tau-src = {
-      url = "github:TensaminDev/Tau/57096c5341f5196ea953788ab8fd3c60ca920817";
+      url = "github:TensaminDev/Tau/714968acb05a2e877f03690028ae604afcbbc701";
       flake = false;
     };
     mtp-src = {
@@ -255,7 +255,7 @@
               pname = "iota";
               version = "0.1.0";
               src = source;
-              hash = "sha256-Yvthehdmnbi9KduaitPrclaoVcA9QwTODww6iRpNCw4=";
+              hash = "sha256-GJMKOCpMq902eMzE4zBQaje3/zHxe86311Pkff3toHw=";
             };
           };
           cli = self.packages.${system}.default.overrideAttrs {

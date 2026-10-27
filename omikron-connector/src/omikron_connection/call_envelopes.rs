@@ -102,10 +102,14 @@ impl OmikronConnection {
             return Err(Error::Invalid);
         }
         let principal = self
-            .password_principal(user)
+            .password_identity(user)
             .await
             .map_err(|_| Error::Invalid)?;
-        let authority = principal.rsplit_once('#').ok_or(Error::Invalid)?.0;
+        let authority = principal
+            .principal
+            .rsplit_once('#')
+            .ok_or(Error::Invalid)?
+            .0;
         if key.recipient.authority != authority
             || self
                 .bound_attempt

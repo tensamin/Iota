@@ -33,6 +33,66 @@ pub fn bind_omega_authority(authority: &AuthorityId) -> Result<(), IdentityError
     }).map_err(storage_error)
 }
 
+/// Bind a local account only after the signed Omega resolver verified its home.
+/// A local profile may match that proof, but must never mint or replace it.
+pub fn bind_verified_omega_hosted_principal(
+    snapshot: &iota_identity::VerifiedPrincipalSnapshot,
+    local_node: &iota_identity::IotaNodeId,
+) -> Result<(), IdentityError> {
+    let descriptor = snapshot.principal_descriptor().descriptor();
+    if descriptor.authority_kind != AuthorityKind::Omega
+        || snapshot.home_descriptor().descriptor().node != *local_node
+    {
+        return Err(IdentityError::InvalidDescriptor(
+            "hosted Omega principal required".into(),
+        ));
+    }
+    let owner = i64::try_from(descriptor.principal.user_id)
+        .map_err(|_| IdentityError::InvalidDescriptor("hosted user ID range".into()))?;
+    let handle = SqlitePrincipalStore
+        .get_by_canonical_id(&descriptor.principal)?
+        .ok_or(IdentityError::NotFound)?
+        .handle;
+    let mut keys = descriptor
+        .public_keys
+        .iter()
+        .map(|key| key.try_to_base64().map_err(storage_error))
+        .collect::<Result<Vec<_>, _>>()?;
+    keys.sort();
+    keys.dedup();
+    let fence = PrincipalCommitFence {
+        principal: descriptor.principal.clone(),
+        handle,
+        revision: descriptor.revision,
+        home: descriptor.home.clone(),
+        valid_until: descriptor.valid_until,
+        keys,
+    };
+    db::with_immediate_transaction(|tx| {
+        if !snapshot.fresh_for_mutation(now_millis()) {
+            return Err(crate::storage_error::StorageError::MessageUnauthorized);
+        }
+        fence.verify_on(tx)?;
+        let key: Option<String> = tx.query_row(
+            "SELECT u.public_key FROM users u JOIN identity_configuration c ON c.singleton=1
+             JOIN hosted_auth_state a ON a.local_user_id=u.user_id
+             WHERE u.user_id=?1 AND c.omega_authority_id=?2 AND a.enabled=1",
+            params![owner,descriptor.principal.authority.as_str()], |row| row.get(0),
+        ).optional()?;
+        let Some(key) = key else { return Ok(()); };
+        if !fence.keys.contains(&key) {
+            return Err(crate::storage_error::StorageError::MessageUnauthorized);
+        }
+        let existing: Option<i64> = tx.query_row("SELECT principal_handle FROM hosted_principals WHERE local_user_id=?1", [owner], |row| row.get(0)).optional()?;
+        if existing.is_some_and(|existing| existing != handle.0) {
+            return Err(crate::storage_error::StorageError::MessageUnauthorized);
+        }
+        tx.execute("INSERT INTO hosted_principals(local_user_id,principal_handle) VALUES(?1,?2) ON CONFLICT(local_user_id) DO NOTHING", params![owner,handle.0])?;
+        crate::util::relay_work::verify_owner_on(tx,owner,handle)?;
+        Ok(())
+    }).map_err(storage_error)
+}
+
 impl LocalUserStore for SqliteLocalUserStore {
     fn get_local_user(
         &self,

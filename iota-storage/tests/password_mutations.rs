@@ -12,11 +12,56 @@ fn lost_ack_receipts_and_release_snapshots_are_atomic_and_erasure_fenced() {
     let directory = tempfile::tempdir().unwrap();
     iota_util::file_util::configure_storage_directory(directory.path().join("storage"));
     db::initialize_database().unwrap();
+    use iota_identity::{
+        AuthorityKind, LocalNodeIdentity, LocalUserDescriptor, LocalUserId, PrincipalHome,
+    };
+    let node = LocalNodeIdentity::from_keyring(mtp::crypto::Keyring::generate()).unwrap();
+    let user = LocalUserDescriptor {
+        id: LocalUserId(7),
+        username: "alice".into(),
+        display_name: None,
+        public_key: mtp::crypto::Keyring::generate()
+            .public_key_bundle()
+            .try_to_base64()
+            .unwrap(),
+    };
     db::with_db(|conn| {
-        conn.execute("INSERT INTO users(user_id,username,public_key,created_at) VALUES(7,'alice','account-key',1)", [])?;
+        conn.execute("INSERT INTO users(user_id,username,public_key,created_at) VALUES(7,'alice',?1,1)", [&user.public_key])?;
         conn.execute("INSERT INTO user_residency(user_id,username,lifecycle_state,data_state,credential_origin,updated_at) VALUES(7,'alice','managed','present','external',1)", [])?;
         Ok(())
     }).unwrap();
+    let store = iota_storage::identity::SqlitePrincipalStore;
+    store
+        .ensure_local_principal(
+            node.authority_id(),
+            AuthorityKind::Iota,
+            &user,
+            PrincipalHome::Iota(node.node_id().clone()),
+            iota_storage::util::sync::now_millis(),
+        )
+        .unwrap();
+    let now = iota_storage::util::sync::now_millis();
+    let home = iota_identity::SignedNodeDescriptor::sign(
+        iota_identity::NodeDescriptor {
+            node: node.node_id().clone(),
+            public_keys: node.public_keys(),
+            direct_endpoints: vec![],
+            relay_hints: vec![],
+            revision: 1,
+            valid_until: Some(now + 60_000),
+        },
+        &node,
+    )
+    .unwrap();
+    let signed = iota_identity::SignedPrincipalDescriptor::sign(
+        store.local_principal_descriptor(LocalUserId(7)).unwrap(),
+        node.keyring().as_ref(),
+    )
+    .unwrap();
+    let snapshot = signed
+        .verify_snapshot(&node.public_keys(), None, home, None, now)
+        .unwrap();
+    let fence = password_credentials::PasswordAuthorization::from_snapshot(snapshot).unwrap();
     let (key, generation) = password_credentials::authorization(7).unwrap();
     let credential = PasswordCredential {
         user_id: 7,
@@ -27,13 +72,19 @@ fn lost_ack_receipts_and_release_snapshots_are_atomic_and_erasure_fenced() {
         created_at: 1,
         updated_at: 1,
         setup_sha256: Some(vec![4; 32]),
-        password_principal: Some("omega:test#7".into()),
+        password_principal: Some(format!("{}#7", node.authority_id().as_str())),
         password_iota_id: Some(11),
     };
     // Simulate losing the response after SQLite committed. A separate read
     // recovers the receipt without re-running an enrollment or changing bytes.
-    password_credentials::commit_enrollment(&credential, &key, generation, ("finish-1", &[1; 32]))
-        .unwrap();
+    password_credentials::commit_enrollment(
+        &credential,
+        &key,
+        generation,
+        ("finish-1", &[1; 32]),
+        &fence,
+    )
+    .unwrap();
     assert_eq!(
         password_credentials::mutation_outcome(7, &key, generation, ("finish-1", &[1; 32]))
             .unwrap(),
@@ -54,7 +105,8 @@ fn lost_ack_receipts_and_release_snapshots_are_atomic_and_erasure_fenced() {
             &alternate,
             &key,
             generation,
-            ("finish-1", &[2; 32])
+            ("finish-1", &[2; 32]),
+            &fence,
         )
         .is_err()
     );
@@ -68,7 +120,7 @@ fn lost_ack_receipts_and_release_snapshots_are_atomic_and_erasure_fenced() {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            password_credentials::authorize_release(&credential, &key, generation).unwrap();
+            password_credentials::authorize_release(&credential, &key, generation, &fence).unwrap();
             released.wait();
             deliver.wait();
             sender
@@ -76,8 +128,11 @@ fn lost_ack_receipts_and_release_snapshots_are_atomic_and_erasure_fenced() {
                 .unwrap();
         });
         released.wait();
-        password_credentials::commit_disable(7, &key, generation, ("disable-1", &[3; 32])).unwrap();
-        assert!(password_credentials::authorize_release(&credential, &key, generation).is_err());
+        password_credentials::commit_disable(7, &key, generation, ("disable-1", &[3; 32]), &fence)
+            .unwrap();
+        assert!(
+            password_credentials::authorize_release(&credential, &key, generation, &fence).is_err()
+        );
         deliver.wait();
         // The release was granted before disablement. Delivery may be delayed;
         // disablement does not promise recall of an already-granted response.
@@ -91,14 +146,22 @@ fn lost_ack_receipts_and_release_snapshots_are_atomic_and_erasure_fenced() {
     assert!(password_credentials::get(7).unwrap().is_none());
     // Replaying the earlier receipt reports its historical committed outcome,
     // but cannot restore the credential that a later disable removed.
-    password_credentials::commit_enrollment(&credential, &key, generation, ("finish-1", &[1; 32]))
-        .unwrap();
+    password_credentials::commit_enrollment(
+        &credential,
+        &key,
+        generation,
+        ("finish-1", &[1; 32]),
+        &fence,
+    )
+    .unwrap();
     assert!(password_credentials::get(7).unwrap().is_none());
     // A key rotation fences both release and historical receipt disclosure.
     let mut profile = user_manager::get_user(7).unwrap().unwrap();
     profile.public_key = "rotated-key".into();
     user_manager::update_user(profile).unwrap();
-    assert!(password_credentials::authorize_release(&credential, &key, generation).is_err());
+    assert!(
+        password_credentials::authorize_release(&credential, &key, generation, &fence).is_err()
+    );
     assert!(matches!(
         password_credentials::mutation_outcome(7, &key, generation, ("finish-1", &[1; 32])),
         Err(iota_storage::storage_error::StorageError::HostedAuthorizationDenied)

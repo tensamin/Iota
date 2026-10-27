@@ -61,7 +61,11 @@ impl OmikronConnection {
             .password_auth
             .begin_enrollment()
             .map_err(|_| Failure::RateLimited)?;
-        let principal = self.password_principal(user_id).await?;
+        let identity = self.password_identity(user_id).await?;
+        if identity.public_key != public_key {
+            return Err(Failure::Unauthorized);
+        }
+        let principal = identity.principal;
         let request = bytes(opened.content(), DataType::OpaqueMessage, MAX_OPAQUE_BYTES)?;
         let setup = self
             .password_auth
@@ -93,6 +97,7 @@ impl OmikronConnection {
         self.password_auth.enrollments.insert(
             enrollment_id,
             PendingEnrollment {
+                principal_fence: identity.fence,
                 public_key,
                 authorization_generation,
                 user_id,
@@ -166,7 +171,13 @@ impl OmikronConnection {
             .password_auth
             .setup()
             .map_err(|_| Failure::DependencyUnavailable)?;
-        let principal = self.password_principal(user_id).await?;
+        let identity = self.password_identity(user_id).await?;
+        if !identity.fence.same_identity(&pending.principal_fence)
+            || identity.public_key != expected_public_key
+        {
+            return Err(Failure::Unauthorized);
+        }
+        let principal = identity.principal;
         let iota_id = iota_storage::util::config_util::CONFIG
             .load()
             .iota_id
@@ -180,6 +191,9 @@ impl OmikronConnection {
                 .to_bytes()
                 .map_err(|error| error.to_string())?,
         );
+        if pending.created.elapsed() >= self.password_auth.pending_ttl {
+            return Err(Failure::Expired);
+        }
         password_credentials::commit_enrollment(
             &PasswordCredential {
                 user_id,
@@ -198,6 +212,7 @@ impl OmikronConnection {
             &expected_public_key,
             authorization_generation,
             (&operation_id, &request_sha256),
+            &identity.fence,
         )
         .map_err(storage_failure)?;
         self.password_auth.cancel_logins_for_user(user_id);
@@ -260,7 +275,7 @@ impl OmikronConnection {
                 .password_auth
                 .setup()
                 .map_err(|_| Failure::DependencyUnavailable)?;
-            let principal = self.password_principal(user_id).await?;
+            let principal = self.password_identity(user_id).await?.principal;
             let iota_id = iota_storage::util::config_util::CONFIG
                 .load()
                 .iota_id
@@ -324,6 +339,7 @@ impl OmikronConnection {
                 .map_err(|_| Failure::Unauthorized)?;
             let user_id = i64::try_from(opened.signer_id()).map_err(|error| error.to_string())?;
             use sha2::{Digest, Sha256};
+            let identity = self.password_identity(user_id).await?;
             let operation_id = opened.message_id().to_string();
             let request_sha256 = Sha256::digest(
                 frame
@@ -337,6 +353,7 @@ impl OmikronConnection {
                 &expected_public_key,
                 authorization_generation,
                 (&operation_id, &request_sha256),
+                &identity.fence,
             )
             .map_err(storage_failure)?;
             self.password_auth.cancel_logins_for_user(user_id);

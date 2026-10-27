@@ -14,15 +14,14 @@ async fn committed_password_receipts_and_health_survive_lost_responses() {
         use std::io::{Read, Write};
         use std::sync::atomic::{AtomicBool, Ordering};
         let account = Keyring::generate();
-        let account_key = account.public_key_bundle().try_to_base64().unwrap();
-        let omega = Keyring::generate().public_key_bundle();
-        let authority = iota_identity::AuthorityId::for_omega(&omega)
+        let omega = Keyring::generate();
+        let node = iota_identity::LocalNodeIdentity::from_keyring(Keyring::generate()).unwrap();
+        let authority = iota_identity::AuthorityId::for_omega(&omega.public_key_bundle())
             .unwrap()
             .as_str()
             .to_owned();
-        let discovery = serde_json::json!({"authority_id": authority, "public_key": omega.try_to_base64().unwrap()}).to_string();
-        let profile =
-            serde_json::json!({"user_id":7,"iota_id":11,"public_key": account_key}).to_string();
+        let discovery = serde_json::json!({"authority_id": authority, "public_key": omega.public_key_bundle().try_to_base64().unwrap()}).to_string();
+        let profile = password_identity_fixture(&omega, &node, account.public_key_bundle(), 1);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let stopped = Arc::new(AtomicBool::new(false));
@@ -58,6 +57,7 @@ async fn committed_password_receipts_and_health_survive_lost_responses() {
             .args(["--exact", "password::recovery_tests::committed_password_receipts_and_health_survive_lost_responses"])
             .env("PASSWORD_RECEIPT_TEST_CHILD", "1")
             .env("PASSWORD_RECEIPT_ACCOUNT_KEY", base64::engine::general_purpose::STANDARD.encode(account.try_to_bytes().unwrap()))
+            .env("PASSWORD_RECEIPT_NODE_KEY", base64::engine::general_purpose::STANDARD.encode(node.keyring().try_to_bytes().unwrap()))
             .env("PASSWORD_RECEIPT_OMEGA_AUTHORITY", authority)
             .env("OMEGA_API_URL", format!("http://{address}"))
             .status().unwrap();
@@ -72,11 +72,23 @@ async fn committed_password_receipts_and_health_survive_lost_responses() {
     std::fs::create_dir(&directory).unwrap();
     iota_util::file_util::configure_storage_directory(directory.clone());
     db::initialize_database().unwrap();
+    iota_storage::identity::bind_omega_authority(
+        &iota_identity::AuthorityId::new(
+            std::env::var("PASSWORD_RECEIPT_OMEGA_AUTHORITY").unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let mut config = (**iota_storage::util::config_util::CONFIG.load()).clone();
     config.iota_id = Some(11);
     iota_storage::util::config_util::CONFIG.store(Arc::new(config));
-    let node = Keyring::generate();
     use base64::Engine as _;
+    let node = Keyring::from_bytes(
+        &base64::engine::general_purpose::STANDARD
+            .decode(std::env::var("PASSWORD_RECEIPT_NODE_KEY").unwrap())
+            .unwrap(),
+    )
+    .unwrap();
     let account = Keyring::from_bytes(
         &base64::engine::general_purpose::STANDARD
             .decode(std::env::var("PASSWORD_RECEIPT_ACCOUNT_KEY").unwrap())
@@ -97,6 +109,7 @@ async fn committed_password_receipts_and_health_survive_lost_responses() {
         Arc::new(std::sync::Mutex::new(iota_state::AppState::new())),
     );
     *connection.keyring.write().await = Some(Arc::new(node));
+    let principal_fence = connection.password_identity(7).await.unwrap().fence;
     let setup = opaque::generate_server_setup();
     let authority = std::env::var("PASSWORD_RECEIPT_OMEGA_AUTHORITY").unwrap();
     let principal_string = format!("{authority}#7");
@@ -131,11 +144,10 @@ async fn committed_password_receipts_and_health_survive_lost_responses() {
         .set(Arc::new(setup))
         .ok()
         .unwrap();
-    connection
-        .password_auth
-        .omega_authority
-        .set(authority)
-        .unwrap();
+    assert_eq!(
+        connection.password_auth.omega_authority.get(),
+        Some(&authority)
+    );
     let node = connection.keyring.read().await.clone().unwrap();
     let enrollment_id = Uuid::new_v4();
     let original = connection
@@ -190,6 +202,7 @@ async fn committed_password_receipts_and_health_survive_lost_responses() {
     connection.password_auth.enrollments.insert(
         enrollment_id,
         runtime::PendingEnrollment {
+            principal_fence: connection.password_identity(7).await.unwrap().fence,
             public_key: key.clone(),
             authorization_generation: generation,
             user_id: 7,
@@ -222,14 +235,21 @@ async fn committed_password_receipts_and_health_survive_lost_responses() {
         password_credentials::get(7).unwrap().as_ref(),
         Some(&credential)
     );
-    password_credentials::commit_enrollment(&credential, &key, generation, (&operation, &digest))
-        .unwrap();
+    password_credentials::commit_enrollment(
+        &credential,
+        &key,
+        generation,
+        (&operation, &digest),
+        &principal_fence,
+    )
+    .unwrap();
     assert!(
         password_credentials::commit_enrollment(
             &credential,
             &key,
             generation,
-            ("competing-enrollment", &[7; 32])
+            ("competing-enrollment", &[7; 32]),
+            &principal_fence,
         )
         .is_err()
     );
@@ -344,6 +364,7 @@ async fn committed_password_receipts_and_health_survive_lost_responses() {
         connection.password_auth.logins.insert(
             session,
             PendingLogin {
+                principal_fence: Some(connection.password_identity(7).await.unwrap().fence),
                 connection_generation: connection.password_connection_generation(),
                 user_id: 7,
                 participant_id: 99,
@@ -392,6 +413,7 @@ async fn committed_password_receipts_and_health_survive_lost_responses() {
                 &key,
                 generation,
                 ("disable-before-release", &[8; 32]),
+                &principal_fence,
             )
             .unwrap();
             release.notify_one();
@@ -408,6 +430,7 @@ async fn committed_password_receipts_and_health_survive_lost_responses() {
                 &key,
                 generation,
                 ("disable-after-release", &[9; 32]),
+                &principal_fence,
             )
             .unwrap();
             transport.sender.send(&protected).await.unwrap();

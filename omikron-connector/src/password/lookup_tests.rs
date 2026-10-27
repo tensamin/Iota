@@ -14,20 +14,26 @@ async fn omega_lookups_overlap_at_ke1_and_ke3_and_fail_closed() {
             },
         };
         let account = Keyring::generate();
-        let account_key = account.public_key_bundle().try_to_base64().unwrap();
-        let omega = Keyring::generate().public_key_bundle();
-        let authority = iota_identity::AuthorityId::for_omega(&omega)
+        let omega = Keyring::generate();
+        let node = iota_identity::LocalNodeIdentity::from_keyring(Keyring::generate()).unwrap();
+        let authority = iota_identity::AuthorityId::for_omega(&omega.public_key_bundle())
             .unwrap()
             .as_str()
             .to_owned();
-        let discovery = serde_json::json!({"authority_id":authority,"public_key":omega.try_to_base64().unwrap()}).to_string();
+        let discovery = serde_json::json!({"authority_id":authority,"public_key":omega.public_key_bundle().try_to_base64().unwrap()}).to_string();
         let other = Keyring::generate().public_key_bundle();
         let changed_authority = serde_json::json!({"authority_id":iota_identity::AuthorityId::for_omega(&other).unwrap().as_str(),"public_key":other.try_to_base64().unwrap()}).to_string();
         let profile =
-            serde_json::json!({"user_id":7,"iota_id":11,"public_key":account_key}).to_string();
-        let changed_key = serde_json::json!({"user_id":7,"iota_id":11,"public_key":other.try_to_base64().unwrap()}).to_string();
-        let changed_iota =
-            serde_json::json!({"user_id":7,"iota_id":12,"public_key":account_key}).to_string();
+            super::super::password_identity_fixture(&omega, &node, account.public_key_bundle(), 1);
+        let changed_key = super::super::password_identity_fixture(&omega, &node, other, 2);
+        let other_node =
+            iota_identity::LocalNodeIdentity::from_keyring(Keyring::generate()).unwrap();
+        let changed_iota = super::super::password_identity_fixture(
+            &omega,
+            &other_node,
+            account.public_key_bundle(),
+            2,
+        );
         let responses = Arc::new((
             discovery,
             changed_authority,
@@ -91,6 +97,7 @@ async fn omega_lookups_overlap_at_ke1_and_ke3_and_fail_closed() {
             .args(["--exact","password::provisioning::lookup_tests::omega_lookups_overlap_at_ke1_and_ke3_and_fail_closed","--nocapture"])
             .env("PASSWORD_LOOKUP_CHILD","1")
             .env("PASSWORD_LOOKUP_ACCOUNT",base64::engine::general_purpose::STANDARD.encode(account.try_to_bytes().unwrap()))
+            .env("PASSWORD_LOOKUP_NODE",base64::engine::general_purpose::STANDARD.encode(node.keyring().try_to_bytes().unwrap()))
             .env("PASSWORD_LOOKUP_AUTHORITY",authority)
             .env("OMEGA_API_URL",format!("http://{address}"))
             .status().unwrap();
@@ -105,6 +112,11 @@ async fn omega_lookups_overlap_at_ke1_and_ke3_and_fail_closed() {
     std::fs::create_dir_all(&directory).unwrap();
     iota_util::file_util::configure_storage_directory(directory.clone());
     db::initialize_database().unwrap();
+    iota_storage::identity::bind_omega_authority(
+        &iota_identity::AuthorityId::new(std::env::var("PASSWORD_LOOKUP_AUTHORITY").unwrap())
+            .unwrap(),
+    )
+    .unwrap();
     let mut config = (**iota_storage::util::config_util::CONFIG.load()).clone();
     config.iota_id = Some(11);
     iota_storage::util::config_util::CONFIG.store(Arc::new(config));
@@ -127,7 +139,14 @@ async fn omega_lookups_overlap_at_ke1_and_ke3_and_fail_closed() {
         Arc::new(dashmap::DashSet::new()),
         Arc::new(std::sync::Mutex::new(iota_state::AppState::new())),
     ));
-    *connection.keyring.write().await = Some(Arc::new(Keyring::generate()));
+    *connection.keyring.write().await = Some(Arc::new(
+        Keyring::from_bytes(
+            &base64::engine::general_purpose::STANDARD
+                .decode(std::env::var("PASSWORD_LOOKUP_NODE").unwrap())
+                .unwrap(),
+        )
+        .unwrap(),
+    ));
     let setup = opaque::generate_server_setup();
     let principal = format!("{}#7", std::env::var("PASSWORD_LOOKUP_AUTHORITY").unwrap());
     let registration = opaque::client_registration_start(b"password").unwrap();

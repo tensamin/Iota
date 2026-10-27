@@ -225,19 +225,19 @@ impl OmikronConnection {
         Ok(response)
     }
 
-    pub(super) async fn password_error(&self, frame: &CommunicationValue, kind: CommunicationType) {
+    pub(super) async fn password_error(
+        &self,
+        frame: &CommunicationValue,
+        failure: tau::password::Failure,
+    ) {
         let Some(map) = frame.type_map() else {
             return;
         };
+        let kind = failure.message_type();
         if kind.try_to_id(map).is_none() {
             return;
         }
         let mut response = CommunicationValue::new_with_type_map(kind, map);
-        let failure = match kind {
-            CommunicationType::ErrorNotAuthenticated => tau::password::Failure::Unauthorized,
-            CommunicationType::ErrorInternal => tau::password::Failure::DependencyUnavailable,
-            _ => tau::password::Failure::InvalidRequest,
-        };
         let Ok(payload) = failure.payload(map) else {
             return;
         };

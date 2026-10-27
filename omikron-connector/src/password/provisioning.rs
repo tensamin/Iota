@@ -9,6 +9,7 @@ use iota_storage::users::{password_credentials, user_manager};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::PublicKeyBundle;
 use sha2::{Digest, Sha256};
+use tau::password::Failure;
 use uuid::Uuid;
 
 use super::{
@@ -45,20 +46,15 @@ impl OmikronConnection {
             Ok(prepared) => prepared,
             Err(error) => {
                 iota_logger::log!("Password KE1 admission failed: {error}");
-                self.password_error(frame, CommunicationType::ErrorNotAuthenticated)
-                    .await;
+                self.password_error(frame, error).await;
                 return;
             }
         };
-        let request_id = prepared.request_id;
         let session_id = prepared.session_id;
         let user_id = prepared.user_id;
         let participant_id = prepared.participant_id;
         let generation = prepared.connection_generation;
-        let type_map = frame
-            .type_map()
-            .expect("handler request has a negotiated type map")
-            .clone();
+        let request = frame.clone();
         let connection = self.clone();
         let pending = self.track_operation();
         self.preparation_tasks.lock().await.spawn(async move {
@@ -86,12 +82,7 @@ impl OmikronConnection {
                         generation,
                     );
                     iota_logger::log!("Password KE1 processing failed: {error}");
-                    let response = CommunicationValue::new_with_type_map(
-                        CommunicationType::ErrorNotAuthenticated,
-                        &type_map,
-                    )
-                    .with_id(request_id);
-                    let _ = connection.send_message(&response).await;
+                    connection.password_error(&request, error).await;
                 }
             }
         });
@@ -100,9 +91,9 @@ impl OmikronConnection {
     fn prepare_password_provisioning_start(
         &self,
         frame: &CommunicationValue,
-    ) -> Result<PreparedPasswordStart, String> {
+    ) -> Result<PreparedPasswordStart, Failure> {
         if !self.password_auth.malformed_budget_available() {
-            return Err("password service busy".into());
+            return Err(Failure::RateLimited);
         }
         let content = frame.payload();
         let request_id = frame.id().ok_or("missing request ID")?;
@@ -132,15 +123,16 @@ impl OmikronConnection {
         let setup = self
             .password_auth
             .setup()
-            .map_err(|error| error.to_string())?;
+            .map_err(|_| Failure::DependencyUnavailable)?;
         let (attempt, delay) = self
             .password_auth
             .begin_attempt(user_id)
-            .map_err(|error| error.to_string())?;
+            .map_err(|_| Failure::RateLimited)?;
         let connection_generation = self.password_connection_generation();
         match self.password_auth.logins.entry(session_id) {
             Entry::Vacant(slot) => {
                 slot.insert(PendingLogin {
+                    principal_fence: None,
                     connection_generation,
                     user_id,
                     participant_id,
@@ -153,7 +145,7 @@ impl OmikronConnection {
                     attempt: Some(attempt),
                 });
             }
-            Entry::Occupied(_) => return Err("session already started".into()),
+            Entry::Occupied(_) => return Err(Failure::Conflict),
         }
         Ok(PreparedPasswordStart {
             connection_generation,
@@ -172,7 +164,7 @@ impl OmikronConnection {
     async fn execute_password_provisioning_start(
         &self,
         prepared: PreparedPasswordStart,
-    ) -> Result<CommunicationValue, String> {
+    ) -> Result<CommunicationValue, Failure> {
         let PreparedPasswordStart {
             connection_generation,
             request_id,
@@ -187,22 +179,17 @@ impl OmikronConnection {
         } = prepared;
         let cancellation = self.preparation_cancellation();
         if cancellation.is_cancelled() {
-            return Err("connection closed".into());
+            return Err(Failure::Cancelled);
         }
         if !delay.is_zero() {
             tokio::select! {
-                _ = cancellation.cancelled() => return Err("connection closed".into()),
+                _ = cancellation.cancelled() => return Err(Failure::Cancelled),
                 _ = tokio::time::sleep(delay) => {},
             }
         }
-        let (principal, discovered_key) = tokio::try_join!(
-            async {
-                self.password_principal(user_id)
-                    .await
-                    .map_err(|error| error.to_string())
-            },
-            self.validate_password_hosting(user_id),
-        )?;
+        let identity = self.password_identity(user_id).await?;
+        let principal = identity.principal;
+        let discovered_key = identity.public_key;
         let discovered_fingerprint = super::wire::key_fingerprint(&discovered_key)?;
         if self
             .password_auth
@@ -215,7 +202,7 @@ impl OmikronConnection {
                     .is_some_and(|advertised| advertised != &discovered_fingerprint)
             })
         {
-            return Err("discovered account key changed".into());
+            return Err(Failure::Unauthorized);
         }
         let runtime = self.password_auth.clone();
         let mut ke1_timing = super::timing::Timing::start(super::timing::Stage::Ke1);
@@ -225,7 +212,7 @@ impl OmikronConnection {
                     if !runtime.logins.get(&session_id).is_some_and(|pending| {
                         pending.created.elapsed() < PASSWORD_OPERATION_TIMEOUT
                     }) {
-                        return Err("password exchange cancelled".to_owned());
+                        return Err(Failure::Cancelled);
                     }
                     let contact_key_sha256 = public_key_fingerprint(&contact_key)?;
                     let binding = PasswordLoginBindingV1 {
@@ -235,10 +222,10 @@ impl OmikronConnection {
                         contact_key_sha256: &contact_key_sha256,
                     };
                     // Run the same lookups for every account and use a dummy record when absent.
-                    let profile =
-                        user_manager::get_user(user_id).map_err(|error| error.to_string())?;
-                    let credential =
-                        password_credentials::get(user_id).map_err(|error| error.to_string())?;
+                    let profile = user_manager::get_user(user_id)
+                        .map_err(|_| Failure::DependencyUnavailable)?;
+                    let credential = password_credentials::get(user_id)
+                        .map_err(|_| Failure::DependencyUnavailable)?;
                     let compatible_credential = credential.as_ref().filter(|credential| {
                         profile.as_ref().is_some_and(|profile| {
                             profile.public_key == discovered_key
@@ -257,34 +244,36 @@ impl OmikronConnection {
                         &ke1,
                         &binding,
                     )
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|_| Failure::DependencyUnavailable)?;
                     let hash = compatible_credential
                         .map(|value| Sha256::digest(&value.opaque_record).to_vec());
-                    Ok::<_, String>((
+                    Ok::<_, Failure>((
                         response.response,
                         response.state,
                         compatible_credential.is_some(),
                         hash,
                     ))
                 })
-                .await??;
+                .await
+                .map_err(|_| Failure::DependencyUnavailable)??;
         ke1_timing.success();
         drop(ke1_timing);
         let mut pending = self
             .password_auth
             .logins
             .get_mut(&session_id)
-            .ok_or("password exchange cancelled")?;
+            .ok_or(Failure::Cancelled)?;
         if pending.connection_generation != connection_generation
             || pending.user_id != user_id
             || pending.participant_id != participant_id
             || pending.created.elapsed() >= PASSWORD_OPERATION_TIMEOUT
         {
-            return Err("password exchange expired".into());
+            return Err(Failure::Expired);
         }
         pending.state = Some(state);
         pending.real_record = real_record;
         pending.record_hash = record_hash;
+        pending.principal_fence = Some(identity.fence);
         Ok(
             CommunicationValue::new(CommunicationType::PasswordProvisioningResponse)
                 .with_id(request_id)
@@ -303,8 +292,7 @@ impl OmikronConnection {
             }
             Err(error) => {
                 iota_logger::log!("Password KE3 failed: {error}");
-                self.password_error(frame, CommunicationType::ErrorNotAuthenticated)
-                    .await;
+                self.password_error(frame, error).await;
             }
         }
     }
@@ -312,7 +300,7 @@ impl OmikronConnection {
     pub(super) async fn provisioning_finish(
         &self,
         frame: &CommunicationValue,
-    ) -> Result<CommunicationValue, String> {
+    ) -> Result<CommunicationValue, Failure> {
         let id = session(frame.payload())?;
         let (_, mut pending) = self
             .password_auth
@@ -325,7 +313,7 @@ impl OmikronConnection {
                         .and_then(|id| u64::try_from(id).ok())
                         == Some(pending.participant_id)
             })
-            .ok_or("OPAQUE session expired")?;
+            .ok_or(Failure::Expired)?;
         match self.finish_pending_login(frame, id, &mut pending).await {
             Ok(response) => Ok(response),
             Err(error) => {
@@ -336,7 +324,7 @@ impl OmikronConnection {
                         attempt.cancel();
                     }
                 }
-                Err(error.to_string())
+                Err(error.failure())
             }
         }
     }
@@ -361,15 +349,16 @@ impl OmikronConnection {
                 .abort_login(id, user_id, participant, generation);
             Ok::<_, String>(())
         })();
-        self.password_error(
-            frame,
-            if result.is_ok() {
-                CommunicationType::Success
-            } else {
-                CommunicationType::ErrorInvalidData
-            },
-        )
-        .await;
+        if result.is_err() {
+            self.password_error(frame, Failure::InvalidRequest).await;
+        } else if let Some(map) = frame.type_map() {
+            let mut response =
+                CommunicationValue::new_with_type_map(CommunicationType::Success, map);
+            if let Some(id) = frame.id() {
+                response = response.with_id(id);
+            }
+            let _ = self.send_message(&response).await;
+        }
     }
 
     async fn finish_pending_login(
@@ -380,10 +369,12 @@ impl OmikronConnection {
     ) -> Result<CommunicationValue, PasswordFinishError> {
         let operation_started = Instant::now();
         let content = frame.payload();
-        if pending.created.elapsed() >= self.password_auth.pending_ttl
-            || pending.user_id
-                != positive(content, DataType::UserId)
-                    .map_err(|_| PasswordFinishError::InvalidClientMessage)?
+        if pending.created.elapsed() >= self.password_auth.pending_ttl {
+            return Err(PasswordFinishError::Expired);
+        }
+        if pending.user_id
+            != positive(content, DataType::UserId)
+                .map_err(|_| PasswordFinishError::InvalidClientMessage)?
             || pending.participant_id
                 != u64::try_from(
                     positive(content, DataType::ProvisioningParticipantId)
@@ -410,15 +401,19 @@ impl OmikronConnection {
             .map_err(|_| PasswordFinishError::InvalidClientMessage)?;
         opaque::validate_login_finalization(&ke3)
             .map_err(|_| PasswordFinishError::InvalidClientMessage)?;
-        let (principal, discovered_key) = tokio::try_join!(
-            async {
-                self.password_principal(pending.user_id)
-                    .await
-                    .map_err(|error| error.to_string())
-            },
-            self.validate_password_hosting(pending.user_id),
-        )
-        .map_err(|_| PasswordFinishError::CredentialUnavailable)?;
+        let identity = self
+            .password_identity(pending.user_id)
+            .await
+            .map_err(PasswordFinishError::Identity)?;
+        if !pending
+            .principal_fence
+            .as_ref()
+            .is_some_and(|previous| previous.same_identity(&identity.fence))
+        {
+            return Err(PasswordFinishError::CredentialChanged);
+        }
+        let principal = identity.principal;
+        let discovered_key = identity.public_key;
         let discovered_fingerprint = super::wire::key_fingerprint(&discovered_key)
             .map_err(|_| PasswordFinishError::CredentialUnavailable)?;
         let (release_key, authorization_generation) =
@@ -450,7 +445,7 @@ impl OmikronConnection {
                 // Admission checked the idle TTL. A consumed KE3 keeps its lease
                 // for this bounded processing budget, even across that idle TTL.
                 if operation_started.elapsed() >= PASSWORD_OPERATION_TIMEOUT {
-                    return Err(PasswordFinishError::BindingMismatch);
+                    return Err(PasswordFinishError::ProcessingTimeout);
                 }
                 let contact_key_sha256 = public_key_fingerprint(&contact_key)
                     .map_err(|_| PasswordFinishError::InvalidClientMessage)?;
@@ -532,7 +527,7 @@ impl OmikronConnection {
             .clone()
             .ok_or(PasswordFinishError::NodeUnavailable)?;
         if operation_started.elapsed() >= PASSWORD_OPERATION_TIMEOUT {
-            return Err(PasswordFinishError::BindingMismatch);
+            return Err(PasswordFinishError::ProcessingTimeout);
         }
         let response = self
             .build_protected(
@@ -555,7 +550,7 @@ impl OmikronConnection {
             release.notified().await;
         }
         if operation_started.elapsed() >= PASSWORD_OPERATION_TIMEOUT {
-            return Err(PasswordFinishError::BindingMismatch);
+            return Err(PasswordFinishError::ProcessingTimeout);
         }
         // This atomic snapshot grants release. Disablement or rotation that
         // wins first rejects it. A later commit cannot retract ciphertext in flight.
@@ -563,10 +558,11 @@ impl OmikronConnection {
             &credential,
             &release_key,
             authorization_generation,
+            &identity.fence,
         )
         .map_err(|_| PasswordFinishError::CredentialChanged)?;
         if operation_started.elapsed() >= PASSWORD_OPERATION_TIMEOUT {
-            return Err(PasswordFinishError::BindingMismatch);
+            return Err(PasswordFinishError::ProcessingTimeout);
         }
         // Clear pressure only after the protected credential is ready to deliver.
         if let Some(attempt) = pending.attempt.take() {

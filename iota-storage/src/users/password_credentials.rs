@@ -199,8 +199,10 @@ pub fn authorize_release(
     credential: &PasswordCredential,
     expected_public_key: &str,
     generation: i64,
+    fence: &PasswordAuthorization,
 ) -> Result<(), StorageError> {
     db::with_immediate_transaction(|tx| {
+        verify_principal_on(tx, credential.user_id, expected_public_key, fence)?;
         let authorized: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM users u JOIN hosted_auth_state a ON a.local_user_id = u.user_id
              WHERE u.user_id = ?1 AND u.public_key = ?2 AND a.enabled = 1 AND a.generation = ?3)",
@@ -211,6 +213,80 @@ pub fn authorize_release(
         }
         Ok(())
     })
+}
+
+/// A verified authority/home proof and its transaction fence. Callers cannot
+/// substitute unsigned identity data or extend the proof's mutation lifetime.
+#[derive(Clone, Debug)]
+pub struct PasswordAuthorization {
+    snapshot: iota_identity::VerifiedPrincipalSnapshot,
+    principal: crate::identity::PrincipalCommitFence,
+}
+
+impl PasswordAuthorization {
+    pub fn from_snapshot(
+        snapshot: iota_identity::VerifiedPrincipalSnapshot,
+    ) -> Result<Self, StorageError> {
+        use iota_identity::PrincipalStore;
+        let descriptor = snapshot.principal_descriptor().descriptor();
+        let resolved = crate::identity::SqlitePrincipalStore
+            .get_by_canonical_id(&descriptor.principal)
+            .map_err(|_| StorageError::HostedAuthorizationDenied)?
+            .ok_or(StorageError::HostedAuthorizationDenied)?;
+        let principal = crate::identity::PrincipalCommitFence::capture(&resolved)
+            .map_err(|_| StorageError::HostedAuthorizationDenied)?;
+        let mut keys = descriptor
+            .public_keys
+            .iter()
+            .map(|key| {
+                key.try_to_base64()
+                    .map_err(|_| StorageError::HostedAuthorizationDenied)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        keys.sort();
+        keys.dedup();
+        if principal.revision != descriptor.revision
+            || principal.home != descriptor.home
+            || principal.valid_until != descriptor.valid_until
+            || principal.keys != keys
+            || !snapshot.fresh_for_mutation(crate::util::sync::now_millis())
+        {
+            return Err(StorageError::HostedAuthorizationDenied);
+        }
+        Ok(Self {
+            snapshot,
+            principal,
+        })
+    }
+
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.principal == other.principal
+    }
+}
+
+fn verify_principal_on(
+    connection: &rusqlite::Connection,
+    owner: i64,
+    key: &str,
+    fence: &PasswordAuthorization,
+) -> Result<(), StorageError> {
+    if !fence
+        .snapshot
+        .fresh_for_mutation(crate::util::sync::now_millis())
+    {
+        return Err(StorageError::HostedAuthorizationDenied);
+    }
+    fence.principal.verify_on(connection)?;
+    crate::util::relay_work::verify_owner_on(connection, owner, fence.principal.handle)?;
+    if !fence
+        .principal
+        .keys
+        .iter()
+        .any(|candidate| candidate == key)
+    {
+        return Err(StorageError::HostedAuthorizationDenied);
+    }
+    Ok(())
 }
 
 pub fn delete(user_id: i64) -> Result<bool, StorageError> {

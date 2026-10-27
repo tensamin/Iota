@@ -206,29 +206,16 @@ impl DaemonServices {
         let omega_host = omikron_connector::omega_discovery::omega_host();
         let locator = AuthorityLocator::new(omega_host)
             .expect("the configured Omega host is a valid authority locator");
-        let local_identity: Arc<dyn IdentityResolver> =
-            Arc::new(iota_storage::identity::LocalIdentityResolver::new(
-                authority.clone(),
-                AuthorityKind::Omega,
-                node_identity
-                    .as_ref()
-                    .and_then(|identity| identity.node_id())
-                    .map(PrincipalHome::Iota)
-                    .unwrap_or_else(|| PrincipalHome::Omega(locator.clone())),
-                local_users.clone(),
-                Arc::new(iota_storage::identity::SqlitePrincipalStore),
-            ));
-        let omega_identity: Arc<dyn IdentityResolver> =
+        let identities: Arc<dyn IdentityResolver> =
             Arc::new(omikron_connector::identity::OmegaIdentityResolver::new(
                 client.clone(),
                 authority.clone(),
                 locator,
                 principals.clone(),
+                node_identity
+                    .as_ref()
+                    .and_then(|identity| identity.node_id()),
             ));
-        let identities: Arc<dyn IdentityResolver> = Arc::new(
-            CompositeIdentityResolver::new(vec![local_identity, omega_identity])
-                .expect("the identity resolver chain is not empty"),
-        );
         let router: Arc<dyn PeerRouter> = router.unwrap_or_else(|| {
             Arc::new(omikron_connector::router::OmikronPeerRouter::new(
                 client.clone(),
@@ -614,6 +601,59 @@ impl RelayNodeIdentity for InactiveServices {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn centralized_mutations_cannot_resolve_from_unsigned_local_profiles() {
+        struct UnsignedOmega;
+
+        #[async_trait]
+        impl OmikronClient for UnsignedOmega {
+            async fn send_message(
+                &self,
+                _: &CommunicationValue,
+            ) -> Result<(), omikron_connector::OmikronError> {
+                panic!("identity resolution must use a correlated request")
+            }
+
+            async fn await_response(
+                &self,
+                request: &CommunicationValue,
+                _: std::time::Duration,
+            ) -> Result<CommunicationValue, omikron_connector::OmikronError> {
+                use mtp::codec::{CommunicationType, DataType, DataValue};
+                assert!(request.is_type(CommunicationType::GetUserData));
+                Ok(CommunicationValue::new(CommunicationType::GetUserData)
+                    .add_typed_default(DataType::UserId, DataValue::UnsignedNumber(42))
+                    .add_typed_default(DataType::IotaId, DataValue::UnsignedNumber(7)))
+            }
+
+            async fn reconnect(&self) -> Result<(), omikron_connector::OmikronError> {
+                panic!("identity resolution must not reconnect the connector")
+            }
+
+            async fn rotate_identity(&self) -> Result<(), omikron_connector::OmikronError> {
+                panic!("identity resolution must not change the node identity")
+            }
+
+            async fn is_connected(&self) -> bool {
+                true
+            }
+        }
+
+        let authority = AuthorityId::new(format!("omega-key:{}", "a".repeat(64))).unwrap();
+        let services =
+            DaemonServices::with_centralized_client(Arc::new(UnsignedOmega), authority.clone());
+        let result = services
+            .identities
+            .resolve_current_principal(&PrincipalId {
+                authority,
+                user_id: 42,
+            })
+            .await;
+        assert!(
+            matches!(result, Err(IdentityError::Unavailable(reason)) if reason == "Omega signed identity is unavailable")
+        );
+    }
 
     #[test]
     fn active_services_can_be_composed_without_omikron() {

@@ -71,11 +71,14 @@ pub(super) struct PendingLogin {
     pub(super) state: Option<ServerLoginState>,
     pub(super) real_record: bool,
     pub(super) record_hash: Option<Vec<u8>>,
+    pub(super) principal_fence:
+        Option<iota_storage::users::password_credentials::PasswordAuthorization>,
     pub(super) created: Instant,
     pub(super) attempt: Option<AttemptLease>,
 }
 
 pub(super) struct PendingEnrollment {
+    pub(super) principal_fence: iota_storage::users::password_credentials::PasswordAuthorization,
     pub(super) public_key: String,
     pub(super) authorization_generation: i64,
     pub(super) user_id: i64,
