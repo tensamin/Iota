@@ -132,6 +132,11 @@ pub fn execute(owner: i64, request: &Request) -> Result<Response, StorageError> 
             Request::Acknowledge { cursor, page_id } => acknowledge(tx, owner, cursor, page_id),
         }
     });
+    if let (Request::Acknowledge { page_id, .. }, Ok(Response::Acknowledged { .. })) =
+        (request, &outcome)
+    {
+        super::super::relay_work::fault_point("after_sync_acknowledgment_commit", page_id);
+    }
     match outcome {
         Err(StorageError::InvalidRelayPayload(code)) => Ok(Response::Unavailable {
             error: match code {
