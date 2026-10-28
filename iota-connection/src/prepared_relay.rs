@@ -137,6 +137,31 @@ fn text(frame: &CommunicationValue, field: DataType) -> Result<String, StorageEr
     Ok(value)
 }
 
+fn verify_file_signature(
+    keys: &[iota_identity::PublicKeyBundle],
+    public_key: &str,
+    payload: &[u8],
+    signature: &[u8],
+) -> Result<(), StorageError> {
+    if public_key.len() > 16 * 1024 || signature.len() > 8192 {
+        return Err(invalid("file signature length"));
+    }
+    let key = iota_identity::PublicKeyBundle::from_base64(public_key)
+        .map_err(|_| invalid("file signing key"))?;
+    let bytes = key
+        .try_as_bytes()
+        .map_err(|_| invalid("file signing key"))?;
+    if !keys.iter().any(|candidate| {
+        candidate
+            .try_as_bytes()
+            .is_ok_and(|candidate| candidate == bytes)
+    }) {
+        return Err(StorageError::MessageUnauthorized);
+    }
+    iota_identity::verify_dual_signature(&key, payload, signature)
+        .map_err(|_| StorageError::MessageUnauthorized)
+}
+
 pub(crate) fn prepare_application(
     verified: &crate::federated_relay::VerifiedFederatedRelay,
     sender: Option<LocalUserId>,
@@ -237,6 +262,54 @@ fn prepare_application_inner(
         .get_comm_type_enum()
         .ok_or(StorageError::UnsupportedRelayOperation)?
     {
+        CommunicationType::FileShareOffered => {
+            let json = text(frame, DataType::Json)?;
+            if json.len() > tau_relay_protocol::files::MAX_CONTROL_BYTES {
+                return Err(invalid("file offer length"));
+            }
+            let offer: tau_relay_protocol::files::ShareOffer =
+                serde_json::from_str(&json).map_err(|_| invalid("file offer"))?;
+            offer
+                .manifest
+                .validate()
+                .map_err(|_| invalid("file manifest"))?;
+            verify_file_signature(
+                &verified.signer.public_keys,
+                &offer.signing_public_key,
+                &offer.signing_bytes(),
+                &offer.signature,
+            )?;
+            if offer.manifest.key.origin != signer_identity
+                || offer.manifest.envelope.recipient != recipient_identity
+                || offer.chat_id
+                    != tau_relay_protocol::canonical_chat_id(&signer_identity, &recipient_identity)
+            {
+                return Err(StorageError::MessageUnauthorized);
+            }
+            ApplicationOperation::FileShareOffered { offer }
+        }
+        CommunicationType::FileShareRevoked => {
+            let json = text(frame, DataType::Json)?;
+            if json.len() > tau_relay_protocol::files::MAX_CONTROL_BYTES {
+                return Err(invalid("file revocation length"));
+            }
+            let revoke: tau_relay_protocol::files::ShareRevoke =
+                serde_json::from_str(&json).map_err(|_| invalid("file revocation"))?;
+            verify_file_signature(
+                &verified.signer.public_keys,
+                &revoke.signing_public_key,
+                &revoke.signing_bytes(),
+                &revoke.signature,
+            )?;
+            if revoke.key.origin != signer_identity
+                || revoke.recipient != recipient_identity
+                || revoke.chat_id
+                    != tau_relay_protocol::canonical_chat_id(&signer_identity, &recipient_identity)
+            {
+                return Err(StorageError::MessageUnauthorized);
+            }
+            ApplicationOperation::FileShareRevoked { revoke }
+        }
         CommunicationType::MessageSend => {
             if frame.get_data(DataType::RelayMessageId).is_some()
                 && text(frame, DataType::RelayMessageId)? != verified.message_id
@@ -666,6 +739,32 @@ impl PreparedRelayOperation {
                 .map_err(|_| invalid("recipient principal"))?,
         )?;
         match &self.operation {
+            ApplicationOperation::FileShareOffered { offer } => {
+                let source = match &self.principal_fences[0].home {
+                    PrincipalHome::Iota(node) => Some(node.as_str()),
+                    _ => None,
+                };
+                iota_storage::util::files::apply_offer_in_tx(
+                    tx,
+                    owner,
+                    self.signer,
+                    self.recipient,
+                    offer,
+                    effect.sent_by_self,
+                    source,
+                )?;
+            }
+            ApplicationOperation::FileShareRevoked { revoke } => {
+                iota_storage::util::files::apply_revoke_in_tx(
+                    tx,
+                    owner,
+                    self.signer,
+                    self.recipient,
+                    revoke,
+                    &self.recipient_identity,
+                    effect.sent_by_self,
+                )?;
+            }
             ApplicationOperation::MessageSend {
                 content,
                 send_time,
@@ -953,7 +1052,12 @@ impl PreparedRelayOperation {
         for effect in &self.effects {
             if !effect.sent_by_self {
                 let blocked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM blocked_users WHERE user_id = ?1 AND blocked_principal = ?2)", params![effect.owner.0, self.signer.0], |r| r.get(0))?;
-                if blocked {
+                if blocked
+                    && !matches!(
+                        self.operation,
+                        ApplicationOperation::FileShareRevoked { .. }
+                    )
+                {
                     return Err(StorageError::MessageUnauthorized);
                 }
             }

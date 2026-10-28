@@ -491,6 +491,9 @@ impl ClientConnectionManager {
                     .with_request_id(&request),
             ];
         };
+        if let Some(responses) = message_handlers::handle_file_storage_request(&frame) {
+            return responses;
+        }
         if frame.is_type(CommunicationType::UserResolve) {
             let request = frame.clone();
             let resolver = self.identities.clone();

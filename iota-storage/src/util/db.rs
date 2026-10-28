@@ -1,6 +1,7 @@
 mod backup;
 use backup::db_file_path;
 pub use backup::verify_and_backup_database;
+pub use backup::{backup_encrypted_storage, restore_encrypted_storage};
 pub use backup::{backup_password_recovery, restore_password_recovery, validate_password_recovery};
 mod migrations;
 use migrations::run_migrations;

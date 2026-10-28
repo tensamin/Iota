@@ -480,6 +480,13 @@ impl OmikronConnection {
         let _ = self.send_message(&result).await;
     }
 
+    pub(super) async fn handle_file_request(self: Arc<Self>, cv: &CommunicationValue) {
+        let response = match run_asset_handler(cv, message_handlers::handle_file_request).await {
+            Ok(response) | Err(response) => response,
+        };
+        let _ = self.send_message(&response).await;
+    }
+
     pub(super) async fn handle_user_asset_upload_chunk(self: Arc<Self>, cv: &CommunicationValue) {
         let result =
             match run_asset_handler(cv, message_handlers::handle_user_asset_upload_chunk).await {

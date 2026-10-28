@@ -32,6 +32,8 @@ impl PeerManager {
             last_authentication_error: std::sync::Mutex::new(None),
             dials: std::sync::Mutex::new(HashMap::new()),
             recovery: RwLock::new(None),
+            file_worker_started: AtomicBool::new(false),
+            file_reads: tokio::sync::Semaphore::new(4),
         }
     }
 

@@ -81,6 +81,12 @@ enum StateV1 {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum OperationV1 {
+    FileShareOffered {
+        offer: tau_relay_protocol::files::ShareOffer,
+    },
+    FileShareRevoked {
+        revoke: tau_relay_protocol::files::ShareRevoke,
+    },
     MessageSend {
         content: String,
         send_time: i64,
@@ -133,6 +139,8 @@ enum OperationV1 {
 macro_rules! convert_operation {
     ($value:expr, $from:ident, $to:ident, $state:expr, $secret:expr) => {
         match $value {
+            $from::FileShareOffered { offer } => $to::FileShareOffered { offer },
+            $from::FileShareRevoked { revoke } => $to::FileShareRevoked { revoke },
             $from::MessageSend {
                 content,
                 send_time,

@@ -392,7 +392,12 @@ fn capture(
             let dictionary: Option<String> = row.get(4)?;
             if owner_principal.as_deref() != Some(&principal)
                 || generation != Some(scope.authorization_generation)
-                || dictionary.as_deref() != Some(scope.dictionary.as_str())
+                || !dictionary.as_deref().is_some_and(|dictionary| {
+                    iota_identity::relay_protocol::sync::dictionaries_compatible(
+                        dictionary,
+                        &scope.dictionary,
+                    )
+                })
             {
                 return Err(protocol_error(SyncError::SnapshotRequired));
             }

@@ -14,6 +14,15 @@ const ABANDONED_UPLOAD_MS: i64 = 24 * 60 * 60 * 1_000;
 const CLEANUP_INTERVAL_MS: i64 = 15 * 60 * 1_000;
 static LAST_CLEANUP: AtomicI64 = AtomicI64::new(0);
 
+// Filesystem writes and their SQLite offsets form one operation. This also
+// prevents cleanup/delete from unlinking a blob while a reader opens it.
+static ASSET_IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) fn lock_io() -> Result<std::sync::MutexGuard<'static, ()>, StorageError> {
+    ASSET_IO
+        .lock()
+        .map_err(|_| StorageError::Other("asset I/O lock poisoned".into()))
+}
+
 #[derive(Debug, Clone)]
 pub struct UserAssetMetadata {
     pub id: i64,
@@ -149,6 +158,7 @@ pub fn start(
     mime_type: &str,
 ) -> Result<UploadStatus, StorageError> {
     validate(user_id, asset_id, Some(upload_id))?;
+    let _io = lock_io()?;
     if size < 0 || sha256.len() != 32 || mime_type.is_empty() || mime_type.len() > 255 {
         return Err(StorageError::Other("invalid asset metadata".into()));
     }
@@ -173,11 +183,19 @@ pub fn start(
 
     let file_name = random_file_name();
     let directory = asset_dir()?;
+    let outstanding: i64 = db::with_db(|conn| {
+        Ok(conn.query_row(
+            "SELECT COALESCE(SUM(size-received),0) FROM user_asset_uploads WHERE state='uploading'",
+            [],
+            |row| row.get(0),
+        )?)
+    })?;
     let required_free = limits
         .min_free_asset_storage_bytes
         .checked_add(
             u64::try_from(size).map_err(|_| StorageError::Other("invalid asset size".into()))?,
         )
+        .and_then(|value| value.checked_add(outstanding as u64))
         .ok_or_else(|| StorageError::Other("filesystem reservation overflow".into()))?;
     if fs2::available_space(&directory)? < required_free {
         return Err(StorageError::AssetResourceLimit(
@@ -243,6 +261,7 @@ pub fn start(
 }
 
 pub fn status(user_id: i64, upload_id: &str) -> Result<Option<UploadStatus>, StorageError> {
+    let _io = lock_io()?;
     let Some((status, file_name)) = load_upload(user_id, upload_id)? else {
         return Ok(None);
     };
@@ -258,6 +277,7 @@ pub fn append(
     if chunk.is_empty() || chunk.len() > MAX_CHUNK_BYTES {
         return Err(StorageError::Other("invalid asset chunk size".into()));
     }
+    let _io = lock_io()?;
     let Some((status, file_name)) = load_upload(user_id, upload_id)? else {
         return Err(StorageError::Other("upload not found".into()));
     };
@@ -293,6 +313,7 @@ pub fn append(
 }
 
 pub fn commit(user_id: i64, upload_id: &str) -> Result<(UserAssetMetadata, bool), StorageError> {
+    let _io = lock_io()?;
     let Some((status, file_name)) = load_upload(user_id, upload_id)? else {
         return Err(StorageError::Other("upload not found".into()));
     };
@@ -335,6 +356,12 @@ pub fn commit(user_id: i64, upload_id: &str) -> Result<(UserAssetMetadata, bool)
 
     let now = sync::now_millis();
     let (metadata, replaced_file) = db::with_immediate_transaction(|tx| {
+        let current: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM user_asset_uploads WHERE user_id=?1 AND upload_id=?2 AND state='uploading' AND file_name=?3 AND received=?4)",params![user_id,upload_id,file_name,status.size],|row|row.get(0))?;
+        if !current {
+            return Err(StorageError::Other(
+                "upload was cancelled before commit".into(),
+            ));
+        }
         let existing = tx.query_row(
             "SELECT id, file_name, created_at FROM user_assets WHERE user_id = ?1 AND asset_id = ?2",
             params![user_id, status.asset_id],
@@ -389,6 +416,7 @@ pub fn commit(user_id: i64, upload_id: &str) -> Result<(UserAssetMetadata, bool)
 }
 
 pub fn abort(user_id: i64, upload_id: &str) -> Result<bool, StorageError> {
+    let _io = lock_io()?;
     let upload = load_upload(user_id, upload_id)?;
     let Some((status, file_name)) = upload else {
         return Ok(false);
@@ -413,12 +441,13 @@ pub fn list_page(
     user_id: i64,
     after_id: Option<i64>,
 ) -> Result<(Vec<UserAssetMetadata>, Option<i64>), StorageError> {
+    let _io = lock_io()?;
     if user_id <= 0 || after_id.is_some_and(|id| id <= 0) {
         return Err(StorageError::Other("invalid asset list cursor".into()));
     }
     cleanup_if_due()?;
     db::with_db(|conn| {
-        let mut statement = conn.prepare("SELECT id, user_id, asset_id, file_name, size, sha256, mime_type, revision, created_at, updated_at FROM user_assets WHERE user_id = ?1 AND deleted = 0 AND id < ?2 ORDER BY id DESC LIMIT ?3")?;
+        let mut statement = conn.prepare(&format!("SELECT id, user_id, asset_id, file_name, size, sha256, mime_type, revision, created_at, updated_at FROM user_assets WHERE user_id = ?1 AND deleted = 0 AND id < ?2 AND {} ORDER BY id DESC LIMIT ?3",crate::util::files::ASSET_ACCESS))?;
         let mut items = statement
             .query_map(
                 params![user_id, after_id.unwrap_or(i64::MAX), ASSET_PAGE_SIZE + 1],
@@ -436,9 +465,10 @@ pub fn list_page(
 }
 
 pub fn list(user_id: i64) -> Result<Vec<UserAssetMetadata>, StorageError> {
+    let _io = lock_io()?;
     cleanup_if_due()?;
     db::with_db(|conn| {
-        let mut statement = conn.prepare("SELECT id, user_id, asset_id, file_name, size, sha256, mime_type, revision, created_at, updated_at FROM user_assets WHERE user_id = ?1 AND deleted = 0 ORDER BY updated_at DESC")?;
+        let mut statement = conn.prepare(&format!("SELECT id, user_id, asset_id, file_name, size, sha256, mime_type, revision, created_at, updated_at FROM user_assets WHERE user_id = ?1 AND deleted = 0 AND {} ORDER BY updated_at DESC",crate::util::files::ASSET_ACCESS))?;
         statement
             .query_map([user_id], metadata_from_row)?
             .collect::<Result<Vec<_>, _>>()
@@ -452,13 +482,14 @@ pub fn read_chunk(
     offset: i64,
     amount: usize,
 ) -> Result<Option<(UserAssetMetadata, Vec<u8>)>, StorageError> {
+    let _io = lock_io()?;
     validate(user_id, asset_id, None)?;
     if offset < 0 || amount == 0 || amount > MAX_CHUNK_BYTES {
         return Err(StorageError::Other("invalid asset chunk range".into()));
     }
     let value = db::with_db(|conn| {
         Ok(conn.query_row(
-            "SELECT id, user_id, asset_id, file_name, size, sha256, mime_type, revision, created_at, updated_at FROM user_assets WHERE user_id = ?1 AND asset_id = ?2 AND deleted = 0",
+            &format!("SELECT id, user_id, asset_id, file_name, size, sha256, mime_type, revision, created_at, updated_at FROM user_assets WHERE user_id = ?1 AND asset_id = ?2 AND deleted = 0 AND {}",crate::util::files::ASSET_ACCESS),
             params![user_id, asset_id],
             |row| Ok((metadata_from_row(row)?, row.get::<_, String>(3)?)),
         ).optional()?)
@@ -477,6 +508,7 @@ pub fn read_chunk(
 }
 
 pub fn delete(user_id: i64, asset_id: &str) -> Result<Option<UserAssetMetadata>, StorageError> {
+    let _io = lock_io()?;
     validate(user_id, asset_id, None)?;
     let deleted = db::with_immediate_transaction(|tx| {
         let value = tx.query_row(
@@ -509,7 +541,9 @@ pub fn delete(user_id: i64, asset_id: &str) -> Result<Option<UserAssetMetadata>,
 }
 
 pub fn purge_user(user_id: i64) -> Result<(), StorageError> {
+    let _io = lock_io()?;
     let files = db::with_immediate_transaction(|tx| {
+        crate::util::files::purge_in_tx(tx, user_id)?;
         let mut files = HashSet::new();
         for query in [
             "SELECT file_name FROM user_assets WHERE user_id = ?1",
@@ -536,6 +570,11 @@ pub fn purge_user(user_id: i64) -> Result<(), StorageError> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn cleanup_abandoned() -> Result<(), StorageError> {
+    let _io = lock_io()?;
+    cleanup_if_due()
 }
 
 fn cleanup_if_due() -> Result<(), StorageError> {
@@ -568,6 +607,7 @@ fn cleanup_if_due() -> Result<(), StorageError> {
         let mut files = HashSet::new();
         for query in [
             "SELECT file_name FROM user_assets WHERE deleted = 0",
+            "SELECT a.file_name FROM user_assets a JOIN file_managed_assets m ON m.storage_user_id=a.user_id AND m.asset_id=a.asset_id",
             "SELECT file_name FROM user_asset_uploads WHERE state = 'uploading'",
         ] {
             let mut statement = conn.prepare(query)?;

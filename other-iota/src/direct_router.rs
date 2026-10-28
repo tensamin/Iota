@@ -70,6 +70,7 @@ impl DirectPeerRouter {
     }
 
     pub fn attach_manager(&self, manager: &Arc<PeerManager>) {
+        manager.start_file_replication();
         if let Ok(mut current) = self.manager.write() {
             *current = Some(Arc::downgrade(manager));
         }

@@ -4,6 +4,7 @@ use super::*;
  * database is moved aside rather than opened again, preserving material for
  * operator recovery while allowing the daemon to report the failed storage. */
 pub fn verify_and_backup_database() -> Result<(), StorageError> {
+    let _assets = crate::util::user_assets::lock_io()?;
     let storage_dir = iota_util::file_util::storage_directory();
     std::fs::create_dir_all(&storage_dir)?;
     let path = storage_dir.join(format!("{DB_NAME}.sqlite3"));
@@ -45,8 +46,142 @@ pub fn verify_and_backup_database() -> Result<(), StorageError> {
         None,
     )?;
     drop(destination);
+    copy_snapshot_assets(
+        &temporary,
+        &storage_dir.join("assets"),
+        &backup_dir.join("assets"),
+    )?;
     std::fs::File::open(&temporary)?.sync_all()?;
     std::fs::rename(temporary, backup)?;
+    Ok(())
+}
+
+/// Asset filenames are internal random identifiers. Copy only committed blobs
+/// referenced by the SQLite snapshot, and verify bytes before publishing it.
+fn copy_snapshot_assets(
+    database: &std::path::Path,
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<(), StorageError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let snapshot = Connection::open(database)?;
+    let exists: bool = snapshot.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_assets')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(());
+    }
+    std::fs::create_dir_all(target)?;
+    let mut statement =
+        snapshot.prepare("SELECT file_name,size,sha256 FROM user_assets WHERE deleted=0")?;
+    for row in statement.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Vec<u8>>(2)?,
+        ))
+    })? {
+        let (name, size, expected) = row?;
+        if name.len() != 48 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(StorageError::Other("invalid backup asset filename".into()));
+        }
+        let destination = target.join(&name);
+        let temporary = target.join(format!(".{name}.tmp"));
+        std::fs::copy(source.join(&name), &temporary)?;
+        let mut file = std::fs::File::open(&temporary)?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+        }
+        if file.metadata()?.len() != size as u64 || hash.finalize().as_slice() != expected {
+            return Err(StorageError::Other(
+                "backup asset integrity mismatch".into(),
+            ));
+        }
+        file.sync_all()?;
+        std::fs::rename(temporary, destination)?;
+    }
+    let mut uploads = snapshot
+        .prepare("SELECT file_name,received FROM user_asset_uploads WHERE state='uploading'")?;
+    for row in uploads.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        let (name, received) = row?;
+        if name.len() != 48 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(StorageError::Other("invalid upload backup filename".into()));
+        }
+        let temporary = target.join(format!(".{name}.tmp"));
+        std::fs::copy(source.join(&name), &temporary)?;
+        let file = std::fs::File::open(&temporary)?;
+        if file.metadata()?.len() != received as u64 {
+            return Err(StorageError::Other("upload backup offset mismatch".into()));
+        }
+        file.sync_all()?;
+        std::fs::rename(temporary, target.join(name))?;
+    }
+    std::fs::File::open(target)?.sync_all()?;
+    Ok(())
+}
+
+/// A new database + ciphertext snapshot. Client decryption keys are not escrowed.
+pub fn backup_encrypted_storage(destination: &std::path::Path) -> Result<(), StorageError> {
+    let _assets = crate::util::user_assets::lock_io()?;
+    std::fs::create_dir(destination)?;
+    let database = destination.join("messages.sqlite3");
+    with_db(|source| {
+        let mut target = Connection::open(&database)?;
+        rusqlite::backup::Backup::new(source, &mut target)?.run_to_completion(
+            128,
+            Duration::from_millis(10),
+            None,
+        )?;
+        Ok(())
+    })?;
+    copy_snapshot_assets(
+        &database,
+        &iota_util::file_util::storage_directory().join("assets"),
+        &destination.join("assets"),
+    )?;
+    std::fs::File::open(database)?.sync_all()?;
+    std::fs::write(
+        destination.join("complete"),
+        b"tensamin-encrypted-storage-v1\n",
+    )?;
+    std::fs::File::open(destination.join("complete"))?.sync_all()?;
+    std::fs::File::open(destination)?.sync_all()?;
+    Ok(())
+}
+
+/// Restore into a new directory, never over an active database. Point Iota at
+/// this directory only after this function returns successfully.
+pub fn restore_encrypted_storage(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(), StorageError> {
+    std::fs::create_dir(destination)?;
+    let database = destination.join("messages.sqlite3");
+    std::fs::copy(source.join("messages.sqlite3"), &database)?;
+    let connection = Connection::open(&database)?;
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    if integrity != "ok" {
+        return Err(StorageError::Other(
+            "backup database integrity mismatch".into(),
+        ));
+    }
+    drop(connection);
+    copy_snapshot_assets(
+        &database,
+        &source.join("assets"),
+        &destination.join("assets"),
+    )?;
+    std::fs::File::open(database)?.sync_all()?;
+    std::fs::File::open(destination)?.sync_all()?;
     Ok(())
 }
 

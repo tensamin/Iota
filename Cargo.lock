@@ -4950,7 +4950,7 @@ dependencies = [
 [[package]]
 name = "tau"
 version = "0.1.0"
-source = "git+https://github.com/TensaminDev/Tau.git?rev=cb1f5953c0f9e71c4a01688abaf8432fda3c90da#cb1f5953c0f9e71c4a01688abaf8432fda3c90da"
+source = "git+https://github.com/TensaminDev/Tau.git?rev=e140d4ac71fb83d4de32a108f65355cc9d52afea#e140d4ac71fb83d4de32a108f65355cc9d52afea"
 dependencies = [
  "dashmap",
  "libc",
@@ -4967,7 +4967,7 @@ dependencies = [
 [[package]]
 name = "tau-relay-protocol"
 version = "0.1.0"
-source = "git+https://github.com/TensaminDev/Tau.git?rev=cb1f5953c0f9e71c4a01688abaf8432fda3c90da#cb1f5953c0f9e71c4a01688abaf8432fda3c90da"
+source = "git+https://github.com/TensaminDev/Tau.git?rev=e140d4ac71fb83d4de32a108f65355cc9d52afea#e140d4ac71fb83d4de32a108f65355cc9d52afea"
 dependencies = [
  "base64 0.22.1",
  "mtp",

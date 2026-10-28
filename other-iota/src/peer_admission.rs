@@ -272,6 +272,7 @@ impl PeerManager {
             };
             if !frame.is_type(mtp::codec::CommunicationType::Relay)
                 && !frame.is_type(mtp::codec::CommunicationType::ChatSecretRecoveryRequest)
+                && !frame.is_type(mtp::codec::CommunicationType::FileReplicaRead)
                 && let Some(frame_id) = frame.id()
                 && let Some((_, response)) = pending
                     .lock()

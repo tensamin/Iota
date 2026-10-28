@@ -92,6 +92,13 @@ impl PeerManager {
         F: FnOnce(CommunicationValue) -> Fut,
         Fut: Future<Output = Result<(), String>>,
     {
+        if frame.is_type(mtp::codec::CommunicationType::FileReplicaRead) {
+            if let Some(response) = self.file_range_response(node, key, &frame).await {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), send(response)).await;
+            }
+            return;
+        }
         if frame.is_type(mtp::codec::CommunicationType::ChatSecretRecoveryRequest) {
             use iota_connection::chat_secret_recovery::{
                 RecoveryError, RecoveryReply, decode_request, reply_frame,
@@ -209,9 +216,12 @@ impl DirectPeerConnection for OutgoingPeer {
         &self,
         frame: CommunicationValue,
     ) -> Result<CommunicationValue, RouteError> {
+        let expected = frame
+            .is_type(mtp::codec::CommunicationType::FileReplicaRead)
+            .then_some(mtp::codec::CommunicationType::FileReplicaReadResponse);
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            self.0.request(&frame, None),
+            self.0.request(&frame, expected),
         )
         .await
         .map_err(|_| RouteError::Delivery("peer control request timed out".into()))?

@@ -7,11 +7,11 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     type-maps = {
-      url = "github:TensaminDev/Mtp-Type-Maps/6d0f1dee1391417b7f364189e03a39b17b01ce36";
+      url = "github:TensaminDev/Mtp-Type-Maps/bcaf5a2f1a43f1945fa531ecd688b31ae648919e";
       flake = false;
     };
     tau-src = {
-      url = "github:TensaminDev/Tau/cb1f5953c0f9e71c4a01688abaf8432fda3c90da";
+      url = "github:TensaminDev/Tau/e140d4ac71fb83d4de32a108f65355cc9d52afea";
       flake = false;
     };
     mtp-src = {
@@ -255,7 +255,7 @@
               pname = "iota";
               version = "0.1.0";
               src = source;
-              hash = "sha256-Dmz2487R7UqtLUl7eeg5B02xIVBmKD4TAwGMfdJtyCA=";
+              hash = "sha256-fc0ySjQyiHDuN6e/Ovg0SjWaqOG5paidVXUpXRDDirY=";
             };
           };
           cli = self.packages.${system}.default.overrideAttrs {

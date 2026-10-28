@@ -3,6 +3,7 @@ mod http_client;
 use http_client::certificate_to_pem;
 pub use http_client::publish_omega_node_descriptor;
 mod direct_router;
+mod file_replication;
 mod iota_resolver;
 mod omega_resolver;
 mod peer_manager;
@@ -174,6 +175,8 @@ pub struct PeerManager {
     last_authentication_error: std::sync::Mutex<Option<String>>,
     dials: std::sync::Mutex<HashMap<IotaNodeId, tokio::sync::watch::Receiver<DialState>>>,
     recovery: RwLock<Option<Arc<dyn iota_connection::chat_secret_recovery::PeerRecoveryHandler>>>,
+    file_worker_started: AtomicBool,
+    file_reads: tokio::sync::Semaphore,
 }
 
 /// A checked directory/admission snapshot. Provisional trust is not permission

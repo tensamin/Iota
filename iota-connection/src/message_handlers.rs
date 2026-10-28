@@ -39,6 +39,7 @@ pub use blobs::{
     handle_user_blob_delete, handle_user_blob_get, handle_user_blob_list, handle_user_blob_put,
 };
 mod assets;
+mod files;
 #[cfg(test)]
 use assets::asset_error;
 pub use assets::{
@@ -47,6 +48,7 @@ pub use assets::{
     handle_user_asset_upload_commit, handle_user_asset_upload_start,
     handle_user_asset_upload_status,
 };
+pub use files::{handle_file_request, handle_file_storage_request};
 mod policies;
 pub use policies::{
     handle_blocked_users_get, handle_message_storage_policy_get, handle_message_storage_policy_set,

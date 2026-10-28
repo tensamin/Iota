@@ -10,6 +10,7 @@ pub mod config_util;
 pub mod db;
 pub mod downstream_relay;
 pub mod e2ee_storage;
+pub mod files;
 pub mod message_retention;
 pub mod message_storage_policy;
 pub mod outgoing_relay;
