@@ -14,6 +14,33 @@ use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
+struct TransportMetrics;
+
+impl mtp::webserver::WebServerMetrics for TransportMetrics {
+    fn error_occurred(&self, error: &mtp::webserver::WebServerError) {
+        iota_logger::log_event!(
+            iota_logger::PrintType::General,
+            iota_logger::LogLevel::Error,
+            "transport.error",
+            "error={}",
+            error
+        );
+    }
+
+    fn request_completed(&self, _path: &str, status: u16, duration: std::time::Duration) {
+        if status >= 400 {
+            iota_logger::log_event!(
+                iota_logger::PrintType::General,
+                iota_logger::LogLevel::Warn,
+                "transport.request_failed",
+                "status={} elapsed_ms={}",
+                status,
+                duration.as_millis()
+            );
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait ClientPublicKeyResolver: Send + Sync {
     async fn public_key(&self, client_id: u64) -> Option<mtp::crypto::PublicKeyBundle>;
@@ -271,6 +298,7 @@ pub async fn start(
         HashMap::<IpAddr, (std::time::Instant, usize)>::new(),
     ));
     let web_config = WebServerConfig::new()
+        .with_metrics(Arc::new(TransportMetrics))
         .max_request_body(introduction_limits.max_request_bytes)
         .route("/", move |request, response| {
             root(assets.clone(), request, response)

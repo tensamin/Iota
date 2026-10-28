@@ -71,8 +71,14 @@ pub fn handle_global_settings_load(cv: &CommunicationValue) -> CommunicationValu
     let Ok(my_id_i64) = i64::try_from(my_id) else {
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
-    let Ok(settings_value) = settings::load_global(my_id_i64) else {
-        return error_response(cv, CommunicationType::ErrorInternal);
+    let settings_value = match settings::load_global(my_id_i64) {
+        Ok(value) => value,
+        Err(error) => {
+            return internal_handler_error(cv, "settings.global_load", error).add_typed_default(
+                DataType::ErrorType,
+                DataValue::Str("settings_unavailable".into()),
+            );
+        }
     };
     let Some(settings_value_str) = settings_value else {
         let mut response = CommunicationValue::new(CommunicationType::ErrorNotFound)
@@ -168,6 +174,10 @@ pub fn handle_settings_save(
                 DataValue::Str("Invalid settings_name".to_string()),
             )
             .add_typed_default(
+                DataType::ErrorType,
+                DataValue::Str("invalid_settings_name".into()),
+            )
+            .add_typed_default(
                 DataType::SettingsName,
                 DataValue::Str(settings_name.to_string()),
             )
@@ -248,14 +258,24 @@ pub fn handle_settings_load(
                 DataValue::Str("Invalid settings_name".to_string()),
             )
             .add_typed_default(
+                DataType::ErrorType,
+                DataValue::Str("invalid_settings_name".into()),
+            )
+            .add_typed_default(
                 DataType::SettingsName,
                 DataValue::Str(settings_name.to_string()),
             )
             .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id));
     }
 
-    let Ok(settings_value) = settings::load(my_id_i64, session_id_i64, settings_name) else {
-        return error_response(cv, CommunicationType::ErrorInternal);
+    let settings_value = match settings::load(my_id_i64, session_id_i64, settings_name) {
+        Ok(value) => value,
+        Err(error) => {
+            return internal_handler_error(cv, "settings.load", error).add_typed_default(
+                DataType::ErrorType,
+                DataValue::Str("settings_unavailable".into()),
+            );
+        }
     };
     let Some(settings_value_str) = settings_value else {
         return CommunicationValue::new(CommunicationType::ErrorNotFound)
@@ -313,8 +333,14 @@ pub fn handle_settings_list(
         return error_response(cv, CommunicationType::ErrorInvalidData);
     };
 
-    let Ok(settings) = settings::list(my_id_i64, session_id_i64) else {
-        return error_response(cv, CommunicationType::ErrorInternal);
+    let settings = match settings::list(my_id_i64, session_id_i64) {
+        Ok(value) => value,
+        Err(error) => {
+            return internal_handler_error(cv, "settings.list", error).add_typed_default(
+                DataType::ErrorType,
+                DataValue::Str("settings_unavailable".into()),
+            );
+        }
     };
     let settings_json = settings.into_iter().map(DataValue::Str).collect();
     CommunicationValue::new(CommunicationType::SettingsList)

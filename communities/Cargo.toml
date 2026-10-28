@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "db3125809293e462ec1593704e9c4d2172437533" }
+mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "87c535650a3a33b166139b02cdd7327d412d3bca" }
 iota-util = { path = "../iota-util" }
 
 futures = "*"

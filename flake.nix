@@ -11,11 +11,11 @@
       flake = false;
     };
     tau-src = {
-      url = "github:TensaminDev/Tau/714968acb05a2e877f03690028ae604afcbbc701";
+      url = "github:TensaminDev/Tau/cb1f5953c0f9e71c4a01688abaf8432fda3c90da";
       flake = false;
     };
     mtp-src = {
-      url = "github:Nonanium/MTP/db3125809293e462ec1593704e9c4d2172437533";
+      url = "github:Nonanium/MTP/87c535650a3a33b166139b02cdd7327d412d3bca";
       flake = false;
     };
   };
@@ -255,7 +255,7 @@
               pname = "iota";
               version = "0.1.0";
               src = source;
-              hash = "sha256-GJMKOCpMq902eMzE4zBQaje3/zHxe86311Pkff3toHw=";
+              hash = "sha256-Dmz2487R7UqtLUl7eeg5B02xIVBmKD4TAwGMfdJtyCA=";
             };
           };
           cli = self.packages.${system}.default.overrideAttrs {

@@ -271,13 +271,19 @@ pub fn handle_messages_get(cv: &CommunicationValue) -> CommunicationValue {
     };
     let mut msg_array: Vec<DataValue> = Vec::new();
     for m in &messages {
-        let Ok(value) = stored_message_value(
+        let value = match stored_message_value(
             m,
             my_id_i64,
             partner_id,
             cv.type_map().unwrap_or(&mtp::codec::TypeMap::latest()),
-        ) else {
-            return error_response(cv, CommunicationType::ErrorInternal);
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return internal_handler_error(cv, "messages.serialize", error).add_typed_default(
+                    DataType::ErrorType,
+                    DataValue::Str("stored_message_invalid".into()),
+                );
+            }
         };
         msg_array.push(value);
     }
@@ -315,15 +321,29 @@ pub fn handle_message_get(cv: &CommunicationValue) -> CommunicationValue {
         .with_request_id(cv)
         .with_receiver(u64::try_from(owner).expect("authenticated sender is non-negative"));
     let Some(alias) = message.external_principal else {
-        return error_response(cv, CommunicationType::ErrorInternal);
+        return internal_handler_error(
+            cv,
+            "message.principal",
+            "stored message has no external principal",
+        )
+        .add_typed_default(
+            DataType::ErrorType,
+            DataValue::Str("stored_message_invalid".into()),
+        );
     };
-    let Ok(fields) = stored_message_fields(
+    let fields = match stored_message_fields(
         &message,
         owner,
         alias.0,
         cv.type_map().unwrap_or(&mtp::codec::TypeMap::latest()),
-    ) else {
-        return error_response(cv, CommunicationType::ErrorInternal);
+    ) {
+        Ok(fields) => fields,
+        Err(error) => {
+            return internal_handler_error(cv, "message.fields", error).add_typed_default(
+                DataType::ErrorType,
+                DataValue::Str("stored_message_invalid".into()),
+            );
+        }
     };
     for (data_type, value) in fields {
         response = response.add_typed_default(data_type, value);
