@@ -152,6 +152,35 @@ impl OmikronConnection {
     }
 
     pub(super) async fn handle_account_state_request(self: Arc<Self>, cv: &CommunicationValue) {
+        // TU logins do not pass through password provisioning's signed identity
+        // lookup. Establish that same verified home/key binding before discovery.
+        if matches!(
+            tau::sync::decode_request(cv),
+            Ok(tau::sync::Request::Discover { .. })
+        ) {
+            let user = cv
+                .require_sender()
+                .ok()
+                .and_then(|id| i64::try_from(id).ok());
+            let verified = match user {
+                Some(user) => self.password_identity(user).await.map(|_| ()),
+                None => Err(tau::password::Failure::InvalidRequest),
+            };
+            if let Err(error) = verified {
+                log!("Account sync identity verification failed: {:?}", error);
+                let error = match error {
+                    tau::password::Failure::DependencyUnavailable
+                    | tau::password::Failure::Cancelled => tau::sync::SyncError::Retryable,
+                    _ => tau::sync::SyncError::Unauthorized,
+                };
+                if let Ok(response) =
+                    tau::sync::encode_response(cv, &tau::sync::Response::Unavailable { error })
+                {
+                    let _ = self.send_message(&response).await;
+                }
+                return;
+            }
+        }
         let response = message_handlers::handle_account_state_request(cv);
         let scoped_ack = matches!(
             tau::sync::decode_request(cv),

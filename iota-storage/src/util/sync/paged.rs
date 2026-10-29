@@ -111,12 +111,41 @@ pub fn execute(owner: i64, request: &Request) -> Result<Response, StorageError> 
     }
     // Protocol failures must not commit a partially materialized snapshot.
     let outcome = db::with_immediate_transaction(|tx| {
-        authorize(tx, owner, request.scope()).map_err(protocol_error)?;
+        if let Some(scope) = request.scope() {
+            authorize(tx, owner, scope).map_err(protocol_error)?;
+        }
         tx.execute(
             "DELETE FROM account_sync_pages WHERE expires_at<=?1",
             [now_millis()],
         )?;
         match request {
+            Request::Discover {
+                device_id,
+                dictionary,
+            } => {
+                let identity: Option<(String, i64, i64)> = tx.query_row(
+                    "SELECT p.authority_id,p.remote_user_id,a.generation FROM hosted_principals h
+                     JOIN principals p ON p.principal_pk=h.principal_handle JOIN hosted_auth_state a ON a.local_user_id=h.local_user_id
+                     WHERE h.local_user_id=?1 AND a.enabled=1 AND p.retired_at IS NULL",
+                    [owner], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).optional()?;
+                let (authority, user_id, generation) =
+                    identity.ok_or_else(|| protocol_error(SyncError::Unauthorized))?;
+                let scope = Scope {
+                    principal: iota_identity::relay_protocol::Principal::new(
+                        authority,
+                        u64::try_from(user_id)
+                            .map_err(|_| protocol_error(SyncError::Unauthorized))?,
+                    )
+                    .map_err(|_| protocol_error(SyncError::Unauthorized))?,
+                    device_id: device_id.clone(),
+                    authorization_generation: generation,
+                    schema: SCHEMA.into(),
+                    dictionary: dictionary.clone(),
+                };
+                authorize(tx, owner, &scope).map_err(protocol_error)?;
+                Ok(Response::Scope { scope })
+            }
             Request::Snapshot { scope, page, limit } => {
                 page_response(tx, owner, scope, "snapshot", 0, page, *limit)
             }
