@@ -116,6 +116,37 @@ pub fn due(limit: usize) -> Result<Vec<Proposal>, StorageError> {
     })
 }
 
+/// Only unaccepted work may yield. A peer's lower digest breaks simultaneous
+/// proposals without changing an escrow, accepted relay or readable epoch.
+pub fn yield_to_peer_in_tx(
+    tx: &Transaction<'_>,
+    first: &PrincipalId,
+    second: &PrincipalId,
+    digest: &[u8; 32],
+) -> Result<(), StorageError> {
+    let pair = sorted_pair(first, second)?;
+    let first_key = principal_key(&pair[0])?;
+    let second_key = principal_key(&pair[1])?;
+    let pending: Option<Vec<u8>> = tx.query_row(
+        "SELECT operation_digest FROM initial_secret_proposals WHERE first_principal=?1 AND second_principal=?2 AND state IN ('awaiting_peer_proof','verifying')",
+        params![first_key, second_key], |row| row.get(0),
+    ).optional()?;
+    let Some(pending) = pending else {
+        return Ok(());
+    };
+    if digest.as_slice() >= pending.as_slice()
+        || initialization_state_on(tx, first, second, Some(&pending))?
+            != InitializationState::ExactPendingProposal
+    {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE initial_secret_proposals SET state='rejected',last_error='conflict',claim_owner=NULL,claim_deadline=NULL WHERE first_principal=?1 AND second_principal=?2 AND operation_digest=?3 AND state IN ('awaiting_peer_proof','verifying') AND NOT EXISTS(SELECT 1 FROM chat_secret_escrows WHERE first_principal=?1 AND second_principal=?2)",
+        params![first_key, second_key, pending],
+    )?;
+    Ok(())
+}
+
 pub fn claim(observed: &Proposal) -> Result<Option<Proposal>, StorageError> {
     db::with_immediate_transaction(|tx| {
         let now = sync::now_millis();

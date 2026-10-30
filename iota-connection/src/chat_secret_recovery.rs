@@ -727,6 +727,11 @@ impl PeerRecoveryHandler for RecoveryCoordinator {
             recheck_homes_in_tx(tx, local, &partner_home, &owner_home)?;
             let epoch = committed_epoch_on(tx, &owner, &partner, request.epoch)?;
             let escrow = storage::escrow_for_recovery_on(tx, &owner, &partner, &owner, epoch)?;
+            if escrow.is_none()
+                && let Some(digest) = &request.proposal_digest
+            {
+                storage::initial_proposals::yield_to_peer_in_tx(tx, &owner, &partner, digest)?;
+            }
             let state = if escrow.is_none() {
                 Some(storage::initialization_state_on(
                     tx,
@@ -1074,14 +1079,6 @@ pub async fn handle_get_chat_secret(cv: &CommunicationValue) -> CommunicationVal
     .await
     {
         Ok(Ok(())) => crate::message_handlers::handle_get_chat_secret(cv),
-        Ok(Err(RecoveryError::NoSuchConversation)) => {
-            use tau::CommunicationResponseExt;
-            let Some(map) = cv.type_map() else {
-                return response;
-            };
-            CommunicationValue::new_with_type_map(mtp::codec::CommunicationType::ErrorNotSet, map)
-                .with_request_id(cv)
-        }
         _ => response,
     }
 }

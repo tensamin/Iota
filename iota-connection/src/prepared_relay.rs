@@ -409,11 +409,8 @@ fn prepare_application_inner(
                 }
             }
             let version = positive_version()?;
-            // A shared Iota commits both initial envelopes in the same transaction.
-            let shared_initializer =
-                (historical || (sender.is_some() && recipient.is_some())) && version == 1;
             if signer_identity == recipient_identity
-                || (signer_identity > recipient_identity && !shared_initializer)
+                || (version != 1 && signer_identity > recipient_identity)
             {
                 return Err(StorageError::MessageUnauthorized);
             }

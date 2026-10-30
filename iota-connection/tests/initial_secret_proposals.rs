@@ -95,6 +95,8 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
             "conflict",
             "proof_then_outage",
             "concurrent",
+            "reverse",
+            "race",
             "revocation",
             "persistence_failure",
         ] {
@@ -121,7 +123,7 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
         mode: AtomicU8::new(0),
         requests: AtomicUsize::new(0),
     });
-    install_recovery(Arc::new(RecoveryCoordinator::new(
+    let recovery = Arc::new(RecoveryCoordinator::new(
         Arc::new(Resolver),
         peer.clone(),
         Arc::new(SqlitePrincipalStore),
@@ -131,13 +133,35 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
         Arc::new(OriginalOperationVerifier {
             relay: fixture.service.clone(),
         }),
-    )));
-    let frame = fixture.frame(0, "proposal", secret(&fixture));
-    let accept = || {
-        fixture
-            .service
-            .accept_relay(fixture.sources[0].clone(), frame.clone())
+    ));
+    install_recovery(recovery.clone());
+    let mut signer = usize::from(scenario == "reverse");
+    let mut frame = fixture.frame(signer, "proposal", secret(&fixture));
+    let mut race_incoming = None;
+    if scenario == "race" {
+        let other = fixture.frame(1, "proposal", secret(&fixture));
+        let digest = |frame: &mtp::codec::CommunicationValue| {
+            storage::operation_digest(
+                storage::RelayFormat::TauSignedRelayV1,
+                &frame.clone().without_id().to_bytes().unwrap(),
+            )
+        };
+        if digest(&frame) < digest(&other) {
+            race_incoming = Some(frame);
+            frame = other;
+            signer = 1;
+        } else {
+            race_incoming = Some(other);
+        }
+    }
+    let source = if signer == 0 {
+        fixture.sources[0].clone()
+    } else {
+        IngressSource::DirectPeer {
+            node_id: fixture.destination.node_id().clone(),
+        }
     };
+    let accept = || fixture.service.accept_relay(source.clone(), frame.clone());
     if scenario == "persistence_failure" {
         execute(
             "CREATE TRIGGER fail_proposal BEFORE INSERT ON initial_secret_proposals BEGIN SELECT RAISE(ABORT,'storage unavailable'); END;",
@@ -189,7 +213,7 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
     assert_eq!(count("SELECT count(*) FROM chat_secret_escrows"), 0);
     assert_eq!(count("SELECT count(*) FROM chat_secrets"), 0);
     let observed = db::with_db(|connection| {
-        storage::initial_proposals::get_on(connection, &fixture.ids[0], "proposal")
+        storage::initial_proposals::get_on(connection, &fixture.ids[signer], "proposal")
     })
     .unwrap()
     .unwrap();
@@ -202,7 +226,7 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
         ));
     }
     let same = db::with_db(|connection| {
-        storage::initial_proposals::get_on(connection, &fixture.ids[0], "proposal")
+        storage::initial_proposals::get_on(connection, &fixture.ids[signer], "proposal")
     })
     .unwrap()
     .unwrap();
@@ -210,6 +234,66 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
     assert_eq!(observed.digest, same.digest);
     assert_eq!(observed.generation, same.generation);
     assert_eq!(peer.requests.load(Ordering::SeqCst), 1);
+    if scenario == "race" {
+        use iota_connection::federated_relay::{protocol, protocol_principal};
+        let incoming = race_incoming.unwrap();
+        let digest = storage::operation_digest(
+            storage::RelayFormat::TauSignedRelayV1,
+            &incoming.clone().without_id().to_bytes().unwrap(),
+        );
+        assert!(digest < observed.digest);
+        let request = RecoveryRequest {
+            version: RECOVERY_VERSION,
+            pair: protocol::ConversationPair::new(
+                protocol_principal(&fixture.ids[0]),
+                protocol_principal(&fixture.ids[1]),
+            )
+            .unwrap(),
+            owner: protocol_principal(&fixture.ids[1]),
+            epoch: Some(1),
+            nonce: [7; 32],
+            proposal_digest: Some(digest.try_into().unwrap()),
+        };
+        assert!(matches!(
+            recovery
+                .handle_peer_request(
+                    fixture.destination.node_id(),
+                    &fixture.destination.public_keys(),
+                    &request
+                )
+                .await,
+            Err(RecoveryError::NoSuchConversation)
+        ));
+        assert_eq!(
+            count("SELECT count(*) FROM initial_secret_proposals WHERE state='rejected'"),
+            1
+        );
+        assert_eq!(count("SELECT count(*) FROM chat_secrets"), 0);
+        peer.mode.store(1, Ordering::SeqCst);
+        let incoming_source = if signer == 0 {
+            IngressSource::DirectPeer {
+                node_id: fixture.destination.node_id().clone(),
+            }
+        } else {
+            fixture.sources[0].clone()
+        };
+        accepted(
+            fixture
+                .service
+                .accept_relay(incoming_source, incoming)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM initial_secret_proposals WHERE state='committed'"),
+            1
+        );
+        assert!(matches!(
+            accept().await.unwrap(),
+            RelayOutcome::Rejected { .. }
+        ));
+        return;
+    }
     assert!(
         matches!(
             fixture.accept(0, "proposal", secret(&fixture)).await,
@@ -261,7 +345,14 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
         .retry_initial_secret_proposals()
         .await
         .unwrap();
-    if scenario == "outage" {
+    if scenario == "reverse" {
+        assert_eq!(
+            count("SELECT count(*) FROM initial_secret_proposals WHERE state='committed'"),
+            1
+        );
+        assert_eq!(count("SELECT count(*) FROM chat_secrets"), 1);
+        accepted(accept().await.unwrap());
+    } else if scenario == "outage" {
         assert_eq!(
             count("SELECT count(*) FROM initial_secret_proposals WHERE state='committed'"),
             1
