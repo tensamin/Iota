@@ -59,7 +59,9 @@ impl RecoveryTransport for Peer {
             db::with_immediate_transaction(|tx| storage::purge_owner_in_tx(tx, LocalUserId(1)))
                 .unwrap();
         }
-        let result = if mode == 4 {
+        let result = if mode == 7 {
+            Err(RecoveryError::Conflict)
+        } else if mode == 4 {
             let evidence: storage::Escrow = db::with_db(|connection| {
                 let bytes: Vec<u8> = connection.query_row(
                     "SELECT verified_prepared_operation FROM initial_secret_proposals",
@@ -92,13 +94,15 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
             "outage",
             "identity",
             "erasure",
-            "conflict",
+            "accepted_proposal",
             "proof_then_outage",
             "concurrent",
             "reverse",
             "race",
             "revocation",
             "persistence_failure",
+            "dishonest_digest",
+            "unproven_conflict",
         ] {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -177,6 +181,16 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
     }
     if scenario == "concurrent" {
         let reverse = fixture.frame(1, "competing-proposal", secret(&fixture));
+        let lowest = [&frame, &reverse]
+            .map(|frame| {
+                storage::operation_digest(
+                    storage::RelayFormat::TauSignedRelayV1,
+                    &frame.clone().without_id().to_bytes().unwrap(),
+                )
+            })
+            .into_iter()
+            .min()
+            .unwrap();
         let (first, second) = tokio::join!(
             accept(),
             fixture.service.accept_relay(
@@ -187,21 +201,21 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
             )
         );
         let outcomes = [first.unwrap(), second.unwrap()];
-        assert_eq!(
+        assert!(
             outcomes
                 .iter()
-                .filter(|outcome| matches!(outcome, RelayOutcome::RetryLater { .. }))
-                .count(),
-            1
+                .all(|outcome| !matches!(outcome, RelayOutcome::Accepted { .. }))
         );
         assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(outcome, RelayOutcome::Rejected { .. }))
-                .count(),
+            count(
+                "SELECT count(*) FROM initial_secret_proposals WHERE state IN ('awaiting_peer_proof','verifying')"
+            ),
             1
         );
-        assert_eq!(count("SELECT count(*) FROM initial_secret_proposals"), 1);
+        let winner: Vec<u8> = db::with_db(|connection| Ok(connection.query_row(
+            "SELECT operation_digest FROM initial_secret_proposals WHERE state IN ('awaiting_peer_proof','verifying')", [], |row| row.get(0),
+        )?)).unwrap();
+        assert_eq!(winner, lowest);
         assert_eq!(count("SELECT count(*) FROM relay_inbox"), 0);
         return;
     }
@@ -218,6 +232,62 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
     .unwrap()
     .unwrap();
     assert_eq!(observed.generation, 1);
+    if scenario == "dishonest_digest" {
+        let request = RecoveryRequest {
+            version: RECOVERY_VERSION,
+            pair: ConversationPair::new(
+                tau::relay_protocol::Principal::new(
+                    fixture.ids[0].authority.as_str().into(),
+                    fixture.ids[0].user_id,
+                )
+                .unwrap(),
+                tau::relay_protocol::Principal::new(
+                    fixture.ids[1].authority.as_str().into(),
+                    fixture.ids[1].user_id,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            owner: tau::relay_protocol::Principal::new(
+                fixture.ids[1].authority.as_str().into(),
+                fixture.ids[1].user_id,
+            )
+            .unwrap(),
+            epoch: Some(1),
+            nonce: [1; 32],
+            proposal_digest: Some([0; 32]),
+        };
+        for nonce in [1, 2, 3] {
+            let request = RecoveryRequest {
+                nonce: [nonce; 32],
+                ..request.clone()
+            };
+            let _ = recovery
+                .handle_peer_request(
+                    fixture.destination.node_id(),
+                    &fixture.destination.public_keys(),
+                    &request,
+                )
+                .await;
+            let current = db::with_db(|connection| {
+                storage::initial_proposals::get_on(
+                    connection,
+                    &observed.signer,
+                    &observed.message_id,
+                )
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                current.state, observed.state,
+                "an authenticated peer's invented digest rejected a real proposal"
+            );
+            assert_eq!(current.generation, observed.generation);
+        }
+        assert_eq!(count("SELECT count(*) FROM chat_secret_escrows"), 0);
+        assert_eq!(count("SELECT count(*) FROM chat_secrets"), 0);
+        return;
+    }
     execute("UPDATE initial_secret_proposals SET next_at=9223372036854775807");
     for _ in 0..10 {
         assert!(matches!(
@@ -262,11 +332,11 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
                     &request
                 )
                 .await,
-            Err(RecoveryError::NoSuchConversation)
+            Err(RecoveryError::Conflict)
         ));
         assert_eq!(
             count("SELECT count(*) FROM initial_secret_proposals WHERE state='rejected'"),
-            1
+            0
         );
         assert_eq!(count("SELECT count(*) FROM chat_secrets"), 0);
         peer.mode.store(1, Ordering::SeqCst);
@@ -296,10 +366,17 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
     }
     assert!(
         matches!(
-            fixture.accept(0, "proposal", secret(&fixture)).await,
+            fixture
+                .service
+                .accept_relay(
+                    source.clone(),
+                    fixture.frame(signer, "proposal", secret(&fixture))
+                )
+                .await
+                .unwrap(),
             RelayOutcome::Rejected { .. }
         ),
-        "same message ID cannot replace signed bytes"
+        "same canonical signer and message ID cannot replace signed bytes"
     );
     if scenario == "outage" {
         execute("UPDATE initial_secret_proposals SET next_at=0");
@@ -333,8 +410,9 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
         match scenario.as_str() {
             "identity" => 2,
             "erasure" => 3,
-            "conflict" => 4,
+            "accepted_proposal" => 4,
             "proof_then_outage" => 5,
+            "unproven_conflict" => 7,
             _ => 1,
         },
         Ordering::SeqCst,
@@ -352,7 +430,7 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
         );
         assert_eq!(count("SELECT count(*) FROM chat_secrets"), 1);
         accepted(accept().await.unwrap());
-    } else if scenario == "outage" {
+    } else if scenario == "outage" || scenario == "accepted_proposal" {
         assert_eq!(
             count("SELECT count(*) FROM initial_secret_proposals WHERE state='committed'"),
             1
@@ -382,7 +460,7 @@ async fn proposals_remain_unaccepted_until_fresh_fenced_proof() {
         assert_eq!(count("SELECT count(*) FROM chat_secret_escrows"), 0);
         match scenario.as_str() {
             "erasure" => assert_eq!(count("SELECT count(*) FROM initial_secret_proposals"), 0),
-            "proof_then_outage" => assert_eq!(
+            "proof_then_outage" | "unproven_conflict" => assert_eq!(
                 count(
                     "SELECT count(*) FROM initial_secret_proposals WHERE state='awaiting_peer_proof'"
                 ),

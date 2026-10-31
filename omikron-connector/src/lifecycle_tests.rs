@@ -100,6 +100,191 @@ impl Loopback {
 }
 
 #[tokio::test]
+async fn chat_read_dispatch_uses_canonical_owner_and_preserves_historical_epochs() {
+    if std::env::var_os("IOTA_CHAT_READ_DISPATCH_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "omikron_connection::lifecycle_tests::chat_read_dispatch_uses_canonical_owner_and_preserves_historical_epochs", "--nocapture"])
+            .env("IOTA_CHAT_READ_DISPATCH_CHILD", "1")
+            .status().unwrap();
+        assert!(status.success());
+        return;
+    }
+    let storage = StorageDirectory(
+        PathBuf::from("/tmp/opencode").join(format!("connector-chat-reads-{}", Uuid::new_v4())),
+    );
+    std::fs::create_dir_all(&storage.0).unwrap();
+    relay_support::initialize(&storage.0);
+    let fixture = relay_support::Fixture::new(true);
+    iota_storage::node_directory::SqliteNodeDirectory
+        .ensure_local_descriptor(
+            &fixture.node,
+            vec![],
+            vec![],
+            iota_storage::util::sync::now_millis(),
+        )
+        .unwrap();
+    let network = Loopback::new().await;
+    let connector = network.connector().await;
+    assert!(
+        connector
+            .install_identity_resolver(Arc::new(relay_support::Resolver))
+            .is_ok()
+    );
+    network.start_reader(&connector).await;
+    let canonical = serde_json::to_string(&fixture.ids[0]).unwrap();
+    let request = CommunicationValue::new(CommunicationType::UserResolve)
+        .with_id(101)
+        .with_sender(1)
+        .add_typed_default(DataType::UserAddress, DataValue::Str(canonical.clone()));
+    network.peer.sender.send(&request).await.unwrap();
+    let resolved = timeout(NETWORK_BUDGET, network.peer.receive())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        resolved.is_type(CommunicationType::UserResolved),
+        "{resolved:?}"
+    );
+    assert_eq!(resolved.id(), request.id());
+    assert_eq!(
+        resolved.get_data(DataType::Principal).as_str(),
+        Some(canonical.as_str())
+    );
+
+    relay_support::accepted(
+        fixture
+            .accept(
+                0,
+                "chat-read-contact",
+                CommunicationValue::new(CommunicationType::AddConversation).add_typed_default(
+                    DataType::ChatPartnerId,
+                    DataValue::UnsignedNumber(fixture.ids[1].user_id.into()),
+                ),
+            )
+            .await,
+    );
+
+    let request = CommunicationValue::new(CommunicationType::GetChats)
+        .with_id(102)
+        .with_sender(1);
+    network.peer.sender.send(&request).await.unwrap();
+    let chats = timeout(NETWORK_BUDGET, network.peer.receive())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(chats.is_type(CommunicationType::GetChats));
+    assert_eq!(chats.id(), request.id());
+    assert_eq!(chats.receiver(), Some(1));
+    let contacts = chats
+        .get_data(DataType::UserIds)
+        .and_then(DataValue::as_array)
+        .unwrap();
+    assert_eq!(contacts.len(), 1);
+    assert_eq!(
+        contacts[0]
+            .get_field(
+                DataType::Principal
+                    .try_to_id(chats.type_map().unwrap())
+                    .unwrap()
+            )
+            .and_then(DataValue::as_str),
+        Some(serde_json::to_string(&fixture.ids[1]).unwrap().as_str())
+    );
+
+    relay_support::accepted(
+        fixture
+            .accept(1, "initial-chat-read", relay_support::secret(&fixture))
+            .await,
+    );
+    let rotation = relay_support::secret(&fixture)
+        .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(2));
+    let Some(DataValue::Array(mut copies)) = rotation.get_data(DataType::Recipients).cloned()
+    else {
+        panic!("secret recipient fixture missing");
+    };
+    let encrypted = DataType::EncryptedSecret
+        .try_to_id(rotation.type_map().unwrap())
+        .unwrap();
+    for copy in &mut copies {
+        let DataValue::Container(fields) = copy else {
+            panic!("recipient fixture must be a container");
+        };
+        let DataValue::Bytes(bytes) = &mut fields
+            .iter_mut()
+            .find(|(kind, _)| *kind == encrypted)
+            .unwrap()
+            .1
+        else {
+            panic!("envelope fixture must be bytes");
+        };
+        bytes.push(2);
+    }
+    let rotation = rotation.add_typed_default(DataType::Recipients, DataValue::Array(copies));
+    relay_support::accepted(fixture.accept(0, "rotated-chat-read", rotation).await);
+    let owner = tau::relay_protocol::Principal::new(
+        fixture.ids[0].authority.as_str().into(),
+        fixture.ids[0].user_id,
+    )
+    .unwrap();
+    let partner = tau::relay_protocol::Principal::new(
+        fixture.ids[1].authority.as_str().into(),
+        fixture.ids[1].user_id,
+    )
+    .unwrap();
+    let pair = tau::relay_protocol::ConversationPair::new(owner.clone(), partner.clone()).unwrap();
+    for (id, epoch) in [(103, Some(1)), (104, Some(2)), (105, None)] {
+        let scope = tau::chat_secret::ReadRequest {
+            owner: owner.clone(),
+            secret_id: tau::relay_protocol::chat_secret_id(&pair.chat_id().unwrap()),
+            pair: pair.clone(),
+            epoch: epoch.map(|epoch| epoch.try_into().unwrap()),
+        };
+        let request = scope
+            .to_frame(&TypeMap::latest(), id)
+            .unwrap()
+            .with_sender(1);
+        network.peer.sender.send(&request).await.unwrap();
+        let response = timeout(NETWORK_BUDGET, network.peer.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        let decoded = tau::chat_secret::ReadResponse::from_frame(&response, &request).unwrap();
+        assert_eq!(decoded.scope.epoch.unwrap().get(), epoch.unwrap_or(2));
+        assert_eq!(decoded.scope.owner, owner);
+        assert_eq!(
+            decoded.encrypted_secret,
+            if epoch == Some(1) {
+                vec![1]
+            } else {
+                vec![1, 2]
+            }
+        );
+    }
+    let forbidden = tau::chat_secret::ReadRequest {
+        owner: partner,
+        secret_id: tau::relay_protocol::chat_secret_id(&pair.chat_id().unwrap()),
+        pair,
+        epoch: Some(1.try_into().unwrap()),
+    }
+    .to_frame(&TypeMap::latest(), 106)
+    .unwrap()
+    .with_sender(1);
+    network.peer.sender.send(&forbidden).await.unwrap();
+    let denied = timeout(NETWORK_BUDGET, network.peer.receive())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        denied.is_type(CommunicationType::ErrorNotFound),
+        "{denied:?}"
+    );
+    assert!(denied.get_data(DataType::EncryptedSecret).is_none());
+    assert_eq!(denied.id(), forbidden.id());
+    assert_eq!(connector.stop().await.unwrap(), ShutdownOutcome::Complete);
+    network.close().await;
+}
+
+#[tokio::test]
 async fn envelope_authority_is_bound_to_the_current_identified_attempt() {
     let network = Loopback::new().await;
     let connector = network.connector().await;

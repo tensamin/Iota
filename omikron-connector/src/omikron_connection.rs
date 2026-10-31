@@ -543,6 +543,7 @@ pub struct OmikronConnection {
     pub(crate) app: Arc<std::sync::Mutex<AppState>>,
     invitation_sync: Arc<InvitationSyncRuntime>,
     relay_service: Arc<OnceLock<Arc<iota_connection::relay_service::RelayService>>>,
+    identities: Arc<OnceLock<Arc<dyn iota_identity::IdentityResolver>>>,
     local_deliveries: Arc<OnceLock<Arc<dyn other_iota::LocalDeliverySink>>>,
     pending_deliveries: Arc<OnceLock<Arc<PendingDelivery>>>,
 }
@@ -592,6 +593,7 @@ impl OmikronConnection {
             app,
             invitation_sync: Arc::new(InvitationSyncRuntime::new()),
             relay_service: Arc::new(OnceLock::new()),
+            identities: Arc::new(OnceLock::new()),
             local_deliveries: Arc::new(OnceLock::new()),
             pending_deliveries: Arc::new(OnceLock::new()),
         }
@@ -602,6 +604,13 @@ impl OmikronConnection {
         relay: Arc<iota_connection::relay_service::RelayService>,
     ) -> Result<(), Arc<iota_connection::relay_service::RelayService>> {
         self.relay_service.set(relay)
+    }
+
+    pub fn install_identity_resolver(
+        &self,
+        identities: Arc<dyn iota_identity::IdentityResolver>,
+    ) -> Result<(), Arc<dyn iota_identity::IdentityResolver>> {
+        self.identities.set(identities)
     }
 
     pub fn relay_service(&self) -> Option<Arc<iota_connection::relay_service::RelayService>> {

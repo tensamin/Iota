@@ -78,6 +78,7 @@ impl OmikronConnection {
             return;
         }
 
+        dispatch!(UserResolve, handle_user_resolve);
         dispatch!(GetChatSecret, handle_get_chat_secret);
         dispatch!(TAuthAuthorize, handle_tauth_authorize);
         dispatch!(PasswordEnrollmentStart, handle_password_enrollment_start);

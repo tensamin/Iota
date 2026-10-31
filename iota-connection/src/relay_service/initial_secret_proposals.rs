@@ -27,6 +27,12 @@ impl RelayService {
             } else {
                 (&verified.recipient, &verified.signer)
             };
+            // `operation` was prepared from the verified original relay. Only
+            // this signed evidence, never an authenticated digest assertion,
+            // may supersede a competing uncommitted proposal.
+            if proposals::get_on(tx, &escrow.signer, &escrow.message_id)?.is_none() {
+                proposals::yield_to_verified_proposal_in_tx(tx, escrow)?;
+            }
             proposals::persist_in_tx(tx, escrow, &prepared, first, second)
         });
         let proposal = match persisted {
@@ -135,7 +141,10 @@ impl RelayService {
         {
             return Err(StorageError::PendingRelayConflict);
         }
-        db::with_immediate_transaction(|tx| proposals::verify_identity_in_tx(tx, proposal))?;
+        db::with_immediate_transaction(|tx| {
+            proposals::verify_identity_in_tx(tx, proposal)?;
+            operation.verify_origin_authorization_in_tx(tx, true)
+        })?;
         let map = TypeMap::new(
             mtp::type_map::Version::parse(&operation.type_map_version)
                 .ok_or(StorageError::InvalidRelayPayload("proposal type map"))?,
@@ -149,6 +158,19 @@ impl RelayService {
                     StorageError::Other("proposal verification unavailable".into())
                 }
             })?;
+        if let crate::prepared_relay::DeliveryTarget::Remote(node) = &operation.delivery {
+            // Give the destination the actual signed proposal before probing.
+            // Simultaneous proposals can then select the lower verified digest.
+            // Neither this receipt nor a transport failure selects a usable key;
+            // the gate below still requires fresh authenticated recovery proof.
+            let frame = CommunicationValue::try_from_bytes_with(&operation.frame, &map)
+                .map_err(|_| StorageError::InvalidRelayPayload("proposal frame"))?
+                .with_id(operation.frame_id);
+            let _ = self
+                .router
+                .route(&RouteDestination::Iota(node.clone()), frame)
+                .await;
+        }
         let guard = crate::chat_secret_recovery::gate_initial_set_chat_secret(escrow)
             .await
             .map_err(|error| match error {

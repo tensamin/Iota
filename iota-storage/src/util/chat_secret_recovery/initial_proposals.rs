@@ -116,14 +116,19 @@ pub fn due(limit: usize) -> Result<Vec<Proposal>, StorageError> {
     })
 }
 
-/// Only unaccepted work may yield. A peer's lower digest breaks simultaneous
-/// proposals without changing an escrow, accepted relay or readable epoch.
-pub fn yield_to_peer_in_tx(
+/// The caller must independently verify the competing signed operation before
+/// entering this transaction. A recovery probe's digest is not that evidence.
+pub fn yield_to_verified_proposal_in_tx(
     tx: &Transaction<'_>,
-    first: &PrincipalId,
-    second: &PrincipalId,
-    digest: &[u8; 32],
+    proposal: &Escrow,
 ) -> Result<(), StorageError> {
+    proposal.validate()?;
+    if proposal.version != 1 {
+        return Err(invalid());
+    }
+    let first = &proposal.first;
+    let second = &proposal.second;
+    let digest = &proposal.operation_digest;
     let pair = sorted_pair(first, second)?;
     let first_key = principal_key(&pair[0])?;
     let second_key = principal_key(&pair[1])?;

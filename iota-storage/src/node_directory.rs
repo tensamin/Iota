@@ -135,12 +135,13 @@ impl SqliteNodeDirectory {
             current_key,
         )) = current
         {
-            if revision > descriptor.revision
-                || (revision == descriptor.revision && resolved_at > verified.resolved_at())
-            {
-                return Err(crate::storage_error::StorageError::Other(
-                    "stale node descriptor update was rejected".into(),
-                ));
+            if revision > descriptor.revision {
+                return Err(crate::storage_error::StorageError::Other(format!(
+                    "stale node descriptor update was rejected: node={} stored_revision={} incoming_revision={}",
+                    descriptor.node.as_str(),
+                    revision,
+                    descriptor.revision
+                )));
             }
             if revision == descriptor.revision
                 && (valid_until != descriptor.valid_until
@@ -151,6 +152,12 @@ impl SqliteNodeDirectory {
                 return Err(crate::storage_error::StorageError::Other(
                     "conflicting node descriptor revision was rejected".into(),
                 ));
+            }
+            // Concurrent lookups can verify the same signed descriptor before
+            // committing in reverse order. An exact duplicate must not move
+            // freshness or key validity backwards.
+            if revision == descriptor.revision && resolved_at >= verified.resolved_at() {
+                return Ok(());
             }
         }
         transaction.execute(

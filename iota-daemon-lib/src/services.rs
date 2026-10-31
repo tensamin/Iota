@@ -177,10 +177,15 @@ impl DaemonServices {
             &services,
             Arc::new(iota_storage::node_directory::SqliteNodeDirectory),
             &identity,
-            Arc::new(UnsupportedRecoveryTransport),
-            None,
+            services
+                .direct_router
+                .as_ref()
+                .expect("centralized peer router")
+                .clone(),
+            services.direct_router.as_ref(),
         );
         let _ = omikron.install_relay_service(services.relay.clone());
+        let _ = omikron.install_identity_resolver(services.identities.clone());
         Ok(services)
     }
 
@@ -216,11 +221,44 @@ impl DaemonServices {
                     .as_ref()
                     .and_then(|identity| identity.node_id()),
             ));
+        let web = &iota_storage::util::config_util::CONFIG.load().web;
+        let federation_client: Arc<dyn other_iota::FederationIdentityClient> =
+            Arc::new(other_iota::HttpFederationIdentityClient::new(
+                web.allow_lan_federation,
+                web.allow_raw_ip_federation,
+            ));
+        let nodes: Arc<dyn NodeDirectory> =
+            Arc::new(iota_storage::node_directory::SqliteNodeDirectory);
+        let identities: Arc<dyn IdentityResolver> = Arc::new(
+            CompositeIdentityResolver::new(vec![
+                identities,
+                Arc::new(
+                    other_iota::RemoteIotaResolver::new(
+                        federation_client.clone(),
+                        principals.clone(),
+                        nodes.clone(),
+                    )
+                    .with_authority_directory(Arc::new(
+                        iota_storage::authority_directory::SqliteAuthorityDirectory,
+                    )),
+                ),
+                Arc::new(other_iota::RemoteOmegaResolver::new(
+                    federation_client,
+                    principals.clone(),
+                    nodes,
+                )),
+            ])
+            .expect("centralized and remote identity resolvers compose"),
+        );
         let router: Arc<dyn PeerRouter> = router.unwrap_or_else(|| {
             Arc::new(omikron_connector::router::OmikronPeerRouter::new(
                 client.clone(),
             ))
         });
+        let direct_router = Arc::new(other_iota::DirectPeerRouter::default());
+        let router: Arc<dyn PeerRouter> = Arc::new(
+            other_iota::relay_router::DirectThenRelayRouter::new(direct_router.clone(), router),
+        );
         let mut relay = RelayService::new(local_users.clone(), router.clone());
         if let Some(node_identity) = node_identity {
             relay = relay.with_federation(identities.clone(), node_identity);
@@ -232,10 +270,10 @@ impl DaemonServices {
                 identities,
                 principals,
                 local_users,
-                node_identities: Arc::new(InactiveNodeIdentityResolver),
+                node_identities: Arc::new(iota_storage::node_directory::SqliteNodeDirectory),
                 relay,
                 router,
-                direct_router: None,
+                direct_router: Some(direct_router),
                 relay_routers: None,
                 centralized: Some(Arc::new(CentralizedServices { omikron: client })),
             },
@@ -317,22 +355,6 @@ impl DaemonServices {
 }
 
 struct InactiveIdentityResolver;
-
-struct UnsupportedRecoveryTransport;
-
-#[async_trait]
-impl iota_connection::chat_secret_recovery::RecoveryTransport for UnsupportedRecoveryTransport {
-    async fn request(
-        &self,
-        _: &IotaNodeId,
-        _: &iota_connection::chat_secret_recovery::RecoveryRequest,
-    ) -> Result<
-        iota_connection::chat_secret_recovery::AuthenticatedRecoveryReply,
-        iota_connection::chat_secret_recovery::RecoveryError,
-    > {
-        Err(iota_connection::chat_secret_recovery::RecoveryError::RetryablePeerUnavailable)
-    }
-}
 
 fn start_chat_secret_recovery(
     services: &DaemonServices,

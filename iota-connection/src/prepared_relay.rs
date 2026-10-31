@@ -1008,17 +1008,11 @@ impl PreparedRelayOperation {
         db::with_immediate_transaction(|tx| self.commit_in_tx(tx, claim, false, check))
     }
 
-    pub(crate) fn commit_in_tx(
+    pub(crate) fn verify_origin_authorization_in_tx(
         &self,
         tx: &Transaction<'_>,
-        claim: &relay_replay::ProcessingClaim,
         durable_origin: bool,
-        check: impl FnOnce(&Transaction<'_>) -> Result<(), StorageError>,
     ) -> Result<(), StorageError> {
-        if claim.signer != self.signer || claim.message_id != self.message_id {
-            return Err(StorageError::StaleRelayClaim);
-        }
-        relay_replay::verify_claim_in_tx(tx, claim)?;
         self.verify_principal_fences_on(tx)?;
         self.validate_origin_lease()?;
         if let Some(lease) = &self.origin_lease {
@@ -1035,6 +1029,21 @@ impl PreparedRelayOperation {
                 iota_storage::hosted_auth::verify_in_tx(tx, &lease.authorization())?;
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn commit_in_tx(
+        &self,
+        tx: &Transaction<'_>,
+        claim: &relay_replay::ProcessingClaim,
+        durable_origin: bool,
+        check: impl FnOnce(&Transaction<'_>) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        if claim.signer != self.signer || claim.message_id != self.message_id {
+            return Err(StorageError::StaleRelayClaim);
+        }
+        relay_replay::verify_claim_in_tx(tx, claim)?;
+        self.verify_origin_authorization_in_tx(tx, durable_origin)?;
         check(tx)?;
         for (handle, identity) in [
             (self.signer, &self.signer_identity),

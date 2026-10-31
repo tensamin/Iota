@@ -1,6 +1,29 @@
 use super::*;
 
 impl OmikronConnection {
+    pub(super) async fn handle_user_resolve(self: Arc<Self>, cv: &CommunicationValue) {
+        let response = if let Some(identities) = self.identities.get() {
+            match tokio::time::timeout(
+                Duration::from_secs(15),
+                message_handlers::handle_user_resolve(cv, identities.as_ref()),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(_) => error_response(cv, CommunicationType::ErrorNoIota).add_typed_default(
+                    DataType::ErrorType,
+                    DataValue::Str("resolve_timeout".into()),
+                ),
+            }
+        } else {
+            error_response(cv, CommunicationType::ErrorNoIota).add_typed_default(
+                DataType::ErrorType,
+                DataValue::Str("resolver_unavailable".into()),
+            )
+        };
+        let _ = self.send_message(&response).await;
+    }
+
     pub(super) async fn handle_get_chat_secret(self: Arc<Self>, cv: &CommunicationValue) {
         let _ = self
             .send_message(&iota_connection::chat_secret_recovery::handle_get_chat_secret(cv).await)

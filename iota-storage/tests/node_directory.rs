@@ -27,7 +27,7 @@ async fn node_directory_persists_identity_revision_endpoints_and_pins() {
         &identity,
     )
     .unwrap();
-    let verified = signed.verify(None, now).unwrap();
+    let verified = signed.clone().verify(None, now).unwrap();
     SqliteNodeDirectory
         .upsert_node_descriptor(&verified)
         .unwrap();
@@ -50,6 +50,52 @@ async fn node_directory_persists_identity_revision_endpoints_and_pins() {
     assert_eq!(resolved.direct_endpoints, vec![endpoint.clone()]);
     assert_eq!(resolved.relay_hints, vec![relay]);
     assert_eq!(resolved.last_successful_endpoint, Some(endpoint.clone()));
+
+    let snapshot = || {
+        iota_storage::util::db::with_db(|db| {
+            Ok(db.query_row(
+                "SELECT n.descriptor_revision,n.last_resolved_at,k.valid_from,k.valid_until FROM node_directory n JOIN node_keys k ON k.node_id=n.node_id AND k.source_revision=n.descriptor_revision WHERE n.node_id=?1",
+                [identity.node_id().as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, Option<i64>>(3)?)),
+            )?)
+        }).unwrap()
+    };
+    let original = snapshot();
+    let older = signed.clone().verify(Some(1), now - 1).unwrap();
+    SqliteNodeDirectory.upsert_node_descriptor(&older).unwrap();
+    assert_eq!(
+        snapshot(),
+        original,
+        "older duplicate must not alter freshness or key validity"
+    );
+    let newer = signed.clone().verify(Some(1), now + 10).unwrap();
+    SqliteNodeDirectory.upsert_node_descriptor(&newer).unwrap();
+    assert_eq!(snapshot(), (1, now + 10, original.2, original.3));
+    SqliteNodeDirectory.upsert_node_descriptor(&newer).unwrap();
+    assert_eq!(snapshot(), (1, now + 10, original.2, original.3));
+
+    // Both observations are verified before either commits. Force the older
+    // lookup to finish last without relying on thread timing or sleeps.
+    let older = signed.clone().verify(Some(1), now + 20).unwrap();
+    let newer = signed.verify(Some(1), now + 30).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let (committed, wait) = std::sync::mpsc::channel();
+    let old_thread = std::thread::spawn({
+        let barrier = barrier.clone();
+        move || {
+            barrier.wait();
+            wait.recv().unwrap();
+            SqliteNodeDirectory.upsert_node_descriptor(&older).unwrap();
+        }
+    });
+    let new_thread = std::thread::spawn(move || {
+        barrier.wait();
+        SqliteNodeDirectory.upsert_node_descriptor(&newer).unwrap();
+        committed.send(()).unwrap();
+    });
+    old_thread.join().unwrap();
+    new_thread.join().unwrap();
+    assert_eq!(snapshot(), (1, now + 30, original.2, original.3));
     assert_eq!(
         SqliteNodeDirectory.pinned_node(&endpoint).unwrap(),
         Some(identity.node_id().clone())

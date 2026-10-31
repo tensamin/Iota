@@ -259,9 +259,18 @@ impl RecoveryCoordinator {
                     self.check_key(peer, &response.key).await?;
                     match response.reply.result {
                         Err(RecoveryError::NoSuchConversation) => {}
-                        Ok(_) => {
-                            let _ = self.enqueue(owner, partner, None);
-                            return Err(RecoveryError::Conflict);
+                        Ok(evidence) => {
+                            let accepted = decode_evidence(&request, &evidence)?;
+                            self.verifier.verify(&accepted, local).await?;
+                            if &accepted != escrow {
+                                let _ = self.enqueue(owner, partner, None);
+                                return Err(RecoveryError::Conflict);
+                            }
+                        }
+                        // A peer's pending/conflict assertion is not signed
+                        // competing-operation evidence and cannot reject ours.
+                        Err(RecoveryError::Conflict) => {
+                            return Err(RecoveryError::RetryablePeerUnavailable);
                         }
                         Err(error) => return Err(error),
                     }
@@ -727,11 +736,6 @@ impl PeerRecoveryHandler for RecoveryCoordinator {
             recheck_homes_in_tx(tx, local, &partner_home, &owner_home)?;
             let epoch = committed_epoch_on(tx, &owner, &partner, request.epoch)?;
             let escrow = storage::escrow_for_recovery_on(tx, &owner, &partner, &owner, epoch)?;
-            if escrow.is_none()
-                && let Some(digest) = &request.proposal_digest
-            {
-                storage::initial_proposals::yield_to_peer_in_tx(tx, &owner, &partner, digest)?;
-            }
             let state = if escrow.is_none() {
                 Some(storage::initialization_state_on(
                     tx,
